@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -106,7 +107,7 @@ namespace
         }
     };
 
-    /// @brief RAII wrapper for a single int stored on a CUDA device.
+    /// @brief RAII wrapper for int metadata stored on a CUDA device.
     struct CudaIntBuffer
     {
         int *ptr = nullptr; ///< Device pointer owned by this buffer.
@@ -115,6 +116,14 @@ namespace
         {
             checkCuda(cudaMalloc(reinterpret_cast<void **>(&ptr), sizeof(int)), "cudaMalloc(int)");
             checkCuda(cudaMemcpy(ptr, &value, sizeof(int), cudaMemcpyHostToDevice), "cudaMemcpy host-to-device(int)");
+        }
+
+        explicit CudaIntBuffer(std::initializer_list<int> values)
+        {
+            std::vector<int> host(values);
+            checkCuda(cudaMalloc(reinterpret_cast<void **>(&ptr), host.size() * sizeof(int)), "cudaMalloc(int[])");
+            checkCuda(cudaMemcpy(ptr, host.data(), host.size() * sizeof(int), cudaMemcpyHostToDevice),
+                      "cudaMemcpy host-to-device(int[])");
         }
 
         ~CudaIntBuffer()
@@ -722,17 +731,28 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAcc
     CudaFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(v_stride), 0.0f);
     CudaFloatBuffer d_ref_next(static_cast<size_t>(v_stride), 0.0f);
     CudaFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+    CudaFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    CudaStreamHandle stream;
 
     CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
     verifier_kernel.allocateGPUState(state_floats);
+    verifier_kernel.setGPUStream(stream.stream);
+    std::vector<float> initial_live_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(initial_live_state.data(), nullptr, nullptr));
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.chunk_forward(
         d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
         d_verifier_out.ptr, nullptr,
         verifier_len, n_heads, d_k, d_v,
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(verifier recurrence capture)");
+    std::vector<float> live_state_before_publish(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(live_state_before_publish.data(), nullptr, nullptr));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        nullptr, accepted_rows - 1, nullptr));
+        nullptr, accepted_rows - 1, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     ASSERT_TRUE(verifier_kernel.recurrent_step(
         d_Q_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
         d_K_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
@@ -745,7 +765,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAcc
         nullptr,
         n_heads, d_k, d_v,
         /*use_qk_l2norm=*/true));
-    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(restored recurrence decode)");
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(restored recurrence decode)");
 
     CUDAGatedDeltaNet ref_kernel(cuda_ordinal_);
     ref_kernel.allocateGPUState(state_floats);
@@ -771,8 +791,13 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAcc
     const auto restored = d_restored_next.toHost();
     const auto ref = d_ref_next.toHost();
     const auto diff = diffStats(restored, ref, 0, restored.size());
+    const auto live_state_diff =
+        diffStats(live_state_before_publish, initial_live_state, 0, initial_live_state.size());
     EXPECT_LT(diff.first, 2e-4f);
     EXPECT_LT(diff.second, 1e-4);
+    EXPECT_LT(live_state_diff.first, 1e-7f);
+    EXPECT_LT(live_state_diff.second, 1e-7)
+        << "CUDA verifier capture must not mutate live recurrence state before publication";
 }
 
 TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceDeviceMetadataRestoreCapturesAndMatchesAcceptedPrefix)
@@ -821,24 +846,27 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceDeviceMetadataRestoreCapturesAnd
     CudaFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(v_stride), 0.0f);
     CudaFloatBuffer d_ref_next(static_cast<size_t>(v_stride), 0.0f);
     CudaFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
-    CudaIntBuffer d_committed_state_row(accepted_rows - 1);
+    CudaFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    CudaIntBuffer d_accepted_state_slots({-1, accepted_rows - 1});
+    constexpr int metadata_request_index = 1;
     CudaStreamHandle stream;
 
     CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
     verifier_kernel.allocateGPUState(state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.chunk_forward(
         d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
         d_verifier_out.ptr, nullptr,
         verifier_len, n_heads, d_k, d_v,
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
     ASSERT_FALSE(verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
-        nullptr, d_committed_state_row.ptr, 0, nullptr));
+        nullptr, d_accepted_state_slots.ptr, metadata_request_index, nullptr));
 
     captureAndLaunchOnce(stream.stream, [&] {
         return verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
-                   nullptr, d_committed_state_row.ptr, 0, stream.stream) &&
+                   nullptr, d_accepted_state_slots.ptr, metadata_request_index, stream.stream) &&
                verifier_kernel.recurrent_step(
                    d_Q_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
                    d_K_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
@@ -1141,12 +1169,14 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceTwoRowVerifierRowZeroRestoreMatc
     CudaFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(v_stride), 0.0f);
     CudaFloatBuffer d_ref_next(static_cast<size_t>(v_stride), 0.0f);
     CudaFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+    CudaFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
     CudaStreamHandle stream;
 
     CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
     verifier_kernel.allocateGPUState(state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.chunk_forward(
         d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
         d_verifier_out.ptr, nullptr,
@@ -1154,6 +1184,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceTwoRowVerifierRowZeroRestoreMatc
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
         nullptr, accepted_rows - 1, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     ASSERT_TRUE(verifier_kernel.recurrent_step(
         d_Q_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
         d_K_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
@@ -1246,12 +1278,14 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiSt
     CudaFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(v_stride), 0.0f);
     CudaFloatBuffer d_ref_continuation(continuation_output_elems, 0.0f);
     CudaFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+    CudaFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
     CudaStreamHandle stream;
 
     CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
     verifier_kernel.allocateGPUState(state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(verifier_kernel.chunk_forward(
         d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
@@ -1260,6 +1294,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiSt
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
         nullptr, accepted_rows - 1, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     for (int row = 0; row < continuation_rows; ++row)
     {
         const int source_row = accepted_rows + row;
@@ -1344,10 +1380,14 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcce
     CudaFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(channels), 0.0f);
     CudaFloatBuffer d_ref_next(static_cast<size_t>(channels), 0.0f);
     CudaFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -77.0f);
+    CudaFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    CudaStreamHandle stream;
 
     CUDAShortConvolution verifier_kernel(cuda_ordinal_);
     verifier_kernel.allocateGPUState(state_floats);
+    verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr,
         d_weight.ptr,
@@ -1357,7 +1397,9 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcce
         verifier_len, channels, kernel_size,
         /*apply_silu=*/true));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        nullptr, accepted_rows - 1, nullptr));
+        nullptr, accepted_rows - 1, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr + static_cast<size_t>(continuation_row) * channels,
         d_weight.ptr,
@@ -1366,7 +1408,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcce
         nullptr,
         1, channels, kernel_size,
         /*apply_silu=*/true));
-    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(restored short-conv decode)");
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(restored short-conv decode)");
 
     CUDAShortConvolution ref_kernel(cuda_ordinal_);
     ref_kernel.allocateGPUState(state_floats);
@@ -1421,13 +1463,16 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvDeviceMetadataRestoreCapturesAndM
     CudaFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(channels), 0.0f);
     CudaFloatBuffer d_ref_next(static_cast<size_t>(channels), 0.0f);
     CudaFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -77.0f);
-    CudaIntBuffer d_committed_state_row(accepted_rows - 1);
+    CudaFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    CudaIntBuffer d_accepted_state_slots({-1, accepted_rows - 1});
+    constexpr int metadata_request_index = 1;
     CudaStreamHandle stream;
 
     CUDAShortConvolution verifier_kernel(cuda_ordinal_);
     verifier_kernel.allocateGPUState(state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr,
         d_weight.ptr,
@@ -1437,11 +1482,11 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvDeviceMetadataRestoreCapturesAndM
         verifier_len, channels, kernel_size,
         /*apply_silu=*/true));
     ASSERT_FALSE(verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
-        nullptr, d_committed_state_row.ptr, 0, nullptr));
+        nullptr, d_accepted_state_slots.ptr, metadata_request_index, nullptr));
 
     captureAndLaunchOnce(stream.stream, [&] {
         return verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
-                   nullptr, d_committed_state_row.ptr, 0, stream.stream) &&
+                   nullptr, d_accepted_state_slots.ptr, metadata_request_index, stream.stream) &&
                verifier_kernel.forward(
                    d_input.ptr + static_cast<size_t>(continuation_row) * channels,
                    d_weight.ptr,
@@ -1648,12 +1693,14 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvTwoRowVerifierRowZeroRestoreMatch
     CudaFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(channels), 0.0f);
     CudaFloatBuffer d_ref_next(static_cast<size_t>(channels), 0.0f);
     CudaFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -77.0f);
+    CudaFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
     CudaStreamHandle stream;
 
     CUDAShortConvolution verifier_kernel(cuda_ordinal_);
     verifier_kernel.allocateGPUState(state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr,
         d_weight.ptr,
@@ -1664,6 +1711,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvTwoRowVerifierRowZeroRestoreMatch
         /*apply_silu=*/true));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
         nullptr, accepted_rows - 1, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr + static_cast<size_t>(continuation_row) * channels,
         d_weight.ptr,
@@ -1731,12 +1780,14 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiSte
     CudaFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(channels), 0.0f);
     CudaFloatBuffer d_ref_continuation(continuation_output_elems, 0.0f);
     CudaFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -77.0f);
+    CudaFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
     CudaStreamHandle stream;
 
     CUDAShortConvolution verifier_kernel(cuda_ordinal_);
     verifier_kernel.allocateGPUState(state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr,
@@ -1748,6 +1799,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiSte
         /*apply_silu=*/true));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
         nullptr, accepted_rows - 1, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     for (int row = 0; row < continuation_rows; ++row)
     {
         const int source_row = accepted_rows + row;

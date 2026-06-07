@@ -2574,10 +2574,13 @@ namespace
                                         {"target_query_len", "5"},
                                         {"valid_sampled_count", "3"},
                                         {"committed_output_count", "3"},
-                                        {"committed_state_row", "2"},
-                                        {"committed_state_index", "2"},
+                                        {"accepted_state_count", "2"},
+                                        {"committed_state_row", "1"},
+                                        {"committed_state_index", "1"},
+                                        {"accepted_state_slot_index", "1"},
                                         {"bonus_ready_token_row", "-1"},
                                         {"bonus_ready_token_index", "-1"},
+                                        {"bonus_ready_state_slot_index", "-1"},
                                         {"accepted_verifier_input_prefix", "2"},
                                         {"accepted_mtp_draft_prefix", "1"},
                                         {"rejected_token_count", "2"},
@@ -3178,6 +3181,8 @@ namespace
         EXPECT_EQ(probe.mtp_request.stochastic_residual_samples, 0u);
         EXPECT_EQ(probe.mtp_request.stochastic_terminal_samples, 1u);
         EXPECT_DOUBLE_EQ(probe.mtp_request.stochastic_acceptance_rate, 1.0);
+        EXPECT_EQ(probe.mtp_transaction_commits, 1u);
+        EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingGPURequiresDeviceVerifier)
@@ -3272,6 +3277,8 @@ namespace
         EXPECT_EQ(probe.mtp_stochastic_terminal_samples, 1u);
         EXPECT_EQ(probe.mtp_request.verify_mode, "speculative-sampling");
         EXPECT_TRUE(probe.mtp_request.stochastic_verify);
+        EXPECT_EQ(probe.mtp_transaction_commits, 1u);
+        EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingRejectsWithResidualCorrection)
@@ -3330,6 +3337,9 @@ namespace
         EXPECT_EQ(probe.mtp_request.stochastic_residual_samples, 1u);
         EXPECT_EQ(probe.mtp_request.stochastic_terminal_samples, 0u);
         EXPECT_DOUBLE_EQ(probe.mtp_request.stochastic_acceptance_rate, 0.0);
+        EXPECT_EQ(probe.mtp_transaction_commits, 1u);
+        EXPECT_EQ(probe.mtp_transaction_rollbacks, 1u);
+        EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPPPTopologyFailsBeforePrefillForward)

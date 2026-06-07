@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -104,7 +105,7 @@ namespace
         }
     };
 
-    /// @brief RAII wrapper for a single int stored on a HIP device.
+    /// @brief RAII wrapper for int metadata stored on a HIP device.
     struct HipIntBuffer
     {
         int *ptr = nullptr; ///< Device pointer owned by this buffer.
@@ -113,6 +114,14 @@ namespace
         {
             checkHip(hipMalloc(reinterpret_cast<void **>(&ptr), sizeof(int)), "hipMalloc(int)");
             checkHip(hipMemcpy(ptr, &value, sizeof(int), hipMemcpyHostToDevice), "hipMemcpy host-to-device(int)");
+        }
+
+        explicit HipIntBuffer(std::initializer_list<int> values)
+        {
+            std::vector<int> host(values);
+            checkHip(hipMalloc(reinterpret_cast<void **>(&ptr), host.size() * sizeof(int)), "hipMalloc(int[])");
+            checkHip(hipMemcpy(ptr, host.data(), host.size() * sizeof(int), hipMemcpyHostToDevice),
+                     "hipMemcpy host-to-device(int[])");
         }
 
         ~HipIntBuffer()
@@ -493,17 +502,28 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAccep
     HipFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(v_stride), 0.0f);
     HipFloatBuffer d_ref_next(static_cast<size_t>(v_stride), 0.0f);
     HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+    HipFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    HipStreamHandle stream;
 
     ROCmGatedDeltaNet verifier_kernel(0);
     verifier_kernel.allocateGPUState(state_floats);
+    verifier_kernel.setGPUStream(stream.stream);
+    std::vector<float> initial_live_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(initial_live_state.data(), nullptr, nullptr));
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.chunk_forward(
         d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
         d_verifier_out.ptr, nullptr,
         verifier_len, n_heads, d_k, d_v,
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(verifier recurrence capture)");
+    std::vector<float> live_state_before_publish(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(live_state_before_publish.data(), nullptr, nullptr));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        nullptr, accepted_rows - 1, nullptr));
+        nullptr, accepted_rows - 1, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     ASSERT_TRUE(verifier_kernel.recurrent_step(
         d_Q_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
         d_K_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
@@ -516,7 +536,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAccep
         nullptr,
         n_heads, d_k, d_v,
         /*use_qk_l2norm=*/true));
-    checkHip(hipDeviceSynchronize(), "hipDeviceSynchronize(restored recurrence decode)");
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(restored recurrence decode)");
 
     ROCmGatedDeltaNet ref_kernel(0);
     ref_kernel.allocateGPUState(state_floats);
@@ -542,8 +562,13 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAccep
     const auto restored = d_restored_next.toHost();
     const auto ref = d_ref_next.toHost();
     const auto diff = diffStats(restored, ref, 0, restored.size());
+    const auto live_state_diff =
+        diffStats(live_state_before_publish, initial_live_state, 0, initial_live_state.size());
     EXPECT_LT(diff.first, 2e-4f);
     EXPECT_LT(diff.second, 1e-4);
+    EXPECT_LT(live_state_diff.first, 1e-7f);
+    EXPECT_LT(live_state_diff.second, 1e-7)
+        << "ROCm verifier capture must not mutate live recurrence state before publication";
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, RecurrenceDeviceMetadataRestoreMatchesAcceptedPrefix)
@@ -593,22 +618,25 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceDeviceMetadataRestoreMatchesAccept
     HipFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(v_stride), 0.0f);
     HipFloatBuffer d_ref_next(static_cast<size_t>(v_stride), 0.0f);
     HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
-    HipIntBuffer d_committed_state_row(accepted_rows - 1);
+    HipFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    HipIntBuffer d_accepted_state_slots({-1, -1, accepted_rows - 1});
+    constexpr int metadata_request_index = 2;
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet verifier_kernel(0);
     verifier_kernel.allocateGPUState(state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.chunk_forward(
         d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
         d_verifier_out.ptr, nullptr,
         verifier_len, n_heads, d_k, d_v,
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
     ASSERT_FALSE(verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
-        nullptr, d_committed_state_row.ptr, 0, nullptr));
+        nullptr, d_accepted_state_slots.ptr, metadata_request_index, nullptr));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
-        nullptr, d_committed_state_row.ptr, 0, stream.stream));
+        nullptr, d_accepted_state_slots.ptr, metadata_request_index, stream.stream));
     ASSERT_TRUE(verifier_kernel.recurrent_step(
         d_Q_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
         d_K_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
@@ -690,13 +718,11 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseReplay)
     HipFloatBuffer d_dt_bias(dt_bias);
     HipFloatBuffer d_m4_out(output_elems, 0.0f);
     HipFloatBuffer d_step_out(output_elems, 0.0f);
-    HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet m4_kernel(0);
     m4_kernel.allocateGPUState(state_floats);
     m4_kernel.setGPUStream(stream.stream);
-    m4_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.chunk_forward(
         d_Q_m4.ptr, d_K_m4.ptr, d_V_m4.ptr, d_alpha_m4.ptr, d_beta_m4.ptr, d_A_log.ptr, d_dt_bias.ptr,
@@ -962,7 +988,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
         << "ROCm merged-QKV M=4 recurrence must leave the same state as four decode steps";
 }
 
-TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeWithSnapshotsMatchesStepwiseReplay)
+TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeVerifierCaptureIsolatesLiveState)
 {
     if (!hasROCm())
         GTEST_SKIP() << "No ROCm device available";
@@ -1018,6 +1044,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeWithSnapshotsMatc
         static_cast<size_t>(qk_stride + qk_stride + v_dim),
         0.0f);
     HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+    HipFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet m4_kernel(0);
@@ -1025,6 +1052,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeWithSnapshotsMatc
     m4_kernel.setGPUStream(stream.stream);
     m4_kernel.bindDeinterleaveWorkspace(d_m4_scratch.ptr, d_m4_scratch.count);
     m4_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    m4_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     float *m4_q = nullptr;
     float *m4_k = nullptr;
@@ -1089,13 +1117,24 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeWithSnapshotsMatc
 
     const auto m4_out = d_m4_out.toHost();
     const auto step_out = d_step_out.toHost();
+    const auto snapshots = d_snapshots.toHost();
+    std::vector<float> final_snapshot(static_cast<size_t>(state_floats));
+    std::copy_n(
+        snapshots.data() + static_cast<size_t>(verifier_len - 1) * static_cast<size_t>(state_floats),
+        static_cast<size_t>(state_floats),
+        final_snapshot.data());
+
     const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
-    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
+    const auto snapshot_diff = diffStats(final_snapshot, step_state, 0, final_snapshot.size());
+    const auto live_state_diff = diffStats(m4_state, initial_state, 0, m4_state.size());
     EXPECT_LT(out_diff.first, 2e-4f);
     EXPECT_LT(out_diff.second, 1e-4);
-    EXPECT_LT(state_diff.first, 2e-4f);
-    EXPECT_LT(state_diff.second, 1e-4)
-        << "ROCm Qwen3.6 dense-shape merged-QKV M=4 recurrence must match four decode steps";
+    EXPECT_LT(snapshot_diff.first, 2e-4f);
+    EXPECT_LT(snapshot_diff.second, 1e-4)
+        << "ROCm Qwen3.6 verifier capture snapshot must match four decode steps";
+    EXPECT_LT(live_state_diff.first, 1e-7f);
+    EXPECT_LT(live_state_diff.second, 1e-7)
+        << "ROCm verifier capture must not mutate live recurrence state before publication";
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcceptedRow)
@@ -1124,10 +1163,14 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAccept
     HipFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(channels), 0.0f);
     HipFloatBuffer d_ref_next(static_cast<size_t>(channels), 0.0f);
     HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -77.0f);
+    HipFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    HipStreamHandle stream;
 
     ROCmShortConvolution verifier_kernel(0);
     verifier_kernel.allocateGPUState(state_floats);
+    verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr,
         d_weight.ptr,
@@ -1137,7 +1180,9 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAccept
         verifier_len, channels, kernel_size,
         /*apply_silu=*/true));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        nullptr, accepted_rows - 1, nullptr));
+        nullptr, accepted_rows - 1, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr + static_cast<size_t>(continuation_row) * channels,
         d_weight.ptr,
@@ -1146,7 +1191,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAccept
         nullptr,
         1, channels, kernel_size,
         /*apply_silu=*/true));
-    checkHip(hipDeviceSynchronize(), "hipDeviceSynchronize(restored short-conv decode)");
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(restored short-conv decode)");
 
     ROCmShortConvolution ref_kernel(0);
     ref_kernel.allocateGPUState(state_floats);
@@ -1201,13 +1246,16 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvDeviceMetadataRestoreMatchesAccepte
     HipFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(channels), 0.0f);
     HipFloatBuffer d_ref_next(static_cast<size_t>(channels), 0.0f);
     HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -77.0f);
-    HipIntBuffer d_committed_state_row(accepted_rows - 1);
+    HipFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    HipIntBuffer d_accepted_state_slots({-1, accepted_rows - 1});
+    constexpr int metadata_request_index = 1;
     HipStreamHandle stream;
 
     ROCmShortConvolution verifier_kernel(0);
     verifier_kernel.allocateGPUState(state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr,
         d_weight.ptr,
@@ -1217,9 +1265,9 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvDeviceMetadataRestoreMatchesAccepte
         verifier_len, channels, kernel_size,
         /*apply_silu=*/true));
     ASSERT_FALSE(verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
-        nullptr, d_committed_state_row.ptr, 0, nullptr));
+        nullptr, d_accepted_state_slots.ptr, metadata_request_index, nullptr));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
-        nullptr, d_committed_state_row.ptr, 0, stream.stream));
+        nullptr, d_accepted_state_slots.ptr, metadata_request_index, stream.stream));
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr + static_cast<size_t>(continuation_row) * channels,
         d_weight.ptr,
@@ -1436,12 +1484,14 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiStepR
     HipFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(channels), 0.0f);
     HipFloatBuffer d_ref_continuation(continuation_output_elems, 0.0f);
     HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -77.0f);
+    HipFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
     HipStreamHandle stream;
 
     ROCmShortConvolution verifier_kernel(0);
     verifier_kernel.allocateGPUState(state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
     ASSERT_TRUE(verifier_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(verifier_kernel.forward(
         d_input.ptr,
@@ -1453,6 +1503,8 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiStepR
         /*apply_silu=*/true));
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
         nullptr, accepted_rows - 1, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     for (int row = 0; row < continuation_rows; ++row)
     {
         const int source_row = accepted_rows + row;

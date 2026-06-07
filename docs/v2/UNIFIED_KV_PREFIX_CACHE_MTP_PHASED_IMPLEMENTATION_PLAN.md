@@ -21,9 +21,11 @@ Latest MTP transaction-state redesign note, 2026-06-06: Phase 13.6 is implemente
 
 Latest cross-backend MTP verifier-policy note, 2026-06-06: ROCm is no longer treated as the canonical all-position GDN verifier shortcut. Focused ROCm and CUDA long-prefix parity both prove one-row live-state restore matches sequential decode, while M=4 all-position verifier rows are not decode-equivalent for Qwen3.6 dense GDN. `MTPVerifierPolicy` is now the common device-agnostic selector: stateful runners that require decode-equivalent replay use the sequential greedy verifier path, and accepted all-position verifier state is forced through replay unless the runner is both non-stateful for this purpose and supports verifier-row restore. Focused validation passed for `V2_Unit_MTPVerifierPolicy`, `V2_Unit_MTPStateTransaction`, ROCm `MTPGreedyDepth3MatchesPyTorchDecodeTokens`, ROCm `PrefixCacheMTPRestore`, ROCm/CUDA `OneRowRestoreLongPrefixMatchesSequential`, ROCm/CUDA `M4VerifierLongPrefixIsNotDecodeEquivalent`, and CUDA `MTPBenchmarkPromptFixedDepth3MatchesPyTorchDecodeTokens`.
 
-Latest Phase 13.8 redesign, 2026-06-07: Phase 13.8 is no longer framed as inventing a verifier-row shortcut. The accepted target is to port the vLLM-style Qwen MTP/spec-decode transaction into Llaminar: make verifier-row sampling, valid sampled count, accepted speculative prefix, rejected suffix count, committed-state row, and ready-token row first-class metadata; feed accepted-token counts and state indices into stateful GDN/short-conv kernels; commit only accepted hybrid state and shifted MTP rows atomically; and carry the last valid sampled token as the next drafter condition. The current Llaminar greedy transaction starts after the live terminal condition, so for draft depth `D` it forwards `D` target rows: row 0 samples the token after draft[0], rows 0..D-2 verify draft[1..D-1], and row D-1 supplies the bonus ready token only when all drafts are accepted. `MTPDecodeCatchup` remains the sequential oracle and fallback while this is built. The old raw all-position state restore and sidecar-chain verifier-state candidates remain retired by CUDA/ROCm Qwen3.6 negative parity tests.
+Latest Phase 13.8 vLLM alignment note, 2026-06-07: Phase 13.8 is now explicitly a port of vLLM's accepted-count-driven spec-decode state model, not the earlier eager verifier-row publication candidate. vLLM's fast path works because draft/speculative hybrid state is kept in temporary state slots and `num_accepted_tokens`/draft-count metadata controls which state becomes live on the following step; it does not treat "pick verifier row N from an all-position forward" as a valid live GDN/short-conv commit. Llaminar must mirror that contract with runner-owned graph metadata, explicit non-null streams, `IWorkspaceConsumer` bindings, and `MTPStateTransaction` publication. The old CUDA/ROCm dense numbers that depended on direct `vllm_style_spec_decode` row publication are now historical evidence only and must not be used for Phase 13.8 or Phase 14 acceptance.
 
-Latest Phase 13.8 acceptance note, 2026-06-07: the explicit `LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE=1` no-oracle gate produced the speed-positive evidence used to promote the vLLM-style transaction as the normal dense SingleDevice GPU greedy catch-up path, and the parity suite now asserts the default no-env promoted path commits Phase 13.8 transactions on CUDA/ROCm SingleDevice dense GPU runs. Fresh no-env release benchmarks are speed-positive but prompt-sensitive: CUDA Qwen3.6 27B default-lane fixed depth-3 MTP reaches 602.79 prefill / 67.92 decode tok/s versus 708.33 / 41.73 no-MTP on the same binary, with 83.70% acceptance, 36 verifier runs, 159 verifier tokens, 36 transaction commits, and zero transaction validation failures. ROCm default-lane fixed depth-3 MTP reaches 218.27 / 36.14 versus 233.21 / 31.10 at 58.82% acceptance, with 42 verifier runs, 203 verifier tokens, 43 transaction commits, and zero validation failures. The prior high-acceptance ROCm `The quick brown fox`, `-c64 -n48` direct-gate lane remains 73.05 / 54.23 versus 76.35 / 31.92 at 88.57% acceptance. Dense SingleDevice GPU greedy Phase 13.8 is accepted; MoE, TP, PP, ExpertParallel overlay, stochastic sampling, chained-depth prefix restore, and broader stop/continuation gates remain tracked under their later topology/sampling phases.
+Latest Phase 13.8 acceptance note, 2026-06-07: CUDA and ROCm now pass the focused vLLM-style candidate equivalence gate under `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1`, including deferred-rejection transactions that emit the correction token without publishing a ready token and commit the shifted MTP correction row for the next step. Stochastic MTP also passes the normal CUDA/ROCm Qwen3.6 parity cells with the same transaction-validation layer, and ready sampled tokens now carry a sampler-parameter snapshot so stale ready tokens hard-fail if sampling changes before consumption. Phase 13.8 is still not accepted for default promotion until the direct/default lane is proven with broader prefix/stop/reject/continuation coverage and comparable CUDA/ROCm benchmark wins.
+
+Latest Phase 13.8 prefix-restore note, 2026-06-07: the vLLM-style candidate equivalence harness now covers RAM prefix-cache full-hit restore for dense Qwen3.6 SingleDevice ROCm and CUDA at draft depth 1, including terminal logits, terminal hidden, MTP state restore, active transaction commits, and zero transaction validation failures. Draft depth greater than 1 still hard-fails on restored terminal prefix hits with the explicit `Prefix cache terminal restore with chained MTP drafts is not supported` gate; temporarily opening that gate showed CUDA could pass the focused cell while ROCm failed the oracle on the restored request, so this remains a real chained-prefix implementation blocker rather than a fallback to paper over.
 
 Latest deterministic-mode sidequest note, 2026-06-06: `LLAMINAR_DETERMINISTIC` is now an explicit policy gate for split/concurrent GPU routes that can otherwise change reduction order. CUDA deterministic mode disables concurrent prefill/decode plus MoE split-K routes, and ROCm deterministic mode disables native-VNNI atomic-reduce, concurrent prefill/decode, concurrent M=2 row handling, GDN concurrent decode, and nondeterministic MoE router/down/gate-up routes. ROCm graph capture no longer forces the atomic-reduce GEMV path when deterministic mode is active. Focused validation passed on 2026-06-06: `V2_Unit_DeterministicMode`, `V2_Integration_CUDAGemmNonDeterminism`, and `V2_Integration_ROCm_NativeVNNI_GEMV`.
 
@@ -45,8 +47,8 @@ Latest deterministic-mode sidequest note, 2026-06-06: `LLAMINAR_DETERMINISTIC` i
 | Phase 13.5: Small-M GEMV-Many Kernel Prerequisite | In progress | ROCm now has graph-capturable native-VNNI small-M verifier routes for M=2/3/4 across Q/K/IQ codebooks, fused QKV/GateUp shared-quant dispatch, same-codebook and mixed-codebook GDN projection subgroups, heterogeneous-N Qwen3.6 qkv/z batching, fused-SwiGLU/FFN-down routing, declared-workspace FP32 GDN projection batching, a graph-capturable tiny FP32 GDN alpha/beta projection route for M=1/2/3/4, focused ROCm small-M integration/perf coverage, and generated ROCm prefill dispatch tables consumed by `ROCmQuantisedGemmKernel_native_VNNI.hip` from real bucket-aligned sweep CSVs. The latest ROCm small-M hardening slice precomputes quantized activation block sums in declared GEMM workspace for plain/fused/batched verifier routes, fixes stale asymmetric min-correction for native-VNNI formats such as Q4_1/Q5_1, and adds `DispatchPlainAsymmetricNativeSmallMUsesFreshBlockSums` plus the `GemmWorkspaceConsumer` sums-buffer contract. The latest hardening slices added graph-capturable atomic K-partitioning for `kb>1`, preserved captured replay state across live prefix restore/truncate by keying decode/sidecar graph identity on the MoE placement epoch instead of blanket-resetting MoE replay state, preserved sidecar and verifier graph topology across request-local cache clears when workspace generation and MoE placement epoch are stable, implemented verifier-row GDN recurrence/short-conv state capture so reject rollback can restore the accepted verifier row instead of replaying accepted tokens, prevented non-verifier GDN graph paths from clearing shared verifier capture bindings, added an explicit warmup-dependent graph-capture contract so supported MoE router/expert/shared stages are planned capturable before warmup and hard-fail if they are still not capturable at capture time, then removed the legacy post-warmup resegment API/counter entirely, removed the GDN mixed-codebook batched-route bypass for native small-M-compatible subgroups, added `kernel.gdn_projection_route` counters that prove real Qwen3.6 uses qkv/z quantized pairs plus alpha/beta FP32 batched projections instead of a synthetic four-projection full mixed-codebook bundle, added `NativeVNNIGEMMPerfTest.MTP_SmallM_BatchedGDNProjectionShapes` for Qwen3.6-style heterogeneous GDN projection groups at M=2/3/4, and added direct ROCm recurrence/short-conv verifier-row restore regressions. Current same-binary long-lane ROCm evidence ratcheted again: the latest `rocm:0` depth-3 MTP run reached 54.78 decode tok/s versus a 30.93 same-binary graph-enabled baseline at `The quick brown fox`, `-c 64`, `-n 48`, with 81.02% acceptance, 111 accepted tokens, 26 rejected tokens, 27 request rollbacks, 55 verifier runs, and 220 verifier tokens. The same artifact recorded zero `forward_graph.post_warmup_resegment` records after the legacy path removal, 12 verifier-row shortcut restores over 48 GDN layers, captured `main_verifier` replay around 44.39 ms, and `mtp.verifier_forward` around 46.76 ms. The prior depth-3 ratchet reached 54.69 tok/s after batched verifier-backed shifted-cache catchup; depth-2 also reached 48.66 tok/s and depth-1 reached 47.59 tok/s on the same lane. Focused validation passed on 2026-06-03 for the latest ROCm block-sum/capture-contract slice: `V2_Unit_GemmWorkspaceConsumer`, `V2_Integration_ROCmQuantisedGemmSmallM` all-codebook and asymmetric-sums regressions, `NativeVNNIGEMMPerfTest.MTP_SmallM_DirectPrefillRouteComparison`, `V2_Unit_ForwardGraphTypes`, `V2_Unit_MoERoutingStage`, `V2_Unit_PrefillGraphCapturability`, `V2_Unit_MTPGraphConstruction`, `V2_Unit_PrefillDecodeTransition`, `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`, and the focused Qwen3.6 ROCm PyTorch parity cells `MTPGreedyMatchesPyTorchDecodeTokens`, `MTPGreedyDepth3MatchesPyTorchDecodeTokens`, and `PrefixCacheMTPRestore`. The 2026-06-05 ROCm generated-dispatch slice passed `V2_Unit_ROCmNativeVNNITrainerCsvValidator`, `V2_Unit_ROCmNativeVNNITrainerGenerator`, `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`, and `V2_Integration_ROCm_NativeVNNI_GEMM`. Earlier focused validation for the small-M/GDN route also passed: `V2_Integration_HipBLASGemm` and `V2_Integration_ROCmGDNPaddedRealLength`. CPU native VNNI now has explicit all-codebook M=2/3/4 fused projection integration coverage, includes the previously missing `Q4_K` and `Q5_K` CPU smoke/sweep entries, records `kernel.cpu_native_vnni_small_m_fused_projection_calls`, and has a focused `V2_Perf_CPUNativeVNNI_GEMV` row for the MTP small-M fused route. A CPU SingleDevice real Qwen3.6 depth-3 smoke now passes after CPU graph workspace binding for declared GDN verifier-state capture buffers, reaching 9.50 decode tok/s versus a prior 5.80 same-prompt baseline with 100% acceptance and active M=4 CPU fused-projection counters. The latest replay hardening also removes raw `TensorBase *` dirty caches from segmented replay metadata, marks replay outputs through cached stable arena write ids, and keeps the hot path flags-only, fixing a ROCm chained-draft shutdown crash after prefix/MTP state mutation while preserving and slightly improving the ROCm depth-3 speed ratchet. CUDA now exposes specialized native-VNNI small-M GEMV for M=2/3/4 across all CUDA native Q/K/IQ codebooks. `CUDAQuantisedGemmKernel` uses the specialized verifier route for fused projections and fused-SwiGLU/FFN-down small-M paths, initializes IQ grid tables before the small-M route, and declares KPAR scratch against the requested verifier row count rather than a hidden M=4 maximum. Focused CUDA validation passed on 2026-06-06: `V2_Integration_CUDAGemmParity.NativeVNNISpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs`, `MTP_SmallM_FusedProjection_AllNativeFormats`, `MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI`, `Q4_K_VerifierSmallM_UsesSpecializedNativeVNNIRoute`, `Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI`, and `Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs`. Focused ROCm validation also passed on 2026-06-06: `V2_Integration_ROCm_NativeVNNI_GEMV.SpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs`, comparing the specialized M=2/3/4 path against serial GEMVs for every ROCm native codebook. | Keep ROCm SingleDevice dense in Phase 13.5 until profiling shrinks the remaining verifier budget enough to approach the 2x target, especially ordinary GEMM, fused Gate/Up, GDN projection, LM head, verifier graph overhead, and deeper-draft rollback/acceptance cost. Broaden CPU real-model MTP evidence beyond the short 100%-acceptance smoke before treating CPU as Phase 14 benchmark-acceptance ready. |
 | Phase 13.6: Atomic MTP State Transaction And Rollback Contract | Complete | Explicit `PrefixStateProvenance` is wired through live payload/logical captures, global/rank aggregation, runtime snapshots, benchmark JSON, and transaction counters. `MTPStateTransaction` validates committed-state token counts, shifted MTP KV lag, terminal state, ready-token state, and verifier-source provenance. `OrchestrationRunner::decodeStepMTP()` now funnels output publication through transaction commit/rollback helpers, validates state-advanced commits, restores the correct verifier base for decode-equivalent replay, records sampler history exactly once per emitted token, and refuses unsafe verifier-prefill provenance. Focused unit gates passed on 2026-06-06: `V2_Unit_MTPStateTransaction`, `V2_Unit_PrefixStateSnapshot`, and `V2_Unit_PrefillDecodeTransition`. Follow-up CUDA dense validation removed payload-bearing snapshot clones from transaction metadata stamping, added `MoveLeavesSourceEmptyForNestedPayloadHandles`, and passed full focused CUDA dense SingleDevice prefix/MTP parity through `^V2_Integration_Parity_Qwen36_CUDA_SingleDevice_` on 2026-06-06. Focused CUDA MoE parity passed on 2026-06-06: `MTPBenchmarkStyleDepth1EightTokensMatchesReference` with commit-replay checking, `MTPBudgetLimitedOneTokenStepsMatchReference`, `VerifierRowShortcutTwoRowStateMatchesFullReplay`, `PrefixCacheMTPRestore`, and `MTPBenchmarkStyleSkipGatherGreedyMatchesReference`. The no-MTP benchmark-style guard now proves the stable PyTorch-covered prefix and grouped table decode route without pretending near-tie branches are exact-token stable after the fixture metadata horizon. | None for the atomic transaction contract. CUDA raw verifier-row shortcut optimization remains disabled and tracked under the separate verifier-row continuation-equivalence blocker, not Phase 13.6. |
 | Phase 13.7: Stochastic MTP Verification And GPU Sampling | In progress | Added as the production gate for Qwen chat defaults (`temperature=0.6`, `top_p=0.95`, `top_k=20`, presence penalty). The first implementation slice is in place for SingleDevice full-logit execution: `Sampler` can build normalized penalty/temperature/top-k/top-p distributions, residual-sample from `max(p-q,0)`, and expose deterministic random thresholds; `OrchestrationRunner` now runs `MTPVerifyMode::SpeculativeSampling` without the old non-greedy bypass, captures draft/target distributions, applies `min(1,p/q)` acceptance, samples residual corrections on reject, and samples the terminal ready token after all-accepted verifier rows. CUDA and ROCm backends expose explicit-stream, graph-capturable top-k/top-p/temperature device sampling enqueue APIs, plus compact top-k/top-p distribution builders and speculative accept/residual verifier kernels for device-resident tables. A shared `src/v2/kernels/common/SamplingMath.h` now owns the SplitMix thresholds, compact top-k/top-p normalization, compact distribution sampling, and speculative accept/residual math used by CPU `Sampler`, CUDA, and ROCm compact stochastic paths. GPU SingleDevice stochastic MTP now hard-fails unsupported top-k modes or missing compact verifier hooks, and supported runners keep the first token, MTP draft tokens, verifier accept/residual tests, and terminal ready-token sampling on compact device-resident distribution tables instead of copying full logits to host. Focused validation passed on 2026-06-03: `V2_Unit_Sampler`, `V2_Unit_PrefillDecodeTransition`, `V2_Unit_PrefixMTPConfig`, `V2_Unit_ChatCompletionHandler`, `V2_Unit_Static_NoDefaultStreamInGPUCode`, and the direct CUDA/ROCm `GPUSamplingTest.LogitPenaltyDeviceInputsAreGraphCapturable`, `GPUSamplingTest.TopKTopPSampleDeviceOutputIsGraphCapturable`, `GPUSamplingTest.TopKTopPDistributionMatchesCPUSampler`, and `GPUSamplingTest.SpeculativeVerifyDistributionsAreGraphCapturable` integration cases. Real Qwen3.6 27B ROCm and CUDA GPU-graphs stochastic smokes passed through `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticSmoke` and `V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsStochasticSmoke` with active presence penalty, proving fixed non-greedy sampling enters MTP draft/verify instead of recording the old `sampling is not greedy` bypass; the smokes assert structured counters for device first-token sampling, device MTP draft sampling, device verifier distribution build, and accept tests, while asserting host full-logit stochastic counters stay at zero. Normal Qwen3.6 dense parity-suite coverage now includes `V2_Integration_Parity_Qwen36_SingleDevice_Qwen36SingleDevicePrefixMTPParity_MTPStochasticSamplingVerifierRuns` and `V2_Integration_Parity_Qwen36_CUDA_SingleDevice_Qwen36CUDASingleDevicePrefixMTPParity_MTPStochasticSamplingVerifierRuns`, which run a no-MTP stochastic baseline and graph-captured speculative MTP with structured verifier-counter consistency checks and still pass after the shared sampler-math refactor. | Gather benchmark evidence before Phase 14 uses non-greedy MTP results; if exact same-seed token-stream parity is desired later, add an explicit position-stable RNG contract rather than treating speculative distribution equivalence as seed-coupled token equality. |
-| Phase 13.8: vLLM-Style Spec-Decode Transaction | Complete for dense SingleDevice GPU greedy | Redesign accepted on 2026-06-06 after llama.cpp/vLLM source survey and failed CUDA/ROCm all-position shortcut candidates. `MTPSpecDecodeTransaction` and `MTPSpecDecodeMetadata` now own the shared vLLM-style row contract, graph-facing metadata buffers, accepted-count state publication, committed-state row selection, bonus-ready-token row separation, and structured counters. CUDA and ROCm short-conv/GDN publication consume graph-facing committed-state metadata on explicit non-null streams through declared workspace, and `all_position` hard-fails as retired. `DeviceGraphOrchestrator` now runs the promoted dense SingleDevice GPU greedy transaction by default, while unsupported topologies hard-fail rather than silently falling back. Focused validation passed on 2026-06-07 for the Phase 13.8 unit guard set and CUDA/ROCm Qwen3.6 depth-3 and prefix+MTP parity; the parity suite now asserts no-env default promoted GPU runs commit Phase 13.8 transactions. Fresh no-env release benchmarks are speed-positive on Qwen3.6 27B Q4_K_S default 595-prefill/128-decode: CUDA fixed depth-3 reaches 602.79 prefill / 67.92 decode tok/s versus 708.33 / 41.73 no-MTP with 83.70% acceptance, 36 transaction commits, and zero validation failures; ROCm reaches 218.27 / 36.14 versus 233.21 / 31.10 with 58.82% acceptance, 43 commits, and zero validation failures. | MoE, TP, PP, ExpertParallel overlay, stochastic sampling, chained-depth prefix restore, and broader forced accept/reject/stop/continuation fixtures remain later topology/sampling gates under Phase 11/12/13.7/14; do not reopen backend-specific raw verifier-state shortcuts. |
-| Phase 14: Benchmark Acceptance And Default-Enablement Readiness | Waiting on Phase 13.5 and Phase 13.7 | `docs/v2/PREFIX_CACHE_MTP_BENCHMARK_NOTES.md` tracks real Qwen3.6 dense/MoE baseline, graph-capture status, and best observed MTP speedups by domain. A CUDA dense memory-planner sidequest now proves long-context KV capacity is charged separately from bucket-sized GPU activation arenas: Qwen3.6 27B at context 16384 initializes with `Act.Seq=4096`, 4.0 GB KV, and 1785 MB arena, while hybrid KV still reports 16 FA KV layers plus 48 GDN layers. CUDA SingleDevice dense now has accepted promoted no-env Phase 13.8 Qwen3.6 default-lane evidence: fixed depth-3 MTP reaches 602.79 prefill / 67.92 decode tok/s versus 708.33 / 41.73 no-MTP, with 83.70% acceptance and zero transaction validation failures. CUDA SingleDevice MoE now beats the llama.cpp MoE default-lane no-MTP and MTP decode anchors after split-K fused verifier gate/up/down, shared-expert verifier prefill, GDN qkv+z/alpha+beta fused verifier projection work, capture-safe forced verifier routing, deterministic scatter parallelization, cuBLAS FP32 router prefill, fused-runtime down warp-reduce, and IQ4_NL word decode in the shared CUDA native-VNNI helper: clean no-MTP reaches 2707.70 prefill / 119.91 decode tok/s, fixed depth-1 MTP reaches 1946.82 prefill / 148.50 decode tok/s with 71.88% acceptance, and dynamic MTP reaches 1943.69 prefill / 145.36 decode tok/s with 68.75% acceptance. ROCm SingleDevice dense now has accepted promoted no-env Phase 13.8 evidence on both prompt classes: default-lane fixed depth-3 MTP reaches 218.27 / 36.14 versus 233.21 / 31.10 no-MTP at 58.82% acceptance, while the high-acceptance `The quick brown fox`, `-c64 -n48` lane reaches 73.05 / 54.23 versus 76.35 / 31.92 at 88.57% acceptance. ROCm SingleDevice MoE has fresh default-lane speed-positive proof after grouped-decode runtime-table rewarm, streamful prefix terminal-state restore, capture-safe ROCm attention params, verifier-sized route grouping, and grouped/LDS small-M router logits: fixed depth 1 reached 39.94 tok/s versus 19.72 tok/s baseline at `-c 768`, `-n 64`, with 78.12% acceptance; dynamic max-depth 3 previously demoted to depth 1 and reached 37.82 tok/s. `V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalPPHardFail` pins the current LocalPP matrix blocker as an early real-model hard fail with zero MTP draft/verifier counters, preventing recurrence of the old late stage-1 shifted-cache crash while the real PP-aware MTP path is still unimplemented. | Do not use Phase 14 to paper over kernel deficits. Resume benchmark acceptance after Phase 13.5 provides graph-capturable M=2/3/4 GEMV-many coverage and Phase 13.7 proves stochastic MTP correctness for non-greedy chat defaults; then continue matrix-driven benchmark work until remaining supported domains show concrete speedups or documented blockers with traces. |
+| Phase 13.8: vLLM-Style Accepted-Count Spec-Decode State | Implementation active; old shortcut retired | The useful groundwork is in place: `MTPSpecDecodeTransaction`, `MTPSpecDecodeMetadata`, graph-facing accepted-state metadata buffers, explicit-stream metadata upload, transaction counters, and negative CUDA/ROCm tests for raw all-position and sidecar-chain state shortcuts. CUDA and ROCm GDN/short-conv verifier capture now run against runner-declared speculative work-state buffers through `IWorkspaceConsumer`, hard-fail on missing explicit stream/workspace, leave live state untouched before publication, and still prove plain M=4 non-verifier recurrence/conv state matches serial decode. The opt-in `vllm_style_spec_decode` candidate now publishes accepted state from metadata, uses deferred rejection with shifted-cache correction commit instead of main correction replay, and passes focused CUDA/ROCm dense greedy equivalence cells under `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1`; stochastic CUDA/ROCm parity also passes the shared transaction gate with sampler-param-safe ready-token handoff. Dense CUDA/ROCm prefix-cache full-hit restore is covered for depth 1 under the same equivalence gate; chained-depth prefix restore remains hard-failed. Default promotion remains off. | Implement chained-depth prefix restore, broaden stop/reject/continuation parity beyond the current focused cells, then gather comparable CUDA/ROCm benchmark wins before any Phase 14 claim. |
+| Phase 14: Benchmark Acceptance And Default-Enablement Readiness | Waiting on Phase 13.5, 13.7, and 13.8 tuning | `docs/v2/PREFIX_CACHE_MTP_BENCHMARK_NOTES.md` tracks real Qwen3.6 dense/MoE baseline, graph-capture status, and best observed MTP speedups by domain. A CUDA dense memory-planner sidequest now proves long-context KV capacity is charged separately from bucket-sized GPU activation arenas: Qwen3.6 27B at context 16384 initializes with `Act.Seq=4096`, 4.0 GB KV, and 1785 MB arena, while hybrid KV still reports 16 FA KV layers plus 48 GDN layers. The previous CUDA/ROCm dense Phase 13.8 direct-row benchmark wins are now invalidated as acceptance evidence because they depended on eager verifier-row state publication. CUDA SingleDevice MoE remains a useful separate ratchet after split-K fused verifier gate/up/down, shared-expert verifier prefill, GDN qkv+z/alpha+beta fused verifier projection work, capture-safe forced verifier routing, deterministic scatter parallelization, cuBLAS FP32 router prefill, fused-runtime down warp-reduce, and IQ4_NL word decode in the shared CUDA native-VNNI helper: clean no-MTP reaches 2707.70 prefill / 119.91 decode tok/s, fixed depth-1 MTP reaches 1946.82 prefill / 148.50 decode tok/s with 71.88% acceptance, and dynamic MTP reaches 1943.69 prefill / 145.36 decode tok/s with 68.75% acceptance. ROCm SingleDevice MoE has fresh default-lane speed-positive proof after grouped-decode runtime-table rewarm, streamful prefix terminal-state restore, capture-safe ROCm attention params, verifier-sized route grouping, and grouped/LDS small-M router logits: fixed depth 1 reached 39.94 tok/s versus 19.72 tok/s baseline at `-c 768`, `-n 64`, with 78.12% acceptance; dynamic max-depth 3 previously demoted to depth 1 and reached 37.82 tok/s. `V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalPPHardFail` pins the current LocalPP matrix blocker as an early real-model hard fail with zero MTP draft/verifier counters, preventing recurrence of the old late stage-1 shifted-cache crash while the real PP-aware MTP path is still unimplemented. | Do not use Phase 14 to paper over kernel deficits. Resume dense benchmark acceptance only after Phase 13.8 proves accepted-count state publication, stochastic transaction publication, and CUDA/ROCm comparable dense default-lane wins; then continue matrix-driven benchmark work until remaining supported domains show concrete speedups or documented blockers with traces. |
 
 Latest CUDA validation note, 2026-06-06: deep Qwen3.6 MoE CUDA math parity passed for `V2_Integration_Parity_Qwen36MoE_SingleDevice_Math_{DecodeParity,PrefillParity}_CUDA`; focused CUDA MoE prefix/MTP parity passed for `MTPGreedyMatchesPyTorchDecodeTokens`, `PrefixCacheMTPRestore`, `MTPBenchmarkStyleSkipGatherGreedyMatchesReference`, `MTPBenchmarkStyleUsesFusedVerifierPrefillPath`, `MTPBenchmarkStyleDynamicDepthRequestStateResets`, `NoMTPBenchmarkStyleSkipGatherGreedyMatchesGatheredArgmax`, and `VerifierRowShortcutTwoRowStateMatchesFullReplay`. CUDA dense MTP now proves full-graph all-position verifier-row state is not decode-equivalent and keeps that shortcut disabled on CUDA; safe sequential depth-1/depth-3 Qwen3.6 CUDA parity passes, prefix+MTP restore passes, and strict forced-shortcut commit-replay still fails and remains a blocker. CUDA small-M GEMV KPAR workspace is required and max-sized for graph capture, CUDA quantized GEMM advertises fused projection support for GDN batching, and `V2_Unit_CUDAQuantisedGemmWorkspace` plus focused CUDA GEMM/GDN regressions are green. `V2_Integration_CUDAGemmParity` includes `Q4_0_PrefillGraphReplaySurvivesKernelDynamicReset`, which captures the two-pass Stream-K prefill graph on an explicit nonblocking CUDA stream, resets request-scoped kernel state, then replays the graph to prove context-owned GEMM scratch is not freed while graph cache entries survive `clear_cache()`. It also includes `GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM`, which runs a CUDA GDN projection stage on an explicit nonblocking stream, captures/replays it, asserts the qkv+z native subgroup route, asserts the alpha+beta cuBLAS batched FP32 route, and compares alpha/beta outputs against CPU reference. `V2_Integration_CUDAGDNPaddedRealLength` directly covers CUDA verifier-row GDN primitives: recurrence and short-conv accepted-row restores must match independent multi-step replay from nonzero initial state. `V2_Integration_CUDAMoEKernel` now covers CUDA verifier M=2/3/4 fused grouped prefill with split-K gate/up, repeated experts across rows, split/rowwise equivalence, graph replay, one-token `routeWithTensors()` graph capture without host top-k materialization, default FP32 prefill routing through cuBLAS SGEMM for `seq_len >= 16`, fused runtime MoE decode using deterministic down warp-reduce under graph replay, and capture-safe fused sub-kernel timer exports. Clean release Qwen3.6 MoE CUDA default-lane captures in `benchmark_results/cuda_moe_mtp/20260605T070628Z-iq4nl-word-decode` reach 2707.70 prefill / 119.91 decode tok/s without MTP, 1946.82 prefill / 148.50 decode tok/s with fixed depth-1 MTP at 71.88% acceptance, and 1943.69 prefill / 145.36 decode tok/s with dynamic MTP at 68.75% acceptance.
 
@@ -2222,33 +2224,51 @@ Observability:
 - Qwen chat defaults can run MTP without the old `sampling is not greedy` bypass on supported single-device GPU backends.
 - Phase 14 benchmarks can report stochastic MTP speedups separately from greedy MTP speedups.
 
-## Phase 13.8: vLLM-Style Spec-Decode Transaction For Qwen MTP
+## Phase 13.8: vLLM-Style Accepted-Count Spec-Decode State For Qwen MTP
 
 ### Goal
 
-Replace Llaminar's scattered MTP verifier/rollback shape with a vLLM-style spec-decode transaction for Qwen3.5/Qwen3.6 dense and MoE models. The target path is not another post-hoc verifier-row shortcut. It is a first-class transaction where the target verifier runs a uniform decode graph, sampling produces a contiguous accepted output row, accepted-token counts become device-visible state metadata, stateful GDN/short-conv kernels commit only the accepted prefix, shifted MTP KV rows are committed from accepted target hidden rows, and request publication happens atomically.
+Replace Llaminar's scattered MTP verifier/rollback shape with a direct port of vLLM's accepted-count speculative decoding contract for Qwen3.5/Qwen3.6 dense and MoE models. This phase is no longer a search for a clever verifier-row shortcut. The design target is:
 
-vLLM's serving-level metadata is naturally described as a `1 + draft_count` target shape. Llaminar's current greedy SingleDevice candidate starts from an already-live terminal condition token, so its runner-facing target verifier forwards `draft_count` rows: row 0 samples the token after draft[0], rows 0..D-2 verify draft[1..D-1], and row D-1 supplies the bonus ready token only if every draft is accepted. This difference is a contract detail, not a semantic fallback; the shared metadata must keep committed output rows, live state rows, and bonus ready-token rows distinct.
+1. Draft rows are produced by the MTP sidecar.
+2. The target model verifies those rows, plus the bonus row when the verifier shape supports it.
+3. Target verifier rows write KV, GDN recurrence state, and short-conv state into speculative slots, not directly into the live request state.
+4. The sampler produces accepted/recovered/bonus output rows and `num_accepted_tokens`.
+5. A graph-capturable state-publication step commits only the accepted speculative state slots to live state.
+6. Any recovered correction suffix is replayed through the normal decode-equivalent path before becoming live state.
+7. `MTPStateTransaction` publishes tokens, ready-token state, KV counts, GDN/conv state, terminal hidden/logits, and stats atomically.
 
-`MTPDecodeCatchup` remains the sequential correctness oracle and fallback while this path is built. Phase 13.8 is complete only when CUDA and ROCm can run the new transaction with parity and benchmark evidence. CPU should share the same metadata and transaction semantics later, even if its first implementation is not graph-captured.
+vLLM's serving metadata is naturally a `draft_count + 1` target shape: draft-verification rows plus a bonus row. Llaminar may represent the first dense slice with a runner-local `draft_count` row shape when the terminal condition token is already live, but that is only row accounting. The semantic contract must stay identical: committed output rows, speculative state rows, rejected suffix rows, correction rows, and bonus ready-token rows are distinct. A row may be sampled or emitted without becoming live recurrent/conv state.
+
+`MTPDecodeCatchup` remains the sequential correctness oracle while this path is built. Phase 13.8 is complete only when CUDA and ROCm run the accepted-count transaction for greedy and stochastic speculative sampling with continuation parity and comparable benchmark wins. CPU should share the same metadata and transaction semantics later, even if its first implementation is not graph-captured.
+
+### Non-Goals And Retired Paths
+
+- Do not revive "select verifier row N and call it live state" for Qwen3.6 hybrid GDN. That path is retired because continuation parity proved it can preserve immediate sampled tokens while corrupting future GDN/short-conv state.
+- Do not keep backend-specific shortcuts where ROCm and CUDA publish different MTP state semantics. Backend kernels may differ, but the transaction metadata, accepted-count publication rules, and parity gates must be shared.
+- Do not treat all-accepted bonus rows as committed live GDN/conv state. A bonus row can supply the next condition token, but its recurrent state is not live until the next accepted publication makes it so.
+- Do not silently fall back from `vllm_style_spec_decode`. A plain/default selection must hard-fail until accepted; explicit equivalence/development selections must either pass the oracle harness or hard-fail with a useful reason.
 
 ### Design Anchors From vLLM
 
 The vLLM Qwen MTP path provides the shape to port:
 
 - Qwen MTP predictor: embed the sampled/condition token, RMS-normalize token embedding and target hidden separately, concatenate them, project with `mtp.fc`, run the selected MTP decoder layer, then final norm and LM head.
-- Target verifier: run a uniform target decode shape with query length `1 + num_spec_tokens`; graph capture is sized around that shape rather than a generic prefill row source.
+- Target verifier: run a stable target decode shape for speculative rows plus a bonus row; graph capture is sized around that shape rather than a generic prefill row source.
 - Spec metadata: represent draft count, cumulative draft counts, target logits indices, bonus logits indices, valid sampled token count, rejected-token count, and token index to sample explicitly.
 - Hybrid state: pass `num_accepted_tokens`, `num_decode_draft_tokens`, query start locations, and state indices into GDN/Mamba attention metadata and kernels.
-- Conv/recurrent kernels: use accepted-token count to offset the state window and write per-token state slots, so rejected suffix state is not made live.
-- Postprocess: after sampling, compute accepted counts from the sampled output row and update hybrid/prefix block state without a CPU-side full-logit or full-state rollback loop.
+- Conv/recurrent kernels: write speculative per-row state slots and use accepted-token count to shift/select the next live state, so rejected suffix state is not made live.
+- Postprocess: after sampling, compute accepted counts from the sampled output row and update hybrid/prefix block state from metadata, not from a CPU-side full-logit or full-state rollback loop.
 
 The Llaminar port should preserve this architectural shape while using Llaminar primitives: `TransferEngine`, declared graph/workspace bindings, explicit streams, `PrefixStateSnapshot` provenance, `MTPStateTransaction`, `MTPDepthController`, and existing graph-stage contracts.
 
+The key lesson is that vLLM's fast path is not "a larger verifier forward is automatically decode-equivalent." It works by keeping speculative verifier effects in separate cache/state slots, deriving accepted-token counts from sampler output, and publishing only those accepted slots as live state. Llaminar's previous dead end skipped that publication boundary; Phase 13.8 now makes that boundary the center of the design.
+
 ### Source-Survey Mapping To Llaminar
 
-The Phase 13.8 implementation target is based on the current vLLM Qwen MTP
-shape, but must be adapted to Llaminar's per-device graph rules:
+The Phase 13.8 implementation target is based on the vLLM Qwen MTP shape
+surveyed on 2026-06-07, but must be adapted to Llaminar's per-device graph
+rules:
 
 - `vllm/model_executor/models/qwen3_next_mtp.py` and
   `qwen3_5_mtp.py` make the MTP sidecar a normal Qwen decoder fragment:
@@ -2274,8 +2294,9 @@ shape, but must be adapted to Llaminar's per-device graph rules:
   `mamba_attn.py`, and the mamba/GDN helper kernels make
   `num_accepted_tokens`, query start locations, and state indices explicit
   attention metadata. That is the central lesson for Llaminar: GDN and
-  short-conv state publication is an accepted-count commit, not an arbitrary
-  "pick row N from verifier output" shortcut.
+  short-conv state publication is accepted-count-driven state selection from
+  speculative slots, not an arbitrary "pick row N from verifier output"
+  shortcut.
 - vLLM pads and stages metadata into persistent device tensors for graph
   replay. Llaminar must express the same idea through runner-owned
   `IWorkspaceConsumer` bindings and explicit non-null stream uploads before
@@ -2305,15 +2326,18 @@ Immediate implementation slices:
    contract directly: accept-all with bonus, reject-first, reject-after-prefix,
    stop on first draft, stop on accepted draft, stop on correction, discarded
    request, and malformed non-contiguous sampled rows.
-2. Add an always-on dense SingleDevice promoted-path parity matrix for CUDA
+2. Add an always-on dense SingleDevice candidate-path parity matrix for CUDA
    and ROCm that exercises the same cases through real Qwen3.6 where feasible;
    use focused prompt fixtures to force accept/reject/stop behavior rather than
    relying on one benchmark prompt's natural acceptance pattern.
 3. Move the sidecar draft-input update and next-condition token handoff toward
    device metadata so dense GPU drafting can be captured as a stable repeated
    graph rather than a host-synchronized chain.
-4. Reuse the same metadata in Phase 13.7 stochastic rejection sampling so
-   greedy and stochastic MTP differ only in how `sampled_tokens` are produced.
+4. Wire Phase 13.7 stochastic rejection sampling into this same transaction
+   before closing Phase 13.8, so greedy and stochastic MTP differ only in how
+   `sampled_tokens` and accept/residual samples are produced. They must share
+   accepted-state slot publication, bonus-ready-token rows, shifted MTP commit,
+   terminal publication, and transaction counters.
 5. Extend only after single-device dense is boring: LocalTP/GlobalTP must
    coordinate sampled rows and accepted counts domain-wide; MoE/ExpertParallel
    must keep sparse collectives graph-native and use placement fingerprints in
@@ -2324,33 +2348,30 @@ Immediate implementation slices:
 For one request and greedy MTP depth `D`:
 
 1. The sidecar produces `D` draft tokens and draft hidden/logit metadata using existing MTP sidecar graph stages.
-2. The target verifier executes one runner graph with `D` target rows from the already-live terminal condition:
-   - draft token 0 is emitted from the live condition state before the target forward;
-   - row 0 samples the token after draft[0] and therefore verifies draft[1] when `D > 1`;
-   - rows 0..D-2 verify speculative continuations draft[1..D-1];
-   - row D-1 is the bonus row that supplies the next ready token if every draft is accepted.
-3. The sampler produces `sampled_tokens[D]`, with invalid/rejected suffix rows represented as `-1`.
+2. The target verifier executes a stable speculative decode shape. It writes logits, hidden rows, FA KV, and hybrid GDN/short-conv state into speculative slots associated with the transaction, not directly into the committed request state.
+3. The sampler produces `sampled_tokens`, with invalid/rejected suffix rows represented as `-1`. Greedy and stochastic sampling must both use this row contract.
 4. Shared metadata computes:
    - `valid_sampled_count`;
    - `accepted_speculative_prefix`, computed as the contiguous sampled row prefix that matches the drafted row;
    - `rejected_token_count`, computed from the first rejected speculative row and the current verifier shape;
    - `token_index_to_sample = valid_sampled_count - 1`;
    - `next_condition_token = last valid sampled token`, or a backup token for discarded requests.
-5. Shared state-commit metadata computes the one live verifier state row separately from emitted output tokens and any bonus ready-token row:
+5. Shared state-commit metadata computes accepted-count publication separately from emitted output tokens and any bonus ready-token row:
    - `committed_output_count` is the number of tokens emitted to the user for this transaction;
-   - `target_verifier_state_commit_count` is the number of target verifier input rows whose state can be published directly;
-   - on accept-all, `target_verifier_state_commit_count == committed_output_count == draft_count`;
-   - after a rejection, the sampled correction token is emitted but has not itself been forwarded by the target verifier graph, so `target_verifier_state_commit_count` stops at the accepted verifier-input prefix and the correction suffix must be replayed before the transaction can claim decode-equivalent state;
+   - `num_accepted_tokens` is the authoritative metadata value passed to stateful kernels and cache managers;
+   - `target_verifier_state_commit_count` is a derived compatibility field for current code, but the new state publication path must treat accepted count plus state indices as authoritative;
+   - on accept-all, accepted count covers every draft row and the bonus row is retained only as the next condition token;
+   - after a rejection, the sampled correction token may be emitted but its recurrent/conv state is not live until the correction suffix is replayed through the normal decode-equivalent path;
    - `bonus_ready_token_row = valid_sampled_count - 1` only for the all-drafts-accepted terminal row that supplies the next condition token;
    - the bonus ready-token row must never be published as live GDN/short-conv state, because it has not been committed as an output token.
-6. Stateful GDN/short-conv stages consume accepted-token count, committed-state row/index metadata, and full state indices. They may compute all verifier rows, but only the accepted verifier-input prefix becomes live conv/recurrent state until any correction suffix is replayed.
-7. Full-attention KV is truncated/committed to the accepted prefix, and shifted MTP KV commits accepted target hidden rows only.
+6. Stateful GDN/short-conv stages consume accepted-token count, draft-count metadata, query starts, and full state indices. They may compute all speculative rows, but only accepted-count-selected state slots become the next live conv/recurrent state until any correction suffix is replayed.
+7. Full-attention KV is committed or truncated to the accepted prefix, and shifted MTP KV commits accepted target hidden rows only.
 8. `MTPStateTransaction` publishes terminal hidden/logits, ready token, logical token count, main KV count, shifted MTP KV count, sampler history, and stats together.
 9. Any failure before commit restores the checkpoint. Any failure after partial commit is a hard failure until the transaction has a rollback proof.
 
 ### Concrete Llaminar Implementation Design
 
-The promoted Phase 13.8 path is a transaction boundary in `OrchestrationRunner`,
+The candidate Phase 13.8 path is a transaction boundary in `OrchestrationRunner`,
 with backend runners providing only graph-capturable execution and state-publication
 primitives. Do not hide acceptance, rollback, or fallback decisions inside CUDA or
 ROCm-specific code.
@@ -2361,8 +2382,10 @@ Layering:
   for accept/reject semantics, stop-token behavior, ready-token handling, and
   rollback expectations until the new path proves equivalence.
 - `MTPSpecDecodeTransaction` and `MTPSpecDecodeMetadata` are the shared contract.
-  They own padded host metadata, graph-facing int32 buffers, committed-state row
-  selection, bonus-ready-token row separation, and batch-level counters.
+  They own padded host metadata, graph-facing int32 buffers, accepted-state
+  counts, speculative/accepted state-slot selection, bonus-ready-token row
+  separation, compatibility fields for old row-oriented code, and batch-level
+  counters.
 - `OrchestrationRunner` builds the request transaction from verifier output,
   validates it against the oracle in debug/equivalence mode, and performs the
   single atomic publication through `MTPStateTransaction`.
@@ -2371,7 +2394,8 @@ Layering:
   - run the uniform target verifier graph for the runner's target-row count;
   - upload/bind spec-decode metadata on an explicit non-null stream before graph
     replay;
-  - publish live GDN/short-conv state from `committed_state_rows`;
+  - publish live GDN/short-conv state from accepted-count metadata and
+    transaction state-slot indices;
   - truncate/commit main KV and shifted MTP KV to the transaction's verified
     state count, then replay any correction suffix before publishing full
     committed output state.
@@ -2381,13 +2405,14 @@ Layering:
 
 Promotion sequence:
 
-1. Keep `vllm_style_spec_decode` hard-failed while the target verifier graph is
-   not wired into the live runner path.
-2. Add an opt-in equivalence harness that runs the new target-verifier
+1. Keep default `vllm_style_spec_decode` promotion disabled while the target verifier graph is
+   not fully accepted for greedy, stochastic, and benchmark lanes.
+2. Use the opt-in equivalence harness that runs the new target-verifier
    transaction from a checkpoint, then restores the checkpoint and runs
    `shared_stepwise`; compare committed tokens, ready token, main KV count,
-   shifted MTP KV count, terminal hidden/logits provenance, and GDN/short-conv
-   state before any benchmark number is accepted.
+   shifted MTP KV count, terminal hidden/logits provenance, GDN/short-conv
+   state, and at least four continuation tokens before any benchmark number is
+   accepted.
 3. Promote CUDA SingleDevice dense only after the equivalence harness and
    PyTorch parity pass for accept-all, reject-first, reject-after-prefix,
    stop-token, prefix-restore, and continuation-token cases.
@@ -2417,30 +2442,46 @@ falling back or partially publishing state.
 
 2. Graph-facing metadata buffers.
    - Add device buffers for draft counts, accepted-token counts, rejected-token counts, token indices to sample, query start locations, and state indices.
-   - Add per-request committed-state row/index and bonus-ready-token row/index buffers so kernels can distinguish live state publication from emitted correction tokens and from the terminal all-accepted bonus sample.
+   - Add per-request speculative state-slot indices and bonus-ready-token row/index buffers so kernels can distinguish live accepted state from emitted correction tokens and from the terminal all-accepted bonus sample.
    - Stage dynamic metadata before graph capture/replay on explicit non-null streams.
    - Captured replay must not include H2D uploads, lazy allocations, or default/null stream operations.
    - Metadata storage must use declared workspace or persistent runner-owned buffers, not ad hoc GPU allocations.
 
-3. Accepted-count stateful kernels.
-   - Extend CUDA and ROCm short-conv update kernels to accept `num_accepted_tokens` and spec state indices, mirroring the vLLM sliding-window behavior.
-   - Extend CUDA and ROCm GDN recurrence kernels to load the accepted source state and store per-row final states through state-index metadata.
+3. Speculative state slots and accepted-count stateful kernels.
+   - Add runner-owned speculative state storage for GDN recurrence and short-conv state, sized by max draft depth and request batch.
+   - Extend CUDA and ROCm short-conv update kernels to accept `num_accepted_tokens`, `num_decode_draft_tokens`, and spec state indices, mirroring the vLLM sliding-window behavior.
+   - Extend CUDA and ROCm GDN recurrence kernels to load the accepted source state and store per-row speculative final states through state-index metadata.
+   - Add a graph-capturable accepted-count publish stage that copies or swaps only the selected speculative state into the live state buffer after sampling metadata is available.
    - CPU gets a reference implementation of the same state update contract for unit and parity debugging.
    - Add direct kernel/stage tests proving accepted counts 1..4 produce the same live state as serial decode for Qwen3.6-shaped short-conv and GDN recurrence.
 
 4. SingleDevice dense runner path.
    - Implement a named optimized hook, initially `vllm_style_spec_decode`.
    - Restrict first promotion to greedy SingleDevice dense Qwen3.6/Qwen3.5 with one active request.
-   - The hook runs the target verifier graph, samples rows, builds the transaction metadata, commits accepted target hidden rows to shifted MTP KV, updates hybrid state by target verifier state commit count, replays any correction suffix, and returns the same high-level result shape as the oracle.
+   - The hook runs the target verifier graph into speculative state slots, samples rows, builds the transaction metadata, commits accepted target hidden rows to shifted MTP KV, publishes hybrid state by accepted count, replays any correction suffix, and returns the same high-level result shape as the oracle.
    - A debug/equivalence mode must run `shared_stepwise` and the new path from the same checkpoint and compare committed state before promotion.
 
 5. CUDA and ROCm promotion.
    - CUDA and ROCm must both pass commit-replay parity for accept-all, reject-first, reject-after-prefix, and stop-token cases.
    - Qwen3.6 dense prefix+MTP parity must pass on each backend.
+   - Continuation parity must compare at least four future tokens and GDN/short-conv state hashes after the accepted-count publish.
    - Benchmarks must show accepted speculative tokens no longer appear as repeated `decode_equivalent_catchup_forward_one` work.
    - If a backend cannot meet the state contract, hard-fail the named hook and keep `shared_stepwise` selected.
 
-6. TP, PP, MoE, and stochastic extension.
+6. Stochastic extension.
+   - Reuse the Phase 13.8 metadata buffers for draft rows, target rows,
+     accepted counts, rejected suffixes, accepted-state slots, bonus rows, and
+     next-condition token publication.
+   - Device stochastic sampler kernels may fill sampled rows and residual
+     corrections, but must not publish live state outside
+     `MTPStateTransaction`.
+   - CUDA and ROCm graph-captured stochastic MTP must assert transaction
+     commits, zero validation failures, and no host full-logit stochastic path
+     for supported compact top-k/top-p lanes.
+   - Greedy and stochastic benchmark JSON must report separate verifier mode,
+     acceptance, residual-sample, transaction, and rollback counters.
+
+7. TP, PP, and MoE extension.
    - LocalTP/GlobalTP must coordinate sampled output rows and accepted counts domain-wide before state commit.
    - PP remains hard-failed until each stage can enter the same transaction.
    - ExpertParallel MoE must use the same transaction metadata while keeping sparse collectives graph-native.
@@ -2448,21 +2489,26 @@ falling back or partially publishing state.
 
 ### Current Implementation Status, 2026-06-07
 
-- The design pivot is accepted. Phase 13.8 is now a vLLM-style transaction port, not a free-form shortcut search.
+- The design pivot is accepted. Phase 13.8 is now a vLLM-style accepted-count state port, not a free-form shortcut search and not an eager verifier-row publication project.
 - Tier 0 is already implemented: `MTPDecodeCatchup` owns the common sequential accept/reject oracle and `OrchestrationRunner` routes stateful CUDA/ROCm verification through `shared_stepwise`.
-- The named optimized-hook scaffold already exists on `IInferenceRunner`. `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` still selects the explicit Phase 13.8 hook name, but the same hook is now the default promoted path for initialized dense SingleDevice GPU hybrid decode. `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1` runs the live target-verifier candidate so it can be compared against `shared_stepwise`, and `LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE=1` remains a benchmark/debug marker for explicit no-oracle runs. Outside the promoted dense SingleDevice policy the hook hard-fails instead of falling back.
+- The named optimized-hook scaffold exists on `IInferenceRunner`. `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` selects the explicit Phase 13.8 hook name; plain/default use remains disabled, while `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1` runs the candidate under the comparison harness against `shared_stepwise`. `LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE=1` remains a development marker only and must not be used as benchmark acceptance evidence.
 - Retired candidate evidence remains binding:
   - sidecar-chain verifier state is not decode-equivalent on focused ROCm/generic and CUDA Qwen3.6 dense tests;
   - naive all-position selected-state restore is unsafe because CUDA and ROCm long-prefix tests prove continuation drift even when row logits/tokens look plausible.
 - The old `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=all_position` runtime path now hard-fails as retired instead of executing the unsafe candidate.
 - Historical CUDA dense evidence recorded the pre-promotion blocker: no-MTP default lane 707.92 prefill / 41.73 decode tok/s, fixed depth-3 shared catch-up 609.73 / 38.19 with 84.95% acceptance, and `decode_equivalent_catchup_forward_one` at 9272.9 ms / 383 forwards. This is retained as the reason the stepwise verifier path was not Phase 14-acceptable.
 - First implementation slices are focused-green: `MTPSpecDecodeTransaction` provides the shared request, transaction, and batch-summary metadata contract for valid sampled count, accepted speculative prefix, rejected suffix count, sample index, next condition token, committed output tokens, and rejected draft tokens. `OrchestrationRunner` now builds the padded metadata batch for the live decode-equivalent catch-up result, validates that transaction contract before commit, and emits structured `mtp.spec_decode_transaction_metadata` counters for all-accepted and rejected-prefix paths. `MTPSpecDecodeMetadata` defines the graph-facing int32 workspace buffers and host-side padded metadata arrays for draft counts, target query lengths, valid sampled counts, accepted draft prefixes, committed output counts, rejected counts, sample indices, next condition tokens, flags, query starts, state indices, committed-state row/index, bonus-ready-token row/index, draft tokens, and sampled tokens. `MTPSpecDecodeStateCommitPlan` makes the key Phase 13.8 invariant explicit: an all-accepted bonus ready-token row can be sampled and carried forward as the next drafter condition, but it is not the live GDN/short-conv state row because it was not committed as output. `MTPSpecDecodeMetadataWorkspaceBinding` now binds those buffers through `DeviceWorkspaceManager`, the GPU `DeviceGraphOrchestrator` declares the binding as runner-owned extra workspace when MTP is enabled, and metadata upload has a hard explicit non-null stream guard for GPU H2D. The unsafe `all_position` candidate code path has been removed from execution and replaced by an explicit retired-candidate hard failure. Focused validation passed on 2026-06-06: `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`, `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`; build validation also covered `v2_integration_parity_qwen36_single_device_prefix_mtp` and `v2_integration_parity_qwen36_cuda_single_device_prefix_mtp`.
-- Device-metadata state publication slice is focused-green: `ITensorShortConvolution`, `ITensorGatedDeltaNet`, and `IComputeStage` now expose `restoreVerifierStateCaptureRowFromDeviceMetadata()`. CUDA and ROCm short-conv/GDN kernels implement a graph-capturable device-side copy from verifier snapshot rows selected by `committed_state_rows[request_index]`, require explicit non-null streams, and use the already declared verifier-state capture workspace rather than ad hoc allocations. CUDA integration coverage captures metadata restore plus continuation work into a CUDA graph for both recurrence and short-conv; ROCm integration coverage proves the same committed-row metadata path on an explicit HIP stream. Focused validation passed on 2026-06-06 for `V2_Integration_CUDAGDNPaddedRealLength`, `V2_Integration_ROCmGDNPaddedRealLength`, and the Phase 13.8 unit guard set.
-- Runner-facing metadata restore is scaffolded: `IInferenceRunner` and `DeviceGraphOrchestrator` expose `restoreMTPVerifierStateFromSpecDecodeMetadata()`, which uploads a validated `MTPSpecDecodeMetadataBatch` to the runner-owned workspace on an explicit GPU stream, restores every local GDN short-conv/recurrent state from the device `committed_state_rows` buffer, truncates main KV/bookkeeping to the requested accepted token count, and hard-fails on missing workspace, missing backend, invalid metadata, or absent GDN participants. Focused validation passed on 2026-06-07 for `V2_Unit_DeviceGraphOrchestrator`, `V2_Unit_PrefillDecodeTransition`, `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`, and `V2_Unit_MTPDecodeCatchup`.
-- Shared oracle-to-transaction bridge is focused-green: `buildMTPSpecDecodeMetadataBatchFromGreedyCatchup()` converts an `MTPDecodeCatchupGreedyResult` into the same padded graph-facing metadata batch the promoted verifier path must produce, including all-accepted bonus rows and reject-after-prefix correction rows. It rejects accepted-prefix drift between the catch-up result and transaction metadata before the runner can publish state. `OrchestrationRunner` now uses this shared bridge instead of duplicating the transaction invariants in a local lambda. Focused validation passed on 2026-06-07 for `V2_Unit_MTPSpecDecodeMetadata` and `V2_Unit_PrefillDecodeTransition`.
-- First equivalence harness primitive is focused-green: `compareMTPDecodeCatchupGreedyResults()` compares oracle and candidate catch-up results for committed tokens, verifier tokens, acceptance flags, rejected token, ready token, and shifted MTP commit count while intentionally allowing the candidate to use fewer main forwards. This gives the promoted verifier transaction a shared result-level regression gate before backend state snapshots are compared. Focused validation passed on 2026-06-07 for `V2_Unit_MTPDecodeCatchup`.
-- Runtime state equivalence primitive is focused-green: `compareMTPRuntimeStateSnapshots()` compares oracle and candidate `PrefixRuntimeStateSnapshot` values for decode position, per-sequence lengths, main KV token counts, shifted MTP KV token counts, terminal hidden/logit availability, and GDN short-conv/recurrent state hashes. This remains the state-level half of the opt-in equivalence harness for promoted-path debugging. Focused validation passed on 2026-06-07 for `V2_Unit_MTPStateTransaction`.
-- Runner-level equivalence harness is scaffolded and focused-green: setting `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1` around a named optimized catch-up candidate now runs the candidate, captures its runtime snapshot, restores the verifier base checkpoint, runs the `shared_stepwise` oracle, compares result and runtime-state equivalence, and only continues if both match. The harness records `mtp.phase138_spec_decode_equivalence_matches`; it remains opt-in development instrumentation for the promoted path. Focused validation passed on 2026-06-07 for `V2_Unit_PrefillDecodeTransition`.
+- Accepted-count state-slot scaffold, 2026-06-07: `MTPSpecDecodeMetadata` now declares and uploads graph-facing `accepted_state_counts`, `speculative_state_slot_indices`, `accepted_state_slot_indices`, and `bonus_ready_state_slot_indices` in runner-owned workspace. The default metadata builder no longer treats emitted correction tokens as live target state; when no explicit verifier-state count is supplied it derives accepted live state from the accepted verifier-input prefix, while explicit counts remain available for oracle/candidate comparison. Committed-state row/index buffers remain declared compatibility fields, but metadata binding/readiness and upload no longer require them; focused unit coverage proves accepted-state-slot metadata binds and uploads when those compatibility buffers are absent. `OrchestrationRunner` includes the new accepted-state count/slot tags in `mtp.spec_decode_transaction_metadata`, and the `vllm_style_spec_decode` development gate now points at accepted-count speculative state-slot publication rather than the retired unrolled-graph framing. Focused validation passed on 2026-06-07: `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`, `V2_Unit_MTPDecodeCatchup`, `V2_Unit_DeviceGraphOrchestrator`, `V2_Unit_PrefillDecodeTransition`, plus CUDA and ROCm Qwen3.6 dense candidate equivalence parity cells `Phase138VllmStyleCandidateEquivalence`.
+- Device-metadata state publication groundwork is focused-green but not sufficient for acceptance: `ITensorShortConvolution`, `ITensorGatedDeltaNet`, and `IComputeStage` now expose `restoreVerifierStateCaptureRowFromDeviceMetadata()`. CUDA and ROCm short-conv/GDN kernels implement a graph-capturable device-side copy from verifier snapshot rows selected by `accepted_state_slot_indices[request_index]`, require explicit non-null streams, and use the already declared verifier-state capture workspace rather than ad hoc allocations. Focused CUDA/ROCm integration coverage now uses multi-entry accepted-state metadata arrays so the selected slot is read from device metadata rather than inferred from the request index or a scalar committed-row buffer. This proves explicit-stream accepted-slot restore mechanics, but the accepted Phase 13.8 path must still add runner-owned speculative state slots and accepted-count publication rather than copying selected batched verifier rows from the live verifier workspace. Focused validation passed on 2026-06-07 for `V2_Integration_CUDAGDNPaddedRealLength`, `V2_Integration_ROCmGDNPaddedRealLength`, `V2_Unit_DeviceGraphOrchestrator`, `V2_Unit_PrefillDecodeTransition`, and `V2_Unit_MTPSpecDecodeMetadata`.
+- Stateful graph construction now carries Phase 13.8 slot terminology directly: `ShortConv1dStage::Params` and `GDNRecurrenceStage::Params` expose `speculative_state_slot_rows` as the semantic request for temporary MTP verifier state slots, while `verifier_state_capture_rows` and the existing workspace names remain compatibility spellings during the migration. `Qwen35Graph` sets both fields for Qwen3.6/Qwen3.5 GDN verifier graphs, and `V2_Unit_MTPGraphConstruction` asserts the explicit speculative-slot request is present. Focused validation passed on 2026-06-07 for `V2_Unit_MTPGraphConstruction`, `V2_Unit_MTPSpecDecodeMetadata`, and `V2_Unit_PrefillDecodeTransition`.
+- Verifier-state isolation is now implemented for CUDA and ROCm GDN/short-conv kernels: `ITensorShortConvolution` and `ITensorGatedDeltaNet` expose `bindSpeculativeStateWorkspace()`, the graph stages request and bind runner-declared speculative work-state buffers through `IWorkspaceConsumer`, and GPU verifier capture paths hard-fail unless an explicit stream and correctly sized work-state buffer are present. Verifier forwards copy live recurrence/conv state into the work buffer, write snapshots from that temporary state, and leave live state untouched until the accepted-state publication step. Focused integration coverage now proves both sides of the contract: plain M=4 recurrence/short-conv still advances live state like serial decode, while verifier-captured CUDA/ROCm GDN state remains at the checkpoint before publication and the captured state slots match stepwise replay. Focused validation passed on 2026-06-07 for `V2_Integration_CUDAGDNPaddedRealLength`, `V2_Integration_ROCmGDNPaddedRealLength`, and `V2_Unit_MTPGraphConstruction`.
+- Runner-facing metadata restore is scaffolded as a compatibility bridge: `IInferenceRunner` and `DeviceGraphOrchestrator` expose `restoreMTPVerifierStateFromSpecDecodeMetadata()`, which uploads a validated `MTPSpecDecodeMetadataBatch` to the runner-owned workspace on an explicit GPU stream, restores local GDN short-conv/recurrent state from accepted-state slot metadata, truncates main KV/bookkeeping to the requested accepted token count, and hard-fails on missing workspace, missing backend, invalid metadata, missing accepted-state counts, missing accepted-state slots, or absent GDN participants. This API should evolve from selected verifier snapshot slots to true runner-owned speculative state-slot publication. Focused validation passed on 2026-06-07 for `V2_Unit_DeviceGraphOrchestrator`, `V2_Unit_PrefillDecodeTransition`, `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`, and `V2_Unit_MTPDecodeCatchup`.
+- Accepted-state publication naming is now present at the tensor-kernel interface: `ITensorShortConvolution` and `ITensorGatedDeltaNet` expose `publishAcceptedSpeculativeStateFromDeviceMetadata()`, and the runner bridge calls that semantic entry point instead of the retired verifier-row restore spelling. During migration, the default implementation delegates to `restoreVerifierStateCaptureRowFromDeviceMetadata()` so existing CUDA/ROCm kernels stay green, but future true speculative-slot kernels can replace the implementation without changing `DeviceGraphOrchestrator`. Focused validation passed on 2026-06-07 for `V2_Unit_DeviceGraphOrchestrator`, `V2_Unit_PrefillDecodeTransition`, `V2_Integration_CUDAGDNPaddedRealLength`, and `V2_Integration_ROCmGDNPaddedRealLength`.
+- Correction replay planning is now part of the shared metadata contract: `MTPSpecDecodeStateCommitPlan` and `MTPSpecDecodeMetadataBatch` carry per-request `correction_replay_start_indices` and `correction_replay_counts`. Accept-all transactions publish accepted speculative state and retain the bonus row only as a ready-token source; reject transactions publish live state only through the accepted verifier-input prefix and explicitly mark any non-stopped correction suffix for replay; stopped correction rows do not publish correction state and do not request replay. The dormant `vllm_style_spec_decode` candidate now reads this shared replay plan instead of recomputing suffix ranges locally. Focused validation passed on 2026-06-07 for `V2_Unit_MTPSpecDecodeMetadata` and `V2_Unit_PrefillDecodeTransition`.
+- Shared oracle-to-transaction bridge is focused-green: `buildMTPSpecDecodeMetadataBatchFromGreedyCatchup()` converts an `MTPDecodeCatchupGreedyResult` into the same padded graph-facing metadata batch the candidate verifier path must produce, including all-accepted bonus rows and reject-after-prefix correction rows. It rejects accepted-prefix drift between the catch-up result and transaction metadata before the runner can publish state. `OrchestrationRunner` now uses this shared bridge instead of duplicating the transaction invariants in a local lambda. Focused validation passed on 2026-06-07 for `V2_Unit_MTPSpecDecodeMetadata` and `V2_Unit_PrefillDecodeTransition`.
+- First equivalence harness primitive is focused-green: `compareMTPDecodeCatchupGreedyResults()` compares oracle and candidate catch-up results for committed tokens, verifier tokens, acceptance flags, rejected token, ready token, and shifted MTP commit count while intentionally allowing the candidate to use fewer main forwards. This gives the candidate transaction a shared result-level regression gate before backend state snapshots are compared. Focused validation passed on 2026-06-07 for `V2_Unit_MTPDecodeCatchup`.
+- Runtime state equivalence primitive is focused-green: `compareMTPRuntimeStateSnapshots()` compares oracle and candidate `PrefixRuntimeStateSnapshot` values for decode position, per-sequence lengths, main KV token counts, shifted MTP KV token counts, terminal hidden/logit availability, and GDN short-conv/recurrent state hashes. This remains the state-level half of the opt-in equivalence harness for candidate-path debugging. Focused validation passed on 2026-06-07 for `V2_Unit_MTPStateTransaction`.
+- Runner-level equivalence harness is scaffolded and focused-green: setting `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1` around a named optimized catch-up candidate now runs the candidate, captures its runtime snapshot, restores the verifier base checkpoint, runs the `shared_stepwise` oracle, compares result and runtime-state equivalence, and only continues if both match. Deferred rejection is represented as a correction-token emit without a ready token; the candidate commits the shifted MTP correction row so the next sidecar condition remains aligned, then the harness verifies the deferred candidate against the oracle before preserving candidate state. The harness records `mtp.phase138_spec_decode_equivalence_matches` and `mtp.phase138_vllm_style_deferred_rejection_matches`; it remains opt-in development instrumentation for the candidate path. Focused validation passed on 2026-06-07 for `V2_Unit_PrefillDecodeTransition`, the CUDA/ROCm Qwen3.6 dense `Phase138VllmStyleCandidateEquivalence` parity cells, the ROCm depth-3 reject regression, and the CUDA depth-3 benchmark-style regression.
 - Target-verifier row semantics are now explicit and focused-green:
   `buildMTPDecodeCatchupGreedyResultFromVerifierRows()` converts sampled target
   verifier rows into the same catch-up result shape as the oracle while carrying
@@ -2473,105 +2519,61 @@ falling back or partially publishing state.
   through the accepted input prefix until the correction suffix is replayed.
   Focused validation passed on 2026-06-07 for `V2_Unit_MTPDecodeCatchup` and
   `V2_Unit_MTPSpecDecodeMetadata`.
-- The live target-verifier DGO path is implemented and now promoted for dense
-  SingleDevice GPU greedy catch-up: it commits the first shifted MTP row from
-  the condition terminal hidden,
-  enables all-position logits, runs the uniform verifier forward over `D`
-  target rows from the already-live terminal condition, samples verifier rows
-  on the device, builds shared spec-decode metadata,
-  commits accepted shifted MTP rows from verifier hidden rows, restores GDN /
-  short-conv state from graph-facing committed-state metadata, replays any
-  correction suffix before publishing decode-equivalent state, and records
-  `mtp.phase138_vllm_style_spec_decode_runs`. It remains hard-failed outside
-  the promoted dense SingleDevice GPU policy. Focused validation passed on 2026-06-07 for
-  `V2_Unit_DeviceGraphOrchestrator`, `V2_Unit_PrefillDecodeTransition`,
-  `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`,
-  `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_MTPStateTransaction`.
-- Reject-after-prefix candidate parity exposed a stale ready-token surface rather
-  than a state-restore failure: ROCm depth-3 had matching committed output,
-  verifier tokens, shifted commit count, and runtime-state equivalence, but the
-  candidate sampled the post-correction ready token from normal logits after
-  toggling all-position verifier output. The candidate now re-enables
-  all-position logits for correction-suffix replay and samples row 0 from that
-  explicit suffix replay output before disabling the mode. Focused validation
-  passed on 2026-06-07 for ROCm
-  `MTPGreedyDepth3MatchesPyTorchDecodeTokens`, CUDA
-  `MTPBenchmarkPromptFixedDepth3MatchesPyTorchDecodeTokens`, CUDA
-  `MTPGreedyMatchesPyTorchDecodeTokens`, CUDA/ROCm `PrefixCacheMTPRestore`, and
-  the Phase 13.8 unit guard set under
-  `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` plus
-  `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1`. Dedicated always-on CTest
-  regressions now preserve that env wiring: ROCm
-  `V2_Integration_Parity_Qwen36_SingleDevice_Phase138CandidateDepth3RejectRegression`
-  and CUDA
-  `V2_Integration_Parity_Qwen36_CUDA_SingleDevice_Phase138CandidateDepth3BenchmarkRegression`
-  passed on 2026-06-07.
-- Real dense SingleDevice parity has first candidate-equivalence evidence:
-  with `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` and
-  `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1`, CUDA and ROCm
-  `MTPGreedyMatchesPyTorchDecodeTokens` both pass and their perf JSON contains
-  `decode_equivalent_optimized_catchup_selected`,
-  `phase138_vllm_style_spec_decode_runs`, and
-  `phase138_spec_decode_equivalence_matches`. Prefix+MTP restore also passes for
-  CUDA and ROCm under the same env. This proves the live path can match the
-  stepwise oracle on the first dense parity cells; remaining work is broader
-  accept/reject/stop/depth coverage and extending the same contract beyond
-  dense SingleDevice.
-- Direct no-oracle candidate parity is green for the first benchmarkable slice:
-  ROCm `MTPGreedyDepth3MatchesPyTorchDecodeTokens` and CUDA
-  `MTPBenchmarkPromptFixedDepth3MatchesPyTorchDecodeTokens` pass with
-  `LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE=1`.
-- Direct no-oracle parity is now source-owned in the Qwen3.6 dense parity suite
-  instead of relying only on CTest env injection. The direct tests cover CUDA
-  and ROCm depth-3 normal decode, CUDA depth-3 benchmark-prompt decode, and
-  CUDA/ROCm depth-1 prefix+MTP restore, while asserting that transaction commits
-  occurred and transaction validation failures stayed at zero. Focused CTest
-  passed on 2026-06-07: `ctest --test-dir build_v2_integration -R
-  "Phase138Direct" --output-on-failure --parallel`.
-- The same focused pass deliberately exposed two still-unpromoted surfaces:
-  chained-depth prefix restore still hard-fails with the existing
-  "Prefix cache terminal restore with chained MTP drafts is not supported"
-  guard, and the ROCm benchmark-prompt parity fixture diverges from its PyTorch
-  metadata even for the no-MTP baseline. Neither is claimed as green for
-  promotion.
-- Promoted no-env release benchmarks are speed-positive for SingleDevice dense
-  CUDA and ROCm. On Qwen3.6 27B Q4_K_S default 595-prefill/128-decode, CUDA
-  fixed depth-3 MTP reaches 602.79 prefill / 67.92 decode tok/s versus 708.33 /
-  41.73 no-MTP, with 83.70% acceptance, 36 verifier runs, 159 verifier tokens,
-  36 transaction commits, and zero transaction validation failures. ROCm fixed
-  depth-3 promoted MTP reaches 218.27 / 36.14 versus 233.21 / 31.10 no-MTP on
-  the same default lane at 58.82% acceptance, with 42 verifier runs, 203
-  verifier tokens, 43 transaction commits, and zero validation failures. The
-  high-acceptance ROCm `The quick brown fox`,
-  `-c64 -n48` direct-gate lane remains 73.05 / 54.23 versus 76.35 / 31.92,
-  with 88.57% acceptance. Promoted artifacts are under
-  `/tmp/llaminar-mtp-bench/phase138-accept/dense-{cuda,rocm}-{nomtp,promoted-d3}.json`.
-- Promotion slice, 2026-06-07: the direct `vllm_style_spec_decode` transaction
-  is promoted from explicit env-only development mode to the normal
-  SingleDevice dense GPU greedy catch-up path when all of these are true:
-  MTP is enabled, the runner is initialized for one GPU request, the model is
-  dense (`GraphConfig::isMoE() == false`), the graph is not TP/PP/domain
-  sharded, and `requiresMTPDecodeEquivalentVerifierReplay()` is true. Explicit
-  `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=all_position` still hard-fails as
-  retired, and explicit `vllm_style_spec_decode` still hard-fails outside the
-  promoted dense SingleDevice policy rather than falling back. MoE, LocalTP,
-  GlobalTP/NodeLocalTP, PP, ExpertParallel overlay, and chained-depth
-  prefix-restore promotion remain pending gates.
-- Acceptance slice, 2026-06-07: the dense parity base now expects Phase 13.8
-  transaction commits for no-env CUDA/ROCm SingleDevice GPU MTP cases, not only
-  explicit direct-candidate tests. Focused promoted/default parity passed for
-  CUDA/ROCm depth-3 normal decode and prefix+MTP restore alongside the Phase
-  13.8 unit guard set.
-- Follow-on gates: broaden the live transaction equivalence matrix across
-  explicit accept-all, reject-first, reject-after-prefix, stop-token,
-  chained-depth prefix restore, and continuation cases on CUDA and ROCm, then
-  extend the same policy to TP/MoE only after matching parity and benchmark
-  evidence. These are tracked as later topology/sampling work rather than a
-  blocker for the accepted dense SingleDevice GPU greedy Phase 13.8 scope.
+- Eager verifier-row publication rollback, 2026-06-07: the direct
+  `vllm_style_spec_decode` experiments are invalidated for Qwen3.6 hybrid GDN.
+  They wrote live GDN/short-conv state by selecting rows from a batched target
+  verifier. Focused CUDA/ROCm continuation checks show this can preserve
+  immediate sampled tokens while still diverging several continuation tokens
+  later. Those benchmark artifacts remain useful as a performance target, but
+  they are not correctness evidence and must not drive Phase 14 claims.
+- Stochastic transaction handoff, 2026-06-07: legacy all-position,
+  verifier-row-restore, and decode-equivalent replay paths now validate the
+  same `MTPSpecDecodeTransaction` metadata before publishing output. All-accepted
+  stochastic verifier rows propagate the precomputed terminal ready token through
+  the transaction instead of resampling or requiring a greedy-only bypass. Ready
+  sampled tokens carry the exact `SamplingParams` snapshot that produced them;
+  consuming a ready token after sampling parameters change hard-fails before
+  state mutation. Focused validation passed for `V2_Unit_PrefillDecodeTransition`
+  and the normal CUDA/ROCm Qwen3.6 dense stochastic MTP parity cells.
+- Prefix-restore equivalence, 2026-06-07: dense SingleDevice CUDA and ROCm now
+  have `Phase138VllmStyleCandidatePrefixRestoreEquivalence` parity cells. They
+  run the opt-in candidate equivalence harness across a first request and a RAM
+  prefix-cache full hit at draft depth 1, proving terminal logits, terminal
+  hidden, and MTP state restore still publish through Phase 13.8 transactions
+  with zero validation failures. Draft depth greater than 1 currently hits the
+  explicit chained-MTP prefix-restore hard gate. A temporary gate removal showed
+  the focused CUDA cell can pass while ROCm fails the oracle on the restored
+  request, so the gate is still required until the restored shifted-MTP and
+  terminal-hidden state contract is fixed for both backends.
+- Focused 2026-06-07 regression gate passed 9/9 for prefix-flow unit coverage,
+  prefill/decode transition coverage, CUDA/ROCm stochastic parity, CUDA/ROCm
+  candidate equivalence, and CUDA/ROCm depth-1 prefix-restore candidate
+  equivalence. `V2_Unit_PrefixCachePrefillFlow` now asserts the fast rejected
+  chained-draft path restores the accepted verifier row and replays only the
+  correction suffix instead of reverting to a full live-checkpoint rollback.
+- Current hard gate: no backend is accepted for Phase 13.8 until it implements
+  speculative state slots plus accepted-count publication for greedy and
+  stochastic paths. The named `vllm_style_spec_decode` hook may run only under
+  explicit equivalence/development knobs until acceptance; plain/default use
+  should hard-fail instead of silently falling back or publishing partial state.
+  Always-on parity should assert the equivalence path, transaction activity,
+  and zero validation failures before any benchmark claim.
+- Next implementation slice:
+  1. add runner-owned speculative GDN/short-conv state slots sized by draft
+     depth;
+  2. replace the remaining compatibility verifier-snapshot publication bridge
+     with accepted-count plus speculative/accepted state-slot buffers uploaded
+     before capture/replay on an explicit non-null stream;
+  3. implement CUDA and ROCm publish stages that move only the
+     accepted-count-selected speculative state into the live state;
+  4. compare that path against `shared_stepwise` for accept-all, reject-first,
+     reject-after-prefix, stop-token, prefix restore, and four-token
+     continuation cases before reenabling any direct benchmark mode;
+  5. then wire stochastic MTP through the same transaction rows.
 - Stop-token row-semantics unit coverage is now in place: `V2_Unit_MTPDecodeCatchup`
   pins verifier-row transactions where the first draft stops, an accepted
   speculative token stops, and a rejected correction token stops. These tests
-  prove the promoted metadata contract does not publish bonus ready-token state
+  prove the shared metadata contract does not publish bonus ready-token state
   or correction-token state when generation has already completed.
 
 ### Files
@@ -2604,8 +2606,8 @@ falling back or partially publishing state.
 - Unit tests for any graph-facing metadata buffer builder, including discarded requests, rejected suffix rows, all-accepted bonus rows, and the rule that bonus ready-token rows are not committed as live state.
 - CUDA and ROCm direct short-conv accepted-count state tests for accepted counts 1..4.
 - CUDA and ROCm direct GDN recurrence accepted-count state tests for accepted counts 1..4.
-- Integration tests proving the named `vllm_style_spec_decode` hook hard-fails unless all required metadata/state kernels are available.
-- Qwen3.6 dense SingleDevice CUDA and ROCm parity comparing `vllm_style_spec_decode` with `shared_stepwise` for accept-all, reject-first, reject-after-prefix, stop-token, prefix restore, and at least four future continuation tokens.
+- Integration tests proving the named `vllm_style_spec_decode` hook either hard-fails when selected without the explicit development gate or passes the equivalence harness with active transaction commits and zero validation failures.
+- Qwen3.6 dense SingleDevice CUDA and ROCm parity comparing the accepted-count `vllm_style_spec_decode` path with `shared_stepwise` for accept-all, reject-first, reject-after-prefix, stop-token, prefix restore, and at least four future continuation tokens.
 - Benchmark tests recording baseline, `shared_stepwise`, and `vllm_style_spec_decode` decode throughput plus verifier graph, state commit, sidecar, sampler, and accepted-count counters.
 
 Focused command shape:
@@ -2617,6 +2619,10 @@ ctest --test-dir build_v2_integration -R "^V2_Unit_MTPSpecDecodeMetadata$|^V2_Un
 
 Benchmark command shape:
 
+Run these only after the accepted-count speculative state-slot path is enabled
+and the focused parity/equivalence gates above are green; old direct-row
+candidate benchmark numbers are historical and not acceptance evidence.
+
 ```bash
 cmake --build build_v2_release --target llaminar2 --parallel
 ./build_v2_release/llaminar2 benchmark -m /opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf -d cuda:0 -c 64 -n 48 --mtp --mtp-draft-tokens 3 --benchmark-json-output /tmp/llaminar-mtp-bench/dense-cuda-phase138-vllm-style-d3.json
@@ -2627,12 +2633,14 @@ cmake --build build_v2_release --target llaminar2 --parallel
 
 - The plan no longer depends on raw all-position verifier-row restore for Qwen3.6 dense.
 - `MTPSpecDecodeTransaction` is the shared metadata contract for accepted counts, rejected suffixes, sample indices, next condition tokens, and committed output rows.
-- `MTPSpecDecodeMetadata` declares graph-facing metadata buffers and deterministic padded host arrays for backend upload/binding, including committed-state row/index and bonus-ready-token row/index metadata.
+- `MTPSpecDecodeMetadata` declares graph-facing metadata buffers and deterministic padded host arrays for backend upload/binding, including accepted-state counts, speculative state-slot indices, accepted-state slot indices, committed-state compatibility row/index fields, and bonus-ready-token row/state-slot metadata.
 - CUDA and ROCm stateful short-conv/GDN kernels consume accepted-token metadata and prove accepted-count state equivalence against serial decode.
-- `vllm_style_spec_decode` is selected only through a named runner capability and records its implementation name in structured counters.
+- `vllm_style_spec_decode` is selected only through a named runner capability, remains default-disabled until accepted, and records its implementation name in structured counters when the explicit equivalence/development path runs.
 - CUDA and ROCm SingleDevice Qwen3.6 dense parity pass for prefix+MTP restore and greedy depth-3 MTP under the new transaction.
+- CUDA and ROCm SingleDevice Qwen3.6 dense stochastic MTP use the same Phase 13.8 transaction metadata/state publication path, with parity or distribution-equivalence coverage, active transaction commits, zero transaction validation failures, and benchmark counters for stochastic accept/residual behavior.
 - Benchmarks show accepted speculative tokens no longer pay repeated full one-token main decode replay, or the remaining blocker is documented with structured counters and traces.
 - No Phase 14 dense MTP speedup claim uses an unproven backend-specific verifier shortcut.
+- CUDA and ROCm default-lane dense MTP produce comparable speedup classes before Phase 13.8 is considered benchmark-accepted. A backend that lags by a large margin, such as a 1.16x ROCm win beside a 1.63x CUDA win, keeps this phase in tuning until counters identify and remove the bottleneck or the remaining gap is explicitly split into a follow-up phase.
 
 ## Phase 14: Benchmark Acceptance And Default-Enablement Readiness
 
@@ -2772,6 +2780,7 @@ Acceptance targets before considering default enablement:
 - On acceptance-limited prompts, adaptive depth should avoid known-regressive fixed depths and stay within noise of the best fixed depth observed for that lane.
 - On high-acceptance prompts, adaptive depth should promote back to the fastest safe depth and preserve the existing speedup ratchet.
 - Dense MTP target is approximately 2x decode throughput versus disabled on Qwen3.6 27B for the supported GPU backend.
+- Dense MTP acceptance requires CUDA and ROCm to post comparable default-lane wins when both backends are in scope. A backend that is merely speed-positive but much smaller than the other backend's win is a tuning blocker, not an accepted result, unless hardware-specific traces and counters justify splitting the gap into a named follow-up phase.
 - MoE MTP target is approximately 1.5x decode throughput versus disabled on Qwen3.6 35B MoE for the supported ExpertParallel topology.
 - Prefix plus MTP must not regress versus the faster of prefix-only and MTP-only for the benchmarked prompt class without an explicit documented reason.
 - ExpertParallel graph-captured chunks should reduce host dispatch overhead inside domain-local compute segments. Sparse collective and rebalance overhead must be reported separately from graph replay time.

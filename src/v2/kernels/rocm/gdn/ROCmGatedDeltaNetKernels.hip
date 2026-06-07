@@ -914,13 +914,13 @@ namespace {
 __global__ void rocm_gdn_restore_state_from_capture_metadata_kernel(
     float *__restrict__ dst_state,
     const float *__restrict__ state_snapshots,
-    const int32_t *__restrict__ device_committed_state_rows,
+    const int32_t *__restrict__ device_accepted_state_slot_indices,
     int request_index,
     int snapshot_stride_floats,
     int max_snapshot_rows,
     int state_floats)
 {
-    const int row = device_committed_state_rows[request_index];
+    const int row = device_accepted_state_slot_indices[request_index];
     if (row < 0 || row >= max_snapshot_rows)
         return;
 
@@ -996,7 +996,7 @@ void rocmGDN_stream_synchronize(void *stream)
 bool rocmGDN_restore_state_from_capture_metadata(
     float *dst_state,
     const float *state_snapshots,
-    const int32_t *device_committed_state_rows,
+    const int32_t *device_accepted_state_slot_indices,
     int request_index,
     int snapshot_stride_floats,
     int max_snapshot_rows,
@@ -1004,7 +1004,7 @@ bool rocmGDN_restore_state_from_capture_metadata(
     int device_idx,
     void *stream)
 {
-    if (!dst_state || !state_snapshots || !device_committed_state_rows ||
+    if (!dst_state || !state_snapshots || !device_accepted_state_slot_indices ||
         request_index < 0 || snapshot_stride_floats < state_floats ||
         max_snapshot_rows <= 0 || state_floats <= 0 || !stream)
     {
@@ -1018,7 +1018,7 @@ bool rocmGDN_restore_state_from_capture_metadata(
         dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
         dst_state,
         state_snapshots,
-        device_committed_state_rows,
+        device_accepted_state_slot_indices,
         request_index,
         snapshot_stride_floats,
         max_snapshot_rows,

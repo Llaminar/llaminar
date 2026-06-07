@@ -908,11 +908,9 @@ TEST_F(Test__DeviceGraphOrchestrator, VllmStyleSpecDecodeCandidateHardFailsOutsi
             []() -> int32_t { return 9; });
 
     EXPECT_FALSE(result.ok);
-    EXPECT_NE(result.error.find("vllm_style_spec_decode is promoted only for"),
+    EXPECT_NE(result.error.find("vllm_style_spec_decode is not promoted for hybrid GDN"),
               std::string::npos);
-    EXPECT_NE(result.error.find("dense SingleDevice GPU hybrid decode"),
-              std::string::npos);
-    EXPECT_NE(result.error.find("TP, PP, MoE"),
+    EXPECT_NE(result.error.find("accepted-count speculative state-slot publication"),
               std::string::npos);
 }
 

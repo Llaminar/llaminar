@@ -125,7 +125,7 @@ namespace
 
         void *defaultStream() override { return &default_stream_; }
         void *createStream() override { return &capture_stream_; }
-        void destroyStream(void *) override {}
+        void destroyStream(void *) override { ++destroy_stream_calls_; }
 
         void *createEvent() override
         {
@@ -147,6 +147,11 @@ namespace
         void *collectiveComm() const override { return nullptr; }
         void synchronize() override {}
         void synchronizeStream(void *) override { ++synchronize_stream_calls_; }
+        bool synchronizeStreamChecked(void *) override
+        {
+            ++synchronize_stream_checked_calls_;
+            return synchronize_stream_checked_result_;
+        }
         void insertStreamDependency(void *, void *) override {}
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override
@@ -160,6 +165,9 @@ namespace
         }
 
         int synchronize_stream_calls_ = 0;
+        int synchronize_stream_checked_calls_ = 0;
+        int destroy_stream_calls_ = 0;
+        bool synchronize_stream_checked_result_ = true;
         int events_created_ = 0;
         int events_destroyed_ = 0;
         int events_recorded_ = 0;
@@ -654,6 +662,40 @@ TEST(Test__GraphSegmentCache, ResetCanDestroyCaptureStream)
     EXPECT_EQ(cache.capture_stream, nullptr);
 }
 
+TEST(Test__GraphSegmentCache, ResetPreserveSynchronizesExplicitCaptureStreamWithCheckedAPI)
+{
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    void *stream = cache.capture_stream;
+    ASSERT_NE(stream, nullptr);
+
+    cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
+
+    EXPECT_EQ(cache.capture_stream, stream);
+    EXPECT_EQ(cache.gpu_ctx_ref, &gpu_ctx);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 1);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0)
+        << "Graph cache reset must use checked stream sync so poisoned GPU work is visible";
+    EXPECT_EQ(gpu_ctx.destroy_stream_calls_, 0);
+}
+
+TEST(Test__GraphSegmentCache, ResetDestroyClearsCaptureStreamAfterCheckedSyncFailure)
+{
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    FakeReplayGPUContext gpu_ctx;
+    gpu_ctx.synchronize_stream_checked_result_ = false;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+
+    cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+
+    EXPECT_EQ(cache.capture_stream, nullptr);
+    EXPECT_EQ(cache.gpu_ctx_ref, nullptr);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 1);
+    EXPECT_EQ(gpu_ctx.destroy_stream_calls_, 1)
+        << "A failed stream sync must not leave the cache with a dangling stream handle";
+}
+
 TEST(Test__ForwardGraphCache, ReplayResetPreservesSegmentCaptureStream)
 {
     ForwardGraphCache cache;
@@ -860,10 +902,11 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;
-        }));
+    }));
 
     EXPECT_TRUE(post_launch_called);
-    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 1);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 1);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags expected_tags = {

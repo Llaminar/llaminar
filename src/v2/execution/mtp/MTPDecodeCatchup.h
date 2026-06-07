@@ -39,6 +39,7 @@ namespace llaminar2
 
         int main_forward_token_count = 0;
         int shifted_commit_count = 0;
+        std::string debug_trace;
 
         /**
          * Number of verifier input rows whose target-model state may be

@@ -83,10 +83,14 @@ namespace llaminar2
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::STOPPED_FLAGS, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS, requests + 1));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::STATE_INDICES, target_slots));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_COUNTS, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::SPECULATIVE_STATE_SLOT_INDICES, target_slots));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_ROWS, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_INDICES, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_SLOT_INDICES, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_ROWS, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_INDICES, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::BONUS_READY_STATE_SLOT_INDICES, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::DRAFT_TOKENS, draft_slots));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::SAMPLED_TOKENS, target_slots));
         return reqs;
@@ -122,7 +126,9 @@ namespace llaminar2
             !has_size(batch.rejected_token_counts, requests) ||
             !has_size(batch.all_drafts_accepted_flags, requests) ||
             !has_size(batch.stopped_flags, requests) ||
-            !has_size(batch.state_indices, target_slots))
+            !has_size(batch.state_indices, target_slots) ||
+            !has_size(batch.accepted_state_counts, requests) ||
+            !has_size(batch.speculative_state_slot_indices, target_slots))
         {
             return statePlanFailure(shape, batch.request_count, "metadata batch arrays are undersized");
         }
@@ -133,8 +139,13 @@ namespace llaminar2
         plan.request_count = batch.request_count;
         fillInvalid(plan.committed_state_rows, requests);
         fillInvalid(plan.committed_state_indices, requests);
+        fillZero(plan.accepted_state_counts, requests);
+        fillInvalid(plan.accepted_state_slot_indices, requests);
+        fillInvalid(plan.correction_replay_start_indices, requests);
+        fillZero(plan.correction_replay_counts, requests);
         fillInvalid(plan.bonus_ready_token_rows, requests);
         fillInvalid(plan.bonus_ready_token_indices, requests);
+        fillInvalid(plan.bonus_ready_state_slot_indices, requests);
 
         for (int i = 0; i < batch.request_count; ++i)
         {
@@ -152,6 +163,8 @@ namespace llaminar2
             const bool stopped =
                 batch.stopped_flags[static_cast<size_t>(i)] != 0;
             const int target_offset = i * shape.maxTargetQueryLen();
+            const int accepted_state_count =
+                batch.accepted_state_counts[static_cast<size_t>(i)];
 
             auto fail_request = [&](const char *reason)
             {
@@ -185,8 +198,23 @@ namespace llaminar2
             {
                 return fail_request("target verifier state commit count is outside committed verifier-input prefix");
             }
+            if (accepted_state_count != state_commit_count)
+                return fail_request("accepted state count must match target verifier state commit count");
             if (rejected_count != target_query_len - valid_sampled_count)
                 return fail_request("rejected token count does not match valid sampled prefix");
+
+            plan.accepted_state_counts[static_cast<size_t>(i)] =
+                accepted_state_count;
+
+            const int correction_replay_count =
+                std::max(0, committed_count - accepted_state_count);
+            if (correction_replay_count > 0 && !stopped)
+            {
+                plan.correction_replay_start_indices[static_cast<size_t>(i)] =
+                    accepted_state_count;
+                plan.correction_replay_counts[static_cast<size_t>(i)] =
+                    correction_replay_count;
+            }
 
             const int extra_valid_sampled = valid_sampled_count - committed_count;
             if (extra_valid_sampled > 0)
@@ -200,26 +228,34 @@ namespace llaminar2
                         "valid sampled suffix beyond committed outputs is only allowed for an all-accepted bonus ready token");
                 }
                 const int bonus_row = valid_sampled_count - 1;
+                const int32_t bonus_slot_index =
+                    batch.speculative_state_slot_indices[static_cast<size_t>(target_offset + bonus_row)];
                 const int32_t bonus_index =
                     batch.state_indices[static_cast<size_t>(target_offset + bonus_row)];
-                if (bonus_index < 0)
+                if (bonus_index < 0 || bonus_slot_index < 0)
                     return fail_request("bonus ready-token row has no state index");
                 plan.bonus_ready_token_rows[static_cast<size_t>(i)] = bonus_row;
                 plan.bonus_ready_token_indices[static_cast<size_t>(i)] =
                     bonus_index;
+                plan.bonus_ready_state_slot_indices[static_cast<size_t>(i)] =
+                    bonus_slot_index;
             }
 
             if (state_commit_count > 0)
             {
                 const int committed_row = state_commit_count - 1;
+                const int32_t accepted_slot_index =
+                    batch.speculative_state_slot_indices[static_cast<size_t>(target_offset + committed_row)];
                 const int32_t committed_index =
                     batch.state_indices[static_cast<size_t>(target_offset + committed_row)];
-                if (committed_index < 0)
+                if (committed_index < 0 || accepted_slot_index < 0)
                     return fail_request("committed state row has no state index");
                 plan.committed_state_rows[static_cast<size_t>(i)] =
                     committed_row;
                 plan.committed_state_indices[static_cast<size_t>(i)] =
                     committed_index;
+                plan.accepted_state_slot_indices[static_cast<size_t>(i)] =
+                    accepted_slot_index;
             }
         }
 
@@ -232,11 +268,31 @@ namespace llaminar2
         const std::vector<int32_t> &committed_output_counts,
         const std::vector<int32_t> &stopped_flags)
     {
+        if (!shape.valid())
+            return metadataFailure(shape, "invalid MTP spec-decode metadata shape");
+        if (requests.empty())
+            return metadataFailure(shape, "MTP spec-decode metadata batch has no requests");
+        std::vector<int32_t> target_verifier_state_commit_counts;
+        target_verifier_state_commit_counts.reserve(requests.size());
+        for (const MTPSpecDecodeRequest &request : requests)
+        {
+            MTPSpecDecodeTransaction tx =
+                buildMTPSpecDecodeTransaction(request);
+            if (!tx.ok)
+            {
+                return metadataFailure(
+                    shape,
+                    std::string("request transaction metadata failed: ") +
+                        tx.error);
+            }
+            target_verifier_state_commit_counts.push_back(
+                static_cast<int32_t>(tx.accepted_speculative_prefix));
+        }
         return buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
             shape,
             requests,
             committed_output_counts,
-            committed_output_counts,
+            target_verifier_state_commit_counts,
             stopped_flags);
     }
 
@@ -282,10 +338,16 @@ namespace llaminar2
         fillZero(batch.stopped_flags, requests_slots);
         fillZero(batch.query_start_locs, requests_slots + 1);
         fillInvalid(batch.state_indices, target_slots);
+        fillZero(batch.accepted_state_counts, requests_slots);
+        fillInvalid(batch.speculative_state_slot_indices, target_slots);
         fillInvalid(batch.committed_state_rows, requests_slots);
         fillInvalid(batch.committed_state_indices, requests_slots);
+        fillInvalid(batch.accepted_state_slot_indices, requests_slots);
+        fillInvalid(batch.correction_replay_start_indices, requests_slots);
+        fillZero(batch.correction_replay_counts, requests_slots);
         fillInvalid(batch.bonus_ready_token_rows, requests_slots);
         fillInvalid(batch.bonus_ready_token_indices, requests_slots);
+        fillInvalid(batch.bonus_ready_state_slot_indices, requests_slots);
         fillInvalid(batch.draft_tokens, draft_slots);
         fillInvalid(batch.sampled_tokens, target_slots);
 
@@ -341,6 +403,8 @@ namespace llaminar2
                 committed_count;
             batch.target_verifier_state_commit_counts[request_index] =
                 state_commit_count;
+            batch.accepted_state_counts[request_index] =
+                state_commit_count;
             batch.rejected_token_counts[request_index] = tx.rejected_token_count;
             batch.token_indices_to_sample[request_index] = tx.token_index_to_sample;
             batch.next_condition_tokens[request_index] = tx.next_condition_token;
@@ -353,6 +417,8 @@ namespace llaminar2
             for (int row = 0; row < tx.target_query_len; ++row)
             {
                 batch.state_indices[static_cast<size_t>(target_offset + row)] =
+                    query_cursor + row;
+                batch.speculative_state_slot_indices[static_cast<size_t>(target_offset + row)] =
                     query_cursor + row;
             }
             query_cursor += tx.target_query_len;
@@ -382,10 +448,20 @@ namespace llaminar2
             std::move(commit_plan.committed_state_rows);
         batch.committed_state_indices =
             std::move(commit_plan.committed_state_indices);
+        batch.accepted_state_counts =
+            std::move(commit_plan.accepted_state_counts);
+        batch.accepted_state_slot_indices =
+            std::move(commit_plan.accepted_state_slot_indices);
+        batch.correction_replay_start_indices =
+            std::move(commit_plan.correction_replay_start_indices);
+        batch.correction_replay_counts =
+            std::move(commit_plan.correction_replay_counts);
         batch.bonus_ready_token_rows =
             std::move(commit_plan.bonus_ready_token_rows);
         batch.bonus_ready_token_indices =
             std::move(commit_plan.bonus_ready_token_indices);
+        batch.bonus_ready_state_slot_indices =
+            std::move(commit_plan.bonus_ready_state_slot_indices);
         return batch;
     }
 
@@ -424,6 +500,10 @@ namespace llaminar2
             expected_all_drafts_accepted
                 ? std::optional<int32_t>{result.ready_token}
                 : std::optional<int32_t>{};
+        const int expected_accepted_verifier_prefix =
+            std::min<int>(
+                static_cast<int>(request.draft_tokens.size()),
+                result.accepted_speculative_prefix + 1);
 
         MTPSpecDecodeRequest spec_request =
             buildMTPSpecDecodeRequestFromVerifierOutput(
@@ -442,7 +522,7 @@ namespace llaminar2
                 {static_cast<int32_t>(
                     result.target_verifier_state_commit_count >= 0
                         ? result.target_verifier_state_commit_count
-                        : static_cast<int>(result.accepted_tokens.size()))},
+                        : expected_accepted_verifier_prefix)},
                 {result.stopped_on_output ? 1 : 0});
         if (!batch.ok)
             return batch;
@@ -450,10 +530,6 @@ namespace llaminar2
             return metadataFailure(shape, "MTP spec-decode metadata batch produced no transaction");
 
         const MTPSpecDecodeTransaction &tx = batch.transactions.front();
-        const int expected_accepted_verifier_prefix =
-            std::min<int>(
-                static_cast<int>(request.draft_tokens.size()),
-                result.accepted_speculative_prefix + 1);
         if (tx.accepted_speculative_prefix != expected_accepted_verifier_prefix)
         {
             return metadataFailure(
@@ -506,10 +582,12 @@ namespace llaminar2
                stopped_flags &&
                query_start_locs &&
                state_indices &&
-               committed_state_rows &&
-               committed_state_indices &&
+               accepted_state_counts &&
+               speculative_state_slot_indices &&
+               accepted_state_slot_indices &&
                bonus_ready_token_rows &&
                bonus_ready_token_indices &&
+               bonus_ready_state_slot_indices &&
                draft_tokens &&
                sampled_tokens;
     }
@@ -609,6 +687,35 @@ namespace llaminar2
             return true;
         };
 
+        auto bind_int32_optional = [&](const char *name, int32_t **out) -> bool
+        {
+            const WorkspaceDescriptor *desc = reqs.find(name);
+            if (!desc)
+            {
+                *out = nullptr;
+                return true;
+            }
+            if (!workspace_->hasBuffer(name))
+            {
+                *out = nullptr;
+                return true;
+            }
+            const size_t size = workspace_->getBufferSize(name);
+            if (size < desc->size_bytes)
+            {
+                error << "workspace buffer " << name << " is too small: "
+                      << size << " < " << desc->size_bytes;
+                return false;
+            }
+            *out = static_cast<int32_t *>(workspace_->getBuffer(name));
+            if (!*out)
+            {
+                error << "workspace buffer " << name << " returned null";
+                return false;
+            }
+            return true;
+        };
+
         if (!bind_int32(
                 MTPSpecDecodeWorkspaceBuffers::DRAFT_COUNTS,
                 &device_pointers_.draft_counts) ||
@@ -646,17 +753,29 @@ namespace llaminar2
                 MTPSpecDecodeWorkspaceBuffers::STATE_INDICES,
                 &device_pointers_.state_indices) ||
             !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_COUNTS,
+                &device_pointers_.accepted_state_counts) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::SPECULATIVE_STATE_SLOT_INDICES,
+                &device_pointers_.speculative_state_slot_indices) ||
+            !bind_int32_optional(
                 MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_ROWS,
                 &device_pointers_.committed_state_rows) ||
-            !bind_int32(
+            !bind_int32_optional(
                 MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_INDICES,
                 &device_pointers_.committed_state_indices) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_SLOT_INDICES,
+                &device_pointers_.accepted_state_slot_indices) ||
             !bind_int32(
                 MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_ROWS,
                 &device_pointers_.bonus_ready_token_rows) ||
             !bind_int32(
                 MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_INDICES,
                 &device_pointers_.bonus_ready_token_indices) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::BONUS_READY_STATE_SLOT_INDICES,
+                &device_pointers_.bonus_ready_state_slot_indices) ||
             !bind_int32(
                 MTPSpecDecodeWorkspaceBuffers::DRAFT_TOKENS,
                 &device_pointers_.draft_tokens) ||
@@ -743,6 +862,15 @@ namespace llaminar2
             return true;
         };
 
+        auto upload_optional = [&](int32_t *dst,
+                                   const std::vector<int32_t> &src,
+                                   const char *name) -> bool
+        {
+            if (!dst)
+                return true;
+            return upload(dst, src, name);
+        };
+
         if (!upload(ptrs.draft_counts, batch.draft_counts,
                     MTPSpecDecodeWorkspaceBuffers::DRAFT_COUNTS) ||
             !upload(ptrs.target_query_lens, batch.target_query_lens,
@@ -767,14 +895,22 @@ namespace llaminar2
                     MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS) ||
             !upload(ptrs.state_indices, batch.state_indices,
                     MTPSpecDecodeWorkspaceBuffers::STATE_INDICES) ||
-            !upload(ptrs.committed_state_rows, batch.committed_state_rows,
-                    MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_ROWS) ||
-            !upload(ptrs.committed_state_indices, batch.committed_state_indices,
-                    MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_INDICES) ||
+            !upload(ptrs.accepted_state_counts, batch.accepted_state_counts,
+                    MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_COUNTS) ||
+            !upload(ptrs.speculative_state_slot_indices, batch.speculative_state_slot_indices,
+                    MTPSpecDecodeWorkspaceBuffers::SPECULATIVE_STATE_SLOT_INDICES) ||
+            !upload_optional(ptrs.committed_state_rows, batch.committed_state_rows,
+                             MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_ROWS) ||
+            !upload_optional(ptrs.committed_state_indices, batch.committed_state_indices,
+                             MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_INDICES) ||
+            !upload(ptrs.accepted_state_slot_indices, batch.accepted_state_slot_indices,
+                    MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_SLOT_INDICES) ||
             !upload(ptrs.bonus_ready_token_rows, batch.bonus_ready_token_rows,
                     MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_ROWS) ||
             !upload(ptrs.bonus_ready_token_indices, batch.bonus_ready_token_indices,
                     MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_INDICES) ||
+            !upload(ptrs.bonus_ready_state_slot_indices, batch.bonus_ready_state_slot_indices,
+                    MTPSpecDecodeWorkspaceBuffers::BONUS_READY_STATE_SLOT_INDICES) ||
             !upload(ptrs.draft_tokens, batch.draft_tokens,
                     MTPSpecDecodeWorkspaceBuffers::DRAFT_TOKENS) ||
             !upload(ptrs.sampled_tokens, batch.sampled_tokens,

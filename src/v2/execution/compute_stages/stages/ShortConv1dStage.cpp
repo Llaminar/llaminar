@@ -69,9 +69,10 @@ namespace llaminar2
             return reqs;
 
         const int max_seq_len = std::max(1, m > 0 ? m : params_.seq_len);
-        if (params_.verifier_state_capture_rows > 0 && params_.kernel_size > 1)
+        const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
+        if (speculative_slot_rows > 0 && params_.kernel_size > 1)
         {
-            const int rows = std::min(params_.verifier_state_capture_rows, max_seq_len);
+            const int rows = std::min(speculative_slot_rows, max_seq_len);
             const size_t state_floats =
                 static_cast<size_t>(params_.channels) *
                 static_cast<size_t>(params_.kernel_size - 1);
@@ -79,6 +80,13 @@ namespace llaminar2
                                     static_cast<size_t>(rows) * state_floats * sizeof(float),
                                     256,
                                     true});
+            if (params_.device_id.is_gpu())
+            {
+                reqs.buffers.push_back({speculativeStateWorkBufferName(),
+                                        state_floats * sizeof(float),
+                                        256,
+                                        true});
+            }
         }
 
         if (!params_.device_id.is_gpu())
@@ -131,11 +139,22 @@ namespace llaminar2
 
         const int capture_state_size = params_.channels * std::max(0, params_.kernel_size - 1);
         verifier_capture_workspace_bound_ = false;
+        speculative_state_work_bound_ = false;
         verifier_capture_rows_bound_ = 0;
         verifier_capture_state_size_bound_ = capture_state_size;
 
-        if (params_.verifier_state_capture_rows <= 0)
+        const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
+        if (speculative_slot_rows <= 0)
+        {
+            params_.kernel->bindVerifierStateCaptureWorkspace(
+                nullptr,
+                0,
+                capture_state_size);
+            params_.kernel->bindSpeculativeStateWorkspace(
+                nullptr,
+                capture_state_size);
             return;
+        }
 
         float *capture = nullptr;
         int capture_rows = 0;
@@ -148,7 +167,7 @@ namespace llaminar2
             if (capture_state_size > 0)
             {
                 capture_rows = static_cast<int>(std::min<size_t>(
-                    static_cast<size_t>(params_.verifier_state_capture_rows),
+                    static_cast<size_t>(speculative_slot_rows),
                     available_floats / static_cast<size_t>(capture_state_size)));
             }
         }
@@ -158,6 +177,23 @@ namespace llaminar2
         params_.kernel->bindVerifierStateCaptureWorkspace(
             capture,
             capture_rows,
+            capture_state_size);
+
+        float *speculative_work = nullptr;
+        if (bound_workspace_ && bound_workspace_->hasBuffer(speculativeStateWorkBufferName()))
+        {
+            const std::string work_name = speculativeStateWorkBufferName();
+            const size_t available_floats =
+                bound_workspace_->getBufferSize(work_name) / sizeof(float);
+            if (available_floats >= static_cast<size_t>(std::max(0, capture_state_size)))
+            {
+                speculative_work = static_cast<float *>(bound_workspace_->getBuffer(work_name));
+            }
+        }
+        speculative_state_work_bound_ =
+            speculative_work != nullptr || !params_.device_id.is_gpu();
+        params_.kernel->bindSpeculativeStateWorkspace(
+            speculative_work,
             capture_state_size);
     }
 
@@ -198,6 +234,18 @@ namespace llaminar2
         return std::string(WS_VERIFIER_STATE_CAPTURE) + "_" + workspaceStableId();
     }
 
+    std::string ShortConv1dStage::speculativeStateWorkBufferName() const
+    {
+        return std::string(WS_SPECULATIVE_STATE_WORK) + "_" + workspaceStableId();
+    }
+
+    int ShortConv1dStage::requestedSpeculativeStateSlotRows() const
+    {
+        return std::max(
+            params_.speculative_state_slot_rows,
+            params_.verifier_state_capture_rows);
+    }
+
     void ShortConv1dStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
     {
         prefill_replay_params_set_ = true;
@@ -225,7 +273,7 @@ namespace llaminar2
 
     bool ShortConv1dStage::verifierStateCaptureWorkspaceRequired() const
     {
-        return params_.verifier_state_capture_rows > 0 &&
+        return requestedSpeculativeStateSlotRows() > 0 &&
                params_.kernel_size > 1;
     }
 
@@ -233,13 +281,16 @@ namespace llaminar2
     {
         if (!verifierStateCaptureWorkspaceRequired())
             return true;
-        if (verifier_capture_workspace_bound_)
+        if (verifier_capture_workspace_bound_ && speculative_state_work_bound_)
             return true;
 
         LOG_ERROR("[ShortConv1dStage] Missing required verifier state capture workspace '"
                   << verifierStateCaptureBufferName()
-                  << "' (requested_rows=" << params_.verifier_state_capture_rows
+                  << "' or speculative state workspace '"
+                  << speculativeStateWorkBufferName()
+                  << "' (requested_rows=" << requestedSpeculativeStateSlotRows()
                   << ", bound_rows=" << verifier_capture_rows_bound_
+                  << ", speculative_work_bound=" << speculative_state_work_bound_
                   << ", state_size=" << verifier_capture_state_size_bound_
                   << ", layer=" << params_.layer_idx
                   << ", device=" << params_.device_id.toString() << ")");
@@ -257,18 +308,19 @@ namespace llaminar2
     }
 
     bool ShortConv1dStage::restoreVerifierStateCaptureRowFromDeviceMetadata(
-        const int32_t *device_committed_state_rows,
+        const int32_t *device_accepted_state_slot_indices,
         int request_index,
         void *stream)
     {
-        if (!hasVerifierStateCapture() || !params_.kernel || !device_committed_state_rows ||
+        if (!hasVerifierStateCapture() || !params_.kernel ||
+            !device_accepted_state_slot_indices ||
             request_index < 0 || !stream)
         {
             return false;
         }
         return params_.kernel->restoreVerifierStateCaptureRowFromDeviceMetadata(
             params_.conv_state,
-            device_committed_state_rows,
+            device_accepted_state_slot_indices,
             request_index,
             stream);
     }

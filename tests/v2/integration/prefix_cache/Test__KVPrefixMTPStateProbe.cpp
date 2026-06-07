@@ -461,6 +461,10 @@ namespace
         EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u)
             << "Speculative-sampling mode must actually verify at least one draft token on "
             << backend_name;
+        EXPECT_GT(snapshot.mtp_transaction_commits, 0u)
+            << backend_name << " stochastic MTP must publish through Phase 13.8 transactions";
+        EXPECT_EQ(snapshot.mtp_transaction_validation_failures, 0u)
+            << backend_name << " stochastic MTP transaction validation failed";
         EXPECT_EQ(snapshot.mtp_request.verify_mode, "speculative-sampling");
         EXPECT_TRUE(snapshot.mtp_request.stochastic_verify);
         EXPECT_GE(snapshot.mtp_stochastic_accept_tests, 1u);
@@ -477,6 +481,8 @@ namespace
         EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0);
         EXPECT_GE(counter("verifier_stochastic_device_distributions"), 2.0);
         EXPECT_GE(counter("stochastic_accept_tests"), 1.0);
+        EXPECT_GE(counter("transaction_validation_passes"), 1.0)
+            << backend_name << " stochastic MTP must validate at least one Phase 13.8 transaction";
         EXPECT_EQ(counter("first_token_stochastic_samples"), 0.0)
             << backend_name << " stochastic MTP must not sample first token from host full logits";
         EXPECT_EQ(counter("mtp_token_stochastic_samples"), 0.0)

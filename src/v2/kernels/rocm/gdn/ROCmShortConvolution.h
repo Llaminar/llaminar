@@ -53,7 +53,7 @@ extern "C"
     bool rocmGDN_restore_state_from_capture_metadata(
         float *dst_state,
         const float *state_snapshots,
-        const int32_t *device_committed_state_rows,
+        const int32_t *device_accepted_state_slot_indices,
         int request_index,
         int snapshot_stride_floats,
         int max_snapshot_rows,
@@ -87,6 +87,11 @@ namespace llaminar2
             verifier_state_capture_rows_ = rows;
             verifier_state_capture_size_ = state_size;
         }
+        void bindSpeculativeStateWorkspace(float *workspace, int state_size) override
+        {
+            speculative_state_work_ = workspace;
+            speculative_state_work_size_ = state_size;
+        }
 
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
         {
@@ -111,12 +116,13 @@ namespace llaminar2
 
         bool restoreVerifierStateCaptureRowFromDeviceMetadata(
             float *dst_state,
-            const int32_t *device_committed_state_rows,
+            const int32_t *device_accepted_state_slot_indices,
             int request_index,
             void *stream) override
         {
             (void)dst_state;
-            if (!gpu_state_ || !verifier_state_capture_ || !device_committed_state_rows ||
+            if (!gpu_state_ || !verifier_state_capture_ ||
+                !device_accepted_state_slot_indices ||
                 request_index < 0 || !stream ||
                 verifier_state_capture_rows_ <= 0 ||
                 verifier_state_capture_size_ != state_size_)
@@ -128,7 +134,7 @@ namespace llaminar2
             return rocmGDN_restore_state_from_capture_metadata(
                 gpu_state_,
                 verifier_state_capture_,
-                device_committed_state_rows,
+                device_accepted_state_slot_indices,
                 request_index,
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
@@ -198,7 +204,10 @@ namespace llaminar2
                 LOG_ERROR("[ROCmShortConvolution] Missing GPU convolution state");
                 return false;
             }
-            float *effective_state = gpu_state_;
+            float *effective_state =
+                prepareEffectiveStateForVerifierForward(required_state_size, stream_);
+            if (!effective_state)
+                return false;
             float *effective_output = output;
 
             // GDN QKV short-conv is commonly in-place. Prefill needs scratch
@@ -255,6 +264,10 @@ namespace llaminar2
                 return false;
             }
 
+            float *effective_state =
+                prepareEffectiveStateForVerifierForward(required_state_size, stream_);
+            if (!effective_state)
+                return false;
             float *effective_output = output;
             const bool needs_scratch = (input == output);
             if (needs_scratch)
@@ -270,7 +283,7 @@ namespace llaminar2
             }
 
             const bool ok = rocmGDN_short_conv1d_effective(
-                input, weight, bias, effective_output, gpu_state_,
+                input, weight, bias, effective_output, effective_state,
                 seq_len, channels, kernel_size, apply_silu,
                 device_effective_seq_len,
                 verifier_state_capture_,
@@ -361,6 +374,8 @@ namespace llaminar2
         float *verifier_state_capture_ = nullptr;
         int verifier_state_capture_rows_ = 0;
         int verifier_state_capture_size_ = 0;
+        float *speculative_state_work_ = nullptr;
+        int speculative_state_work_size_ = 0;
 
         float *scratchPointer() const
         {
@@ -370,6 +385,36 @@ namespace llaminar2
         int scratchCapacity() const
         {
             return bound_scratch_ ? bound_scratch_size_ : scratch_size_;
+        }
+
+        float *prepareEffectiveStateForVerifierForward(int required_state_size, void *stream)
+        {
+            const bool verifier_capture_active =
+                verifier_state_capture_ != nullptr &&
+                verifier_state_capture_rows_ > 0 &&
+                verifier_state_capture_size_ == required_state_size;
+            if (!verifier_capture_active)
+                return gpu_state_;
+            if (!stream)
+            {
+                LOG_ERROR("[ROCmShortConvolution] Speculative verifier state requires an explicit stream");
+                return nullptr;
+            }
+            if (!speculative_state_work_ ||
+                speculative_state_work_size_ != required_state_size)
+            {
+                LOG_ERROR("[ROCmShortConvolution] Speculative verifier state workspace was not bound: need "
+                          << required_state_size << " floats, have "
+                          << speculative_state_work_size_);
+                return nullptr;
+            }
+
+            rocmGDN_gpu_memcpy_async(
+                speculative_state_work_,
+                gpu_state_,
+                static_cast<size_t>(required_state_size),
+                stream);
+            return speculative_state_work_;
         }
 
         bool allocateScratch(int scratch_size)

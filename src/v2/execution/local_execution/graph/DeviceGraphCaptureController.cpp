@@ -1734,7 +1734,7 @@ namespace llaminar2
             return result;
         }
 
-        if (!segment_cache.ensureCaptureStream(gpu_ctx))
+        if (!segment_cache.ensureCaptureStream(gpu_ctx, ctx->deviceId()))
         {
             // No capture stream means segmented capture cannot proceed safely;
             // caller should fall back to fast decode for this step.

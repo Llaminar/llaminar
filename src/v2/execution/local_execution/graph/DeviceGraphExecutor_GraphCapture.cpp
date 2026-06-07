@@ -17,6 +17,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../../memory/BufferArena.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
 
@@ -27,10 +28,71 @@ namespace llaminar2
     // GraphSegmentCache — capture stream management
     // =========================================================================
 
-    bool DeviceGraphExecutor::GraphSegmentCache::ensureCaptureStream(IWorkerGPUContext *ctx)
+    IWorkerGPUContext *DeviceGraphExecutor::GraphSegmentCache::resolveLifecycleContext(
+        const char *operation)
+    {
+        if (capture_device.is_gpu() && capture_context_from_pool)
+        {
+            try
+            {
+                IWorkerGPUContext &resolved =
+                    GPUDeviceContextPool::instance().getContext(capture_device);
+                gpu_ctx_ref = &resolved;
+                return &resolved;
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[GraphSegmentCache] Failed to resolve GPU context for "
+                          << operation << " on " << capture_device.toString()
+                          << ": " << e.what());
+                return nullptr;
+            }
+        }
+
+        return gpu_ctx_ref;
+    }
+
+    namespace
+    {
+        bool graphSegmentContextIsPoolOwned(IWorkerGPUContext *ctx, const DeviceId &device)
+        {
+            if (!ctx || !device.is_gpu())
+                return false;
+            try
+            {
+                return &GPUDeviceContextPool::instance().getContext(device) == ctx;
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
+        }
+    }
+
+    bool DeviceGraphExecutor::GraphSegmentCache::ensureCaptureStream(
+        IWorkerGPUContext *ctx,
+        DeviceId device)
     {
         if (capture_stream)
+        {
+            if (capture_device.is_valid() &&
+                device.is_valid() &&
+                !(capture_device == device))
+            {
+                LOG_ERROR("[GraphSegmentCache] Capture stream already belongs to "
+                          << capture_device.toString() << ", cannot reuse for "
+                          << device.toString());
+                return false;
+            }
+            if (!capture_device.is_valid() && device.is_gpu())
+            {
+                capture_device = device;
+                capture_context_from_pool = graphSegmentContextIsPoolOwned(ctx, device);
+            }
+            if (!gpu_ctx_ref)
+                gpu_ctx_ref = ctx;
             return true;
+        }
         if (!ctx)
         {
             LOG_ERROR("[GraphSegmentCache] No GPU context for stream creation");
@@ -43,24 +105,71 @@ namespace llaminar2
             return false;
         }
         gpu_ctx_ref = ctx;
-        LOG_DEBUG("[GraphSegmentCache] Created local capture stream");
+        capture_device = device.is_gpu() ? device : DeviceId::invalid();
+        capture_context_from_pool = graphSegmentContextIsPoolOwned(ctx, capture_device);
+        LOG_DEBUG("[GraphSegmentCache] Created local capture stream"
+                  << (capture_device.is_valid()
+                          ? std::string(" for ") + capture_device.toString()
+                          : std::string{}));
         return true;
     }
 
     void DeviceGraphExecutor::GraphSegmentCache::synchronizeCaptureStream()
     {
-        if (capture_stream && gpu_ctx_ref)
-            gpu_ctx_ref->synchronizeStream(capture_stream);
+        if (!capture_stream)
+            return;
+
+        IWorkerGPUContext *ctx = resolveLifecycleContext("capture stream synchronization");
+        if (!ctx)
+        {
+            LOG_ERROR("[GraphSegmentCache] Cannot synchronize capture stream: no live GPU context");
+            return;
+        }
+
+        try
+        {
+            if (!ctx->synchronizeStreamChecked(capture_stream))
+            {
+                LOG_ERROR("[GraphSegmentCache] Capture stream synchronization failed");
+            }
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[GraphSegmentCache] Capture stream synchronization threw: " << e.what());
+        }
     }
 
     void DeviceGraphExecutor::GraphSegmentCache::destroyCaptureStream()
     {
         if (!capture_stream)
+        {
+            gpu_ctx_ref = nullptr;
+            capture_device = DeviceId::invalid();
+            capture_context_from_pool = false;
             return;
-        if (gpu_ctx_ref)
-            gpu_ctx_ref->destroyStream(capture_stream);
+        }
+
+        IWorkerGPUContext *ctx = resolveLifecycleContext("capture stream destruction");
+        if (ctx)
+        {
+            try
+            {
+                ctx->destroyStream(capture_stream);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[GraphSegmentCache] Capture stream destruction threw: " << e.what());
+            }
+        }
+        else
+        {
+            LOG_ERROR("[GraphSegmentCache] Dropping capture stream handle without destruction "
+                      "because its GPU context is unavailable");
+        }
         capture_stream = nullptr;
         gpu_ctx_ref = nullptr;
+        capture_device = DeviceId::invalid();
+        capture_context_from_pool = false;
     }
 
     bool DeviceGraphExecutor::GraphSegmentCache::ensureSyncEvent(IWorkerGPUContext *ctx)
@@ -75,6 +184,8 @@ namespace llaminar2
             LOG_ERROR("[GraphSegmentCache] Failed to create sync event");
             return false;
         }
+        if (!gpu_ctx_ref)
+            gpu_ctx_ref = ctx;
         return true;
     }
 
@@ -82,8 +193,23 @@ namespace llaminar2
     {
         if (!sync_event)
             return;
-        if (gpu_ctx_ref)
-            gpu_ctx_ref->destroyEvent(sync_event);
+        IWorkerGPUContext *ctx = resolveLifecycleContext("sync event destruction");
+        if (ctx)
+        {
+            try
+            {
+                ctx->destroyEvent(sync_event);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[GraphSegmentCache] Sync event destruction threw: " << e.what());
+            }
+        }
+        else
+        {
+            LOG_ERROR("[GraphSegmentCache] Dropping sync event handle without destruction "
+                      "because its GPU context is unavailable");
+        }
         sync_event = nullptr;
     }
 
@@ -592,7 +718,9 @@ namespace llaminar2
                 collectives_graph_capturable);
 
             // Create the capture stream early so warmup runs on it.
-            if (segment_cache.ensureCaptureStream(gpu_ctx))
+            if (segment_cache.ensureCaptureStream(
+                    gpu_ctx,
+                    ctx ? ctx->deviceId() : DeviceId::invalid()))
             {
                 void *warmup_stream = segment_cache.capture_stream;
 

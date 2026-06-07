@@ -153,14 +153,15 @@ namespace llaminar2::test::parity::qwen36
     {
         const char *candidate =
             std::getenv("LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE");
-        const char *direct =
-            std::getenv("LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE");
-        return candidate &&
-               std::strcmp(candidate, "vllm_style_spec_decode") == 0 &&
-               direct &&
-               (std::strcmp(direct, "1") == 0 ||
-                std::strcmp(direct, "true") == 0 ||
-                std::strcmp(direct, "TRUE") == 0);
+        if (!candidate ||
+            std::strcmp(candidate, "vllm_style_spec_decode") != 0)
+        {
+            return false;
+        }
+        return DebugEnv::isTruthyEnvValue(
+                   std::getenv("LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK")) ||
+               DebugEnv::isTruthyEnvValue(
+                   std::getenv("LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE"));
     }
 
     inline bool densePhase138PromotedTransactionExpected(
@@ -177,13 +178,14 @@ namespace llaminar2::test::parity::qwen36
         {
             return false;
         }
-        return test_case.devices.front().isGPU();
+        return false;
     }
 
     inline void expectPhase138TransactionUsed(
         const DensePrefixRestoreParityCase &test_case,
         const PrefixRuntimeStateSnapshot &snapshot,
-        const std::string &context)
+        const std::string &context,
+        bool allow_transaction_rollbacks = false)
     {
         if (!densePhase138PromotedTransactionExpected(test_case))
         {
@@ -191,8 +193,11 @@ namespace llaminar2::test::parity::qwen36
         }
         EXPECT_GT(snapshot.mtp_transaction_commits, 0u)
             << context << " did not commit any MTP transactions";
-        EXPECT_EQ(snapshot.mtp_transaction_rollbacks, 0u)
-            << context << " should not roll back under the Phase 13.8 transaction";
+        if (!allow_transaction_rollbacks)
+        {
+            EXPECT_EQ(snapshot.mtp_transaction_rollbacks, 0u)
+                << context << " should not roll back under the Phase 13.8 transaction";
+        }
         EXPECT_EQ(snapshot.mtp_transaction_validation_failures, 0u)
             << context << " hit MTP transaction validation failures";
     }
@@ -1622,6 +1627,139 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_GE(after_second.mtp_verifier_runs, 1u);
             EXPECT_GE(after_second.mtp_verifier_token_count, expected_first_step_drafts + 1);
         }
+        expectPhase138TransactionUsed(
+            test_case,
+            after_second,
+            test_case.name + " restored request");
+    }
+
+    inline void runDensePhase138VllmStyleCandidateEquivalence(
+        DensePrefixRestoreParityCase test_case,
+        int mtp_draft_tokens = 2)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        ASSERT_GE(mtp_draft_tokens, 1);
+        ASSERT_LE(mtp_draft_tokens, 3);
+
+        test_case.name += " Phase13.8 vllm-style candidate equivalence";
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        ScopedEnvironmentValues phase138_env({
+            {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
+            {"LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK", "1"},
+        });
+
+        auto factory = createOrchestrationRunnerFactory();
+        auto runner = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(
+                test_case,
+                model_path,
+                /*enable_prefix_cache=*/false,
+                /*block_size=*/2,
+                /*enable_mtp=*/true,
+                mtp_draft_tokens));
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        auto result = runner->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const auto snapshot = runner->prefixStateProbe();
+        runner->shutdown();
+
+        ASSERT_TRUE(result.error.empty()) << result.error;
+        ASSERT_EQ(result.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(result.tokens, expected_tokens);
+        EXPECT_GT(snapshot.mtp_transaction_commits, 0u)
+            << "Phase 13.8 candidate did not commit any MTP transactions";
+        EXPECT_EQ(snapshot.mtp_transaction_rollbacks, 0u);
+        EXPECT_EQ(snapshot.mtp_transaction_validation_failures, 0u);
+    }
+
+    inline void runDensePhase138VllmStyleCandidatePrefixRestoreEquivalence(
+        DensePrefixRestoreParityCase test_case,
+        int mtp_draft_tokens = 2)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        ASSERT_GE(mtp_draft_tokens, 1);
+        ASSERT_LE(mtp_draft_tokens, 3);
+
+        test_case.name += " Phase13.8 vllm-style candidate prefix restore equivalence";
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        ScopedEnvironmentValues phase138_env({
+            {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
+            {"LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK", "1"},
+        });
+
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+
+        auto baseline = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(
+                test_case,
+                model_path,
+                /*enable_prefix_cache=*/false,
+                /*block_size=*/static_cast<int>(prompt_tokens.size()),
+                /*enable_mtp=*/false));
+        ASSERT_NE(baseline, nullptr);
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        auto baseline_result = baseline->generate(prompt_tokens, test_case.decode_steps, greedy);
+        baseline->shutdown();
+        ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
+        ASSERT_EQ(baseline_result.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(baseline_result.tokens, expected_tokens);
+
+        auto runner = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(
+                test_case,
+                model_path,
+                /*enable_prefix_cache=*/true,
+                /*block_size=*/static_cast<int>(prompt_tokens.size()),
+                /*enable_mtp=*/true,
+                mtp_draft_tokens));
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+        auto first = runner->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const auto after_first = runner->prefixStateProbe();
+        ASSERT_TRUE(first.error.empty()) << first.error;
+        ASSERT_EQ(first.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(first.tokens, expected_tokens);
+        EXPECT_EQ(first.tokens, baseline_result.tokens);
+        EXPECT_TRUE(after_first.prefix_cache_ready);
+        EXPECT_GE(after_first.prefix_cache_inserts, 1u);
+        EXPECT_GT(after_first.prefix_cache_mtp_state_bytes, 0u);
+        expectPhase138TransactionUsed(
+            test_case,
+            after_first,
+            test_case.name + " first request");
+
+        auto second = runner->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const auto after_second = runner->prefixStateProbe();
+        runner->shutdown();
+
+        ASSERT_TRUE(second.error.empty()) << second.error;
+        ASSERT_EQ(second.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(second.tokens, expected_tokens);
+        EXPECT_EQ(second.tokens, baseline_result.tokens);
+        EXPECT_TRUE(after_second.prefix_cache_ready);
+        EXPECT_GE(after_second.prefix_cache_hits, 1u);
+        EXPECT_TRUE(after_second.prefix_request.hit);
+        EXPECT_EQ(after_second.prefix_request.matched_tokens,
+                  static_cast<int>(prompt_tokens.size()));
+        EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
+        EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
+        EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
         expectPhase138TransactionUsed(
             test_case,
             after_second,
@@ -4462,6 +4600,11 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_FALSE(after_mtp.mtp_bypassed) << after_mtp.mtp_bypass_reason;
         EXPECT_EQ(after_mtp.mtp_request.verify_mode, "speculative-sampling");
         EXPECT_TRUE(after_mtp.mtp_request.stochastic_verify);
+        expectPhase138TransactionUsed(
+            test_case,
+            after_mtp,
+            test_case.name + " stochastic MTP",
+            /*allow_transaction_rollbacks=*/true);
         EXPECT_GE(after_mtp.mtp_draft_steps, 1u);
         EXPECT_GE(after_mtp.mtp_verifier_runs, 1u);
         EXPECT_GE(after_mtp.mtp_verifier_token_count, 2u);

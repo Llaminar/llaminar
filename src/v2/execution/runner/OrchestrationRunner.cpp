@@ -84,6 +84,21 @@ namespace llaminar2
             return false;
         }
 
+        bool samplingParamsEqual(const SamplingParams &a, const SamplingParams &b)
+        {
+            return a.temperature == b.temperature &&
+                   a.top_k == b.top_k &&
+                   a.top_p == b.top_p &&
+                   a.seed == b.seed &&
+                   a.presence_penalty == b.presence_penalty &&
+                   a.frequency_penalty == b.frequency_penalty &&
+                   a.dry_multiplier == b.dry_multiplier &&
+                   a.dry_base == b.dry_base &&
+                   a.dry_allowed_length == b.dry_allowed_length &&
+                   a.dry_penalty_last_n == b.dry_penalty_last_n &&
+                   a.dry_sequence_breakers == b.dry_sequence_breakers;
+        }
+
         void synchronizeRunnerPrimaryDeviceBeforeRelease(const IInferenceRunner *runner)
         {
             if (!runner)
@@ -656,6 +671,7 @@ namespace llaminar2
         mtp_bypass_reason_.clear();
         mtp_stats_ = {};
         ready_sampled_token_.reset();
+        ready_sampled_params_.reset();
         last_token_ = prompt_tokens.back();
 
         // Broadcast to worker ranks so they prefill with the same tokens
@@ -754,6 +770,7 @@ namespace llaminar2
                 runner_->clear_cache();
                 prefill_logits_ready_ = false;
                 ready_sampled_token_.reset();
+                ready_sampled_params_.reset();
 
                 auto make_common_hit = [&]()
                 {
@@ -1170,8 +1187,10 @@ namespace llaminar2
 
         const bool use_ready_logits = prefill_logits_ready_;
         const std::optional<int32_t> ready_sampled_token = ready_sampled_token_;
+        const std::optional<SamplingParams> ready_sampled_params = ready_sampled_params_;
         prefill_logits_ready_ = false;
         ready_sampled_token_.reset();
+        ready_sampled_params_.reset();
         PrefixStateSnapshot verifier_base_checkpoint = checkpoint;
 
         auto fail_after_checkpoint = [&](const std::string &message) -> GenerationResult
@@ -1196,6 +1215,7 @@ namespace llaminar2
                                            std::string{}, {{"reason", message}});
             prefill_logits_ready_ = use_ready_logits;
             ready_sampled_token_ = ready_sampled_token;
+            ready_sampled_params_ = ready_sampled_params;
             result.error = message;
             return result;
         };
@@ -1330,10 +1350,12 @@ namespace llaminar2
             if (prefill_logits_ready_ && ready_token.has_value())
             {
                 ready_sampled_token_ = *ready_token;
+                ready_sampled_params_ = active_sampling_params_;
             }
             else
             {
                 ready_sampled_token_.reset();
+                ready_sampled_params_.reset();
             }
 
             for (int32_t token : tokens)
@@ -1451,14 +1473,20 @@ namespace llaminar2
                  {"valid_sampled_count", std::to_string(tx.valid_sampled_count)},
                  {"committed_output_count",
                   std::to_string(metadata.committed_output_counts.front())},
+                 {"accepted_state_count",
+                  std::to_string(metadata.accepted_state_counts.front())},
                  {"committed_state_row",
                   std::to_string(metadata.committed_state_rows.front())},
                  {"committed_state_index",
                   std::to_string(metadata.committed_state_indices.front())},
+                 {"accepted_state_slot_index",
+                  std::to_string(metadata.accepted_state_slot_indices.front())},
                  {"bonus_ready_token_row",
                   std::to_string(metadata.bonus_ready_token_rows.front())},
                  {"bonus_ready_token_index",
                   std::to_string(metadata.bonus_ready_token_indices.front())},
+                 {"bonus_ready_state_slot_index",
+                  std::to_string(metadata.bonus_ready_state_slot_indices.front())},
                  {"accepted_verifier_input_prefix",
                   std::to_string(tx.accepted_speculative_prefix)},
                  {"accepted_mtp_draft_prefix",
@@ -2267,6 +2295,118 @@ namespace llaminar2
             {
                 return std::string("MTP commit replay check could not capture committed state");
             }
+            auto summarize_probe = [](const PrefixRuntimeStateSnapshot &probe)
+            {
+                auto summarize_cache = [](const std::vector<PrefixKVCacheProbe> &caches)
+                {
+                    std::string out;
+                    for (const auto &cache : caches)
+                    {
+                        if (!out.empty())
+                            out += ";";
+                        out += cache.owner + ":";
+                        const size_t limit = std::min<size_t>(cache.layers.size(), 6);
+                        for (size_t i = 0; i < limit; ++i)
+                        {
+                            if (i > 0)
+                                out += ",";
+                            const auto &layer = cache.layers[i];
+                            out += "L" + std::to_string(layer.global_layer) +
+                                   "/S" + std::to_string(layer.seq_idx) +
+                                   "=" + std::to_string(layer.cached_tokens) +
+                                   "@" + std::to_string(layer.ring_head);
+                        }
+                        if (cache.layers.size() > limit)
+                            out += ",...";
+                    }
+                    return out.empty() ? std::string("none") : out;
+                };
+
+                std::string positions;
+                for (size_t i = 0; i < probe.positions.size(); ++i)
+                {
+                    if (i > 0)
+                        positions += ",";
+                    positions += std::to_string(probe.positions[i]);
+                }
+                std::string seqs;
+                for (size_t i = 0; i < probe.sequence_lengths.size(); ++i)
+                {
+                    if (i > 0)
+                        seqs += ",";
+                    seqs += std::to_string(probe.sequence_lengths[i]);
+                }
+                std::string gdn;
+                const size_t gdn_limit = std::min<size_t>(probe.gdn_layers.size(), 4);
+                for (size_t i = 0; i < gdn_limit; ++i)
+                {
+                    if (i > 0)
+                        gdn += ",";
+                    const auto &layer = probe.gdn_layers[i];
+                    gdn += "L" + std::to_string(layer.global_layer) +
+                           "/r=" + std::to_string(layer.recurrence_hash) +
+                           "/c=" + std::to_string(layer.conv_hash);
+                }
+                if (probe.gdn_layers.size() > gdn_limit)
+                    gdn += ",...";
+                if (gdn.empty())
+                    gdn = "none";
+
+                return std::string("pos=[") + positions +
+                       "] seq=[" + seqs +
+                       "] kv={" + summarize_cache(probe.kv_caches) +
+                       "} mtp={" + summarize_cache(probe.mtp_kv_caches) +
+                       "} gdn={" + gdn + "}";
+            };
+            const PrefixRuntimeStateSnapshot committed_probe_before =
+                runner_->prefixStateProbe();
+
+            int continuation_check_depth = 1;
+            if (const char *depth_env =
+                    std::getenv("LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_DEPTH"))
+            {
+                char *end = nullptr;
+                const long parsed = std::strtol(depth_env, &end, 10);
+                if (end != depth_env && parsed > 0)
+                {
+                    continuation_check_depth =
+                        static_cast<int>(std::min<long>(parsed, 16));
+                }
+            }
+
+            auto sample_continuation = [&](int32_t first_input)
+                -> std::optional<std::vector<int32_t>>
+            {
+                std::vector<int32_t> tokens;
+                tokens.reserve(static_cast<size_t>(continuation_check_depth));
+                int32_t input = first_input;
+                for (int i = 0; i < continuation_check_depth; ++i)
+                {
+                    if (!runner_->forward(&input, 1))
+                    {
+                        return std::nullopt;
+                    }
+                    const int32_t sampled = runner_->sampleGreedyOnDevice();
+                    if (sampled < 0)
+                    {
+                        return std::nullopt;
+                    }
+                    tokens.push_back(sampled);
+                    input = sampled;
+                }
+                return tokens;
+            };
+
+            std::optional<std::vector<int32_t>> live_committed_continuation =
+                sample_continuation(expected_next_token);
+            if (!live_committed_continuation)
+            {
+                return std::string("MTP commit replay check live committed continuation forward failed");
+            }
+            if (!runner_->restoreLivePrefixState(committed_checkpoint))
+            {
+                return std::string("MTP commit replay check could not restore committed state after live continuation check");
+            }
 
             const PrefixStateSnapshot &base = *verifier_replay_base_checkpoint;
             if (!runner_->restoreLivePrefixState(base))
@@ -2306,42 +2446,6 @@ namespace llaminar2
                        " used_ready_logits=" + (use_ready_logits ? std::string("true") : std::string("false"));
             }
 
-            int continuation_check_depth = 1;
-            if (const char *depth_env =
-                    std::getenv("LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_DEPTH"))
-            {
-                char *end = nullptr;
-                const long parsed = std::strtol(depth_env, &end, 10);
-                if (end != depth_env && parsed > 0)
-                {
-                    continuation_check_depth =
-                        static_cast<int>(std::min<long>(parsed, 16));
-                }
-            }
-
-            auto sample_continuation = [&](int32_t first_input)
-                -> std::optional<std::vector<int32_t>>
-            {
-                std::vector<int32_t> tokens;
-                tokens.reserve(static_cast<size_t>(continuation_check_depth));
-                int32_t input = first_input;
-                for (int i = 0; i < continuation_check_depth; ++i)
-                {
-                    if (!runner_->forward(&input, 1))
-                    {
-                        return std::nullopt;
-                    }
-                    const int32_t sampled = runner_->sampleGreedyOnDevice();
-                    if (sampled < 0)
-                    {
-                        return std::nullopt;
-                    }
-                    tokens.push_back(sampled);
-                    input = sampled;
-                }
-                return tokens;
-            };
-
             std::optional<std::vector<int32_t>> committed_continuation =
                 sample_continuation(expected_next_token);
             if (!committed_continuation)
@@ -2373,15 +2477,76 @@ namespace llaminar2
                 {
                     return std::string("MTP commit replay check could not restore committed state after continuation check");
                 }
+                auto summarize_prefix_replays = [&]() -> std::string
+                {
+                    std::string summary;
+                    for (size_t prefix_len = 0;
+                         prefix_len <= tokens_to_replay.size();
+                         ++prefix_len)
+                    {
+                        if (!runner_->restoreLivePrefixState(base))
+                        {
+                            summary += " len" + std::to_string(prefix_len) + "=restore_failed";
+                            continue;
+                        }
+                        bool prefix_ok = true;
+                        for (size_t i = 0; i < prefix_len; ++i)
+                        {
+                            const int32_t replay_token = tokens_to_replay[i];
+                            if (!runner_->forward(&replay_token, 1))
+                            {
+                                prefix_ok = false;
+                                break;
+                            }
+                        }
+                        if (!prefix_ok)
+                        {
+                            summary += " len" + std::to_string(prefix_len) + "=forward_failed";
+                            continue;
+                        }
+                        std::optional<std::vector<int32_t>> prefix_continuation =
+                            sample_continuation(expected_next_token);
+                        summary += " len" + std::to_string(prefix_len) + "=";
+                        summary += prefix_continuation
+                                       ? join_tokens(*prefix_continuation)
+                                       : std::string("sample_failed");
+                    }
+                    (void)runner_->restoreLivePrefixState(committed_checkpoint);
+                    return summary;
+                };
+                if (*live_committed_continuation != *replay_continuation)
+                {
+                    const PrefixRuntimeStateSnapshot mismatch_probe =
+                        runner_->prefixStateProbe();
+                    return std::string("MTP live committed state continuation mismatch against full replay: path=") +
+                           path +
+                           " condition_token=" + std::to_string(condition_token) +
+                           " accepted_tokens=" + join_tokens(tokens_to_replay) +
+                           " next_token=" + std::to_string(expected_next_token) +
+                           " live_committed_continuation=" + join_tokens(*live_committed_continuation) +
+                           " committed_continuation=" + join_tokens(*committed_continuation) +
+                           " replay_continuation=" + join_tokens(*replay_continuation) +
+                           " prefix_replay_continuations=" + summarize_prefix_replays() +
+                           " committed_probe_before={" + summarize_probe(committed_probe_before) + "}" +
+                           " mismatch_probe={" + summarize_probe(mismatch_probe) + "}" +
+                           " continuation_depth=" + std::to_string(continuation_check_depth) +
+                           " used_ready_logits=" + (use_ready_logits ? std::string("true") : std::string("false"));
+                }
                 if (*committed_continuation != *replay_continuation)
                 {
+                    const PrefixRuntimeStateSnapshot mismatch_probe =
+                        runner_->prefixStateProbe();
                     return std::string("MTP committed state continuation mismatch against full replay: path=") +
                            path +
                            " condition_token=" + std::to_string(condition_token) +
                            " accepted_tokens=" + join_tokens(tokens_to_replay) +
                            " next_token=" + std::to_string(expected_next_token) +
+                           " live_committed_continuation=" + join_tokens(*live_committed_continuation) +
                            " committed_continuation=" + join_tokens(*committed_continuation) +
                            " replay_continuation=" + join_tokens(*replay_continuation) +
+                           " prefix_replay_continuations=" + summarize_prefix_replays() +
+                           " committed_probe_before={" + summarize_probe(committed_probe_before) + "}" +
+                           " mismatch_probe={" + summarize_probe(mismatch_probe) + "}" +
                            " continuation_depth=" + std::to_string(continuation_check_depth) +
                            " used_ready_logits=" + (use_ready_logits ? std::string("true") : std::string("false"));
                 }
@@ -2531,70 +2696,165 @@ namespace llaminar2
                     }
                     else
                     {
-                        PrefixRuntimeStateSnapshot candidate_state =
-                            runner_->prefixStateProbe();
-                        if (!runner_->restoreLivePrefixState(verifier_base_checkpoint))
+                        const bool candidate_deferred_rejection =
+                            !candidate.all_speculative_accepted &&
+                            !candidate.stopped_on_output &&
+                            candidate.ready_token < 0;
+                        PrefixStateSnapshot candidate_live_checkpoint;
+                        if (candidate_deferred_rejection)
                         {
-                            catchup.ok = false;
-                            catchup.error =
-                                "MTP Phase 13.8 equivalence check could not restore verifier base after candidate";
-                        }
-                        else
-                        {
-                            MTPDecodeCatchupGreedyRequest oracle_request =
-                                catchup_request;
-                            oracle_request.implementation_name =
-                                "shared_stepwise_equivalence_oracle";
-                            MTPDecodeCatchupGreedyResult oracle =
-                                runSharedStepwiseMTPDecodeCatchupGreedy(
-                                    *runner_,
-                                    oracle_request,
-                                    sample_after_forward);
-                            PrefixRuntimeStateSnapshot oracle_state =
-                                runner_->prefixStateProbe();
-                            if (!oracle.ok)
+                            candidate_live_checkpoint =
+                                runner_->captureLivePrefixState();
+                            if (!candidate_live_checkpoint.valid)
                             {
-                                catchup = std::move(oracle);
+                                catchup.ok = false;
+                                catchup.error =
+                                    "MTP Phase 13.8 equivalence check could not capture vLLM-style candidate state";
+                            }
+                        }
+                        if (catchup.error.empty())
+                        {
+                            PrefixRuntimeStateSnapshot candidate_state =
+                                runner_->prefixStateProbe();
+                            if (!runner_->restoreLivePrefixState(verifier_base_checkpoint))
+                            {
+                                catchup.ok = false;
+                                catchup.error =
+                                    "MTP Phase 13.8 equivalence check could not restore verifier base after candidate";
                             }
                             else
                             {
-                                MTPDecodeCatchupGreedyEquivalence result_eq =
-                                    compareMTPDecodeCatchupGreedyResults(
-                                        oracle,
-                                        candidate);
-                                MTPStateValidationResult state_eq =
-                                    compareMTPRuntimeStateSnapshots(
-                                        oracle_state,
-                                        candidate_state);
-                                if (!result_eq.ok)
+                                MTPDecodeCatchupGreedyRequest oracle_request =
+                                    catchup_request;
+                                oracle_request.implementation_name =
+                                    "shared_stepwise_equivalence_oracle";
+                                MTPDecodeCatchupGreedyResult oracle =
+                                    runSharedStepwiseMTPDecodeCatchupGreedy(
+                                        *runner_,
+                                        oracle_request,
+                                        sample_after_forward);
+                                PrefixRuntimeStateSnapshot oracle_state =
+                                    runner_->prefixStateProbe();
+                                if (!oracle.ok)
                                 {
-                                    catchup.ok = false;
-                                    catchup.error =
-                                        std::string("MTP Phase 13.8 catch-up result equivalence failed: ") +
-                                        result_eq.error +
-                                        "; runtime_state_equivalence=" +
-                                        (state_eq.ok ? std::string("ok") : state_eq.reason);
-                                }
-                                else if (!state_eq.ok)
-                                {
-                                    catchup.ok = false;
-                                    catchup.error =
-                                        std::string("MTP Phase 13.8 runtime state equivalence failed: ") +
-                                        state_eq.reason;
+                                    catchup = std::move(oracle);
                                 }
                                 else
                                 {
-                                    PerfStatsCollector::addCounter(
-                                        "mtp",
-                                        "phase138_spec_decode_equivalence_matches",
-                                        1.0,
-                                        "decode",
-                                        {},
-                                        {{"implementation", catchup_implementation},
-                                         {"draft_tokens", std::to_string(draft_tokens.size())},
-                                         {"candidate_forward_tokens", std::to_string(candidate.main_forward_token_count)},
-                                         {"oracle_forward_tokens", std::to_string(oracle.main_forward_token_count)}});
-                                    catchup = std::move(oracle);
+                                    if (candidate_deferred_rejection)
+                                    {
+                                        auto fail_deferred = [&](std::string reason)
+                                        {
+                                            catchup.ok = false;
+                                            catchup.error =
+                                                std::string("MTP Phase 13.8 vLLM-style deferred-rejection check failed: ") +
+                                                std::move(reason);
+                                        };
+
+                                        const int expected_candidate_position =
+                                            verifier_base_checkpoint.cached_tokens +
+                                            std::max(0, candidate.target_verifier_state_commit_count);
+                                        if (candidate.accepted_tokens != oracle.accepted_tokens)
+                                        {
+                                            fail_deferred(
+                                                "committed output tokens mismatch: oracle=[" +
+                                                join_tokens(oracle.accepted_tokens) +
+                                                "] candidate=[" +
+                                                join_tokens(candidate.accepted_tokens) + "]");
+                                        }
+                                        else if (candidate.verifier_tokens != oracle.verifier_tokens)
+                                        {
+                                            fail_deferred(
+                                                "verifier tokens mismatch: oracle=[" +
+                                                join_tokens(oracle.verifier_tokens) +
+                                                "] candidate=[" +
+                                                join_tokens(candidate.verifier_tokens) + "]");
+                                        }
+                                        else if (candidate.accepted_speculative_prefix !=
+                                                 oracle.accepted_speculative_prefix)
+                                        {
+                                            fail_deferred("accepted speculative prefix mismatch");
+                                        }
+                                        else if (candidate.rejected_verified_token !=
+                                                 oracle.rejected_verified_token)
+                                        {
+                                            fail_deferred("rejected verified token mismatch");
+                                        }
+                                        else if (candidate.target_verifier_state_commit_count < 0)
+                                        {
+                                            fail_deferred("candidate did not report accepted state commit count");
+                                        }
+                                        else if (candidate_state.current_position !=
+                                                 expected_candidate_position)
+                                        {
+                                            fail_deferred(
+                                                "candidate state position mismatch: expected=" +
+                                                std::to_string(expected_candidate_position) +
+                                                " actual=" +
+                                                std::to_string(candidate_state.current_position));
+                                        }
+                                        else if (!runner_->restoreLivePrefixState(candidate_live_checkpoint))
+                                        {
+                                            fail_deferred(
+                                                "could not restore vLLM-style candidate state after oracle check");
+                                        }
+                                        else
+                                        {
+                                            PerfStatsCollector::addCounter(
+                                                "mtp",
+                                                "phase138_vllm_style_deferred_rejection_matches",
+                                                1.0,
+                                                "decode",
+                                                {},
+                                                {{"implementation", catchup_implementation},
+                                                 {"draft_tokens", std::to_string(draft_tokens.size())},
+                                                 {"candidate_forward_tokens", std::to_string(candidate.main_forward_token_count)},
+                                                 {"oracle_forward_tokens", std::to_string(oracle.main_forward_token_count)},
+                                                 {"state_commit_count", std::to_string(candidate.target_verifier_state_commit_count)}});
+                                            catchup = std::move(candidate);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        MTPDecodeCatchupGreedyEquivalence result_eq =
+                                            compareMTPDecodeCatchupGreedyResults(
+                                                oracle,
+                                                candidate);
+                                        MTPStateValidationResult state_eq =
+                                            compareMTPRuntimeStateSnapshots(
+                                                oracle_state,
+                                                candidate_state);
+                                        if (!result_eq.ok)
+                                        {
+                                            catchup.ok = false;
+                                            catchup.error =
+                                                std::string("MTP Phase 13.8 catch-up result equivalence failed: ") +
+                                                result_eq.error +
+                                                "; runtime_state_equivalence=" +
+                                                (state_eq.ok ? std::string("ok") : state_eq.reason);
+                                        }
+                                        else if (!state_eq.ok)
+                                        {
+                                            catchup.ok = false;
+                                            catchup.error =
+                                                std::string("MTP Phase 13.8 runtime state equivalence failed: ") +
+                                                state_eq.reason;
+                                        }
+                                        else
+                                        {
+                                            PerfStatsCollector::addCounter(
+                                                "mtp",
+                                                "phase138_spec_decode_equivalence_matches",
+                                                1.0,
+                                                "decode",
+                                                {},
+                                                {{"implementation", catchup_implementation},
+                                                 {"draft_tokens", std::to_string(draft_tokens.size())},
+                                                 {"candidate_forward_tokens", std::to_string(candidate.main_forward_token_count)},
+                                                 {"oracle_forward_tokens", std::to_string(oracle.main_forward_token_count)}});
+                                            catchup = std::move(oracle);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2628,6 +2888,10 @@ namespace llaminar2
             const int32_t ready_token = catchup.ready_token;
             const bool stopped_on_output = catchup.stopped_on_output;
             const int main_forward_token_count = catchup.main_forward_token_count;
+            const bool deferred_rejection_without_ready_token =
+                !all_speculative_accepted &&
+                !stopped_on_output &&
+                ready_token < 0;
             result.is_complete = result.is_complete || stopped_on_output;
 
             if (auto tx_error = validate_spec_decode_transaction(
@@ -2713,12 +2977,13 @@ namespace llaminar2
                  {"verifier_state_matches_output", "true"},
                  {"verifier_path", "decode_equivalent_catchup"},
                  {"catchup_implementation", catchup_implementation},
-                 {"decode_equivalent_replay_required", "true"},
+                 {"decode_equivalent_replay_required",
+                  deferred_rejection_without_ready_token ? "deferred_next_step" : "true"},
                  {"output_tokens", std::to_string(accepted_tokens.size())},
                  {"ready_token", std::to_string(ready_token)},
                  {"used_ready_logits", use_ready_logits ? "true" : "false"}});
 
-            if (!stopped_on_output)
+            if (!stopped_on_output && ready_token >= 0)
             {
                 if (auto mismatch = verify_committed_prefix_replay(
                         "decode_equivalent_sequential_verifier",
@@ -2733,12 +2998,13 @@ namespace llaminar2
                     "decode_equivalent_sequential_verifier",
                     verifier_base_checkpoint,
                     accepted_tokens,
-                    stopped_on_output ? std::optional<int32_t>{}
-                                      : std::optional<int32_t>{ready_token},
-                    /*terminal_logits_ready=*/!stopped_on_output,
+                    stopped_on_output || ready_token < 0
+                        ? std::optional<int32_t>{}
+                        : std::optional<int32_t>{ready_token},
+                    /*terminal_logits_ready=*/!stopped_on_output && ready_token >= 0,
                     /*is_complete=*/stopped_on_output,
                     PrefixStateProvenance::DecodeEquivalent,
-                    /*state_advanced=*/true))
+                    /*state_advanced=*/!deferred_rejection_without_ready_token))
             {
                 return fail_after_checkpoint(*commit_error);
             }
@@ -3365,6 +3631,19 @@ namespace llaminar2
             {
                 return fail_after_checkpoint(*mismatch);
             }
+            if (auto tx_error = validate_spec_decode_transaction(
+                    "accepted_verifier_state",
+                    "legacy_all_position",
+                    draft_tokens,
+                    accepted_tokens,
+                    result.is_complete ? std::optional<int32_t>{}
+                                       : std::optional<int32_t>{next_ready_token},
+                    all_speculative_accepted,
+                    result.is_complete,
+                    accepted_speculative_prefix))
+            {
+                return fail_after_checkpoint(*tx_error);
+            }
             if (auto commit_error = commit_mtp_transaction_outputs(
                     "accepted_verifier_state",
                     verifier_base_checkpoint,
@@ -3647,6 +3926,18 @@ namespace llaminar2
                     }
                 }
 
+                if (auto tx_error = validate_spec_decode_transaction(
+                        "verifier_row_restore",
+                        "legacy_verifier_row_restore",
+                        draft_tokens,
+                        accepted_tokens,
+                        shortcut_ready_token,
+                        all_speculative_accepted,
+                        result.is_complete,
+                        accepted_speculative_prefix))
+                {
+                    return fail_after_checkpoint(*tx_error);
+                }
                 if (auto commit_error = commit_mtp_transaction_outputs(
                         "verifier_row_restore",
                         verifier_base_checkpoint,
@@ -3792,6 +4083,31 @@ namespace llaminar2
                 {},
                 {{"token", std::to_string(next_ready_token)}});
         }
+        else if (all_speculative_accepted && !result.is_complete)
+        {
+            const int terminal_row = static_cast<int>(draft_tokens.size()) - 1;
+            const int32_t precomputed_ready_token =
+                terminal_row >= 0 &&
+                        terminal_row < static_cast<int>(sampled_verifier_tokens.size())
+                    ? sampled_verifier_tokens[static_cast<size_t>(terminal_row)]
+                    : -1;
+            if (precomputed_ready_token < 0)
+            {
+                result.error =
+                    "MTP replay could not find the precomputed all-accepted ready token";
+                return result;
+            }
+            replay_ready_token = precomputed_ready_token;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "replay_precomputed_ready_tokens",
+                1.0,
+                "decode",
+                {},
+                {{"token", std::to_string(precomputed_ready_token)},
+                 {"stochastic_verify", stochastic_verify ? "true" : "false"},
+                 {"uses_sampling_penalties", use_sampling_penalties ? "true" : "false"}});
+        }
 
         if (!use_sequential_shifted_replay_commit &&
             !runner_->commitMTPShiftedRowsFromPartialForward(
@@ -3812,7 +4128,19 @@ namespace llaminar2
             {
                 result.error = *mismatch;
                 return result;
+                }
             }
+        if (auto tx_error = validate_spec_decode_transaction(
+                "decode_equivalent_replay",
+                "legacy_decode_equivalent_replay",
+                draft_tokens,
+                accepted_tokens,
+                replay_ready_token,
+                all_speculative_accepted,
+                result.is_complete,
+                accepted_speculative_prefix))
+        {
+            return fail_after_checkpoint(*tx_error);
         }
         if (auto commit_error = commit_mtp_transaction_outputs(
                 "decode_equivalent_replay",
@@ -3871,15 +4199,21 @@ namespace llaminar2
             // recurrence state and creates duplicate KV cache entries).
             if (ready_sampled_token_.has_value())
             {
-                if (!active_sampling_params_.is_greedy() ||
-                    active_sampling_params_.has_penalties())
+                if (!ready_sampled_params_.has_value())
                 {
                     result.error =
-                        "Ready MTP verifier token is only valid for greedy decode without penalties";
+                        "Ready MTP verifier token is missing the sampling parameters that produced it";
+                    return result;
+                }
+                if (!samplingParamsEqual(*ready_sampled_params_, active_sampling_params_))
+                {
+                    result.error =
+                        "Ready MTP verifier token was sampled with different sampling parameters";
                     return result;
                 }
                 ready_token_for_decode = ready_sampled_token_;
                 ready_sampled_token_.reset();
+                ready_sampled_params_.reset();
             }
             prefill_logits_ready_ = false;
             LOG_TRACE("[decodeStep] Using prefill logits (skipping forward)");
@@ -3887,6 +4221,7 @@ namespace llaminar2
         else
         {
             ready_sampled_token_.reset();
+            ready_sampled_params_.reset();
             LOG_TRACE("[decodeStep] Running forward with last_token_=" << last_token_);
             // Run single-token forward with last token
             if (!runner_->forward(&last_token_, 1))
@@ -4175,6 +4510,7 @@ namespace llaminar2
 #endif
         prefill_logits_ready_ = false;
         ready_sampled_token_.reset();
+        ready_sampled_params_.reset();
         mtp_bypassed_ = false;
         mtp_bypass_recorded_for_request_ = false;
         mtp_bypass_reason_.clear();

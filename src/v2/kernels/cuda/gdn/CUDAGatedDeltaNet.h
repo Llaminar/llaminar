@@ -71,7 +71,7 @@ extern "C"
     bool cudaGDN_restore_state_from_capture_metadata(
         float *dst_state,
         const float *state_snapshots,
-        const int32_t *device_committed_state_rows,
+        const int32_t *device_accepted_state_slot_indices,
         int request_index,
         int snapshot_stride_floats,
         int max_snapshot_rows,
@@ -115,6 +115,11 @@ namespace llaminar2
             verifier_state_capture_rows_ = rows;
             verifier_state_capture_size_ = state_size;
         }
+        void bindSpeculativeStateWorkspace(float *workspace, int state_size) override
+        {
+            speculative_state_work_ = workspace;
+            speculative_state_work_size_ = state_size;
+        }
 
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
         {
@@ -139,12 +144,13 @@ namespace llaminar2
 
         bool restoreVerifierStateCaptureRowFromDeviceMetadata(
             float *dst_state,
-            const int32_t *device_committed_state_rows,
+            const int32_t *device_accepted_state_slot_indices,
             int request_index,
             void *stream) override
         {
             (void)dst_state;
-            if (!gpu_state_ || !verifier_state_capture_ || !device_committed_state_rows ||
+            if (!gpu_state_ || !verifier_state_capture_ ||
+                !device_accepted_state_slot_indices ||
                 request_index < 0 || !stream ||
                 verifier_state_capture_rows_ <= 0 ||
                 verifier_state_capture_size_ != state_size_)
@@ -156,7 +162,7 @@ namespace llaminar2
             return cudaGDN_restore_state_from_capture_metadata(
                 gpu_state_,
                 verifier_state_capture_,
-                device_committed_state_rows,
+                device_accepted_state_slot_indices,
                 request_index,
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
@@ -245,7 +251,10 @@ namespace llaminar2
                 LOG_ERROR("[CUDAGatedDeltaNet] Missing GPU recurrence state");
                 return false;
             }
-            float *effective_state = gpu_state_;
+            float *effective_state =
+                prepareEffectiveStateForVerifierForward(required_state_size, stream_);
+            if (!effective_state)
+                return false;
 
             // All pointers are device pointers — pass directly to CUDA kernel.
             // No H2D/D2H copies, no scratch buffer, no stream synchronization.
@@ -288,7 +297,10 @@ namespace llaminar2
                 LOG_ERROR("[CUDAGatedDeltaNet] Missing GPU recurrence state");
                 return false;
             }
-            float *effective_state = gpu_state_;
+            float *effective_state =
+                prepareEffectiveStateForVerifierForward(required_state_size, stream_);
+            if (!effective_state)
+                return false;
 
             return cudaGDN_chunk_forward_effective(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
@@ -327,7 +339,10 @@ namespace llaminar2
                 LOG_ERROR("[CUDAGatedDeltaNet] Missing GPU recurrence state");
                 return false;
             }
-            float *effective_state = gpu_state_;
+            float *effective_state =
+                prepareEffectiveStateForVerifierForward(required_state_size, stream_);
+            if (!effective_state)
+                return false;
 
             // Keep one-token decode on the same row-split recurrence path as
             // verifier/prefill. The old dedicated decode kernel accumulated
@@ -496,7 +511,39 @@ namespace llaminar2
         float *verifier_state_capture_ = nullptr;
         int verifier_state_capture_rows_ = 0;
         int verifier_state_capture_size_ = 0;
+        float *speculative_state_work_ = nullptr;
+        int speculative_state_work_size_ = 0;
         DeviceWorkspaceManager *workspace_ = nullptr;
+
+        float *prepareEffectiveStateForVerifierForward(int required_state_size, void *stream)
+        {
+            const bool verifier_capture_active =
+                verifier_state_capture_ != nullptr &&
+                verifier_state_capture_rows_ > 0 &&
+                verifier_state_capture_size_ == required_state_size;
+            if (!verifier_capture_active)
+                return gpu_state_;
+            if (!stream)
+            {
+                LOG_ERROR("[CUDAGatedDeltaNet] Speculative verifier state requires an explicit stream");
+                return nullptr;
+            }
+            if (!speculative_state_work_ ||
+                speculative_state_work_size_ != required_state_size)
+            {
+                LOG_ERROR("[CUDAGatedDeltaNet] Speculative verifier state workspace was not bound: need "
+                          << required_state_size << " floats, have "
+                          << speculative_state_work_size_);
+                return nullptr;
+            }
+
+            cudaGDN_gpu_memcpy_async(
+                speculative_state_work_,
+                gpu_state_,
+                static_cast<size_t>(required_state_size),
+                stream);
+            return speculative_state_work_;
+        }
     };
 
 } // namespace llaminar2

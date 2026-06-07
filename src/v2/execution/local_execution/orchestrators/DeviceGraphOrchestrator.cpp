@@ -60,6 +60,7 @@
 #include <iomanip>
 #include <initializer_list>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -1264,6 +1265,7 @@ namespace llaminar2
             for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
                 cache.invalidate();
             mtp_terminal_hidden_row_select_cache_.invalidate();
+            mtp_base_terminal_hidden_copy_cache_.invalidate();
             for (auto &cache : layer_graph_cache_)
                 cache.invalidate();
             resetKernelDynamicState();
@@ -2718,6 +2720,7 @@ namespace llaminar2
         for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
             cache.invalidate();
         mtp_terminal_hidden_row_select_cache_.invalidate();
+        mtp_base_terminal_hidden_copy_cache_.invalidate();
 
         // Clear device contexts
         device_contexts_.clear();
@@ -3772,7 +3775,81 @@ namespace llaminar2
         return register_with_arena();
     }
 
-    bool DeviceGraphOrchestrator::executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len)
+    bool DeviceGraphOrchestrator::ensureMTPBaseTerminalHiddenBuffer()
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+
+        auto bind_with_arena = [&]() -> bool
+        {
+            if (!arena_)
+                return true;
+            if (arena_->isRegistered(BufferId::MTP_BASE_TERMINAL_HIDDEN))
+            {
+                if (arena_->getTensor(BufferId::MTP_BASE_TERMINAL_HIDDEN) ==
+                    state_.mtp_base_terminal_hidden.get())
+                {
+                    return true;
+                }
+                if (!arena_->bindExternalBuffer(BufferId::MTP_BASE_TERMINAL_HIDDEN,
+                                                state_.mtp_base_terminal_hidden.get()))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to rebind MTP base terminal hidden with BufferArena");
+                    return false;
+                }
+                mtp_base_terminal_hidden_copy_cache_.invalidate();
+                return true;
+            }
+            if (!arena_->registerExternalBuffer(BufferId::MTP_BASE_TERMINAL_HIDDEN,
+                                                state_.mtp_base_terminal_hidden.get()))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register MTP base terminal hidden with BufferArena");
+                return false;
+            }
+            return true;
+        };
+
+        if (state_.mtp_base_terminal_hidden)
+        {
+            const auto &shape = state_.mtp_base_terminal_hidden->shape();
+            if (shape.size() == 2 &&
+                shape[0] >= 1 &&
+                shape[1] >= static_cast<size_t>(state_.d_model))
+            {
+                return bind_with_arena();
+            }
+            mtp_base_terminal_hidden_copy_cache_.invalidate();
+            state_.mtp_base_terminal_hidden.reset();
+        }
+
+        if (!tensor_factory_ || state_.d_model <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot allocate MTP base terminal hidden buffer without tensor factory/d_model");
+            return false;
+        }
+
+        auto tensor = tensor_factory_->createFP32(
+            {1, static_cast<size_t>(state_.d_model)},
+            state_.device_id);
+        if (!tensor)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate MTP base terminal hidden buffer");
+            return false;
+        }
+
+        state_.mtp_base_terminal_hidden = std::shared_ptr<TensorBase>(tensor.release());
+        return bind_with_arena();
+    }
+
+    bool DeviceGraphOrchestrator::executeMTPHiddenRowSelect(
+        TensorBase *input,
+        BufferId input_buffer_id,
+        TensorBase *output,
+        BufferId output_buffer_id,
+        MTPTerminalHiddenRowSelectGraphCache &cache,
+        const char *node_name,
+        int row_idx,
+        int seq_len)
     {
         if (row_idx < 0 || row_idx >= seq_len)
         {
@@ -3780,13 +3857,11 @@ namespace llaminar2
                       << row_idx << " seq_len=" << seq_len);
             return false;
         }
-        if (!state_.hidden)
+        if (!input || !output)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden row without hidden-state buffer");
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden row without input/output buffer");
             return false;
         }
-        if (!ensureMTPTerminalHiddenBuffer())
-            return false;
 
         if (state_.d_model <= 0)
         {
@@ -3795,7 +3870,7 @@ namespace llaminar2
             return false;
         }
 
-        const size_t hidden_rows = state_.hidden->rows();
+        const size_t hidden_rows = input->rows();
         if (hidden_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Hidden-state row capacity exceeds int range: rows="
@@ -3810,13 +3885,12 @@ namespace llaminar2
             return false;
         }
 
-        auto &cache = mtp_terminal_hidden_row_select_cache_;
         const bool rebuild =
             !cache.valid ||
             !cache.graph ||
             !cache.stage ||
-            cache.input != state_.hidden.get() ||
-            cache.output != state_.prefix_terminal_hidden.get() ||
+            cache.input != input ||
+            cache.output != output ||
             cache.device != state_.device_id ||
             cache.seq_capacity != seq_capacity ||
             cache.d_model != state_.d_model;
@@ -3825,16 +3899,16 @@ namespace llaminar2
         {
             HiddenStateRowSelectStage::Params params;
             params.device_id = state_.device_id;
-            params.input = state_.hidden.get();
-            params.output = state_.prefix_terminal_hidden.get();
+            params.input = input;
+            params.output = output;
             params.seq_len = seq_capacity;
             params.d_model = state_.d_model;
             params.selected_row_idx = row_idx;
-            params.input_buffer_id = BufferId::HIDDEN_STATE;
-            params.output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
+            params.input_buffer_id = input_buffer_id;
+            params.output_buffer_id = output_buffer_id;
             params.workspace_buffer_name =
                 std::string(HiddenStateRowSelectStage::WS_SELECTED_ROW_SCALAR) +
-                "_mtp_terminal_hidden";
+                "_" + (node_name && node_name[0] != '\0' ? node_name : "mtp_hidden_row_select");
 
             auto stage = ComputeStageFactory::createHiddenStateRowSelect(params);
             auto *row_select_stage = dynamic_cast<HiddenStateRowSelectStage *>(stage.get());
@@ -3845,14 +3919,14 @@ namespace llaminar2
             }
 
             auto graph = std::make_unique<ComputeGraph>();
-            graph->addNode("mtp_terminal_hidden_row_select",
+            graph->addNode(node_name && node_name[0] != '\0' ? node_name : "mtp_hidden_row_select",
                            std::move(stage),
                            state_.device_id);
 
             cache.graph = std::move(graph);
             cache.stage = row_select_stage;
-            cache.input = state_.hidden.get();
-            cache.output = state_.prefix_terminal_hidden.get();
+            cache.input = input;
+            cache.output = output;
             cache.device = state_.device_id;
             cache.seq_capacity = seq_capacity;
             cache.d_model = state_.d_model;
@@ -3866,6 +3940,83 @@ namespace llaminar2
             return false;
 
         return execute(*cache.graph, ctx);
+    }
+
+    bool DeviceGraphOrchestrator::executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len)
+    {
+        if (!state_.hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden row without hidden-state buffer");
+            return false;
+        }
+        if (!ensureMTPTerminalHiddenBuffer())
+            return false;
+        return executeMTPHiddenRowSelect(
+            state_.hidden.get(),
+            BufferId::HIDDEN_STATE,
+            state_.prefix_terminal_hidden.get(),
+            BufferId::PREFIX_TERMINAL_HIDDEN,
+            mtp_terminal_hidden_row_select_cache_,
+            "mtp_terminal_hidden_row_select",
+            row_idx,
+            seq_len);
+    }
+
+    bool DeviceGraphOrchestrator::preserveMTPBaseTerminalHidden()
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (!state_.prefix_terminal_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot preserve MTP base terminal hidden without terminal hidden state");
+            return false;
+        }
+        if (!ensureMTPBaseTerminalHiddenBuffer())
+            return false;
+        const bool ok = executeMTPHiddenRowSelect(
+            state_.prefix_terminal_hidden.get(),
+            BufferId::PREFIX_TERMINAL_HIDDEN,
+            state_.mtp_base_terminal_hidden.get(),
+            BufferId::MTP_BASE_TERMINAL_HIDDEN,
+            mtp_base_terminal_hidden_copy_cache_,
+            "mtp_base_terminal_hidden_copy",
+            0,
+            1);
+        if (ok)
+        {
+            if (state_.device_id.is_gpu())
+            {
+                IWorkerGPUContext *gpu_ctx = nullptr;
+                void *stream = explicitGPUStreamForOperation("preserveMTPBaseTerminalHidden");
+                if (!stream)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] MTP base terminal hidden preserve requires an explicit GPU stream");
+                    return false;
+                }
+                try
+                {
+                    gpu_ctx = &GPUDeviceContextPool::instance().getContext(state_.device_id);
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] MTP base terminal hidden preserve could not acquire GPU context: "
+                              << e.what());
+                    return false;
+                }
+                if (!gpu_ctx->synchronizeStreamChecked(stream))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] MTP base terminal hidden preserve stream synchronization failed");
+                    return false;
+                }
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "phase138_base_terminal_hidden_preserves",
+                1.0,
+                perfPhaseName(),
+                state_.device_id.toString());
+        }
+        return ok;
     }
 
     bool DeviceGraphOrchestrator::refreshMTPTerminalHiddenState(int seq_len, int batch_size)
@@ -4216,7 +4367,9 @@ namespace llaminar2
         }
         if (try_gpu_graph_capture && !rebuilt_graph)
         {
-            if (sidecar_cache.segment_cache.ensureCaptureStream(sidecar_gpu_ctx))
+            if (sidecar_cache.segment_cache.ensureCaptureStream(
+                    sidecar_gpu_ctx,
+                    state_.device_id))
             {
                 void *capture_stream = sidecar_cache.segment_cache.capture_stream;
                 sidecar_dynamic_stream = capture_stream;
@@ -4304,6 +4457,7 @@ namespace llaminar2
         const bool has_sidecar_collectives = !sidecar_cache.collective_nodes.empty();
 
         bool ok = false;
+        bool used_capture_policy = false;
         {
             ScopedStringOverride snapshot_scope(snapshot_context_, sidecar_context);
             PerfStatsCollector::ScopedTimer timer(
@@ -4325,6 +4479,7 @@ namespace llaminar2
             pending_mtp_logits_stream_ = nullptr;
             if (try_gpu_graph_capture && !rebuilt_graph)
             {
+                used_capture_policy = true;
                 if (!sidecar_gpu_ctx)
                 {
                     auto &pool = GPUDeviceContextPool::instance();
@@ -4403,6 +4558,36 @@ namespace llaminar2
                 {{"depth", "0"},
                  {"seq_len", std::to_string(token_count)},
                  {"path", used_segmented_capture ? "segmented" : (rebuilt_graph ? "plain_after_build" : "plain")}});
+        }
+        if (ok && state_.device_id.is_gpu() && sidecar_dynamic_stream && !pending_mtp_logits_stream_)
+        {
+            const bool plain_sidecar_execution = !used_capture_policy || rebuilt_graph;
+            const bool needs_sidecar_completion_before_return =
+                kv_cache_only || plain_sidecar_execution;
+            if (needs_sidecar_completion_before_return)
+            {
+                if (!sidecar_gpu_ctx)
+                {
+                    auto &pool = GPUDeviceContextPool::instance();
+                    sidecar_gpu_ctx = &pool.getContext(state_.device_id);
+                }
+                if (!sidecar_gpu_ctx->synchronizeStreamChecked(sidecar_dynamic_stream))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar stream synchronization failed after "
+                              << sidecar_context << " on " << state_.device_id.toString());
+                    return false;
+                }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "sidecar_explicit_stream_completions",
+                    1.0,
+                    phase,
+                    device_key,
+                    {{"context", sidecar_context},
+                     {"seq_len", std::to_string(token_count)},
+                     {"kv_cache_only", boolTag(kv_cache_only)},
+                     {"path", plain_sidecar_execution ? "plain" : "capture"}});
+            }
         }
         if (ok && state_.device_id.is_gpu() &&
             PerfStatsCollector::gpuStageEventTimingEnabled())
@@ -4920,6 +5105,127 @@ namespace llaminar2
             {
                 handleLivePrefixReplayStateAfterMutation(
                     "mtp_shifted_row_sequential_commit_workspace_rebind");
+            }
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::commitMTPShiftedRowFromPreservedBaseTerminalHidden(
+        int32_t token,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (state_.positions.empty())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit requires position state");
+            return false;
+        }
+
+        const int position_offset =
+            position_offset_override >= 0
+                ? position_offset_override
+                : state_.positions[0];
+        if (position_offset < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid preserved-base MTP shifted-row commit position_offset="
+                      << position_offset << " override=" << position_offset_override);
+            return false;
+        }
+
+        IKVCache *cache = state_.mtp_kv_caches.empty() ? nullptr : state_.mtp_kv_caches[0].get();
+        if (!cache)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit requires an initialized MTP KV cache");
+            return false;
+        }
+
+        const int expected_cached_tokens = std::max(0, position_offset - 1);
+        int current_cached_tokens =
+            cache->get_cached_tokens(cache->first_layer_index(), 0);
+        if (current_cached_tokens > expected_cached_tokens)
+        {
+            if (!allow_speculative_discard)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit cache has unexpected extra rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens
+                          << " position_offset=" << position_offset);
+                return false;
+            }
+            void *stream = explicitGPUStreamForOperation("commitMTPShiftedRowFromPreservedBaseTerminalHidden");
+            if (state_.device_id.is_gpu() && !stream)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit requires an explicit GPU stream");
+                return false;
+            }
+            if (!cache->truncateSequence(0, expected_cached_tokens, stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit failed to discard speculative rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens);
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "speculative_shifted_rows_discarded",
+                static_cast<double>(current_cached_tokens - expected_cached_tokens),
+                perfPhaseName(),
+                state_.device_id.toString());
+            current_cached_tokens = expected_cached_tokens;
+        }
+        if (current_cached_tokens < expected_cached_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit cache mismatch: current="
+                      << current_cached_tokens << " expected=" << expected_cached_tokens
+                      << " position_offset=" << position_offset);
+            return false;
+        }
+
+        if (!state_.mtp_base_terminal_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit requires preserved terminal hidden");
+            return false;
+        }
+
+        PerfStatsCollector::ScopedTimer timer(
+            "mtp",
+            "shifted_row_preserved_base_commit",
+            perfPhaseName(),
+            state_.device_id.toString());
+        const uint64_t workspace_generation_before_commit =
+            state_.device_id.is_gpu() ? workspaceGeneration(state_.device_id) : 0;
+
+        if (!executeMTPDepth0(token,
+                              state_.mtp_base_terminal_hidden.get(),
+                              position_offset,
+                              "mtp_decode_preserved_base_catchup",
+                              true,
+                              BufferId::MTP_BASE_TERMINAL_HIDDEN))
+        {
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "shifted_rows_committed",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString());
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "shifted_row_preserved_base_commits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString());
+
+        if (state_.device_id.is_gpu())
+        {
+            const uint64_t workspace_generation_after_commit =
+                workspaceGeneration(state_.device_id);
+            if (workspace_generation_after_commit != workspace_generation_before_commit)
+            {
+                handleLivePrefixReplayStateAfterMutation(
+                    "mtp_shifted_row_preserved_base_commit_workspace_rebind");
             }
         }
         return true;
@@ -7429,13 +7735,14 @@ namespace llaminar2
         {
             return false;
         }
-        if (state_.device_id.is_cuda())
+        if (requiresMTPDecodeEquivalentVerifierReplay())
         {
-            // CUDA verifier prefill rows can match the immediate greedy token
-            // while still producing GDN/attention state that diverges from the
-            // one-row decode replay several tokens later. Keep CUDA on the
-            // decode-equivalent replay path until the dedicated equivalence
-            // regression can prove multi-token state parity.
+            // Qwen3.5/Qwen3.6 hybrid GDN verifier rows can match immediate
+            // sampled tokens while still producing recurrent/conv state that
+            // diverges from one-row decode replay several continuation tokens
+            // later. Keep all hybrid-GDN backends on the decode-equivalent
+            // stepwise path until accepted-count speculative state-slot
+            // publication proves the stricter continuation-state contract.
             return false;
         }
         auto *hybrid = dynamic_cast<IHybridKVCache *>(state_.kv_cache.get());
@@ -7478,41 +7785,14 @@ namespace llaminar2
         {
             return false;
         }
-
-        const GraphConfig &cfg = graph_builder_->config();
-        if (cfg.isMoE())
-        {
-            return false;
-        }
-        if (cfg.tp_ctx ||
-            cfg.tp_config ||
-            cfg.multi_domain_tp_config ||
-            cfg.pipeline_config ||
-            !cfg.pp_contexts.empty() ||
-            !cfg.domain_tp_contexts.empty())
-        {
-            return false;
-        }
-        if (cfg.qkv_column_parallel ||
-            cfg.ffn_column_parallel ||
-            cfg.lm_head_column_parallel)
-        {
-            return false;
-        }
-        if (cfg.local_n_heads > 0 && cfg.local_n_heads != cfg.n_heads)
-        {
-            return false;
-        }
-        if (cfg.local_n_kv_heads > 0 && cfg.local_n_kv_heads != cfg.n_kv_heads)
-        {
-            return false;
-        }
-        if (cfg.vocab_local > 0 && cfg.vocab_local != cfg.vocab_size)
-        {
-            return false;
-        }
-
-        return true;
+        // The current vLLM-style hook uses a batched target verifier plus
+        // selected-row GDN/short-conv publication. Focused Qwen3.6 long-prefix
+        // parity disproves that state publication contract for hybrid GDN on
+        // both CUDA and ROCm. The next promotable design must keep verifier
+        // hybrid state in speculative slots and publish live state through
+        // accepted-count metadata, or otherwise prove decode-equivalent
+        // continuation state.
+        return false;
     }
 
     bool DeviceGraphOrchestrator::supportsOptimizedMTPDecodeCatchupGreedy() const
@@ -7610,12 +7890,16 @@ namespace llaminar2
                 return result;
             };
 
-            if (!supportsPromotedVllmStyleSpecDecodeSingleDeviceDense())
+            if (!supportsPromotedVllmStyleSpecDecodeSingleDeviceDense() &&
+                !equivalence_check &&
+                !direct_candidate)
             {
                 return fail_vllm(
-                    "Phase 13.8 vllm_style_spec_decode is promoted only for "
-                    "initialized dense SingleDevice GPU hybrid decode; TP, PP, MoE, "
-                    "multi-request, CPU, and non-hybrid paths remain unsupported");
+                    "Phase 13.8 vllm_style_spec_decode is not promoted for "
+                    "hybrid GDN decode: focused CUDA/ROCm continuation parity "
+                    "shows batched verifier-row state publication is not "
+                    "decode-equivalent. Use shared_stepwise until the "
+                    "accepted-count speculative state-slot publication path is implemented");
             }
             if (!state_.isInitialized() ||
                 !state_.device_id.is_gpu() ||
@@ -7647,6 +7931,31 @@ namespace llaminar2
             }
 
             MTPDecodeCatchupGreedyResult result;
+            std::ostringstream debug_trace;
+            auto append_debug_state = [&](const char *label)
+            {
+                if (debug_trace.tellp() > 0)
+                    debug_trace << "; ";
+                const int position =
+                    state_.positions.empty() ? -1 : state_.positions[0];
+                const int sequence_length =
+                    state_.sequence_lengths.empty() ? -1 : state_.sequence_lengths[0];
+                int main_cached = -1;
+                int mtp_cached = -1;
+                if (state_.kv_cache)
+                    main_cached = state_.kv_cache->get_cached_tokens(
+                        state_.kv_cache->first_layer_index(),
+                        0);
+                if (!state_.mtp_kv_caches.empty() && state_.mtp_kv_caches[0])
+                    mtp_cached = state_.mtp_kv_caches[0]->get_cached_tokens(
+                        state_.mtp_kv_caches[0]->first_layer_index(),
+                        0);
+                debug_trace << (label ? label : "state")
+                            << ":pos=" << position
+                            << ",seq=" << sequence_length
+                            << ",main_kv=" << main_cached
+                            << ",mtp_kv=" << mtp_cached;
+            };
             bool all_position_enabled = false;
             auto disable_all_position = [&]() -> bool
             {
@@ -7666,17 +7975,13 @@ namespace llaminar2
             {
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
-                    "phase138_vllm_style_initial_shifted_commit",
+                    "phase138_vllm_style_preserve_base_terminal_hidden",
                     "decode",
                     state_.device_id.toString());
-                if (!commitMTPShiftedRowFromCurrentTerminalHidden(
-                        request.draft_tokens.front(),
-                        /*already_appended_tokens=*/0,
-                        request.allow_speculative_discard,
-                        verifier_base_position))
+                if (!preserveMTPBaseTerminalHidden())
                 {
                     return fail_vllm(
-                        "Phase 13.8 vllm_style_spec_decode initial shifted-cache commit failed");
+                        "Phase 13.8 vllm_style_spec_decode could not preserve base terminal hidden");
                 }
             }
 
@@ -7712,6 +8017,7 @@ namespace llaminar2
                 return fail_after_enable(
                     "Phase 13.8 vllm_style_spec_decode verifier forward failed");
             }
+            append_debug_state("after_verifier_forward");
 
             std::vector<int32_t> sampled_verifier_tokens(
                 request.draft_tokens.size(),
@@ -7757,7 +8063,7 @@ namespace llaminar2
                     graph_builder_->config().vocab_size,
                     request,
                     result);
-            if (!metadata.ok || metadata.committed_state_rows.empty())
+            if (!metadata.ok || metadata.accepted_state_slot_indices.empty())
             {
                 return fail_vllm(
                     "Phase 13.8 vllm_style_spec_decode metadata build failed: " +
@@ -7776,6 +8082,46 @@ namespace llaminar2
             {
                 return fail_vllm(
                     "Phase 13.8 vllm_style_spec_decode selected invalid verifier state commit count");
+            }
+
+            const int target_cached_tokens =
+                verifier_base_position + target_verifier_state_commit_count;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_vllm_style_restore_metadata_state",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"target_cached_tokens", std::to_string(target_cached_tokens)},
+                     {"state_commit_count",
+                      std::to_string(target_verifier_state_commit_count)}});
+                const bool restored =
+                    restoreMTPVerifierStateFromSpecDecodeMetadata(
+                        metadata,
+                        /*request_index=*/0,
+                        target_cached_tokens);
+                if (!restored)
+                {
+                    return fail_vllm(
+                        "Phase 13.8 vllm_style_spec_decode metadata state restore failed");
+                }
+            }
+            append_debug_state("after_metadata_restore");
+
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_vllm_style_deferred_initial_shifted_commit",
+                    "decode",
+                    state_.device_id.toString());
+                if (!commitMTPShiftedRowFromPreservedBaseTerminalHidden(
+                        result.accepted_tokens.front(),
+                        request.allow_speculative_discard,
+                        verifier_base_position))
+                {
+                    return fail_vllm(
+                        "Phase 13.8 vllm_style_spec_decode deferred initial shifted-cache commit failed");
+                }
             }
 
             if (target_verifier_state_commit_count > 1)
@@ -7800,119 +8146,68 @@ namespace llaminar2
                 }
             }
 
-            const int target_cached_tokens =
-                verifier_base_position + target_verifier_state_commit_count;
+            if (metadata.correction_replay_start_indices.empty() ||
+                metadata.correction_replay_counts.empty())
             {
-                PerfStatsCollector::ScopedTimer timer(
-                    "mtp",
-                    "phase138_vllm_style_restore_metadata_state",
-                    "decode",
-                    state_.device_id.toString(),
-                    {{"target_cached_tokens", std::to_string(target_cached_tokens)},
-                     {"state_commit_count",
-                      std::to_string(target_verifier_state_commit_count)}});
-                if (!restoreMTPVerifierStateFromSpecDecodeMetadata(
-                        metadata,
-                        /*request_index=*/0,
-                        target_cached_tokens))
-                {
-                    return fail_vllm(
-                        "Phase 13.8 vllm_style_spec_decode metadata state restore failed");
-                }
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode metadata did not provide correction replay plan");
             }
-
-            const int suffix_start = target_verifier_state_commit_count;
-            const int suffix_count =
-                static_cast<int>(result.accepted_tokens.size()) - suffix_start;
-            if (suffix_count < 0)
+            const int suffix_start = metadata.correction_replay_start_indices.front();
+            const int suffix_count = metadata.correction_replay_counts.front();
+            debug_trace << "; plan:target_cached=" << target_cached_tokens
+                        << ",state_commit=" << target_verifier_state_commit_count
+                        << ",suffix_start=" << suffix_start
+                        << ",suffix_count=" << suffix_count;
+            if (suffix_count < 0 ||
+                suffix_count > static_cast<int>(result.accepted_tokens.size()) ||
+                (suffix_count > 0 &&
+                 (suffix_start < 0 ||
+                  suffix_start + suffix_count >
+                      static_cast<int>(result.accepted_tokens.size()))))
             {
                 return fail_vllm(
                     "Phase 13.8 vllm_style_spec_decode selected invalid suffix replay range");
             }
             if (suffix_count > 0)
             {
-                if (!selectMTPTerminalHiddenRow(
-                        target_verifier_state_commit_count - 1,
-                        static_cast<int>(request.draft_tokens.size())))
-                {
-                    return fail_vllm(
-                        "Phase 13.8 vllm_style_spec_decode failed to select suffix base hidden row");
-                }
-
                 {
                     PerfStatsCollector::ScopedTimer timer(
                         "mtp",
-                        "phase138_vllm_style_enable_suffix_all_position_logits",
+                        "phase138_vllm_style_shifted_correction_commit",
                         "decode",
                         state_.device_id.toString(),
-                        {{"tokens", std::to_string(suffix_count)}});
-                    all_position_enabled = setComputeAllPositionLogits(true);
-                }
-                if (!all_position_enabled)
-                {
-                    return fail_vllm(
-                        "Phase 13.8 vllm_style_spec_decode could not enable suffix all-position logits");
-                }
-
-                PerfStatsCollector::ScopedTimer timer(
-                    "mtp",
-                    "phase138_vllm_style_suffix_replay",
-                    "decode",
-                    state_.device_id.toString(),
-                    {{"tokens", std::to_string(suffix_count)}});
-                for (int i = suffix_start;
-                     i < static_cast<int>(result.accepted_tokens.size());
-                     ++i)
-                {
-                    const int32_t token =
-                        result.accepted_tokens[static_cast<size_t>(i)];
-                    if (!commitMTPShiftedRowFromCurrentTerminalHidden(
-                            token,
-                            i,
-                            request.allow_speculative_discard,
-                            verifier_base_position))
+                        {{"suffix_start", std::to_string(suffix_start)},
+                         {"suffix_tokens", std::to_string(suffix_count)}});
+                    for (int suffix_row = 0; suffix_row < suffix_count; ++suffix_row)
                     {
-                        return fail_after_enable(
-                            "Phase 13.8 vllm_style_spec_decode shifted suffix commit failed");
-                    }
-                    if (!forward(&token, 1, 1))
-                    {
-                        return fail_after_enable(
-                            "Phase 13.8 vllm_style_spec_decode suffix replay forward failed");
-                    }
-                    ++result.main_forward_token_count;
-                }
-
-                if (!result.stopped_on_output)
-                {
-                    int32_t ready = -1;
-                    {
-                        PerfStatsCollector::ScopedTimer sample_timer(
-                            "mtp",
-                            "phase138_vllm_style_suffix_ready_sample_all_position",
-                            "decode",
-                            state_.device_id.toString());
-                        if (!sampleGreedyFromAllPositionLogitsOnDeviceRows(
-                                0,
-                                1,
-                                &ready))
+                        const int token_index = suffix_start + suffix_row;
+                        if (!commitMTPShiftedRowFromCurrentTerminalHidden(
+                                result.accepted_tokens[static_cast<size_t>(token_index)],
+                                token_index,
+                                request.allow_speculative_discard,
+                                verifier_base_position))
                         {
-                            ready = -1;
+                            return fail_vllm(
+                                "Phase 13.8 vllm_style_spec_decode shifted correction commit failed");
                         }
                     }
-                    if (ready < 0)
-                    {
-                        return fail_after_enable(
-                            "Phase 13.8 vllm_style_spec_decode suffix ready-token sample failed");
-                    }
-                    result.ready_token = ready;
                 }
-                if (!disable_all_position())
-                {
-                    return fail_vllm(
-                        "Phase 13.8 vllm_style_spec_decode could not disable suffix all-position logits");
-                }
+                result.ready_token = -1;
+                result.shifted_commit_count =
+                    target_verifier_state_commit_count + suffix_count;
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "phase138_vllm_style_rejection_deferred_correction_commits",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"suffix_tokens", std::to_string(suffix_count)},
+                     {"state_commit_count",
+                      std::to_string(target_verifier_state_commit_count)}});
+                append_debug_state("after_deferred_correction_shifted_commit");
+                debug_trace << "; rejection_suffix_deferred=true";
             }
+            result.debug_trace = debug_trace.str();
 
             PerfStatsCollector::addCounter(
                 "mtp",
@@ -8054,6 +8349,19 @@ namespace llaminar2
         {
             return fail("main_kv_truncate_failed");
         }
+        IWorkerGPUContext *gpu_ctx = nullptr;
+        try
+        {
+            gpu_ctx = &GPUDeviceContextPool::instance().getContext(state_.device_id);
+        }
+        catch (const std::exception &e)
+        {
+            return fail(std::string("metadata_publish_context_failed:") + e.what());
+        }
+        if (!gpu_ctx || !gpu_ctx->synchronizeStreamChecked(stream))
+        {
+            return fail("metadata_publish_stream_sync_failed");
+        }
 
         state_.positions[seq_idx] = target_cached_tokens;
         state_.sequence_lengths[seq_idx] = target_cached_tokens;
@@ -8081,7 +8389,7 @@ namespace llaminar2
         {
             PerfStatsCollector::addCounter(
                 "mtp",
-                "spec_decode_metadata_state_restore_failures",
+                "spec_decode_metadata_state_publication_failures",
                 1.0,
                 "decode",
                 state_.device_id.toString(),
@@ -8101,13 +8409,18 @@ namespace llaminar2
             return fail(std::string("invalid_metadata_batch:") + batch.error);
         }
         if (request_index < 0 || request_index >= batch.request_count ||
-            request_index >= static_cast<int>(batch.committed_state_rows.size()))
+            request_index >= static_cast<int>(batch.accepted_state_counts.size()) ||
+            request_index >= static_cast<int>(batch.accepted_state_slot_indices.size()))
         {
             return fail("bad_request_index");
         }
-        if (batch.committed_state_rows[static_cast<size_t>(request_index)] < 0)
+        if (batch.accepted_state_counts[static_cast<size_t>(request_index)] <= 0)
         {
-            return fail("no_committed_state_row");
+            return fail("no_accepted_state_count");
+        }
+        if (batch.accepted_state_slot_indices[static_cast<size_t>(request_index)] < 0)
+        {
+            return fail("no_accepted_state_slot");
         }
         if (!state_.kv_cache || seq_idx < 0 || seq_idx >= state_.batch_size)
         {
@@ -8161,9 +8474,9 @@ namespace llaminar2
 
         const auto &ptrs =
             mtp_spec_decode_metadata_workspace_->devicePointers();
-        if (!ptrs.committed_state_rows)
+        if (!ptrs.accepted_state_slot_indices)
         {
-            return fail("missing_committed_state_rows_device_buffer");
+            return fail("missing_accepted_state_slot_indices_device_buffer");
         }
 
         int restored_layers = 0;
@@ -8182,21 +8495,21 @@ namespace llaminar2
             {
                 return fail("missing_gdn_state_or_kernel");
             }
-            if (!conv_kernel->restoreVerifierStateCaptureRowFromDeviceMetadata(
+            if (!conv_kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
                     conv_state,
-                    ptrs.committed_state_rows,
+                    ptrs.accepted_state_slot_indices,
                     request_index,
                     stream))
             {
-                return fail("shortconv_metadata_restore_failed");
+                return fail("shortconv_metadata_publish_failed");
             }
-            if (!recurrence_kernel->restoreVerifierStateCaptureRowFromDeviceMetadata(
+            if (!recurrence_kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
                     recurrence_state,
-                    ptrs.committed_state_rows,
+                    ptrs.accepted_state_slot_indices,
                     request_index,
                     stream))
             {
-                return fail("recurrence_metadata_restore_failed");
+                return fail("recurrence_metadata_publish_failed");
             }
             ++restored_layers;
         }
@@ -8213,17 +8526,23 @@ namespace llaminar2
         state_.positions[seq_idx] = target_cached_tokens;
         state_.sequence_lengths[seq_idx] = target_cached_tokens;
         handleLivePrefixReplayStateAfterMutation(
-            "restore_mtp_spec_decode_metadata_state",
-            /*preserve_gpu_replay_state=*/true);
+            "publish_mtp_spec_decode_metadata_state",
+            /*preserve_gpu_replay_state=*/false);
         PerfStatsCollector::addCounter(
             "mtp",
-            "spec_decode_metadata_state_restores",
+            "spec_decode_metadata_state_publications",
             1.0,
             "decode",
             state_.device_id.toString(),
             {{"request_index", std::to_string(request_index)},
-             {"committed_state_row",
-              std::to_string(batch.committed_state_rows[static_cast<size_t>(request_index)])},
+             {"accepted_state_count",
+              std::to_string(batch.accepted_state_counts[static_cast<size_t>(request_index)])},
+             {"accepted_state_slot_index",
+              std::to_string(batch.accepted_state_slot_indices[static_cast<size_t>(request_index)])},
+             {"committed_state_row_compat",
+              request_index < static_cast<int>(batch.committed_state_rows.size())
+                  ? std::to_string(batch.committed_state_rows[static_cast<size_t>(request_index)])
+                  : std::string("-1")},
              {"target_cached_tokens", std::to_string(target_cached_tokens)},
              {"bytes_uploaded", std::to_string(upload.bytes_uploaded)},
              {"gdn_layers", std::to_string(restored_layers)}});
@@ -8879,6 +9198,7 @@ namespace llaminar2
         for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
             cache.resetSessionState();
         mtp_terminal_hidden_row_select_cache_.resetSessionState();
+        mtp_base_terminal_hidden_copy_cache_.resetSessionState();
 
         for (auto &cache : layer_graph_cache_)
         {

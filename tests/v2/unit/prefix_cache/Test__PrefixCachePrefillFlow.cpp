@@ -40,6 +40,7 @@ namespace
             }
             logits_buffer.assign(vocab_size(), -1.0f);
             logits_buffer[prefill_argmax_token] = 10.0f;
+            syncShiftedRowsToPosition();
             return true;
         }
 
@@ -64,6 +65,7 @@ namespace
                 return false;
 
             position += seq_len;
+            syncShiftedRowsToPosition();
             logits_buffer.assign(vocab_size(), -1.0f);
             logits_buffer[prefill_argmax_token] = 10.0f;
             return true;
@@ -75,6 +77,7 @@ namespace
         {
             ++clear_calls;
             position = 0;
+            shifted_mtp_rows = 0;
         }
         int get_position() const override { return position; }
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
@@ -94,6 +97,7 @@ namespace
             ++populate_calls;
             populated_tokens.push_back(hit.cached_tokens);
             position = hit.cached_tokens;
+            syncShiftedRowsToPosition();
             return populate_ok;
         }
 
@@ -124,6 +128,32 @@ namespace
         bool supportsChainedMTPDrafts() const override
         {
             return supports_chained_mtp;
+        }
+
+        bool supportsMTPSidecarPreservesMainState() const override
+        {
+            return true;
+        }
+
+        bool supportsMTPVerifierStateRowRestore() const override
+        {
+            return verifier_row_restore_supported;
+        }
+
+        bool restoreMTPVerifierStateRow(
+            int verifier_row,
+            int target_cached_tokens,
+            int seq_idx = 0) override
+        {
+            (void)seq_idx;
+            if (!verifier_row_restore_supported)
+                return false;
+            ++restore_verifier_row_calls;
+            last_verifier_restore_row = verifier_row;
+            last_verifier_restore_target_tokens = target_cached_tokens;
+            position = target_cached_tokens;
+            syncShiftedRowsToPosition();
+            return true;
         }
 
         bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override
@@ -167,6 +197,21 @@ namespace
             return true;
         }
 
+        bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override
+        {
+            ++commit_mtp_calls;
+            last_commit_already_appended = already_appended_tokens;
+            last_commit_allow_speculative_discard = allow_speculative_discard;
+            last_commit_position_offset_override = position_offset_override;
+            last_commit_tokens.assign(1, token);
+            ++shifted_mtp_rows;
+            return already_appended_tokens >= 0;
+        }
+
         bool setComputeAllPositionLogits(bool enabled) override
         {
             if (!mtp_enabled)
@@ -185,6 +230,7 @@ namespace
             (void)seq_idx;
             PrefixStateSnapshot snapshot;
             snapshot.valid = mtp_enabled;
+            snapshot.provenance = PrefixStateProvenance::DecodeEquivalent;
             snapshot.cached_tokens = position;
             snapshot.mtp_cached_tokens = {shifted_mtp_rows};
             return snapshot;
@@ -219,6 +265,7 @@ namespace
         bool all_position_logits_enabled = false;
         bool supports_chunk_schedule = false;
         bool chunk_schedule_ok = true;
+        bool verifier_row_restore_supported = true;
         std::vector<float> logits_buffer = std::vector<float>(16, -1.0f);
         std::vector<float> mtp_logits;
         std::vector<float> all_position_logits;
@@ -238,12 +285,17 @@ namespace
         int harvest_calls = 0;
         int restore_terminal_calls = 0;
         int restore_live_calls = 0;
+        int restore_verifier_row_calls = 0;
+        int last_verifier_restore_row = -1;
+        int last_verifier_restore_target_tokens = -1;
         int last_mtp_condition_token = -1;
         int restored_tokens = 0;
         int harvested_prompt_token_count = 0;
         int position = 0;
         int shifted_mtp_rows = 0;
         int last_commit_already_appended = 0;
+        bool last_commit_allow_speculative_discard = false;
+        int last_commit_position_offset_override = -1;
         std::vector<int> last_forward_tokens;
         std::vector<int> last_commit_tokens;
         std::vector<int> chained_mtp_positions;
@@ -255,6 +307,15 @@ namespace
         std::vector<int32_t> lookup_tokens;
         std::vector<int32_t> harvested_tokens;
         std::vector<int> populated_tokens;
+
+    private:
+        void syncShiftedRowsToPosition()
+        {
+            if (mtp_enabled)
+            {
+                shifted_mtp_rows = std::max(0, position - 1);
+            }
+        }
     };
 
     class ScopedPrefillChunkScheduleEnv
@@ -692,7 +753,7 @@ TEST(Test__PrefixCachePrefillFlow, FullPrefixTerminalRestoreHardFailsForChainedM
     EXPECT_EQ(mock_ptr->harvest_calls, 0);
 }
 
-TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeRestoresMatchingSidecarCheckpointOnReject)
+TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeUsesVerifierRowRestoreOnReject)
 {
     auto mock = std::make_unique<PrefixFlowMockRunner>();
     auto *mock_ptr = mock.get();
@@ -713,13 +774,16 @@ TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeRest
     EXPECT_EQ(mock_ptr->forward_mtp_calls, 3);
     EXPECT_EQ(mock_ptr->chained_mtp_calls, 2);
     EXPECT_THAT(mock_ptr->chained_mtp_positions, ElementsAre(5, 6));
-    ASSERT_THAT(mock_ptr->restored_mtp_rows, Not(IsEmpty()));
-    EXPECT_EQ(mock_ptr->restored_mtp_rows.back(), 1);
-    EXPECT_EQ(mock_ptr->restore_live_calls, 1);
-    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(9, 11));
-    EXPECT_EQ(mock_ptr->commit_mtp_calls, 1);
-    EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
-    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(9, 11, 15));
+    EXPECT_EQ(mock_ptr->restore_live_calls, 0);
+    EXPECT_EQ(mock_ptr->restore_verifier_row_calls, 1);
+    EXPECT_EQ(mock_ptr->last_verifier_restore_row, 1);
+    EXPECT_EQ(mock_ptr->last_verifier_restore_target_tokens, 6);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(15));
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 2);
+    EXPECT_EQ(mock_ptr->last_commit_already_appended, 2);
+    EXPECT_TRUE(mock_ptr->last_commit_allow_speculative_discard);
+    EXPECT_EQ(mock_ptr->last_commit_position_offset_override, 4);
+    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(15));
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_EQ(probe.mtp_draft_steps, 3u);

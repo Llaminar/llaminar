@@ -46,6 +46,8 @@ namespace llaminar2
         static constexpr const char *WS_INPLACE_PREFILL_SCRATCH = "gdn_shortconv_inplace_scratch";
         static constexpr const char *WS_EFFECTIVE_SEQ_LEN_SCALAR = "gdn_shortconv_effective_seq_len_scalar";
         static constexpr const char *WS_VERIFIER_STATE_CAPTURE = "gdn_shortconv_verifier_state_capture";
+        static constexpr const char *WS_SPECULATIVE_STATE_SLOTS = "gdn_shortconv_verifier_state_capture";
+        static constexpr const char *WS_SPECULATIVE_STATE_WORK = "gdn_shortconv_speculative_state_work";
 
         struct Params
         {
@@ -61,7 +63,8 @@ namespace llaminar2
             int channels = 0;            ///< Number of channels (= QKV dim)
             int kernel_size = 4;         ///< Convolution kernel width
             int layer_idx = -1;          ///< Logical model layer for stable graph workspace naming.
-            int verifier_state_capture_rows = 0; ///< Candidate verifier rows to snapshot for MTP rollback.
+            int verifier_state_capture_rows = 0; ///< Compatibility spelling for speculative state slots.
+            int speculative_state_slot_rows = 0; ///< Phase 13.8 temporary state slots for MTP verifier rows.
 
             /// Kernel implementation (set during graph construction)
             ITensorShortConvolution *kernel = nullptr;
@@ -113,7 +116,7 @@ namespace llaminar2
         bool hasVerifierStateCapture() const override;
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
         bool restoreVerifierStateCaptureRowFromDeviceMetadata(
-            const int32_t *device_committed_state_rows,
+            const int32_t *device_accepted_state_slot_indices,
             int request_index,
             void *stream) override;
 
@@ -133,6 +136,7 @@ namespace llaminar2
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
         uint32_t workspace_slice_id_ = 0;
         bool verifier_capture_workspace_bound_ = false;
+        bool speculative_state_work_bound_ = false;
         int verifier_capture_rows_bound_ = 0;
         int verifier_capture_state_size_bound_ = 0;
 
@@ -141,6 +145,8 @@ namespace llaminar2
         std::string workspaceStableId() const;
         std::string effectiveSeqLenScalarBufferName() const;
         std::string verifierStateCaptureBufferName() const;
+        std::string speculativeStateWorkBufferName() const;
+        int requestedSpeculativeStateSlotRows() const;
         bool verifierStateCaptureWorkspaceRequired() const;
         bool ensureVerifierStateCaptureWorkspaceBound() const;
         bool ensureGpuEffectiveSeqLenStateInitialized();

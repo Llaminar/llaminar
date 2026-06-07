@@ -124,6 +124,8 @@ namespace llaminar2
                 << ", candidate_forwards=" << candidate.main_forward_token_count
                 << ", candidate_state_commit_count="
                 << candidate.target_verifier_state_commit_count;
+            if (!candidate.debug_trace.empty())
+                msg << ", candidate_debug={" << candidate.debug_trace << "}";
             return equivalenceFailure(msg.str());
         }
         if (oracle.shifted_commit_count != candidate.shifted_commit_count)

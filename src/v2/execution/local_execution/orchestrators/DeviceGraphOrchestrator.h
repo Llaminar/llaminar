@@ -235,6 +235,7 @@ namespace llaminar2
         /// hidden row as well as logits; dense prefix-cache reuse can use logits
         /// alone to preserve first-token semantics.
         std::shared_ptr<TensorBase> prefix_terminal_hidden;
+        std::shared_ptr<TensorBase> mtp_base_terminal_hidden;
         std::shared_ptr<TensorBase> prefix_terminal_logits;
 
         /// Per-device KV caches for Pipeline Parallelism
@@ -1923,6 +1924,7 @@ namespace llaminar2
             for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
                 cache.resetSessionState();
             mtp_terminal_hidden_row_select_cache_.resetSessionState();
+            mtp_base_terminal_hidden_copy_cache_.resetSessionState();
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};
             state_.clear();
@@ -2475,6 +2477,7 @@ namespace llaminar2
         };
 
         MTPTerminalHiddenRowSelectGraphCache mtp_terminal_hidden_row_select_cache_;
+        MTPTerminalHiddenRowSelectGraphCache mtp_base_terminal_hidden_copy_cache_;
 
         // =========================================================================
         // Full Forward Graph Cache (Decode Optimization)
@@ -2725,8 +2728,31 @@ namespace llaminar2
         /// Ensure a stable one-row terminal hidden buffer exists for MTP sidecar input.
         bool ensureMTPTerminalHiddenBuffer();
 
+        /// Ensure a stable one-row preserved-base terminal hidden buffer exists.
+        bool ensureMTPBaseTerminalHiddenBuffer();
+
         /// Execute the cached graph-native row select used for MTP terminal hidden refresh.
         bool executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len);
+
+        /// Preserve PREFIX_TERMINAL_HIDDEN into an isolated sidecar input row.
+        bool preserveMTPBaseTerminalHidden();
+
+        /// Commit one shifted row using the preserved base terminal hidden row.
+        bool commitMTPShiftedRowFromPreservedBaseTerminalHidden(
+            int32_t token,
+            bool allow_speculative_discard,
+            int position_offset_override);
+
+        /// Execute a cached graph-native hidden row select into an MTP buffer.
+        bool executeMTPHiddenRowSelect(
+            TensorBase *input,
+            BufferId input_buffer_id,
+            TensorBase *output,
+            BufferId output_buffer_id,
+            MTPTerminalHiddenRowSelectGraphCache &cache,
+            const char *node_name,
+            int row_idx,
+            int seq_len);
 
         /// Copy the latest forward pass terminal hidden row into the stable MTP input buffer.
         bool refreshMTPTerminalHiddenState(int seq_len, int batch_size);

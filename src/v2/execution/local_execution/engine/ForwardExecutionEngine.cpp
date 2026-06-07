@@ -1155,7 +1155,9 @@ namespace llaminar2
             if (early_capture_policy.allow_segmented_capture &&
                 forward_cache.segment_cache.consecutive_failures < early_capture_policy.max_segment_failures)
             {
-                if (forward_cache.segment_cache.ensureCaptureStream(stream_gpu_ctx))
+                if (forward_cache.segment_cache.ensureCaptureStream(
+                        stream_gpu_ctx,
+                        stream_ctx->deviceId()))
                 {
                     replay_stream = forward_cache.segment_cache.capture_stream;
                     dynamic_param_stream = replay_stream;

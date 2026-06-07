@@ -1539,6 +1539,8 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
     ASSERT_NE(short_conv_node, nullptr);
     const auto *short_conv = dynamic_cast<const ShortConv1dStage *>(short_conv_node->stage.get());
     ASSERT_NE(short_conv, nullptr);
+    EXPECT_EQ(short_conv->getParams().speculative_state_slot_rows, 3)
+        << "Phase 13.8 graph construction must request speculative state slots explicitly";
     const WorkspaceRequirements short_conv_reqs =
         short_conv->getWorkspaceRequirements(/*m=*/2);
     EXPECT_NE(short_conv_reqs.find("gdn_shortconv_verifier_state_capture_layer0"), nullptr)
@@ -1548,6 +1550,8 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
     ASSERT_NE(recurrence_node, nullptr);
     const auto *recurrence = dynamic_cast<const GDNRecurrenceStage *>(recurrence_node->stage.get());
     ASSERT_NE(recurrence, nullptr);
+    EXPECT_EQ(recurrence->getParams().speculative_state_slot_rows, 3)
+        << "Phase 13.8 graph construction must request speculative state slots explicitly";
     const WorkspaceRequirements recurrence_reqs =
         recurrence->getWorkspaceRequirements(/*m=*/2);
     EXPECT_NE(recurrence_reqs.find("gdn_verifier_state_capture_layer0"), nullptr)

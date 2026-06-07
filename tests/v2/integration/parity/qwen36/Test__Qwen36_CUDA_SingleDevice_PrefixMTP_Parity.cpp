@@ -72,31 +72,14 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPBenchmarkPromptFixedDepth3Matches
     runDenseBenchmarkStyleFixedMTPParity(cudaSingleDeviceCase(), 3);
 }
 
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138DirectDepth3MatchesPyTorchDecodeTokens)
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidateEquivalence)
 {
-    ScopedEnvironmentValues phase138_env({
-        {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
-        {"LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE", "1"},
-    });
-    runDenseMTPParity(cudaSingleDeviceCase(), false, 3);
+    runDensePhase138VllmStyleCandidateEquivalence(cudaSingleDeviceCase(), 2);
 }
 
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138DirectDepth1PrefixCacheMTPRestore)
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidatePrefixRestoreEquivalence)
 {
-    ScopedEnvironmentValues phase138_env({
-        {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
-        {"LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE", "1"},
-    });
-    runDenseMTPParity(cudaSingleDeviceCase(), true, 1);
-}
-
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138DirectDepth3BenchmarkPromptMatchesPyTorchDecodeTokens)
-{
-    ScopedEnvironmentValues phase138_env({
-        {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
-        {"LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE", "1"},
-    });
-    runDenseBenchmarkStyleFixedMTPParity(cudaSingleDeviceCase(), 3);
+    runDensePhase138VllmStyleCandidatePrefixRestoreEquivalence(cudaSingleDeviceCase(), 1);
 }
 
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleFreshRunnerDeterminism)

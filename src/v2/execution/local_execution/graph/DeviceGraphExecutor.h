@@ -403,6 +403,8 @@ namespace llaminar2
             void *capture_stream = nullptr;           ///< Locally-created blocking stream for capture/replay
             void *sync_event = nullptr;               ///< Cached event for GPU-side inter-stream sync
             IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
+            DeviceId capture_device = DeviceId::invalid(); ///< Device used to resolve the stream owner at teardown
+            bool capture_context_from_pool = false; ///< True when the stream was created by the pool context
             static constexpr int kMaxFailures = 4;    ///< Disable after N failures
 
             GraphSegmentCache() = default;
@@ -423,11 +425,15 @@ namespace llaminar2
                   perf_context(std::move(other.perf_context)),
                   capture_stream(other.capture_stream),
                   sync_event(other.sync_event),
-                  gpu_ctx_ref(other.gpu_ctx_ref)
+                  gpu_ctx_ref(other.gpu_ctx_ref),
+                  capture_device(other.capture_device),
+                  capture_context_from_pool(other.capture_context_from_pool)
             {
                 other.capture_stream = nullptr;
                 other.sync_event = nullptr;
                 other.gpu_ctx_ref = nullptr;
+                other.capture_device = DeviceId::invalid();
+                other.capture_context_from_pool = false;
                 other.capture_variant_signature = 0;
                 other.variant_recapture_count = 0;
             }
@@ -447,9 +453,13 @@ namespace llaminar2
                     capture_stream = other.capture_stream;
                     sync_event = other.sync_event;
                     gpu_ctx_ref = other.gpu_ctx_ref;
+                    capture_device = other.capture_device;
+                    capture_context_from_pool = other.capture_context_from_pool;
                     other.capture_stream = nullptr;
                     other.sync_event = nullptr;
                     other.gpu_ctx_ref = nullptr;
+                    other.capture_device = DeviceId::invalid();
+                    other.capture_context_from_pool = false;
                     other.capture_variant_signature = 0;
                     other.variant_recapture_count = 0;
                 }
@@ -474,7 +484,8 @@ namespace llaminar2
 
             /// Create a local blocking stream for graph capture via the GPU context.
             /// @param ctx GPU context that creates the stream (stored for cleanup)
-            bool ensureCaptureStream(IWorkerGPUContext *ctx);
+            bool ensureCaptureStream(IWorkerGPUContext *ctx,
+                                     DeviceId device = DeviceId::invalid());
 
             /// Wait for queued replay/capture work before graph resources are torn down.
             void synchronizeCaptureStream();
@@ -487,6 +498,9 @@ namespace llaminar2
 
             /// Destroy the cached sync event if it exists
             void destroySyncEvent();
+
+            /// Resolve the current lifecycle context for stream/event cleanup.
+            IWorkerGPUContext *resolveLifecycleContext(const char *operation);
         };
 
         /**

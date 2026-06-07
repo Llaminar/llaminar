@@ -813,6 +813,7 @@ namespace llaminar2
         conv_params.kernel_size = config_.gdn.conv_kernel_size;
         conv_params.layer_idx = layer_idx;
         conv_params.verifier_state_capture_rows = verifier_state_capture_rows;
+        conv_params.speculative_state_slot_rows = verifier_state_capture_rows;
 
         // Use kernel instance from hybrid cache (lifetime tied to cache)
         conv_params.kernel = gdn_state->conv_kernel.get();
@@ -852,6 +853,7 @@ namespace llaminar2
         rec_params.chunk_size = 64;
         rec_params.use_qk_l2norm = true;
         rec_params.verifier_state_capture_rows = verifier_state_capture_rows;
+        rec_params.speculative_state_slot_rows = verifier_state_capture_rows;
 
         // Under TP, V-heads are always sharded (each rank owns a contiguous
         // slice of global V-heads). The global_v_head_offset tells the

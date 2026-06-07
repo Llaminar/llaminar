@@ -1135,12 +1135,13 @@ namespace llaminar2
         }
 
         /**
-         * @brief Upload graph-facing spec-decode metadata and publish the committed verifier state row.
+         * @brief Upload graph-facing spec-decode metadata and publish accepted verifier state.
          *
-         * Phase 13.8 uses this to restore mutable hybrid state from
-         * committed_state_rows[request_index] without host-side row selection.
-         * Implementations must upload metadata on an explicit stream, restore
-         * all participant-local stateful layers from that device metadata, then
+         * The current compatibility bridge still names committed verifier rows,
+         * but the accepted Phase 13.8 path must publish mutable hybrid state
+         * from accepted-count/speculative state-slot metadata. Implementations
+         * must upload metadata on an explicit stream, restore all
+         * participant-local stateful layers from that device metadata, then
          * truncate KV/bookkeeping to target_cached_tokens atomically for the
          * request. Unsupported implementations must return false.
          */
