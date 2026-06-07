@@ -39,6 +39,20 @@ namespace llaminar2
 
         int main_forward_token_count = 0;
         int shifted_commit_count = 0;
+
+        /**
+         * Number of verifier input rows whose target-model state may be
+         * published directly.
+         *
+         * Stepwise catch-up forwards every committed output token, so the
+         * default (-1) means "same as accepted_tokens.size()". A vLLM-style
+         * verifier graph is different after a rejection: the correction token
+         * is sampled from the rejecting row, but that correction token has not
+         * itself been forwarded. Such candidates set this to the accepted
+         * verifier-input prefix and replay the correction suffix before
+         * claiming decode equivalence.
+         */
+        int target_verifier_state_commit_count = -1;
     };
 
     struct MTPDecodeCatchupGreedyEquivalence
@@ -52,6 +66,22 @@ namespace llaminar2
     MTPDecodeCatchupGreedyEquivalence compareMTPDecodeCatchupGreedyResults(
         const MTPDecodeCatchupGreedyResult &oracle,
         const MTPDecodeCatchupGreedyResult &candidate);
+
+    /**
+     * @brief Build the greedy catch-up result implied by target verifier rows.
+     *
+     * sampled_verifier_tokens has one row per verifier input token:
+     *   row i is the target sample after forwarding request.draft_tokens[i].
+     *
+     * This is intentionally not the same as stepwise catch-up after a reject.
+     * The rejecting row supplies a correction output token, but the live target
+     * state is only valid through the accepted verifier-input prefix. Callers
+     * must replay any correction suffix before publishing state as fully
+     * decode-equivalent.
+     */
+    MTPDecodeCatchupGreedyResult buildMTPDecodeCatchupGreedyResultFromVerifierRows(
+        const MTPDecodeCatchupGreedyRequest &request,
+        const std::vector<int32_t> &sampled_verifier_tokens);
 
     /**
      * @brief Run greedy MTP verification through normal one-token decode.

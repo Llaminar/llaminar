@@ -91,6 +91,13 @@ CUDA MoE artifact:
   accepted-prefix drift. `OrchestrationRunner` uses this bridge for its current
   transaction validation, so the live verifier path has a single contract to
   match.
+- Target-verifier row semantics are now explicit. Accept-all verifier rows can
+  publish the terminal accepted-input state and carry a separate bonus ready
+  token. Reject paths are different: the sampled correction is an emitted output
+  token, but it has not been forwarded by the verifier graph. Metadata now
+  carries `target_verifier_state_commit_count` separately from committed output
+  count so the optimized path must publish only the accepted input prefix and
+  replay the correction suffix before claiming decode-equivalent state.
 - The first equivalence harness primitive is in place:
   `compareMTPDecodeCatchupGreedyResults()` allows fewer candidate main forwards
   but requires identical committed tokens, ready/reject semantics, and shifted

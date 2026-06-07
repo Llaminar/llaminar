@@ -299,6 +299,65 @@ TEST(Test__MTPDecodeCatchup, EquivalenceRejectsShiftedCommitCountDrift)
     EXPECT_THAT(eq.error, HasSubstr("shifted MTP commit count mismatch"));
 }
 
+TEST(Test__MTPDecodeCatchup, BuildsVerifierRowsResultForAcceptAll)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildMTPDecodeCatchupGreedyResultFromVerifierRows(
+            request,
+            /*sampled_verifier_tokens=*/{9, 8, 4});
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9, 8));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(9, 8));
+    EXPECT_TRUE(result.all_speculative_accepted);
+    EXPECT_EQ(result.accepted_speculative_prefix, 2);
+    EXPECT_EQ(result.ready_token, 4);
+    EXPECT_EQ(result.main_forward_token_count, 3);
+    EXPECT_EQ(result.shifted_commit_count, 3);
+    EXPECT_EQ(result.target_verifier_state_commit_count, 3);
+}
+
+TEST(Test__MTPDecodeCatchup, BuildsVerifierRowsResultForRejectAfterPrefix)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildMTPDecodeCatchupGreedyResultFromVerifierRows(
+            request,
+            /*sampled_verifier_tokens=*/{9, 3, 4});
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9, 3));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(9, 3));
+    EXPECT_FALSE(result.all_speculative_accepted);
+    EXPECT_EQ(result.accepted_speculative_prefix, 1);
+    EXPECT_EQ(result.rejected_verified_token, 3);
+    EXPECT_EQ(result.ready_token, -1)
+        << "the correction token has not been forwarded by the target verifier rows";
+    EXPECT_EQ(result.main_forward_token_count, 3);
+    EXPECT_EQ(result.shifted_commit_count, 3);
+    EXPECT_EQ(result.target_verifier_state_commit_count, 2)
+        << "state is valid through first token plus accepted speculative prefix only";
+}
+
+TEST(Test__MTPDecodeCatchup, RejectsVerifierRowsAcceptAllWithoutReadyToken)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildMTPDecodeCatchupGreedyResultFromVerifierRows(
+            request,
+            /*sampled_verifier_tokens=*/{9, 8, -1});
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("ready token"));
+}
+
 TEST(Test__MTPDecodeCatchup, SharedStepwiseStopTokenDiscardsReadyToken)
 {
     FakeCatchupRunner runner;

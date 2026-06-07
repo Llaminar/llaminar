@@ -117,6 +117,8 @@ namespace llaminar2
             !has_size(batch.target_query_lens, requests) ||
             !has_size(batch.valid_sampled_counts, requests) ||
             !has_size(batch.committed_output_counts, requests) ||
+            (!batch.target_verifier_state_commit_counts.empty() &&
+             !has_size(batch.target_verifier_state_commit_counts, requests)) ||
             !has_size(batch.rejected_token_counts, requests) ||
             !has_size(batch.all_drafts_accepted_flags, requests) ||
             !has_size(batch.stopped_flags, requests) ||
@@ -140,6 +142,10 @@ namespace llaminar2
             const int target_query_len = batch.target_query_lens[static_cast<size_t>(i)];
             const int valid_sampled_count = batch.valid_sampled_counts[static_cast<size_t>(i)];
             const int committed_count = batch.committed_output_counts[static_cast<size_t>(i)];
+            const int state_commit_count =
+                batch.target_verifier_state_commit_counts.empty()
+                    ? committed_count
+                    : batch.target_verifier_state_commit_counts[static_cast<size_t>(i)];
             const int rejected_count = batch.rejected_token_counts[static_cast<size_t>(i)];
             const bool all_drafts_accepted =
                 batch.all_drafts_accepted_flags[static_cast<size_t>(i)] != 0;
@@ -173,6 +179,12 @@ namespace llaminar2
             {
                 return fail_request("committed output count is outside valid sampled prefix");
             }
+            if (state_commit_count < 0 ||
+                state_commit_count > committed_count ||
+                state_commit_count > draft_count)
+            {
+                return fail_request("target verifier state commit count is outside committed verifier-input prefix");
+            }
             if (rejected_count != target_query_len - valid_sampled_count)
                 return fail_request("rejected token count does not match valid sampled prefix");
 
@@ -197,9 +209,9 @@ namespace llaminar2
                     bonus_index;
             }
 
-            if (committed_count > 0)
+            if (state_commit_count > 0)
             {
-                const int committed_row = committed_count - 1;
+                const int committed_row = state_commit_count - 1;
                 const int32_t committed_index =
                     batch.state_indices[static_cast<size_t>(target_offset + committed_row)];
                 if (committed_index < 0)
@@ -220,6 +232,21 @@ namespace llaminar2
         const std::vector<int32_t> &committed_output_counts,
         const std::vector<int32_t> &stopped_flags)
     {
+        return buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
+            shape,
+            requests,
+            committed_output_counts,
+            committed_output_counts,
+            stopped_flags);
+    }
+
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<MTPSpecDecodeRequest> &requests,
+        const std::vector<int32_t> &committed_output_counts,
+        const std::vector<int32_t> &target_verifier_state_commit_counts,
+        const std::vector<int32_t> &stopped_flags)
+    {
         if (!shape.valid())
             return metadataFailure(shape, "invalid MTP spec-decode metadata shape");
         if (requests.empty())
@@ -228,6 +255,8 @@ namespace llaminar2
             return metadataFailure(shape, "MTP spec-decode metadata batch exceeds max_requests");
         if (committed_output_counts.size() != requests.size())
             return metadataFailure(shape, "committed output count vector does not match request count");
+        if (target_verifier_state_commit_counts.size() != requests.size())
+            return metadataFailure(shape, "target verifier state commit count vector does not match request count");
         if (stopped_flags.size() != requests.size())
             return metadataFailure(shape, "stopped flag vector does not match request count");
 
@@ -245,6 +274,7 @@ namespace llaminar2
         fillZero(batch.valid_sampled_counts, requests_slots);
         fillZero(batch.accepted_draft_prefixes, requests_slots);
         fillZero(batch.committed_output_counts, requests_slots);
+        fillZero(batch.target_verifier_state_commit_counts, requests_slots);
         fillZero(batch.rejected_token_counts, requests_slots);
         fillInvalid(batch.token_indices_to_sample, requests_slots);
         fillInvalid(batch.next_condition_tokens, requests_slots);
@@ -289,6 +319,16 @@ namespace llaminar2
                     shape,
                     "committed output count is outside the valid sampled prefix");
             }
+            const int32_t state_commit_count =
+                target_verifier_state_commit_counts[request_index];
+            if (state_commit_count < 0 ||
+                state_commit_count > committed_count ||
+                state_commit_count > tx.draft_count)
+            {
+                return metadataFailure(
+                    shape,
+                    "target verifier state commit count is outside committed verifier-input prefix");
+            }
 
             const int i = static_cast<int>(request_index);
             const int draft_offset = i * shape.max_draft_tokens;
@@ -299,6 +339,8 @@ namespace llaminar2
             batch.accepted_draft_prefixes[request_index] = tx.accepted_speculative_prefix;
             batch.committed_output_counts[request_index] =
                 committed_count;
+            batch.target_verifier_state_commit_counts[request_index] =
+                state_commit_count;
             batch.rejected_token_counts[request_index] = tx.rejected_token_count;
             batch.token_indices_to_sample[request_index] = tx.token_index_to_sample;
             batch.next_condition_tokens[request_index] = tx.next_condition_token;
@@ -393,10 +435,14 @@ namespace llaminar2
                 result.all_speculative_accepted,
                 result.stopped_on_output);
         MTPSpecDecodeMetadataBatch batch =
-            buildMTPSpecDecodeMetadataBatch(
+            buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
                 shape,
                 {spec_request},
                 {static_cast<int32_t>(result.accepted_tokens.size())},
+                {static_cast<int32_t>(
+                    result.target_verifier_state_commit_count >= 0
+                        ? result.target_verifier_state_commit_count
+                        : static_cast<int>(result.accepted_tokens.size()))},
                 {result.stopped_on_output ? 1 : 0});
         if (!batch.ok)
             return batch;

@@ -449,6 +449,64 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsMetadataFromGreedyCatchupRejectAfterPref
                 ElementsAre(7, 9, 3, kMTPSpecDecodeInvalidToken));
 }
 
+TEST(Test__MTPSpecDecodeMetadata, UsesExplicitVerifierStateCommitCountForRejectedCorrection)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    MTPDecodeCatchupGreedyResult result =
+        buildMTPDecodeCatchupGreedyResultFromVerifierRows(
+            request,
+            /*sampled_verifier_tokens=*/{9, 3, 4});
+    ASSERT_TRUE(result.ok) << result.error;
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+            shape,
+            /*request_id=*/0,
+            /*vocab_size=*/100,
+            request,
+            result);
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    ASSERT_THAT(batch.committed_output_counts, SizeIs(1));
+    ASSERT_THAT(batch.target_verifier_state_commit_counts, SizeIs(1));
+    ASSERT_THAT(batch.committed_state_rows, SizeIs(1));
+    EXPECT_EQ(batch.committed_output_counts[0], 3)
+        << "the correction token is still emitted to the user";
+    EXPECT_EQ(batch.target_verifier_state_commit_counts[0], 2)
+        << "but target verifier rows only carry state through the accepted input prefix";
+    EXPECT_EQ(batch.committed_state_rows[0], 1);
+    EXPECT_EQ(batch.committed_state_indices[0], 1);
+    EXPECT_EQ(batch.bonus_ready_token_rows[0], kMTPSpecDecodeInvalidToken);
+}
+
+TEST(Test__MTPSpecDecodeMetadata, RejectsStateCommitCountPastVerifierInputPrefix)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 2;
+
+    MTPSpecDecodeRequest request;
+    request.vocab_size = 100;
+    request.draft_tokens = {7, 9};
+    request.sampled_tokens = {7, 9, 4};
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
+            shape,
+            {request},
+            /*committed_output_counts=*/{2},
+            /*target_verifier_state_commit_counts=*/{3},
+            /*stopped_flags=*/{0});
+
+    EXPECT_FALSE(batch.ok);
+    EXPECT_THAT(batch.error, HasSubstr("state commit count"));
+}
+
 TEST(Test__MTPSpecDecodeMetadata, RejectsGreedyCatchupAcceptedPrefixDrift)
 {
     MTPSpecDecodeMetadataShape shape;

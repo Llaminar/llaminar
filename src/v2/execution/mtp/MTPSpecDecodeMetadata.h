@@ -60,6 +60,7 @@ namespace llaminar2
         std::vector<int32_t> valid_sampled_counts;
         std::vector<int32_t> accepted_draft_prefixes;
         std::vector<int32_t> committed_output_counts;
+        std::vector<int32_t> target_verifier_state_commit_counts;
         std::vector<int32_t> rejected_token_counts;
         std::vector<int32_t> token_indices_to_sample;
         std::vector<int32_t> next_condition_tokens;
@@ -97,6 +98,13 @@ namespace llaminar2
         const MTPSpecDecodeMetadataShape &shape,
         const std::vector<MTPSpecDecodeRequest> &requests,
         const std::vector<int32_t> &committed_output_counts,
+        const std::vector<int32_t> &stopped_flags);
+
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<MTPSpecDecodeRequest> &requests,
+        const std::vector<int32_t> &committed_output_counts,
+        const std::vector<int32_t> &target_verifier_state_commit_counts,
         const std::vector<int32_t> &stopped_flags);
 
     MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(

@@ -2257,11 +2257,14 @@ For one request and greedy MTP depth `D`:
    - `rejected_token_count = D + 1 - valid_sampled_count`;
    - `token_index_to_sample = valid_sampled_count - 1`;
    - `next_condition_token = last valid sampled token`, or a backup token for discarded requests.
-5. Shared state-commit metadata computes the one live state row separately from any bonus ready-token row:
-   - `committed_state_row = committed_output_count - 1` when at least one output token is committed;
+5. Shared state-commit metadata computes the one live verifier state row separately from emitted output tokens and any bonus ready-token row:
+   - `committed_output_count` is the number of tokens emitted to the user for this transaction;
+   - `target_verifier_state_commit_count` is the number of target verifier input rows whose state can be published directly;
+   - on accept-all, `target_verifier_state_commit_count == committed_output_count == draft_count`;
+   - after a rejection, the sampled correction token is emitted but has not itself been forwarded by the target verifier graph, so `target_verifier_state_commit_count` stops at the accepted verifier-input prefix and the correction suffix must be replayed before the transaction can claim decode-equivalent state;
    - `bonus_ready_token_row = valid_sampled_count - 1` only for the all-drafts-accepted terminal row that supplies the next condition token;
    - the bonus ready-token row must never be published as live GDN/short-conv state, because it has not been committed as an output token.
-6. Stateful GDN/short-conv stages consume accepted-token count, committed-state row/index metadata, and full state indices. They may compute all verifier rows, but only the committed output prefix becomes the live conv/recurrent state.
+6. Stateful GDN/short-conv stages consume accepted-token count, committed-state row/index metadata, and full state indices. They may compute all verifier rows, but only the accepted verifier-input prefix becomes live conv/recurrent state until any correction suffix is replayed.
 7. Full-attention KV is truncated/committed to the accepted prefix, and shifted MTP KV commits accepted target hidden rows only.
 8. `MTPStateTransaction` publishes terminal hidden/logits, ready token, logical token count, main KV count, shifted MTP KV count, sampler history, and stats together.
 9. Any failure before commit restores the checkpoint. Any failure after partial commit is a hard failure until the transaction has a rollback proof.
@@ -2290,8 +2293,9 @@ Layering:
   - upload/bind spec-decode metadata on an explicit non-null stream before graph
     replay;
   - publish live GDN/short-conv state from `committed_state_rows`;
-  - truncate/commit main KV and shifted MTP KV to the transaction's committed
-    output count.
+  - truncate/commit main KV and shifted MTP KV to the transaction's verified
+    state count, then replay any correction suffix before publishing full
+    committed output state.
 - Backend kernels may read device metadata and verifier-state capture buffers,
   but they must not allocate, upload host data, mutate tensor residency flags, or
   use the default/null GPU stream inside captured work.
@@ -2328,13 +2332,13 @@ falling back or partially publishing state.
 
 1. Shared transaction metadata.
    - Add `MTPSpecDecodeTransaction` with request, transaction, and batch-summary structs.
-   - Compute valid sampled count, accepted prefix, rejected suffix count, sample index, next condition token, committed output tokens, and rejected draft tokens without backend-specific logic.
+   - Compute valid sampled count, accepted prefix, rejected suffix count, sample index, next condition token, committed output tokens, target verifier state commit count, and rejected draft tokens without backend-specific logic.
    - Add unit tests for accept-all, reject-after-prefix, reject-first, discarded request, malformed non-contiguous sampled rows, and batch summary totals.
    - Wire structured counters so benchmark JSON can distinguish `shared_stepwise` from `vllm_style_spec_decode`.
 
 2. Graph-facing metadata buffers.
    - Add device buffers for draft counts, accepted-token counts, rejected-token counts, token indices to sample, query start locations, and state indices.
-   - Add per-request committed-state row/index and bonus-ready-token row/index buffers so kernels can distinguish live state publication from the terminal all-accepted bonus sample.
+   - Add per-request committed-state row/index and bonus-ready-token row/index buffers so kernels can distinguish live state publication from emitted correction tokens and from the terminal all-accepted bonus sample.
    - Stage dynamic metadata before graph capture/replay on explicit non-null streams.
    - Captured replay must not include H2D uploads, lazy allocations, or default/null stream operations.
    - Metadata storage must use declared workspace or persistent runner-owned buffers, not ad hoc GPU allocations.
@@ -2348,7 +2352,7 @@ falling back or partially publishing state.
 4. SingleDevice dense runner path.
    - Implement a named optimized hook, initially `vllm_style_spec_decode`.
    - Restrict first promotion to greedy SingleDevice dense Qwen3.6/Qwen3.5 with one active request.
-   - The hook runs the target verifier graph, samples rows, builds the transaction metadata, commits accepted target hidden rows to shifted MTP KV, updates hybrid state by accepted count, and returns the same high-level result shape as the oracle.
+   - The hook runs the target verifier graph, samples rows, builds the transaction metadata, commits accepted target hidden rows to shifted MTP KV, updates hybrid state by target verifier state commit count, replays any correction suffix, and returns the same high-level result shape as the oracle.
    - A debug/equivalence mode must run `shared_stepwise` and the new path from the same checkpoint and compare committed state before promotion.
 
 5. CUDA and ROCm promotion.
@@ -2380,6 +2384,16 @@ falling back or partially publishing state.
 - First equivalence harness primitive is focused-green: `compareMTPDecodeCatchupGreedyResults()` compares oracle and candidate catch-up results for committed tokens, verifier tokens, acceptance flags, rejected token, ready token, and shifted MTP commit count while intentionally allowing the candidate to use fewer main forwards. This gives the future live verifier transaction a shared result-level gate before backend state snapshots are compared. Focused validation passed on 2026-06-07 for `V2_Unit_MTPDecodeCatchup`.
 - Runtime state equivalence primitive is focused-green: `compareMTPRuntimeStateSnapshots()` compares oracle and candidate `PrefixRuntimeStateSnapshot` values for decode position, per-sequence lengths, main KV token counts, shifted MTP KV token counts, terminal hidden/logit availability, and GDN short-conv/recurrent state hashes. This is the state-level half of the non-promoted equivalence harness for the future live verifier transaction. Focused validation passed on 2026-06-07 for `V2_Unit_MTPStateTransaction`.
 - Runner-level equivalence harness is scaffolded and focused-green: setting `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1` around a named optimized catch-up candidate now runs the candidate, captures its runtime snapshot, restores the verifier base checkpoint, runs the `shared_stepwise` oracle, compares result and runtime-state equivalence, and only continues if both match. The harness records `mtp.phase138_spec_decode_equivalence_matches`; it remains opt-in development instrumentation and does not promote `vllm_style_spec_decode`. Focused validation passed on 2026-06-07 for `V2_Unit_PrefillDecodeTransition`.
+- Target-verifier row semantics are now explicit and focused-green:
+  `buildMTPDecodeCatchupGreedyResultFromVerifierRows()` converts sampled target
+  verifier rows into the same catch-up result shape as the oracle while carrying
+  `target_verifier_state_commit_count`. `MTPSpecDecodeMetadata` can now build a
+  metadata batch with an explicit verifier-state commit count separate from
+  committed output count. This pins the vLLM-style rejection invariant: a
+  sampled correction token may be emitted, but verifier state is only live
+  through the accepted input prefix until the correction suffix is replayed.
+  Focused validation passed on 2026-06-07 for `V2_Unit_MTPDecodeCatchup` and
+  `V2_Unit_MTPSpecDecodeMetadata`.
 - Next implementation gate: build the live target-verifier transaction path and
   equivalence harness. The metadata/state-publication primitives are now present,
   so remaining blockers are graph integration, shifted MTP KV commit from
