@@ -676,7 +676,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Restore mutable verifier state using device-side accepted-state slots.
+         * @brief Publish mutable verifier state using device-side accepted-state slots.
          *
          * Phase 13.8 spec-decode transactions compute accepted state-slot
          * indices as graph-visible metadata. Stateful stages use this hook to
@@ -684,7 +684,7 @@ namespace llaminar2
          * row or captured H2D. Implementations must use the supplied explicit
          * stream and fail if it is null.
          */
-        virtual bool restoreVerifierStateCaptureRowFromDeviceMetadata(
+        virtual bool publishAcceptedSpeculativeStateFromDeviceMetadata(
             const int32_t *device_accepted_state_slot_indices,
             int request_index,
             void *stream)

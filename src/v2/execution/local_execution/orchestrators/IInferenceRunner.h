@@ -1137,13 +1137,12 @@ namespace llaminar2
         /**
          * @brief Upload graph-facing spec-decode metadata and publish accepted verifier state.
          *
-         * The current compatibility bridge still names committed verifier rows,
-         * but the accepted Phase 13.8 path must publish mutable hybrid state
-         * from accepted-count/speculative state-slot metadata. Implementations
-         * must upload metadata on an explicit stream, restore all
-         * participant-local stateful layers from that device metadata, then
-         * truncate KV/bookkeeping to target_cached_tokens atomically for the
-         * request. Unsupported implementations must return false.
+         * The accepted Phase 13.8 path publishes mutable hybrid state from
+         * accepted-count/speculative state-slot metadata. Implementations must
+         * upload metadata on an explicit stream, publish all participant-local
+         * stateful layers from that device metadata, then truncate
+         * KV/bookkeeping to target_cached_tokens atomically for the request.
+         * Unsupported implementations must return false.
          */
         virtual bool restoreMTPVerifierStateFromSpecDecodeMetadata(
             const MTPSpecDecodeMetadataBatch &batch,

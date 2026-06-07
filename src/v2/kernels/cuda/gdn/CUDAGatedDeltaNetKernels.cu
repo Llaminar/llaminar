@@ -918,7 +918,7 @@ namespace
 
 namespace
 {
-    __global__ void cuda_gdn_restore_state_from_capture_metadata_kernel(
+    __global__ void cuda_gdn_publish_accepted_speculative_state_from_metadata_kernel(
         float *__restrict__ dst_state,
         const float *__restrict__ state_snapshots,
         const int32_t *__restrict__ device_accepted_state_slot_indices,
@@ -1003,7 +1003,7 @@ extern "C"
         cudaStreamSynchronize((cudaStream_t)stream);
     }
 
-    bool cudaGDN_restore_state_from_capture_metadata(
+    bool cudaGDN_publish_accepted_speculative_state_from_metadata(
         float *dst_state,
         const float *state_snapshots,
         const int32_t *device_accepted_state_slot_indices,
@@ -1024,7 +1024,7 @@ extern "C"
         cudaSetDevice(device_idx);
         constexpr int threads = 256;
         const int blocks = (state_floats + threads - 1) / threads;
-        cuda_gdn_restore_state_from_capture_metadata_kernel<<<
+        cuda_gdn_publish_accepted_speculative_state_from_metadata_kernel<<<
             blocks, threads, 0, (cudaStream_t)stream>>>(
             dst_state,
             state_snapshots,
@@ -1037,7 +1037,7 @@ extern "C"
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            fprintf(stderr, "[cudaGDN_restore_state_from_capture_metadata] %s\n",
+            fprintf(stderr, "[cudaGDN_publish_accepted_speculative_state_from_metadata] %s\n",
                     cudaGetErrorString(err));
             return false;
         }

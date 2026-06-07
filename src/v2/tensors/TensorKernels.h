@@ -2943,16 +2943,13 @@ namespace llaminar2
         }
 
         /**
-         * @brief Restore conv state from an accepted verifier state slot read from device metadata.
+         * @brief Publish live conv state from accepted speculative state metadata.
          *
-         * This is the graph-capturable companion to restoreStateFromSnapshot().
-         * The selected verifier snapshot row lives in
-         * device_accepted_state_slot_indices[request_index], so replay can
-         * publish the accepted MTP prefix without a host-selected row or any
-         * captured H2D node. GPU implementations must require a non-null
-         * explicit stream.
+         * Phase 13.8 treats the device metadata slot as an accepted-count
+         * publication decision, not a host-selected verifier rollback row. GPU
+         * implementations must require a non-null explicit stream.
          */
-        virtual bool restoreVerifierStateCaptureRowFromDeviceMetadata(
+        virtual bool publishAcceptedSpeculativeStateFromDeviceMetadata(
             float *state,
             const int32_t *device_accepted_state_slot_indices,
             int request_index,
@@ -2963,29 +2960,6 @@ namespace llaminar2
             (void)request_index;
             (void)stream;
             return false;
-        }
-
-        /**
-         * @brief Publish live conv state from accepted speculative state metadata.
-         *
-         * Phase 13.8 treats the device metadata slot as an accepted-count
-         * publication decision, not a host-selected verifier rollback row.
-         * Existing backends still implement this through verifier snapshot
-         * storage during the migration; callers should use this semantic entry
-         * point so the implementation can move to true speculative slots
-         * without changing runner code.
-         */
-        virtual bool publishAcceptedSpeculativeStateFromDeviceMetadata(
-            float *state,
-            const int32_t *device_accepted_state_slot_indices,
-            int request_index,
-            void *stream)
-        {
-            return restoreVerifierStateCaptureRowFromDeviceMetadata(
-                state,
-                device_accepted_state_slot_indices,
-                request_index,
-                stream);
         }
 
         /**
@@ -3272,16 +3246,13 @@ namespace llaminar2
         }
 
         /**
-         * @brief Restore recurrence state from an accepted verifier state slot read from device metadata.
+         * @brief Publish live recurrence state from accepted speculative state metadata.
          *
-         * This is the graph-capturable companion to restoreStateFromSnapshot().
-         * The selected verifier snapshot row lives in
-         * device_accepted_state_slot_indices[request_index], which lets the
-         * Phase 13.8 spec-decode transaction publish accepted state inside a
-         * captured graph without host row selection. GPU implementations must
-         * require a non-null explicit stream.
+         * Phase 13.8 treats the device metadata slot as an accepted-count
+         * publication decision, not a host-selected verifier rollback row. GPU
+         * implementations must require a non-null explicit stream.
          */
-        virtual bool restoreVerifierStateCaptureRowFromDeviceMetadata(
+        virtual bool publishAcceptedSpeculativeStateFromDeviceMetadata(
             float *state,
             const int32_t *device_accepted_state_slot_indices,
             int request_index,
@@ -3292,28 +3263,6 @@ namespace llaminar2
             (void)request_index;
             (void)stream;
             return false;
-        }
-
-        /**
-         * @brief Publish live recurrence state from accepted speculative state metadata.
-         *
-         * This is the accepted-count Phase 13.8 spelling of
-         * restoreVerifierStateCaptureRowFromDeviceMetadata(). The compatibility
-         * implementation still copies from verifier snapshot storage, but
-         * runner code should call this method so CUDA, ROCm, and CPU can
-         * converge on true speculative state slots behind the interface.
-         */
-        virtual bool publishAcceptedSpeculativeStateFromDeviceMetadata(
-            float *state,
-            const int32_t *device_accepted_state_slot_indices,
-            int request_index,
-            void *stream)
-        {
-            return restoreVerifierStateCaptureRowFromDeviceMetadata(
-                state,
-                device_accepted_state_slot_indices,
-                request_index,
-                stream);
         }
 
         /**

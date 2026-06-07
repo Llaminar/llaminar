@@ -861,11 +861,11 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceDeviceMetadataRestoreCapturesAnd
         d_verifier_out.ptr, nullptr,
         verifier_len, n_heads, d_k, d_v,
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
-    ASSERT_FALSE(verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
+    ASSERT_FALSE(verifier_kernel.publishAcceptedSpeculativeStateFromDeviceMetadata(
         nullptr, d_accepted_state_slots.ptr, metadata_request_index, nullptr));
 
     captureAndLaunchOnce(stream.stream, [&] {
-        return verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
+        return verifier_kernel.publishAcceptedSpeculativeStateFromDeviceMetadata(
                    nullptr, d_accepted_state_slots.ptr, metadata_request_index, stream.stream) &&
                verifier_kernel.recurrent_step(
                    d_Q_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
@@ -1611,11 +1611,11 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvDeviceMetadataRestoreCapturesAndM
         nullptr,
         verifier_len, channels, kernel_size,
         /*apply_silu=*/true));
-    ASSERT_FALSE(verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
+    ASSERT_FALSE(verifier_kernel.publishAcceptedSpeculativeStateFromDeviceMetadata(
         nullptr, d_accepted_state_slots.ptr, metadata_request_index, nullptr));
 
     captureAndLaunchOnce(stream.stream, [&] {
-        return verifier_kernel.restoreVerifierStateCaptureRowFromDeviceMetadata(
+        return verifier_kernel.publishAcceptedSpeculativeStateFromDeviceMetadata(
                    nullptr, d_accepted_state_slots.ptr, metadata_request_index, stream.stream) &&
                verifier_kernel.forward(
                    d_input.ptr + static_cast<size_t>(continuation_row) * channels,

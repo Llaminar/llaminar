@@ -64,7 +64,7 @@ extern "C"
     void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void rocmGDN_gpu_set_device(int ordinal);
     void rocmGDN_stream_synchronize(void *stream);
-    bool rocmGDN_restore_state_from_capture_metadata(
+    bool rocmGDN_publish_accepted_speculative_state_from_metadata(
         float *dst_state,
         const float *state_snapshots,
         const int32_t *device_accepted_state_slot_indices,
@@ -134,7 +134,7 @@ namespace llaminar2
             return true;
         }
 
-        bool restoreVerifierStateCaptureRowFromDeviceMetadata(
+        bool publishAcceptedSpeculativeStateFromDeviceMetadata(
             float *dst_state,
             const int32_t *device_accepted_state_slot_indices,
             int request_index,
@@ -151,7 +151,7 @@ namespace llaminar2
             }
 
             rocmGDN_gpu_set_device(device_ordinal_);
-            return rocmGDN_restore_state_from_capture_metadata(
+            return rocmGDN_publish_accepted_speculative_state_from_metadata(
                 gpu_state_,
                 verifier_state_capture_,
                 device_accepted_state_slot_indices,

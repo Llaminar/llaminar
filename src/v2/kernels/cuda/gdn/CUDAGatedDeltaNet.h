@@ -68,7 +68,7 @@ extern "C"
     void cudaGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void cudaGDN_gpu_set_device(int ordinal);
     void cudaGDN_stream_synchronize(void *stream);
-    bool cudaGDN_restore_state_from_capture_metadata(
+    bool cudaGDN_publish_accepted_speculative_state_from_metadata(
         float *dst_state,
         const float *state_snapshots,
         const int32_t *device_accepted_state_slot_indices,
@@ -142,7 +142,7 @@ namespace llaminar2
             return true;
         }
 
-        bool restoreVerifierStateCaptureRowFromDeviceMetadata(
+        bool publishAcceptedSpeculativeStateFromDeviceMetadata(
             float *dst_state,
             const int32_t *device_accepted_state_slot_indices,
             int request_index,
@@ -159,7 +159,7 @@ namespace llaminar2
             }
 
             cudaGDN_gpu_set_device(device_ordinal_);
-            return cudaGDN_restore_state_from_capture_metadata(
+            return cudaGDN_publish_accepted_speculative_state_from_metadata(
                 gpu_state_,
                 verifier_state_capture_,
                 device_accepted_state_slot_indices,

@@ -918,7 +918,7 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
 
 namespace {
 
-__global__ void rocm_gdn_restore_state_from_capture_metadata_kernel(
+__global__ void rocm_gdn_publish_accepted_speculative_state_from_metadata_kernel(
     float *__restrict__ dst_state,
     const float *__restrict__ state_snapshots,
     const int32_t *__restrict__ device_accepted_state_slot_indices,
@@ -1000,7 +1000,7 @@ void rocmGDN_stream_synchronize(void *stream)
     hipStreamSynchronize((hipStream_t)stream);
 }
 
-bool rocmGDN_restore_state_from_capture_metadata(
+bool rocmGDN_publish_accepted_speculative_state_from_metadata(
     float *dst_state,
     const float *state_snapshots,
     const int32_t *device_accepted_state_slot_indices,
@@ -1021,7 +1021,7 @@ bool rocmGDN_restore_state_from_capture_metadata(
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     constexpr int threads = 256;
     const int blocks = (state_floats + threads - 1) / threads;
-    hipLaunchKernelGGL(rocm_gdn_restore_state_from_capture_metadata_kernel,
+    hipLaunchKernelGGL(rocm_gdn_publish_accepted_speculative_state_from_metadata_kernel,
         dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
         dst_state,
         state_snapshots,
@@ -1034,7 +1034,7 @@ bool rocmGDN_restore_state_from_capture_metadata(
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
-        fprintf(stderr, "[rocmGDN_restore_state_from_capture_metadata] %s\n",
+        fprintf(stderr, "[rocmGDN_publish_accepted_speculative_state_from_metadata] %s\n",
                 hipGetErrorString(err));
         return false;
     }

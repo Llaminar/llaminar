@@ -313,7 +313,7 @@ namespace llaminar2
             stream ? stream : gpuStream());
     }
 
-    bool ShortConv1dStage::restoreVerifierStateCaptureRowFromDeviceMetadata(
+    bool ShortConv1dStage::publishAcceptedSpeculativeStateFromDeviceMetadata(
         const int32_t *device_accepted_state_slot_indices,
         int request_index,
         void *stream)
@@ -324,7 +324,7 @@ namespace llaminar2
         {
             return false;
         }
-        return params_.kernel->restoreVerifierStateCaptureRowFromDeviceMetadata(
+        return params_.kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
             params_.conv_state,
             device_accepted_state_slot_indices,
             request_index,
