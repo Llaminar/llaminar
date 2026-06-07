@@ -84,6 +84,7 @@ namespace llaminar2
     class ExpertWeightPayloadProvider;
     class PreparedWeightStore;
     class FrozenModelWeightSet;
+    class MTPSpecDecodeMetadataWorkspaceBinding;
     class PrefixStateCache;
     class RamPrefixStorageBackend;
     class DiskPrefixStorageBackend;
@@ -2536,6 +2537,9 @@ namespace llaminar2
         void *stochastic_verify_thresholds_dev_ = nullptr;   ///< FP32 [1, 4]
         std::array<int, 4> stochastic_target_top_k_ = {0, 0, 0, 0};
         std::array<int, 3> stochastic_draft_top_k_ = {0, 0, 0};
+
+        /// Persistent graph-facing MTP spec-decode metadata workspace binding.
+        std::unique_ptr<MTPSpecDecodeMetadataWorkspaceBinding> mtp_spec_decode_metadata_workspace_;
 
         /// Owned tensors when using graph-managed allocation
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;

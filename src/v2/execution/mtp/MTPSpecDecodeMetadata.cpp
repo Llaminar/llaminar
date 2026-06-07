@@ -1,7 +1,12 @@
 #include "MTPSpecDecodeMetadata.h"
 
+#include "../../backends/IBackend.h"
+#include "../local_execution/device/DeviceWorkspaceManager.h"
+
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
+#include <sstream>
 #include <utility>
 
 namespace llaminar2
@@ -182,6 +187,277 @@ namespace llaminar2
         batch.query_start_locs[requests.size()] = query_cursor;
         batch.total_target_query_tokens = query_cursor;
         return batch;
+    }
+
+    bool MTPSpecDecodeMetadataDevicePointers::complete() const
+    {
+        return draft_counts &&
+               target_query_lens &&
+               valid_sampled_counts &&
+               accepted_draft_prefixes &&
+               committed_output_counts &&
+               rejected_token_counts &&
+               token_indices_to_sample &&
+               next_condition_tokens &&
+               all_drafts_accepted_flags &&
+               stopped_flags &&
+               query_start_locs &&
+               state_indices &&
+               draft_tokens &&
+               sampled_tokens;
+    }
+
+    MTPSpecDecodeMetadataWorkspaceBinding::MTPSpecDecodeMetadataWorkspaceBinding(
+        MTPSpecDecodeMetadataShape shape)
+        : shape_(shape)
+    {
+    }
+
+    void MTPSpecDecodeMetadataWorkspaceBinding::setShape(
+        MTPSpecDecodeMetadataShape shape)
+    {
+        shape_ = shape;
+        refreshDevicePointers();
+    }
+
+    MTPSpecDecodeMetadataShape MTPSpecDecodeMetadataWorkspaceBinding::effectiveShape(
+        int m,
+        int n,
+        int k) const
+    {
+        MTPSpecDecodeMetadataShape effective = shape_;
+        if (m > 0)
+            effective.max_requests = std::max(effective.max_requests, m);
+        if (n > 0)
+            effective.max_draft_tokens =
+                std::max(effective.max_draft_tokens, n);
+        if (k > 0)
+            effective.max_draft_tokens =
+                std::max(effective.max_draft_tokens, k);
+        return effective;
+    }
+
+    WorkspaceRequirements MTPSpecDecodeMetadataWorkspaceBinding::getWorkspaceRequirements(
+        int m,
+        int n,
+        int k) const
+    {
+        return buildMTPSpecDecodeWorkspaceRequirements(effectiveShape(m, n, k));
+    }
+
+    void MTPSpecDecodeMetadataWorkspaceBinding::bindWorkspace(
+        DeviceWorkspaceManager *workspace)
+    {
+        workspace_ = workspace;
+        refreshDevicePointers();
+    }
+
+    bool MTPSpecDecodeMetadataWorkspaceBinding::hasWorkspace() const
+    {
+        return workspace_ != nullptr && device_pointers_.complete();
+    }
+
+    void MTPSpecDecodeMetadataWorkspaceBinding::refreshDevicePointers()
+    {
+        device_pointers_ = {};
+        binding_error_.clear();
+        if (!workspace_)
+            return;
+
+        const WorkspaceRequirements reqs =
+            buildMTPSpecDecodeWorkspaceRequirements(shape_);
+        if (reqs.buffers.empty())
+        {
+            binding_error_ = "invalid MTP spec-decode metadata workspace shape";
+            return;
+        }
+
+        std::ostringstream error;
+        auto bind_int32 = [&](const char *name, int32_t **out) -> bool
+        {
+            const WorkspaceDescriptor *desc = reqs.find(name);
+            if (!desc)
+            {
+                error << "missing descriptor for " << name;
+                return false;
+            }
+            if (!workspace_->hasBuffer(name))
+            {
+                error << "workspace missing buffer " << name;
+                return false;
+            }
+            const size_t size = workspace_->getBufferSize(name);
+            if (size < desc->size_bytes)
+            {
+                error << "workspace buffer " << name << " is too small: "
+                      << size << " < " << desc->size_bytes;
+                return false;
+            }
+            *out = static_cast<int32_t *>(workspace_->getBuffer(name));
+            if (!*out)
+            {
+                error << "workspace buffer " << name << " returned null";
+                return false;
+            }
+            return true;
+        };
+
+        if (!bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::DRAFT_COUNTS,
+                &device_pointers_.draft_counts) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::TARGET_QUERY_LENS,
+                &device_pointers_.target_query_lens) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::VALID_SAMPLED_COUNTS,
+                &device_pointers_.valid_sampled_counts) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::ACCEPTED_DRAFT_PREFIXES,
+                &device_pointers_.accepted_draft_prefixes) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::COMMITTED_OUTPUT_COUNTS,
+                &device_pointers_.committed_output_counts) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::REJECTED_TOKEN_COUNTS,
+                &device_pointers_.rejected_token_counts) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::TOKEN_INDICES_TO_SAMPLE,
+                &device_pointers_.token_indices_to_sample) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::NEXT_CONDITION_TOKENS,
+                &device_pointers_.next_condition_tokens) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::ALL_DRAFTS_ACCEPTED_FLAGS,
+                &device_pointers_.all_drafts_accepted_flags) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::STOPPED_FLAGS,
+                &device_pointers_.stopped_flags) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS,
+                &device_pointers_.query_start_locs) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::STATE_INDICES,
+                &device_pointers_.state_indices) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::DRAFT_TOKENS,
+                &device_pointers_.draft_tokens) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::SAMPLED_TOKENS,
+                &device_pointers_.sampled_tokens))
+        {
+            binding_error_ = error.str();
+            device_pointers_ = {};
+        }
+    }
+
+    MTPSpecDecodeMetadataUploadResult uploadMTPSpecDecodeMetadataBatch(
+        const MTPSpecDecodeMetadataBatch &batch,
+        const MTPSpecDecodeMetadataWorkspaceBinding &binding,
+        DeviceId device,
+        IBackend *backend,
+        void *stream)
+    {
+        MTPSpecDecodeMetadataUploadResult result;
+        if (!batch.ok)
+        {
+            result.error = std::string("cannot upload invalid MTP metadata batch: ") +
+                           batch.error;
+            return result;
+        }
+        if (!binding.hasWorkspace())
+        {
+            result.error = std::string("MTP metadata workspace is not completely bound: ") +
+                           binding.bindingError();
+            return result;
+        }
+        if (device.is_gpu())
+        {
+            if (!stream)
+            {
+                result.error =
+                    "MTP metadata GPU upload requires an explicit non-null stream";
+                return result;
+            }
+            if (!backend)
+            {
+                result.error = "MTP metadata GPU upload requires a backend";
+                return result;
+            }
+        }
+
+        const auto &ptrs = binding.devicePointers();
+        auto upload = [&](int32_t *dst,
+                          const std::vector<int32_t> &src,
+                          const char *name) -> bool
+        {
+            if (src.empty())
+                return true;
+            if (!dst)
+            {
+                result.error = std::string("MTP metadata destination is null for ") + name;
+                return false;
+            }
+
+            const size_t bytes = src.size() * sizeof(int32_t);
+            bool ok = true;
+            if (device.is_gpu())
+            {
+                ok = backend->hostToDeviceOnStream(
+                    dst,
+                    src.data(),
+                    bytes,
+                    device.ordinal,
+                    stream);
+            }
+            else
+            {
+                std::memcpy(dst, src.data(), bytes);
+            }
+
+            if (!ok)
+            {
+                result.error = std::string("MTP metadata upload failed for ") + name;
+                return false;
+            }
+
+            result.bytes_uploaded += bytes;
+            return true;
+        };
+
+        if (!upload(ptrs.draft_counts, batch.draft_counts,
+                    MTPSpecDecodeWorkspaceBuffers::DRAFT_COUNTS) ||
+            !upload(ptrs.target_query_lens, batch.target_query_lens,
+                    MTPSpecDecodeWorkspaceBuffers::TARGET_QUERY_LENS) ||
+            !upload(ptrs.valid_sampled_counts, batch.valid_sampled_counts,
+                    MTPSpecDecodeWorkspaceBuffers::VALID_SAMPLED_COUNTS) ||
+            !upload(ptrs.accepted_draft_prefixes, batch.accepted_draft_prefixes,
+                    MTPSpecDecodeWorkspaceBuffers::ACCEPTED_DRAFT_PREFIXES) ||
+            !upload(ptrs.committed_output_counts, batch.committed_output_counts,
+                    MTPSpecDecodeWorkspaceBuffers::COMMITTED_OUTPUT_COUNTS) ||
+            !upload(ptrs.rejected_token_counts, batch.rejected_token_counts,
+                    MTPSpecDecodeWorkspaceBuffers::REJECTED_TOKEN_COUNTS) ||
+            !upload(ptrs.token_indices_to_sample, batch.token_indices_to_sample,
+                    MTPSpecDecodeWorkspaceBuffers::TOKEN_INDICES_TO_SAMPLE) ||
+            !upload(ptrs.next_condition_tokens, batch.next_condition_tokens,
+                    MTPSpecDecodeWorkspaceBuffers::NEXT_CONDITION_TOKENS) ||
+            !upload(ptrs.all_drafts_accepted_flags, batch.all_drafts_accepted_flags,
+                    MTPSpecDecodeWorkspaceBuffers::ALL_DRAFTS_ACCEPTED_FLAGS) ||
+            !upload(ptrs.stopped_flags, batch.stopped_flags,
+                    MTPSpecDecodeWorkspaceBuffers::STOPPED_FLAGS) ||
+            !upload(ptrs.query_start_locs, batch.query_start_locs,
+                    MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS) ||
+            !upload(ptrs.state_indices, batch.state_indices,
+                    MTPSpecDecodeWorkspaceBuffers::STATE_INDICES) ||
+            !upload(ptrs.draft_tokens, batch.draft_tokens,
+                    MTPSpecDecodeWorkspaceBuffers::DRAFT_TOKENS) ||
+            !upload(ptrs.sampled_tokens, batch.sampled_tokens,
+                    MTPSpecDecodeWorkspaceBuffers::SAMPLED_TOKENS))
+        {
+            return result;
+        }
+
+        result.ok = true;
+        return result;
     }
 
 } // namespace llaminar2

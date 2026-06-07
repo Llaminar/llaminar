@@ -1,7 +1,9 @@
 #pragma once
 
 #include "MTPSpecDecodeTransaction.h"
+#include "../../backends/DeviceId.h"
 #include "../local_execution/device/WorkspaceDescriptor.h"
+#include "../../interfaces/IWorkspaceConsumer.h"
 
 #include <cstdint>
 #include <string>
@@ -9,6 +11,8 @@
 
 namespace llaminar2
 {
+    class IBackend;
+
     namespace MTPSpecDecodeWorkspaceBuffers
     {
         constexpr const char *DRAFT_COUNTS = "mtp_spec_decode_draft_counts";
@@ -70,5 +74,79 @@ namespace llaminar2
         const std::vector<MTPSpecDecodeRequest> &requests,
         const std::vector<int32_t> &committed_output_counts,
         const std::vector<int32_t> &stopped_flags);
+
+    struct MTPSpecDecodeMetadataDevicePointers
+    {
+        int32_t *draft_counts = nullptr;
+        int32_t *target_query_lens = nullptr;
+        int32_t *valid_sampled_counts = nullptr;
+        int32_t *accepted_draft_prefixes = nullptr;
+        int32_t *committed_output_counts = nullptr;
+        int32_t *rejected_token_counts = nullptr;
+        int32_t *token_indices_to_sample = nullptr;
+        int32_t *next_condition_tokens = nullptr;
+        int32_t *all_drafts_accepted_flags = nullptr;
+        int32_t *stopped_flags = nullptr;
+        int32_t *query_start_locs = nullptr;
+        int32_t *state_indices = nullptr;
+        int32_t *draft_tokens = nullptr;
+        int32_t *sampled_tokens = nullptr;
+
+        bool complete() const;
+    };
+
+    /**
+     * Runner-owned workspace consumer for graph-facing spec-decode metadata.
+     *
+     * The buffers are not a graph stage scratch allocation. They are persistent
+     * per-runner metadata slots that graph-captured MTP verifier/state stages
+     * can read after the runner uploads a new batch on an explicit stream.
+     */
+    class MTPSpecDecodeMetadataWorkspaceBinding : public IWorkspaceConsumer
+    {
+    public:
+        explicit MTPSpecDecodeMetadataWorkspaceBinding(
+            MTPSpecDecodeMetadataShape shape = {});
+
+        void setShape(MTPSpecDecodeMetadataShape shape);
+        const MTPSpecDecodeMetadataShape &shape() const { return shape_; }
+
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m, int n = 0, int k = 0) const override;
+
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        bool hasWorkspace() const override;
+        DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
+
+        const MTPSpecDecodeMetadataDevicePointers &devicePointers() const
+        {
+            return device_pointers_;
+        }
+
+        const std::string &bindingError() const { return binding_error_; }
+
+    private:
+        MTPSpecDecodeMetadataShape effectiveShape(int m, int n, int k) const;
+        void refreshDevicePointers();
+
+        MTPSpecDecodeMetadataShape shape_;
+        DeviceWorkspaceManager *workspace_ = nullptr;
+        MTPSpecDecodeMetadataDevicePointers device_pointers_;
+        std::string binding_error_;
+    };
+
+    struct MTPSpecDecodeMetadataUploadResult
+    {
+        bool ok = false;
+        std::string error;
+        size_t bytes_uploaded = 0;
+    };
+
+    MTPSpecDecodeMetadataUploadResult uploadMTPSpecDecodeMetadataBatch(
+        const MTPSpecDecodeMetadataBatch &batch,
+        const MTPSpecDecodeMetadataWorkspaceBinding &binding,
+        DeviceId device,
+        IBackend *backend,
+        void *stream);
 
 } // namespace llaminar2

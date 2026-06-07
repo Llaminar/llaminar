@@ -59,15 +59,17 @@ CUDA MoE artifact:
 - First shared metadata slice is green: `MTPSpecDecodeTransaction` is in core,
   `OrchestrationRunner` validates decode-equivalent catch-up results against it
   before commit, and `mtp.spec_decode_transaction_metadata` counters describe
-  accepted/rejected verifier rows. `MTPSpecDecodeMetadata` now declares the
-  graph-facing int32 workspace buffers and padded host metadata arrays for the
-  future CUDA/ROCm hook. Focused unit coverage passed for
+  accepted/rejected verifier rows. `MTPSpecDecodeMetadata` now declares and
+  binds the graph-facing int32 workspace buffers through `DeviceWorkspaceManager`,
+  `DeviceGraphOrchestrator` requests them as runner-owned extra workspace when
+  MTP is enabled on GPU, and GPU metadata upload hard-fails without an explicit
+  non-null stream. Focused unit coverage passed for
   `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`,
   `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`.
 
 ## Retained Actions
 
-- CUDA/ROCm dense: implement graph-facing spec-decode metadata buffers and
+- CUDA/ROCm dense: consume the graph-facing spec-decode metadata buffers from
   accepted-count-aware GDN/short-conv kernels, then promote a named
   `vllm_style_spec_decode` hook only after commit-replay parity and benchmarks.
   Do not re-enable raw all-position verifier-row shortcuts.

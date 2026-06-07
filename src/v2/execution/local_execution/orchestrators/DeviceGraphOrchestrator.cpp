@@ -35,6 +35,7 @@
 #include "../../../kernels/HybridKVCacheConfig.h"
 #include "../../../kernels/IHybridKVCache.h"
 #include "../../compute_stages/stages/MoEExpertComputeStage.h"
+#include "../../mtp/MTPSpecDecodeMetadata.h"
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/ExpertWeightPayloadProvider.h"
 #include "../../../loaders/PreparedWeightStore.h"
@@ -2310,6 +2311,36 @@ namespace llaminar2
                     0,
                 });
             }
+        }
+
+        if (config.mtp.enabled && state_.device_id.is_gpu())
+        {
+            const int max_mtp_draft_tokens = std::max(
+                1,
+                std::max(
+                    config.mtp.draft_tokens,
+                    config.mtp.depth_policy.max_depth));
+            MTPSpecDecodeMetadataShape shape;
+            shape.max_requests = std::max(1, hints.batch_size);
+            shape.max_draft_tokens = max_mtp_draft_tokens;
+
+            if (!mtp_spec_decode_metadata_workspace_)
+            {
+                mtp_spec_decode_metadata_workspace_ =
+                    std::make_unique<MTPSpecDecodeMetadataWorkspaceBinding>(shape);
+            }
+            else
+            {
+                mtp_spec_decode_metadata_workspace_->setShape(shape);
+            }
+
+            extras.push_back(WorkspaceConsumerRequest{
+                mtp_spec_decode_metadata_workspace_.get(),
+                state_.device_id,
+                shape.max_requests,
+                shape.max_draft_tokens,
+                0,
+            });
         }
 
         WorkspaceBudgetConfig workspace_budget;

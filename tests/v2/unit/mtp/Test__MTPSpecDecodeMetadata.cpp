@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
+#include "backends/BackendManager.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
 
 using namespace llaminar2;
@@ -52,6 +54,226 @@ TEST(Test__MTPSpecDecodeMetadata, DeclaresGraphFacingWorkspaceBuffers)
         findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::SAMPLED_TOKENS);
     ASSERT_NE(sampled_tokens, nullptr);
     EXPECT_EQ(sampled_tokens->size_bytes, 8u * sizeof(int32_t));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingBindsEveryDeclaredBuffer)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(shape);
+    WorkspaceRequirements reqs = binding.getWorkspaceRequirements(0, 0, 0);
+
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+    EXPECT_TRUE(binding.bindingError().empty());
+
+    const auto &ptrs = binding.devicePointers();
+    EXPECT_EQ(ptrs.draft_counts,
+              workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::DRAFT_COUNTS));
+    EXPECT_EQ(ptrs.accepted_draft_prefixes,
+              workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::ACCEPTED_DRAFT_PREFIXES));
+    EXPECT_EQ(ptrs.query_start_locs,
+              workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS));
+    EXPECT_EQ(ptrs.sampled_tokens,
+              workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::SAMPLED_TOKENS));
+
+    ptrs.accepted_draft_prefixes[0] = 2;
+    ptrs.sampled_tokens[3] = 42;
+    EXPECT_EQ(ptrs.accepted_draft_prefixes[0], 2);
+    EXPECT_EQ(ptrs.sampled_tokens[3], 42);
+
+    binding.unbindWorkspace();
+    EXPECT_FALSE(binding.hasWorkspace());
+    EXPECT_FALSE(binding.devicePointers().complete());
+}
+
+TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingCanRequestLargerAllocatorShape)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 2;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(shape);
+    WorkspaceRequirements reqs = binding.getWorkspaceRequirements(
+        /*m=*/3,
+        /*n=*/4,
+        /*k=*/0);
+
+    const WorkspaceDescriptor *draft_counts =
+        findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::DRAFT_COUNTS);
+    ASSERT_NE(draft_counts, nullptr);
+    EXPECT_EQ(draft_counts->size_bytes, 3u * sizeof(int32_t));
+
+    const WorkspaceDescriptor *sampled_tokens =
+        findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::SAMPLED_TOKENS);
+    ASSERT_NE(sampled_tokens, nullptr);
+    EXPECT_EQ(sampled_tokens->size_bytes, 15u * sizeof(int32_t));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingReportsIncompleteBinding)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 2;
+
+    WorkspaceRequirements incomplete;
+    incomplete.buffers.push_back({
+        MTPSpecDecodeWorkspaceBuffers::DRAFT_COUNTS,
+        sizeof(int32_t),
+        256,
+        true});
+
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 4096);
+    ASSERT_TRUE(workspace.allocate(incomplete));
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(shape);
+    binding.bindWorkspace(&workspace);
+    EXPECT_FALSE(binding.hasWorkspace());
+    EXPECT_FALSE(binding.bindingError().empty());
+    EXPECT_THAT(binding.bindingError(), HasSubstr("missing buffer"));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, UploadBatchCopiesToBoundWorkspace)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeRequest accept_all;
+    accept_all.vocab_size = 100;
+    accept_all.draft_tokens = {7, 9, 8};
+    accept_all.sampled_tokens = {7, 9, 8, 4};
+
+    MTPSpecDecodeRequest reject_after_first;
+    reject_after_first.vocab_size = 100;
+    reject_after_first.draft_tokens = {11, 12, 13};
+    reject_after_first.sampled_tokens = {
+        11,
+        77,
+        kMTPSpecDecodeInvalidToken,
+        kMTPSpecDecodeInvalidToken};
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatch(
+            shape,
+            {accept_all, reject_after_first},
+            /*committed_output_counts=*/{3, 2},
+            /*stopped_flags=*/{0, 1});
+    ASSERT_TRUE(batch.ok) << batch.error;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(shape);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+
+    MTPSpecDecodeMetadataUploadResult upload =
+        uploadMTPSpecDecodeMetadataBatch(
+            batch,
+            binding,
+            DeviceId::cpu(),
+            /*backend=*/nullptr,
+            /*stream=*/nullptr);
+    ASSERT_TRUE(upload.ok) << upload.error;
+
+    size_t expected_bytes = 0;
+    auto add_bytes = [&](const std::vector<int32_t> &values)
+    {
+        expected_bytes += values.size() * sizeof(int32_t);
+    };
+    add_bytes(batch.draft_counts);
+    add_bytes(batch.target_query_lens);
+    add_bytes(batch.valid_sampled_counts);
+    add_bytes(batch.accepted_draft_prefixes);
+    add_bytes(batch.committed_output_counts);
+    add_bytes(batch.rejected_token_counts);
+    add_bytes(batch.token_indices_to_sample);
+    add_bytes(batch.next_condition_tokens);
+    add_bytes(batch.all_drafts_accepted_flags);
+    add_bytes(batch.stopped_flags);
+    add_bytes(batch.query_start_locs);
+    add_bytes(batch.state_indices);
+    add_bytes(batch.draft_tokens);
+    add_bytes(batch.sampled_tokens);
+    EXPECT_EQ(upload.bytes_uploaded, expected_bytes);
+
+    const auto &ptrs = binding.devicePointers();
+    EXPECT_THAT(std::vector<int32_t>(ptrs.draft_counts, ptrs.draft_counts + 2),
+                ElementsAre(3, 3));
+    EXPECT_THAT(std::vector<int32_t>(
+                    ptrs.accepted_draft_prefixes,
+                    ptrs.accepted_draft_prefixes + 2),
+                ElementsAre(3, 1));
+    EXPECT_THAT(std::vector<int32_t>(ptrs.stopped_flags, ptrs.stopped_flags + 2),
+                ElementsAre(0, 1));
+    EXPECT_THAT(std::vector<int32_t>(ptrs.state_indices, ptrs.state_indices + 8),
+                ElementsAre(0, 1, 2, 3, 4, 5, 6, 7));
+    EXPECT_THAT(std::vector<int32_t>(ptrs.sampled_tokens, ptrs.sampled_tokens + 8),
+                ElementsAre(7, 9, 8, 4,
+                            11, 77,
+                            kMTPSpecDecodeInvalidToken,
+                            kMTPSpecDecodeInvalidToken));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, UploadBatchRejectsGpuNullStream)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 1;
+
+    MTPSpecDecodeRequest request;
+    request.vocab_size = 100;
+    request.draft_tokens = {7};
+    request.sampled_tokens = {7, 9};
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatch(
+            shape,
+            {request},
+            /*committed_output_counts=*/{1},
+            /*stopped_flags=*/{0});
+    ASSERT_TRUE(batch.ok) << batch.error;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(shape);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+
+    MTPSpecDecodeMetadataUploadResult upload =
+        uploadMTPSpecDecodeMetadataBatch(
+            batch,
+            binding,
+            DeviceId::cuda(0),
+            /*backend=*/nullptr,
+            /*stream=*/nullptr);
+    EXPECT_FALSE(upload.ok);
+    EXPECT_THAT(upload.error, HasSubstr("explicit non-null stream"));
 }
 
 TEST(Test__MTPSpecDecodeMetadata, BuildsPaddedBatchMetadataForAcceptAndReject)
