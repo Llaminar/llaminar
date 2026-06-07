@@ -2487,6 +2487,11 @@ falling back or partially publishing state.
   restore, chained-depth prefix restore, and continuation cases on CUDA and
   ROCm, then extend the same policy to TP/MoE only after matching parity and
   benchmark evidence.
+- Stop-token row-semantics unit coverage is now in place: `V2_Unit_MTPDecodeCatchup`
+  pins verifier-row transactions where the first draft stops, an accepted
+  speculative token stops, and a rejected correction token stops. These tests
+  prove the promoted metadata contract does not publish bonus ready-token state
+  or correction-token state when generation has already completed.
 
 ### Files
 

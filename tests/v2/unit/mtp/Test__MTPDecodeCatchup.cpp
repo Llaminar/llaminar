@@ -344,6 +344,80 @@ TEST(Test__MTPDecodeCatchup, BuildsVerifierRowsResultForRejectAfterPrefix)
         << "state is valid through first token plus accepted speculative prefix only";
 }
 
+TEST(Test__MTPDecodeCatchup, BuildsVerifierRowsResultWhenFirstDraftStops)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {7};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildMTPDecodeCatchupGreedyResultFromVerifierRows(
+            request,
+            /*sampled_verifier_tokens=*/{-1, -1, -1});
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7));
+    EXPECT_TRUE(result.verifier_tokens.empty());
+    EXPECT_TRUE(result.stopped_on_output);
+    EXPECT_TRUE(result.all_speculative_accepted)
+        << "no speculative row was rejected before the stop";
+    EXPECT_EQ(result.accepted_speculative_prefix, 0);
+    EXPECT_EQ(result.ready_token, -1);
+    EXPECT_EQ(result.main_forward_token_count, 3)
+        << "the promoted verifier graph still ran the fixed target row count";
+    EXPECT_EQ(result.shifted_commit_count, 1);
+    EXPECT_EQ(result.target_verifier_state_commit_count, 1);
+}
+
+TEST(Test__MTPDecodeCatchup, BuildsVerifierRowsResultWhenAcceptedSpeculativeTokenStops)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {9};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildMTPDecodeCatchupGreedyResultFromVerifierRows(
+            request,
+            /*sampled_verifier_tokens=*/{9, -1, -1});
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(9));
+    EXPECT_TRUE(result.stopped_on_output);
+    EXPECT_TRUE(result.all_speculative_accepted)
+        << "a stop after an accepted speculative token is not a rejection";
+    EXPECT_EQ(result.accepted_speculative_prefix, 1);
+    EXPECT_EQ(result.ready_token, -1);
+    EXPECT_EQ(result.main_forward_token_count, 3);
+    EXPECT_EQ(result.shifted_commit_count, 2);
+    EXPECT_EQ(result.target_verifier_state_commit_count, 2);
+}
+
+TEST(Test__MTPDecodeCatchup, BuildsVerifierRowsResultWhenRejectedCorrectionStops)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {3};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildMTPDecodeCatchupGreedyResultFromVerifierRows(
+            request,
+            /*sampled_verifier_tokens=*/{3, -1, -1});
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 3));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(3));
+    EXPECT_TRUE(result.stopped_on_output);
+    EXPECT_FALSE(result.all_speculative_accepted);
+    EXPECT_EQ(result.accepted_speculative_prefix, 0);
+    EXPECT_EQ(result.rejected_verified_token, 3);
+    EXPECT_EQ(result.ready_token, -1);
+    EXPECT_EQ(result.main_forward_token_count, 3);
+    EXPECT_EQ(result.shifted_commit_count, 2);
+    EXPECT_EQ(result.target_verifier_state_commit_count, 1)
+        << "the stopped correction token has not been forwarded as live state";
+}
+
 TEST(Test__MTPDecodeCatchup, RejectsVerifierRowsAcceptAllWithoutReadyToken)
 {
     MTPDecodeCatchupGreedyRequest request;
