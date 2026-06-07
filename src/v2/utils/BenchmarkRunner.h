@@ -158,6 +158,7 @@ namespace llaminar2
         std::function<void()> post_warmup_cb_;
         std::function<void()> decode_step_cb_;
         DecodeLoopProfile decode_loop_profile_; ///< Accumulated across benchmark iterations
+        SamplingParams decode_sampling_params_; ///< Sampling params used by orchestrated decodeStep()
         std::string last_failure_reason_;
 
         /**

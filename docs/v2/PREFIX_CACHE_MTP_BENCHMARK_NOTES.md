@@ -24,34 +24,20 @@ plan carries detailed implementation status.
 ## Current Findings
 
 - Phase 13.8 vLLM-style transaction is the active dense SingleDevice GPU
-  design, but the direct-candidate benchmark numbers above are historical
-  targets until the accepted-count speculative state-slot path is fully proven.
-- CUDA default-lane depth 3 is the best historical dense target: 67.92 tok/s
-  versus 41.73 no-MTP, with 36 verifier runs, 159 verifier tokens, and zero
-  transaction validation failures.
-- ROCm demonstrates a smaller historical direct-candidate win: default prompt
-  was 1.16x at 58.82% acceptance, while the high-acceptance `qbf` lane reached
-  1.70x at 88.57% acceptance. After acceptance, ROCm must post wins comparable
-  to CUDA or get a trace-backed tuning pass before Phase 14 claims.
-- Sequential verifier MTP remains documented as the old blocker. It was correct
-  but speed-negative because accepted speculative tokens paid repeated
-  decode-equivalent verifier forwards.
-- The raw all-position and sidecar-chain shortcut code/tests have been removed;
-  live work must go through accepted-count speculative state slots.
-- The verifier-capture workspace spelling has also been removed from the active
-  GDN/short-conv stage surface. Current stateful verifier work uses
-  `gdn_speculative_state_slots*` backing buffers plus explicit accepted-count
-  publication, with CPU prefix mutation counters distinguishing replay-state
-  preservation from kernel-dynamic-state reset.
-- The accepted-count candidate now handles rejected transactions by publishing
-  accepted-prefix state, committing shifted rows, forwarding the correction
-  suffix, and sampling a ready token. Rejected/no-ready results hard-fail, and
-  the removed shared-stepwise fallback path is gone.
+  design. The direct-candidate numbers above are historical targets until fresh
+  greedy and stochastic accepted-count benchmarks replace them.
+- Sequential verifier MTP is the old blocker: correct but speed-negative because
+  accepted speculative tokens paid repeated decode-equivalent verifier forwards.
+- Dead raw all-position and sidecar-chain shortcut code/tests are removed. Live
+  work goes through `gdn_speculative_state_slots*`, explicit accepted-count
+  publication, shifted-row commit, suffix forward, and ready-token handoff.
 - Source-owned parity covers CUDA/ROCm depth-3 normal decode, depth-3 prefix
   restore, stop-token, continuation, reject, benchmark-style, and stochastic
-  Phase 13.8 cells. Stochastic parity explicitly selects the accepted-count
-  candidate and records `phase138_stochastic_spec_decode_runs`; stochastic
-  benchmark evidence, MoE, and TP/PP remain pending.
+  Phase 13.8 cells with zero transaction validation failures.
+- Benchmark mode now preserves greedy deterministic defaults for normal runs but
+  passes `temperature/top_k/top_p/seed` into orchestrated decode for
+  `--mtp-verify-mode speculative-sampling`, so stochastic MTP measurements are
+  no longer silently greedy.
 
 ## llama.cpp CUDA Anchors
 

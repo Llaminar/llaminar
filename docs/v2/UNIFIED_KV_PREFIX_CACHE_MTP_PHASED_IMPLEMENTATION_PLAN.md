@@ -27,6 +27,8 @@ Latest Phase 13.8 acceptance note, 2026-06-07: CUDA and ROCm now pass the focuse
 
 Latest Phase 13.8 prefix-restore note, 2026-06-07: the vLLM-style candidate equivalence harness now covers RAM prefix-cache full-hit restore for dense Qwen3.6 SingleDevice ROCm and CUDA at draft depth 3, including terminal logits, terminal hidden, MTP state restore, active transaction commits, chained sidecar drafts from restored terminal hidden, and zero transaction validation failures. The old full-hit chained-depth hard gate has been removed and replaced by `V2_Unit_PrefixCachePrefillFlow` plus the CUDA/ROCm `Phase138VllmStyleCandidatePrefixRestoreEquivalence` cells at max supported depth.
 
+Latest Phase 13.8 benchmark-measurement note, 2026-06-07: `BenchmarkRunner` now keeps the historical greedy deterministic benchmark default for normal runs, but passes configured `temperature`, `top_k`, `top_p`, and deterministic seed into orchestrated decode when `mtp.verify_mode=speculative-sampling`. This fixes the measurement-path bug where stochastic MTP benchmarks were silently run as greedy decode. Focused validation passed for `V2_Unit_BenchmarkRunnerCPU` plus the CUDA/ROCm Qwen3.6 stochastic and candidate-equivalence parity cells.
+
 Latest deterministic-mode sidequest note, 2026-06-06: `LLAMINAR_DETERMINISTIC` is now an explicit policy gate for split/concurrent GPU routes that can otherwise change reduction order. CUDA deterministic mode disables concurrent prefill/decode plus MoE split-K routes, and ROCm deterministic mode disables native-VNNI atomic-reduce, concurrent prefill/decode, concurrent M=2 row handling, GDN concurrent decode, and nondeterministic MoE router/down/gate-up routes. ROCm graph capture no longer forces the atomic-reduce GEMV path when deterministic mode is active. Focused validation passed on 2026-06-06: `V2_Unit_DeterministicMode`, `V2_Integration_CUDAGemmNonDeterminism`, and `V2_Integration_ROCm_NativeVNNI_GEMV`.
 
 | Phase | Status | Current Evidence | Remaining Gate |
@@ -2554,6 +2556,13 @@ falling back or partially publishing state.
   validation passed for `V2_Unit_PrefillDecodeTransition` and the CUDA/ROCm
   Qwen3.6 dense `MTPStochasticSamplingVerifierRuns` parity cells, which now
   assert `phase138_stochastic_spec_decode_runs`.
+- Benchmark measurement fix, 2026-06-07: benchmark decode keeps greedy
+  deterministic defaults except for `MTPVerifyMode::SpeculativeSampling`, where
+  `BenchmarkRunner` now forwards the requested temperature, top-k, top-p, and
+  deterministic seed to orchestrated decode. This prevents stochastic Phase 13.8
+  benchmark evidence from being silently measured as greedy. Focused validation
+  passed for `V2_Unit_BenchmarkRunnerCPU` plus CUDA/ROCm Qwen3.6 stochastic and
+  candidate-equivalence parity cells.
 - Prefix-restore equivalence, 2026-06-07: dense SingleDevice CUDA and ROCm now
   have `Phase138VllmStyleCandidatePrefixRestoreEquivalence` parity cells. They
   run the opt-in candidate equivalence harness across a first request and a RAM

@@ -165,7 +165,7 @@ namespace
         void setDecodeSamplingParams(const SamplingParams &params) override
         {
             sampling_params_set_ = true;
-            last_temperature_ = params.temperature;
+            last_sampling_params_ = params;
         }
 
         void setDecodeStepTokenBudget(int max_tokens) override
@@ -204,7 +204,8 @@ namespace
         int maintenanceCalls() const { return maintenance_calls_; }
         int sampleGreedyCalls() const { return sample_greedy_calls_; }
         bool samplingParamsSet() const { return sampling_params_set_; }
-        float lastTemperature() const { return last_temperature_; }
+        float lastTemperature() const { return last_sampling_params_.temperature; }
+        const SamplingParams &lastSamplingParams() const { return last_sampling_params_; }
 
     private:
         int decode_step_budget_ = 0;
@@ -213,7 +214,7 @@ namespace
         int sample_greedy_calls_ = 0;
         int emitted_tokens_ = 0;
         bool sampling_params_set_ = false;
-        float last_temperature_ = 1.0f;
+        SamplingParams last_sampling_params_;
     };
 
     /**
@@ -432,6 +433,35 @@ TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
     EXPECT_GT(runner->maintenanceCalls(), 0);
     EXPECT_EQ(runner->sampleGreedyCalls(), 0)
         << "BenchmarkRunner must not bypass orchestration decodeStep when it is available";
+}
+
+TEST(Test__BenchmarkRunnerCPU, UsesRequestedSamplingParamsForSpeculativeMTPBenchmark)
+{
+    auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.seed = 123;
+    config.temperature = 0.6f;
+    config.top_k = 20;
+    config.top_p = 0.95f;
+    config.mtp.enabled = true;
+    config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+
+    auto result = bench.run(config);
+
+    ASSERT_TRUE(result.success);
+    ASSERT_TRUE(runner->samplingParamsSet());
+    const SamplingParams &params = runner->lastSamplingParams();
+    EXPECT_EQ(params.temperature, 0.6f);
+    EXPECT_EQ(params.top_k, 20);
+    EXPECT_EQ(params.top_p, 0.95f);
+    EXPECT_EQ(params.seed, 123u);
 }
 
 /**

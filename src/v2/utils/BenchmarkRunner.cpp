@@ -294,12 +294,18 @@ namespace llaminar2
                 {"prefix_cache_enabled", config->prefix_cache.enabled},
                 {"mtp_enabled", config->mtp.enabled},
                 {"mtp_draft_tokens", config->mtp.draft_tokens},
+                {"mtp_verify_mode", mtpVerifyModeToString(config->mtp.verify_mode)},
                 {"mtp_depth_policy", mtpDepthPolicyModeToString(config->mtp.depth_policy.mode)},
                 {"mtp_min_draft_tokens", config->mtp.depth_policy.min_depth},
                 {"mtp_max_draft_tokens", config->mtp.depth_policy.max_depth},
                 {"mtp_depth_window", config->mtp.depth_policy.window_size},
                 {"mtp_depth_promote_windows",
                  config->mtp.depth_policy.promote_consecutive_windows},
+                {"sampling",
+                 {{"temperature", config->temperature},
+                  {"top_k", config->top_k},
+                  {"top_p", config->top_p},
+                  {"seed", config->seed}}},
             };
             if (!config->model_path.empty())
                 config_json["model_path"] = config->model_path;
@@ -450,10 +456,7 @@ namespace llaminar2
 
         if (runner_->supportsDecodeStep())
         {
-            SamplingParams greedy_params;
-            greedy_params.temperature = 0.0f;
-            greedy_params.seed = 42;
-            runner_->setDecodeSamplingParams(greedy_params);
+            runner_->setDecodeSamplingParams(decode_sampling_params_);
 
             while (tokens_generated < n_tokens)
             {
@@ -815,6 +818,19 @@ namespace llaminar2
         // gathered to host for CPU-side sampling.
         const bool has_gpu = runner_->primaryDeviceId().is_gpu();
         runner_->setSkipLogitsGatherDecode(has_gpu);
+
+        decode_sampling_params_ = SamplingParams{};
+        decode_sampling_params_.temperature = 0.0f;
+        decode_sampling_params_.seed = config.seed >= 0
+                                           ? static_cast<unsigned int>(config.seed)
+                                           : 42u;
+        if (config.mtp.enabled &&
+            config.mtp.verify_mode == MTPVerifyMode::SpeculativeSampling)
+        {
+            decode_sampling_params_.temperature = config.temperature;
+            decode_sampling_params_.top_k = config.top_k;
+            decode_sampling_params_.top_p = config.top_p;
+        }
 
         // ========================================================================
         // Warmup Phase - Run once to warm up caches, JIT, etc.
