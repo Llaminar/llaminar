@@ -5287,6 +5287,17 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
         TIMEOUT 1800
     )
+    add_v2_test(V2_Integration_Parity_Qwen36_SingleDevice_Phase138CandidateDepth3RejectRegression
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen36_single_device_prefix_mtp>
+                --gtest_filter=Qwen36SingleDevicePrefixMTPParity.MTPGreedyDepth3MatchesPyTorchDecodeTokens
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;ROCm;GPU;SingleDevice;PyTorch;Phase138;Regression"
+        MPI_PROCS 1
+        TIMEOUT 1800
+    )
+    set_tests_properties(V2_Integration_Parity_Qwen36_SingleDevice_Phase138CandidateDepth3RejectRegression PROPERTIES
+        ENVIRONMENT_MODIFICATION
+            "LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=set:vllm_style_spec_decode;LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=set:1"
+    )
 
     add_executable(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_CPU_SingleDevice_PrefixMTP_Parity.cpp
@@ -5318,6 +5329,17 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;CUDA;GPU;SingleDevice;PyTorch"
         MPI_PROCS 1
         TIMEOUT 1800
+    )
+    add_v2_test(V2_Integration_Parity_Qwen36_CUDA_SingleDevice_Phase138CandidateDepth3BenchmarkRegression
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen36_cuda_single_device_prefix_mtp>
+                --gtest_filter=Qwen36CUDASingleDevicePrefixMTPParity.MTPBenchmarkPromptFixedDepth3MatchesPyTorchDecodeTokens
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;CUDA;GPU;SingleDevice;PyTorch;Phase138;Regression"
+        MPI_PROCS 1
+        TIMEOUT 1800
+    )
+    set_tests_properties(V2_Integration_Parity_Qwen36_CUDA_SingleDevice_Phase138CandidateDepth3BenchmarkRegression PROPERTIES
+        ENVIRONMENT_MODIFICATION
+            "LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=set:vllm_style_spec_decode;LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=set:1"
     )
 
     add_executable(v2_integration_parity_qwen36_local_tp_prefix_mtp

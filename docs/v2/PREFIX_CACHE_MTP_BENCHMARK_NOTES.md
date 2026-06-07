@@ -92,7 +92,9 @@ CUDA MoE artifact:
   suffix replay and samples row 0 from the explicit suffix output. Focused
   validation passed under the candidate/equivalence env for ROCm depth-3 greedy,
   CUDA depth-3 benchmark-prompt greedy, CUDA regular greedy, CUDA/ROCm
-  prefix+MTP restore, and the Phase 13.8 unit guard set.
+  prefix+MTP restore, and the Phase 13.8 unit guard set. This is now pinned by
+  dedicated Phase138 CTest regressions for the ROCm depth-3 reject lane and the
+  CUDA depth-3 benchmark-prompt lane.
 - Device-metadata state publication is now green for the first backend slice:
   CUDA and ROCm short-conv/GDN kernels can restore live state from verifier
   snapshot rows selected by graph-facing `committed_state_rows[request_index]`.

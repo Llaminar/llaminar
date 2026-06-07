@@ -2424,7 +2424,12 @@ falling back or partially publishing state.
   `MTPGreedyMatchesPyTorchDecodeTokens`, CUDA/ROCm `PrefixCacheMTPRestore`, and
   the Phase 13.8 unit guard set under
   `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` plus
-  `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1`.
+  `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1`. Dedicated always-on CTest
+  regressions now preserve that env wiring: ROCm
+  `V2_Integration_Parity_Qwen36_SingleDevice_Phase138CandidateDepth3RejectRegression`
+  and CUDA
+  `V2_Integration_Parity_Qwen36_CUDA_SingleDevice_Phase138CandidateDepth3BenchmarkRegression`
+  passed on 2026-06-07.
 - Real dense SingleDevice parity has first candidate-equivalence evidence:
   with `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` and
   `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1`, CUDA and ROCm
