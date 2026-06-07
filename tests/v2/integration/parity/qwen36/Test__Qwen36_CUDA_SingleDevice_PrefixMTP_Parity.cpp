@@ -72,6 +72,33 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPBenchmarkPromptFixedDepth3Matches
     runDenseBenchmarkStyleFixedMTPParity(cudaSingleDeviceCase(), 3);
 }
 
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138DirectDepth3MatchesPyTorchDecodeTokens)
+{
+    ScopedEnvironmentValues phase138_env({
+        {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
+        {"LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE", "1"},
+    });
+    runDenseMTPParity(cudaSingleDeviceCase(), false, 3);
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138DirectDepth1PrefixCacheMTPRestore)
+{
+    ScopedEnvironmentValues phase138_env({
+        {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
+        {"LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE", "1"},
+    });
+    runDenseMTPParity(cudaSingleDeviceCase(), true, 1);
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138DirectDepth3BenchmarkPromptMatchesPyTorchDecodeTokens)
+{
+    ScopedEnvironmentValues phase138_env({
+        {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
+        {"LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE", "1"},
+    });
+    runDenseBenchmarkStyleFixedMTPParity(cudaSingleDeviceCase(), 3);
+}
+
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleFreshRunnerDeterminism)
 {
     runDenseNoMTPBenchmarkStyleFreshRunnerDeterminism(

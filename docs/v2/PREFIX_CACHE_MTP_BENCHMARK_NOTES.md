@@ -44,8 +44,9 @@ Artifacts:
   all-position selected-state restore are not decode-equivalent for Qwen3.6
   dense.
 - `LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE=1` is still an explicit development
-  gate. Promotion requires broader parity for accept-all, reject-first,
-  reject-after-prefix, stop-token, prefix-restore, and continuation cases.
+  gate. Source-owned parity now covers CUDA/ROCm depth-3 normal decode, CUDA
+  benchmark-prompt depth-3, and CUDA/ROCm depth-1 prefix restore. Promotion
+  still needs broader accept/reject/stop/chained-prefix/continuation coverage.
 
 ## llama.cpp CUDA Anchors
 

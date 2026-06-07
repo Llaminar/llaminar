@@ -149,6 +149,36 @@ namespace llaminar2::test::parity::qwen36
         std::vector<Entry> entries_;
     };
 
+    inline bool densePhase138DirectCandidateEnabled()
+    {
+        const char *candidate =
+            std::getenv("LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE");
+        const char *direct =
+            std::getenv("LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE");
+        return candidate &&
+               std::strcmp(candidate, "vllm_style_spec_decode") == 0 &&
+               direct &&
+               (std::strcmp(direct, "1") == 0 ||
+                std::strcmp(direct, "true") == 0 ||
+                std::strcmp(direct, "TRUE") == 0);
+    }
+
+    inline void expectPhase138DirectTransactionUsed(
+        const PrefixRuntimeStateSnapshot &snapshot,
+        const std::string &context)
+    {
+        if (!densePhase138DirectCandidateEnabled())
+        {
+            return;
+        }
+        EXPECT_GT(snapshot.mtp_transaction_commits, 0u)
+            << context << " did not commit any MTP transactions";
+        EXPECT_EQ(snapshot.mtp_transaction_rollbacks, 0u)
+            << context << " should not roll back under the direct candidate";
+        EXPECT_EQ(snapshot.mtp_transaction_validation_failures, 0u)
+            << context << " hit MTP transaction validation failures";
+    }
+
     class ScopedDenseParityDeterministicMode
     {
     public:
@@ -1534,6 +1564,7 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_GE(after_first.mtp_verifier_runs, 1u);
             EXPECT_GE(after_first.mtp_verifier_token_count, expected_first_step_drafts + 1);
         }
+        expectPhase138DirectTransactionUsed(after_first, test_case.name + " first request");
 
         if (!enable_prefix_cache)
         {
@@ -1570,6 +1601,7 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_GE(after_second.mtp_verifier_runs, 1u);
             EXPECT_GE(after_second.mtp_verifier_token_count, expected_first_step_drafts + 1);
         }
+        expectPhase138DirectTransactionUsed(after_second, test_case.name + " restored request");
     }
 
     inline void runDenseDynamicMTPParity(
@@ -2373,6 +2405,7 @@ namespace llaminar2::test::parity::qwen36
             expected_tokens,
             "fresh " + label + " MTP"));
         EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
+        expectPhase138DirectTransactionUsed(mtp_state, test_case.name + " " + label);
         if (depth_policy.mode == MTPDepthPolicyMode::Dynamic)
         {
             EXPECT_TRUE(mtp_state.mtp_request.adaptive_depth_enabled);

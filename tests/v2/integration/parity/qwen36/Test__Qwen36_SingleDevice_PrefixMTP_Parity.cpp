@@ -43,6 +43,24 @@ TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyDepth3MatchesPyTorchDecodeToken
     runDenseMTPParity(singleDeviceCase(), false, 3);
 }
 
+TEST(Qwen36SingleDevicePrefixMTPParity, Phase138DirectDepth3MatchesPyTorchDecodeTokens)
+{
+    ScopedEnvironmentValues phase138_env({
+        {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
+        {"LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE", "1"},
+    });
+    runDenseMTPParity(singleDeviceCase(), false, 3);
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, Phase138DirectDepth1PrefixCacheMTPRestore)
+{
+    ScopedEnvironmentValues phase138_env({
+        {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
+        {"LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE", "1"},
+    });
+    runDenseMTPParity(singleDeviceCase(), true, 1);
+}
+
 TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
 {
     runDenseDynamicMTPParity(singleDeviceCase(), false);
