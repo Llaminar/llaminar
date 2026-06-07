@@ -7532,6 +7532,9 @@ namespace llaminar2
             const bool equivalence_check =
                 DebugEnv::isTruthyEnvValue(
                     std::getenv("LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK"));
+            const bool direct_candidate =
+                DebugEnv::isTruthyEnvValue(
+                    std::getenv("LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE"));
             auto fail_vllm = [&](std::string reason) -> MTPDecodeCatchupGreedyResult
             {
                 MTPDecodeCatchupGreedyResult result;
@@ -7547,12 +7550,13 @@ namespace llaminar2
                 return result;
             };
 
-            if (!equivalence_check)
+            if (!equivalence_check && !direct_candidate)
             {
                 return fail_vllm(
                     "Phase 13.8 vllm_style_spec_decode is not promoted: "
-                    "live target-verifier graph integration and commit-replay "
-                    "equivalence are still required");
+                    "set LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1 for "
+                    "oracle comparison or LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE=1 "
+                    "for explicit benchmark-only direct execution");
             }
             if (!state_.isInitialized() ||
                 !state_.device_id.is_gpu() ||
@@ -7861,7 +7865,8 @@ namespace llaminar2
                  {"accepted_tokens", std::to_string(result.accepted_tokens.size())},
                  {"state_commit_count",
                   std::to_string(target_verifier_state_commit_count)},
-                 {"suffix_replay_tokens", std::to_string(suffix_count)}});
+                 {"suffix_replay_tokens", std::to_string(suffix_count)},
+                 {"mode", equivalence_check ? "equivalence" : "direct"}});
 
             return result;
         }
