@@ -79,6 +79,11 @@ CUDA MoE artifact:
   CUDA graph; ROCm regression coverage proves the same explicit-stream path.
   The promoted hook is still hard-failed until full accepted-count kernel
   commit/replay parity and runner integration are done.
+- `DeviceGraphOrchestrator` now has a runner-facing restore primitive that
+  uploads an `MTPSpecDecodeMetadataBatch` to the bound workspace and publishes
+  all local GDN state from `committed_state_rows` before truncating KV/bookkeeping.
+  This is still scaffolding: `vllm_style_spec_decode` remains hard-failed until
+  the verifier graph builds the batch live and commit-replay parity is green.
 
 ## Retained Actions
 

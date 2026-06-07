@@ -19,6 +19,7 @@
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/moe/MoERebalanceController.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "models/qwen/QwenStandardGraph.h"
@@ -911,6 +912,21 @@ TEST_F(Test__DeviceGraphOrchestrator, VllmStyleSpecDecodeCandidateHardFailsUntil
               std::string::npos);
     EXPECT_NE(result.error.find("accepted-count"),
               std::string::npos);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, SpecDecodeMetadataStateRestoreHardFailsWithoutState)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+
+    MTPSpecDecodeMetadataBatch batch;
+    batch.ok = true;
+    batch.request_count = 1;
+    batch.committed_state_rows = {0};
+
+    EXPECT_FALSE(orchestrator->restoreMTPVerifierStateFromSpecDecodeMetadata(
+        batch,
+        /*request_index=*/0,
+        /*target_cached_tokens=*/1));
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutState)

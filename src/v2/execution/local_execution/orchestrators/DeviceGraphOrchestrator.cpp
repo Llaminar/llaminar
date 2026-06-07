@@ -7683,6 +7683,165 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::restoreMTPVerifierStateFromSpecDecodeMetadata(
+        const MTPSpecDecodeMetadataBatch &batch,
+        int request_index,
+        int target_cached_tokens,
+        int seq_idx)
+    {
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "spec_decode_metadata_state_restore_failures",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"reason", reason},
+                 {"request_index", std::to_string(request_index)}});
+            LOG_DEBUG("[DeviceGraphOrchestrator] MTP spec-decode metadata state restore unavailable: "
+                      << reason);
+            return false;
+        };
+
+        if (!state_.device_id.is_gpu())
+        {
+            return fail("gpu_required");
+        }
+        if (!batch.ok)
+        {
+            return fail(std::string("invalid_metadata_batch:") + batch.error);
+        }
+        if (request_index < 0 || request_index >= batch.request_count ||
+            request_index >= static_cast<int>(batch.committed_state_rows.size()))
+        {
+            return fail("bad_request_index");
+        }
+        if (batch.committed_state_rows[static_cast<size_t>(request_index)] < 0)
+        {
+            return fail("no_committed_state_row");
+        }
+        if (!state_.kv_cache || seq_idx < 0 || seq_idx >= state_.batch_size)
+        {
+            return fail("missing_cache_or_bad_sequence");
+        }
+        if (seq_idx >= static_cast<int>(state_.positions.size()) ||
+            seq_idx >= static_cast<int>(state_.sequence_lengths.size()))
+        {
+            return fail("missing_sequence_bookkeeping");
+        }
+        if (target_cached_tokens < 0 ||
+            target_cached_tokens > state_.kv_cache->max_seq_len())
+        {
+            return fail("bad_restore_bounds");
+        }
+        if (!mtp_spec_decode_metadata_workspace_ ||
+            !mtp_spec_decode_metadata_workspace_->hasWorkspace())
+        {
+            return fail("metadata_workspace_not_bound");
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+        {
+            return fail("missing_backend");
+        }
+        void *stream =
+            explicitGPUStreamForOperation("restoreMTPVerifierStateFromSpecDecodeMetadata");
+        if (!stream)
+        {
+            return fail("missing_explicit_gpu_stream");
+        }
+
+        MTPSpecDecodeMetadataUploadResult upload =
+            uploadMTPSpecDecodeMetadataBatch(
+                batch,
+                *mtp_spec_decode_metadata_workspace_,
+                state_.device_id,
+                backend,
+                stream);
+        if (!upload.ok)
+        {
+            return fail(std::string("metadata_upload_failed:") + upload.error);
+        }
+
+        auto *hybrid = dynamic_cast<IHybridKVCache *>(state_.kv_cache.get());
+        if (!hybrid)
+        {
+            return fail("non_hybrid_cache");
+        }
+
+        const auto &ptrs =
+            mtp_spec_decode_metadata_workspace_->devicePointers();
+        if (!ptrs.committed_state_rows)
+        {
+            return fail("missing_committed_state_rows_device_buffer");
+        }
+
+        int restored_layers = 0;
+        for (int layer = 0; layer < state_.kv_cache->n_layers(); ++layer)
+        {
+            if (!hybrid->isGDNLayer(layer))
+            {
+                continue;
+            }
+
+            auto *conv_kernel = hybrid->getConvKernel(layer);
+            float *conv_state = hybrid->getConvState(layer);
+            auto *recurrence_kernel = hybrid->getRecurrenceKernel(layer);
+            float *recurrence_state = hybrid->getRecurrenceState(layer);
+            if (!conv_kernel || !conv_state || !recurrence_kernel || !recurrence_state)
+            {
+                return fail("missing_gdn_state_or_kernel");
+            }
+            if (!conv_kernel->restoreVerifierStateCaptureRowFromDeviceMetadata(
+                    conv_state,
+                    ptrs.committed_state_rows,
+                    request_index,
+                    stream))
+            {
+                return fail("shortconv_metadata_restore_failed");
+            }
+            if (!recurrence_kernel->restoreVerifierStateCaptureRowFromDeviceMetadata(
+                    recurrence_state,
+                    ptrs.committed_state_rows,
+                    request_index,
+                    stream))
+            {
+                return fail("recurrence_metadata_restore_failed");
+            }
+            ++restored_layers;
+        }
+
+        if (restored_layers == 0)
+        {
+            return fail("no_gdn_layers");
+        }
+        if (!state_.kv_cache->truncateSequence(seq_idx, target_cached_tokens, stream))
+        {
+            return fail("main_kv_truncate_failed");
+        }
+
+        state_.positions[seq_idx] = target_cached_tokens;
+        state_.sequence_lengths[seq_idx] = target_cached_tokens;
+        handleLivePrefixReplayStateAfterMutation(
+            "restore_mtp_spec_decode_metadata_state",
+            /*preserve_gpu_replay_state=*/true);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "spec_decode_metadata_state_restores",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"request_index", std::to_string(request_index)},
+             {"committed_state_row",
+              std::to_string(batch.committed_state_rows[static_cast<size_t>(request_index)])},
+             {"target_cached_tokens", std::to_string(target_cached_tokens)},
+             {"bytes_uploaded", std::to_string(upload.bytes_uploaded)},
+             {"gdn_layers", std::to_string(restored_layers)}});
+        return true;
+    }
+
     int DeviceGraphOrchestrator::sampleGreedyOnDevice()
     {
         // LmHeadStage always writes the last-token logits to row 0 for both

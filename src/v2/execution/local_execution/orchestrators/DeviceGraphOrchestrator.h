@@ -84,6 +84,7 @@ namespace llaminar2
     class ExpertWeightPayloadProvider;
     class PreparedWeightStore;
     class FrozenModelWeightSet;
+    struct MTPSpecDecodeMetadataBatch;
     class MTPSpecDecodeMetadataWorkspaceBinding;
     class PrefixStateCache;
     class RamPrefixStorageBackend;
@@ -2023,6 +2024,11 @@ namespace llaminar2
         bool supportsMTPVerifierStateRowRestore() const override;
         bool restoreMTPVerifierStateRow(
             int verifier_row,
+            int target_cached_tokens,
+            int seq_idx = 0) override;
+        bool restoreMTPVerifierStateFromSpecDecodeMetadata(
+            const MTPSpecDecodeMetadataBatch &batch,
+            int request_index,
             int target_cached_tokens,
             int seq_idx = 0) override;
 

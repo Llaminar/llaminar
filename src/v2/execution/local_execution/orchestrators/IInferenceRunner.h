@@ -22,6 +22,8 @@
 
 namespace llaminar2
 {
+    struct MTPSpecDecodeMetadataBatch;
+
     // Forward declarations
     class TensorBase;
     struct PlacementPlan;
@@ -1127,6 +1129,29 @@ namespace llaminar2
             int seq_idx = 0)
         {
             (void)verifier_row;
+            (void)target_cached_tokens;
+            (void)seq_idx;
+            return false;
+        }
+
+        /**
+         * @brief Upload graph-facing spec-decode metadata and publish the committed verifier state row.
+         *
+         * Phase 13.8 uses this to restore mutable hybrid state from
+         * committed_state_rows[request_index] without host-side row selection.
+         * Implementations must upload metadata on an explicit stream, restore
+         * all participant-local stateful layers from that device metadata, then
+         * truncate KV/bookkeeping to target_cached_tokens atomically for the
+         * request. Unsupported implementations must return false.
+         */
+        virtual bool restoreMTPVerifierStateFromSpecDecodeMetadata(
+            const MTPSpecDecodeMetadataBatch &batch,
+            int request_index,
+            int target_cached_tokens,
+            int seq_idx = 0)
+        {
+            (void)batch;
+            (void)request_index;
             (void)target_cached_tokens;
             (void)seq_idx;
             return false;
