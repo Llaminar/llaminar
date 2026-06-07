@@ -30,6 +30,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "kernels/cpu/CPURingKVCache.h"
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -103,6 +104,31 @@ public:
 
 namespace
 {
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name),
+              had_old_(std::getenv(name) != nullptr),
+              old_value_(had_old_ ? std::getenv(name) : "")
+        {
+            setenv(name_.c_str(), value, 1);
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+    private:
+        std::string name_;
+        bool had_old_ = false;
+        std::string old_value_;
+    };
+
     class FakeGlobalTPContext : public IGlobalTPContext
     {
     public:
@@ -861,6 +887,30 @@ TEST_F(Test__DeviceGraphOrchestrator, LogitsReturnsNullptrWhenNotInitialized)
 
     // Without initialized state, logits() should return nullptr
     EXPECT_EQ(orchestrator->logits(), nullptr);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, VllmStyleSpecDecodeCandidateHardFailsUntilPromoted)
+{
+    ScopedEnv candidate(
+        "LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE",
+        "vllm_style_spec_decode");
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+
+    EXPECT_STREQ(orchestrator->optimizedMTPDecodeCatchupGreedyName(),
+                 "vllm_style_spec_decode");
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    MTPDecodeCatchupGreedyResult result =
+        orchestrator->runOptimizedMTPDecodeCatchupGreedy(
+            request,
+            []() -> int32_t { return 9; });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.error.find("vllm_style_spec_decode is not promoted"),
+              std::string::npos);
+    EXPECT_NE(result.error.find("accepted-count"),
+              std::string::npos);
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutState)

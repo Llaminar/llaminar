@@ -7486,13 +7486,18 @@ namespace llaminar2
             return false;
         }
         return std::strcmp(candidate, "stepwise") == 0 ||
-               std::strcmp(candidate, "all_position") == 0;
+               std::strcmp(candidate, "all_position") == 0 ||
+               std::strcmp(candidate, "vllm_style_spec_decode") == 0;
     }
 
     const char *DeviceGraphOrchestrator::optimizedMTPDecodeCatchupGreedyName() const
     {
         const char *candidate =
             std::getenv("LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE");
+        if (candidate && std::strcmp(candidate, "vllm_style_spec_decode") == 0)
+        {
+            return "vllm_style_spec_decode";
+        }
         if (candidate && std::strcmp(candidate, "all_position") == 0)
         {
             return "retired_all_position_state_candidate";
@@ -7520,6 +7525,23 @@ namespace llaminar2
                 "decode",
                 state_.device_id.toString(),
                 {{"reason", "retired"}});
+            return result;
+        }
+        if (candidate && std::strcmp(candidate, "vllm_style_spec_decode") == 0)
+        {
+            MTPDecodeCatchupGreedyResult result;
+            result.ok = false;
+            result.error =
+                "Phase 13.8 vllm_style_spec_decode is not promoted: "
+                "accepted-count GDN/short-conv state kernels and commit-replay "
+                "parity are still required";
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "phase138_vllm_style_spec_decode_not_promoted",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"reason", "accepted_count_state_kernels_missing"}});
             return result;
         }
 

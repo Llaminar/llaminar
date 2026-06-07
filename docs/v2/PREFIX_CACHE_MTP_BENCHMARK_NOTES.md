@@ -69,6 +69,9 @@ CUDA MoE artifact:
   GDN/short-conv state. Focused unit coverage passed for
   `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`,
   `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`.
+- The named `vllm_style_spec_decode` hook is now selectable for Phase 13.8
+  development, but deliberately hard-fails until accepted-count state kernels
+  and commit-replay parity are present. This keeps benchmark counters honest.
 
 ## Retained Actions
 

@@ -2315,7 +2315,7 @@ For one request and greedy MTP depth `D`:
 
 - The design pivot is accepted. Phase 13.8 is now a vLLM-style transaction port, not a free-form shortcut search.
 - Tier 0 is already implemented: `MTPDecodeCatchup` owns the common sequential accept/reject oracle and `OrchestrationRunner` routes stateful CUDA/ROCm verification through `shared_stepwise`.
-- The named optimized-hook scaffold already exists on `IInferenceRunner`, but no backend optimized hook is promoted.
+- The named optimized-hook scaffold already exists on `IInferenceRunner`. `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` now selects the explicit Phase 13.8 hook name, but the hook hard-fails as not promoted until accepted-count GDN/short-conv state kernels and commit-replay parity are in place.
 - Retired candidate evidence remains binding:
   - sidecar-chain verifier state is not decode-equivalent on focused ROCm/generic and CUDA Qwen3.6 dense tests;
   - naive all-position selected-state restore is unsafe because CUDA and ROCm long-prefix tests prove continuation drift even when row logits/tokens look plausible.
