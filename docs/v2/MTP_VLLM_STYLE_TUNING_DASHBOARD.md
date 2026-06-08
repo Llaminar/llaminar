@@ -15,10 +15,10 @@ RAG rules:
 
 | Backend | Model | Sampling | RAG | Correctness | Speed evidence | Main blocker |
 |---|---|---|---|---|---|---|
-| CUDA | Dense 27B | greedy | Amber | yes | 39.93 vs 43.74 tok/s, 0.91x | needs refresh after publication path |
-| CUDA | Dense 27B | stochastic | Amber | yes | 39.60 vs 43.74 tok/s, 0.91x | needs bench refresh after publication path |
-| ROCm | Dense 27B | greedy | Amber | yes | 28.20 vs 30.21 tok/s, 0.93x | needs refresh after publication path |
-| ROCm | Dense 27B | stochastic | Amber | yes | 24.79 vs 30.21 tok/s, 0.82x | needs bench refresh after publication path |
+| CUDA | Dense 27B | greedy | Green | yes | 56.91 vs 43.82 tok/s, 1.30x | accepted-count path works |
+| CUDA | Dense 27B | stochastic | Green | yes | seed123 51.88 vs 43.82 tok/s, 1.18x | monitor acceptance |
+| ROCm | Dense 27B | greedy | Green | yes | 41.44 vs 30.19 tok/s, 1.37x | accepted-count path works |
+| ROCm | Dense 27B | stochastic | Amber | yes | seed123 31.31 vs 30.19 tok/s, 1.04x | small win; stochastic stream drift |
 | CPU | Dense 27B | greedy | Amber | yes | not refreshed | CPU state publication/bench gap |
 | CPU | Dense 27B | stochastic | Amber | yes | not refreshed | host verifier is correct, speed unmeasured |
 | CUDA | MoE 35B | greedy | Amber | yes | 118.07 vs 131.92 tok/s, 0.90x | low acceptance, verifier replay |
@@ -31,14 +31,17 @@ RAG rules:
 ## Latest Evidence
 
 - CUDA no-MTP determinism fixed by invalidating request-scoped prefill graph
-  captures on `SessionReset`. Evidence: `V2_Unit_` 497/497 and CUDA
+  captures on `SessionReset`. Latest evidence: `V2_Unit_` 497/497 and CUDA
   no-MTP fresh-run determinism parity passed.
 - Phase A all-position publication now explicitly materializes shifted MTP KV
   rows before state publication. Focused unit gate passed, and GPU stochastic
   parity passed for dense+MoE on CUDA+ROCm in one command.
-- Fresh dense evidence:
-  `benchmark_results/dense_phase138/20260608T_dashboard_dense_greedy/` and
-  `benchmark_results/dense_phase138/20260608T124752Z-postcleanup-cuda-rocm-assessment/`.
+- Fresh dense publication evidence:
+  `benchmark_results/mtp_vllm_style/20260608T-dense-publication-refresh/`.
+  CUDA greedy d1 is 56.91 tok/s, CUDA stochastic d1 seed123 is 51.29 tok/s,
+  ROCm greedy d1 is 41.44 tok/s, ROCm stochastic d1 seed123 is 31.31 tok/s.
+  Long seeded stochastic acceptance matches on CUDA/ROCm at 52 accepted and 12
+  rejected, but generated streams still differ at a few whitespace-token choices.
 - Fresh CUDA MoE greedy evidence:
   `benchmark_results/moe_phase138/20260608T_dashboard_moe_greedy/`.
 - Fresh ROCm MoE evidence:
@@ -50,13 +53,17 @@ RAG rules:
   stochastic sampler 0.61s/192. State publication is correct but not fast.
 - ROCm MoE stage-breakdown parity passed in isolation but took 340.57s; track
   as a test-duration/perf anomaly, not a correctness failure.
-- Dense stochastic profiler: CUDA `decode_equivalent_stochastic_forward_one`
-  23.06 ms/call; ROCm 33.39 ms/call. Verifier replay remains the dense blocker.
+- Historical dense sequential profiler: CUDA `decode_equivalent_stochastic_forward_one`
+  23.06 ms/call; ROCm 33.39 ms/call. Current GPU dense lanes use publication.
+- `V2_Integration_GPUSamplingKernels` passes, so the remaining stochastic gap is
+  real-model stream parity and ROCm sampler/verifier overhead, not the controlled
+  sampler-kernel math. The suite now includes Qwen3.6 real-logit-style seeded
+  rows with close whitespace/code-token probabilities for both CUDA and ROCm.
 - CUDA MoE profiler: `verifier_forward` 16.10 ms/call, sidecar only 0.88
   ms/call. The verifier path, not draft generation, dominates.
 - Dense/MoE parity surfaces remain symmetric across CPU/CUDA/ROCm shared
-  behavior. Latest GPU stochastic verifier gate passed: dense ROCm 27.21s,
-  dense CUDA 26.41s, MoE ROCm 22.27s, MoE CUDA 18.33s.
+  behavior. Latest GPU stochastic verifier gate passed: dense ROCm 28.06s,
+  dense CUDA 26.87s, MoE ROCm 22.33s, MoE CUDA 18.28s.
 
 ## Target Anchors
 
@@ -70,8 +77,7 @@ llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
 
 ## Next Dashboard Updates
 
-1. Refresh dense greedy/stochastic cells on CUDA/ROCm/CPU with the vLLM-style
-   publication path and host/device stochastic verifier coverage.
-2. Refresh CUDA/CPU MoE stochastic benchmark cells.
+1. Add a real-logit seeded stochastic parity lane so CPU/CUDA/ROCm cannot drift.
+2. Refresh dense CPU and CUDA/CPU MoE stochastic benchmark cells.
 3. Re-run the full iteration gate from `MTP_VLLM_STYLE_PROJECT_PLAN.md` before
    any WiP commit.

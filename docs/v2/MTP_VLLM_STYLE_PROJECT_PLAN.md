@@ -122,6 +122,10 @@ Done:
   with `PrefillGraphRejectReason::SessionReset`, fixing CUDA reused-runner
   no-MTP determinism after `clearCache()` without relying on logits gather.
 - CUDA/ROCm compact stochastic sampling kernels exist for top-k/top-p tables.
+- `V2_Integration_GPUSamplingKernels` now includes Qwen3.6 real-logit-style
+  seeded rows with close whitespace/code-token probabilities. CUDA and ROCm
+  graph-captured distribution build, direct sample, and compact sample match
+  the CPU canonical sampler on that fixture.
 - Dense CUDA/ROCm greedy and stochastic have parity/smoke coverage.
 - Dense CPU/CUDA/ROCm SingleDevice Prefix+MTP parity now shares one declarative
   18-case test surface, including prefix restore, split prefill, dynamic/fixed
@@ -139,13 +143,19 @@ Done:
   gate tensors without ensuring device residency on the explicit HIP stream.
 - CUDA and ROCm dense/MoE stochastic verifier parity now pass on the same
   all-position state-publication path.
+- Fresh dense GPU release benchmarks prove the accepted-count path is
+  speed-positive for greedy on both CUDA and ROCm: CUDA d1 is 56.91 vs 43.82
+  tok/s and ROCm d1 is 41.44 vs 30.19 tok/s. Refreshed long seeded stochastic
+  evidence shows matched CUDA/ROCm acceptance at 52 accepted and 12 rejected:
+  CUDA d1 is 51.29 tok/s and ROCm d1 is 31.31 tok/s. ROCm stochastic is only
+  barely speed-positive and remains below the CUDA-class win target.
 - CUDA MoE greedy has parity/style coverage.
 - The dead verifier-row publication hooks and tests were removed.
 
 Open gaps:
 
-- Real-model dense CUDA/ROCm/CPU benchmarks have not yet refreshed after
-  enabling the all-position accepted-count publication path.
+- Real-model dense CPU benchmarks have not yet refreshed after enabling the
+  all-position accepted-count publication path.
 - CPU stochastic accepted-count publication is not yet implemented; CPU
   stochastic currently proves correctness through the decode-equivalent host
   verifier path and still needs speed evidence.
@@ -162,8 +172,10 @@ Open gaps:
 - CUDA and CPU MoE stochastic benchmark lanes still need fresh runs.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE acceptance regressed in fresh runs and must be explained.
-- Dense CUDA/ROCm real-model MTP parity and benchmark refresh still needs to run
-  after the prefill graph reset fix and accepted-count publication path.
+- CUDA and ROCm dense stochastic MTP now match acceptance under the same seed,
+  but the generated token streams still differ at a few real-model samples
+  while the real-logit-style sampler fixture passes. This points at full-model
+  logits/state/perf differences rather than isolated sampler math.
 - TP/PP/ExpertParallel MTP is out of scope until SingleDevice is green.
 
 ## Implementation Phases
@@ -257,6 +269,8 @@ This must cover, as applicable:
 - Dense CPU/CUDA/ROCm greedy MTP and prefix restore.
 - Dense CPU/CUDA/ROCm stochastic MTP. The CPU lane may use the host verifier;
   CUDA/ROCm must use device-resident stochastic verification.
+- Seeded stochastic sampler parity for saved real-model logits must be symmetric
+  across CPU/CUDA/ROCm so backend drift cannot hide behind aggregate counters.
 - Dense CUDA/ROCm GPU graph smokes.
 - MoE CPU/CUDA/ROCm layer-by-layer math prefill/decode parity.
 - MoE CUDA greedy MTP parity/style tests.

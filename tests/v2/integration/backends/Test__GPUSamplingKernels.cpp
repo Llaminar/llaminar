@@ -2515,6 +2515,214 @@ namespace
             << "Qwen3.6 direct top-k/top-p sample mismatch";
     }
 
+    TEST_P(GPUSamplingTest, TopKTopP_Qwen36RealLogitStyleRowsSeededSamplesMatchCPU)
+    {
+        constexpr int vocab_size = 248320;
+        constexpr int top_k = 40;
+        constexpr float top_p = 0.95f;
+        constexpr float temperature = 0.6f;
+        constexpr uint64_t seed = 123;
+
+        struct HotToken
+        {
+            int token_id;
+            float logit;
+        };
+
+        const std::vector<std::vector<HotToken>> rows = {
+            {
+                {262, 8.9500f}, {256, 8.9475f}, {198, 8.72f}, {471, 8.31f},
+                {2972, 8.05f}, {2425, 7.92f}, {2824, 7.81f}, {64700, 7.62f},
+                {357, 7.51f}, {15352, 7.42f}, {11, 7.25f}, {1575, 7.10f},
+                {12, 6.96f}, {49422, 6.80f}, {6163, 6.68f}, {1358, 6.55f},
+                {96220, 6.42f}, {112523, 6.30f}, {96847, 6.22f}, {104980, 6.12f},
+                {98936, 6.05f}, {109120, 5.96f}, {271, 5.86f}, {248068, 5.74f},
+                {8160, 5.63f}, {579, 5.51f}, {264, 5.40f}, {7047, 5.28f},
+                {1817, 5.16f}, {25, 5.04f}, {16, 4.93f}, {13, 4.81f},
+                {220, 4.70f}, {2014, 4.59f}, {53983, 4.47f}, {2570, 4.36f},
+                {5396, 4.25f}, {1891, 4.13f}, {28758, 4.02f}, {99943, 3.91f},
+            },
+            {
+                {256, 9.0100f}, {262, 9.0070f}, {471, 8.84f}, {2972, 8.55f},
+                {1421, 8.36f}, {23398, 8.21f}, {13, 8.04f}, {198, 7.93f},
+                {681, 7.80f}, {8193, 7.69f}, {883, 7.57f}, {36515, 7.44f},
+                {6163, 7.32f}, {96847, 7.20f}, {1, 7.07f}, {11436, 6.95f},
+                {12410, 6.84f}, {13410, 6.73f}, {1414, 6.62f}, {15613, 6.51f},
+                {29223, 6.40f}, {28254, 6.29f}, {836, 6.18f}, {1919, 6.07f},
+                {11, 5.96f}, {271, 5.85f}, {1835, 5.74f}, {5077, 5.63f},
+                {3710, 5.52f}, {5839, 5.41f}, {5757, 5.30f}, {159034, 5.19f},
+                {1503, 5.08f}, {2144, 4.97f}, {3766, 4.86f}, {16545, 4.75f},
+                {51121, 4.64f}, {22527, 4.53f}, {6157, 4.42f}, {77777, 4.31f},
+            },
+            {
+                {271, 9.15f}, {198, 8.98f}, {220, 8.77f}, {25, 8.51f},
+                {16, 8.36f}, {2014, 8.24f}, {2972, 8.12f}, {579, 7.98f},
+                {7047, 7.87f}, {64700, 7.74f}, {2824, 7.61f}, {2570, 7.49f},
+                {262, 7.31f}, {256, 7.29f}, {11, 7.15f}, {12, 7.01f},
+                {6163, 6.88f}, {49422, 6.75f}, {15352, 6.63f}, {357, 6.51f},
+                {471, 6.40f}, {2425, 6.29f}, {5396, 6.18f}, {1358, 6.07f},
+                {96220, 5.96f}, {112523, 5.85f}, {96847, 5.74f}, {104980, 5.63f},
+                {98936, 5.52f}, {109120, 5.41f}, {248068, 5.30f}, {8160, 5.19f},
+                {264, 5.08f}, {1817, 4.97f}, {13, 4.86f}, {53983, 4.75f},
+                {1891, 4.64f}, {28758, 4.53f}, {99943, 4.42f}, {836, 4.31f},
+            },
+        };
+
+        void *d_logits = nullptr;
+        void *d_token_ids = nullptr;
+        void *d_probs = nullptr;
+        void *d_sample_token = nullptr;
+        void *d_direct_token = nullptr;
+
+        auto cleanup = [&]()
+        {
+            if (d_logits)
+                backend_->free(d_logits, device_id_);
+            if (d_token_ids)
+                backend_->free(d_token_ids, device_id_);
+            if (d_probs)
+                backend_->free(d_probs, device_id_);
+            if (d_sample_token)
+                backend_->free(d_sample_token, device_id_);
+            if (d_direct_token)
+                backend_->free(d_direct_token, device_id_);
+        };
+
+        d_logits = backend_->allocate(static_cast<size_t>(vocab_size) * sizeof(float), device_id_);
+        d_token_ids = backend_->allocate(top_k * sizeof(int), device_id_);
+        d_probs = backend_->allocate(top_k * sizeof(float), device_id_);
+        d_sample_token = backend_->allocate(sizeof(int), device_id_);
+        d_direct_token = backend_->allocate(sizeof(int), device_id_);
+        ASSERT_NE(d_logits, nullptr);
+        ASSERT_NE(d_token_ids, nullptr);
+        ASSERT_NE(d_probs, nullptr);
+        ASSERT_NE(d_sample_token, nullptr);
+        ASSERT_NE(d_direct_token, nullptr);
+
+        auto run_row = [&](IWorkerGPUContext &ctx,
+                           const std::vector<float> &logits,
+                           float threshold,
+                           uint64_t offset)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_logits,
+                    logits.data(),
+                    logits.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_logits,
+                    vocab_size,
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    d_token_ids,
+                    d_probs));
+                ASSERT_TRUE(backend_->enqueueSampleDistributionF32Device(
+                    d_token_ids,
+                    d_probs,
+                    top_k,
+                    threshold,
+                    device_id_,
+                    stream,
+                    d_sample_token));
+                ASSERT_TRUE(backend_->enqueueSampleTopKTopPF32Device(
+                    d_logits,
+                    vocab_size,
+                    top_k,
+                    top_p,
+                    temperature,
+                    seed,
+                    offset,
+                    device_id_,
+                    stream,
+                    d_direct_token));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            std::vector<float> logits(static_cast<size_t>(vocab_size), -18.0f);
+            for (int i = 0; i < vocab_size; ++i)
+                logits[static_cast<size_t>(i)] -=
+                    0.00029f * static_cast<float>((i * 53 + static_cast<int>(row) * 17) % 997);
+            for (const HotToken &hot : rows[row])
+                logits[static_cast<size_t>(hot.token_id)] = hot.logit;
+
+            const uint64_t offset = 17 + static_cast<uint64_t>(row) * 11;
+            const float threshold = samplingUniform01(seed, offset);
+            const auto expected_distribution =
+                expectedTopKTopPDistribution(logits, top_k, top_p, temperature);
+            const int expected_sample =
+                expectedSampleDistributionWithThreshold(expected_distribution, threshold);
+            const int expected_direct_sample =
+                expectedTopKTopPSample(logits, top_k, top_p, temperature, seed, offset);
+            ASSERT_EQ(expected_direct_sample, expected_sample)
+                << "CPU direct/distribution sample mismatch at row " << row;
+
+            if (GetParam() == "CUDA")
+            {
+                auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+                run_row(ctx, logits, threshold, offset);
+            }
+            else
+            {
+                auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+                run_row(ctx, logits, threshold, offset);
+            }
+
+            std::vector<int> gpu_ids(top_k, -1);
+            std::vector<float> gpu_probs(top_k, 0.0f);
+            int sample_token = -1;
+            int direct_token = -1;
+            ASSERT_TRUE(backend_->deviceToHost(
+                gpu_ids.data(), d_token_ids, top_k * sizeof(int), device_id_));
+            ASSERT_TRUE(backend_->deviceToHost(
+                gpu_probs.data(), d_probs, top_k * sizeof(float), device_id_));
+            ASSERT_TRUE(backend_->deviceToHost(
+                &sample_token, d_sample_token, sizeof(int), device_id_));
+            ASSERT_TRUE(backend_->deviceToHost(
+                &direct_token, d_direct_token, sizeof(int), device_id_));
+
+            for (int i = 0; i < top_k; ++i)
+            {
+                EXPECT_EQ(gpu_ids[static_cast<size_t>(i)],
+                          expected_distribution[static_cast<size_t>(i)].token_id)
+                    << "real-logit-style row " << row
+                    << " compact distribution token mismatch at slot " << i;
+                EXPECT_NEAR(gpu_probs[static_cast<size_t>(i)],
+                            expected_distribution[static_cast<size_t>(i)].probability,
+                            1e-5f)
+                    << "real-logit-style row " << row
+                    << " compact distribution probability mismatch at slot " << i;
+            }
+            EXPECT_EQ(sample_token, expected_sample)
+                << "real-logit-style row " << row
+                << " compact distribution sample mismatch";
+            EXPECT_EQ(direct_token, expected_direct_sample)
+                << "real-logit-style row " << row
+                << " direct top-k/top-p sample mismatch";
+        }
+
+        cleanup();
+    }
+
     TEST_P(GPUSamplingTest, SpeculativeVerifyDistributionsAreGraphCapturable)
     {
         const std::vector<float> target_logits = {0.1f, 3.2f, 2.0f, 1.2f,
