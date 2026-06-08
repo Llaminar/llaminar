@@ -10,10 +10,11 @@ plan carries detailed implementation status.
 |---|---|---|---|---:|---:|---|
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 877.55 | 43.81 | current clean baseline |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 726.19 | 87.07 | historical 1.99x target, not accepted |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 727.20 | 36.65 | pre-batch baseline, rebench pending |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 726.94 | 36.14 | post-batch, speed-negative |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, shared stepwise | 609.73 | 38.19 | old blocker, 84.95% acceptance |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.54 | 30.21 | current clean baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 217.10 | 34.40 | failed equivalence, not accepted |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 218.17 | 20.33 | post-batch, speed-negative |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 76.35 | 31.92 | short-lane baseline |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 73.05 | 54.23 | historical 1.70x target |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | current baseline |
@@ -42,7 +43,11 @@ plan carries detailed implementation status.
 - 2026-06-08: CUDA/ROCm stochastic MTP now batches compact-distribution
   accept tests for draft rows, while residual correction stays on the existing
   single-row verifier. Focused runner, GPU sampling, CUDA/ROCm graph smoke, and
-  Qwen3.6 stochastic parity tests are green; fresh benchmark capture is next.
+  Qwen3.6 stochastic parity tests are green.
+- Post-batch stochastic dense default benchmarks are still speed-negative:
+  CUDA 36.14 tok/s at 56.47% acceptance, ROCm 20.33 tok/s at 60.00%
+  acceptance. Next tuning target is verifier/residual work, not accept-test
+  launch overhead.
 
 ## llama.cpp CUDA Anchors
 
