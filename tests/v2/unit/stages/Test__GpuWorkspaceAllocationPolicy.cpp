@@ -239,6 +239,16 @@ namespace
         return extension == ".cpp" || extension == ".cu" || extension == ".cuh" ||
                extension == ".h" || extension == ".hpp";
     }
+
+    bool isPhase138HygieneScannedFile(const std::filesystem::path &path)
+    {
+        if (isSourceFile(path))
+            return true;
+        const auto extension = path.extension().string();
+        const auto filename = path.filename().string();
+        return extension == ".md" || extension == ".cmake" ||
+               filename == "CMakeLists.txt";
+    }
 } // namespace
 
 TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSourceOwners)
@@ -299,6 +309,65 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSource
         std::ostringstream out;
         out << "Raw cudaMalloc/hipMalloc calls must stay in sanctioned low-level allocation owners. "
                "Use DeviceWorkspaceManager/IWorkspaceConsumer or backend allocation APIs instead.\n";
+        for (const auto &failure : failures)
+            out << failure << '\n';
+        return out.str();
+    }();
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, RetiredPhase138GreedyCandidateSymbolsStayRemoved)
+{
+    const auto root = repoRoot();
+    const std::vector<std::string> forbidden = {
+        "supportsOptimizedMTPDecodeCatchupGreedy",
+        "optimizedMTPDecodeCatchupGreedyName",
+        "runOptimizedMTPDecodeCatchupGreedy",
+        "supportsPromotedVllmStyleSpecDecode",
+        "LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE",
+        "LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE",
+        "LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK",
+        "phase138_vllm_style_spec_decode",
+        "vllm_style_spec_decode",
+        "Phase138VllmStyleCandidate",
+        "MTPShiftedRowCommitPreservesVerifierForward",
+        "densePhase138DirectCandidateEnabled",
+        "runDensePhase138VllmStyle",
+        "runDenseMTPShiftedRowCommitPreservesVerifierForward",
+    };
+    const std::vector<std::filesystem::path> scan_roots = {
+        root / "src/v2",
+        root / "tests/v2",
+        root / "docs/v2",
+    };
+
+    std::vector<std::string> failures;
+    for (const auto &scan_root : scan_roots)
+    {
+        for (const auto &entry : std::filesystem::recursive_directory_iterator(scan_root))
+        {
+            if (!entry.is_regular_file() || !isPhase138HygieneScannedFile(entry.path()))
+                continue;
+            const auto relative =
+                std::filesystem::relative(entry.path(), root).generic_string();
+            const auto raw_source = readFile(entry.path());
+            const std::string scanned =
+                isSourceFile(entry.path())
+                    ? stripCommentsAndStringLiterals(raw_source)
+                    : raw_source;
+            for (const auto &needle : forbidden)
+            {
+                if (scanned.find(needle) != std::string::npos)
+                    failures.push_back(relative + ": " + needle);
+            }
+        }
+    }
+
+    EXPECT_TRUE(failures.empty()) << [&]
+    {
+        std::ostringstream out;
+        out << "The retired Phase 13.8 raw all-position greedy candidate must not be "
+               "reintroduced. Build future MTP speed paths on the accepted-count "
+               "transaction contract instead.\n";
         for (const auto &failure : failures)
             out << failure << '\n';
         return out.str();
@@ -438,7 +507,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEExecutionScratchUsesWorkspace)
     const auto decode_scratch = sliceBetween(
         source,
         "bool ROCmMoEKernel::ensureStagingCapacity(",
-        "bool ROCmMoEKernel::ensureRuntimeGateUpPointerArrays(");
+        "bool ROCmMoEKernel::ensureGroupedDecodeCapacity(");
     const auto sync_grouping_scratch = sliceBetween(
         source,
         "bool ROCmMoEKernel::prepareExpertGroups(",
