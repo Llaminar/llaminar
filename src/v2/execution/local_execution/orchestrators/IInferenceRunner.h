@@ -1079,40 +1079,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Whether the runner can restore mutable MTP verifier state
-         *        directly from the most recent verifier-row captures.
-         *
-         * When true, the MTP decode path may skip expensive post-sidecar
-         * checkpoint payload captures for narrow greedy paths and require
-         * restoreMTPVerifierStateRow() to succeed on rollback.
-         */
-        virtual bool supportsMTPVerifierStateRowRestore() const
-        {
-            return false;
-        }
-
-        /**
-         * @brief Restore mutable verifier state from a captured all-position
-         *        verifier row, without replaying the accepted verifier prefix.
-         *
-         * The target cached token count is the logical main-model position after
-         * the restored row. Implementations must restore every mutable hybrid
-         * state participant they own, truncate main KV state to target_cached_tokens,
-         * and update decode position bookkeeping. Unsupported topologies return
-         * false so callers can select the slower checkpoint replay path.
-         */
-        virtual bool restoreMTPVerifierStateRow(
-            int verifier_row,
-            int target_cached_tokens,
-            int seq_idx = 0)
-        {
-            (void)verifier_row;
-            (void)target_cached_tokens;
-            (void)seq_idx;
-            return false;
-        }
-
-        /**
          * @brief Read-only runtime state probe for prefix-cache/MTP development.
          *
          * This is diagnostic state only: callers must not mutate runner-owned

@@ -2023,11 +2023,6 @@ namespace llaminar2
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
         bool requiresMTPDecodeEquivalentVerifierReplay() const override;
-        bool supportsMTPVerifierStateRowRestore() const override;
-        bool restoreMTPVerifierStateRow(
-            int verifier_row,
-            int target_cached_tokens,
-            int seq_idx = 0) override;
 
         /**
          * @brief Inspect request-local runtime state for prefix-cache/MTP probes.

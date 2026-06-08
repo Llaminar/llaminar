@@ -79,22 +79,6 @@ namespace llaminar2
         const MTPDecodeCatchupGreedyResult &candidate);
 
     /**
-     * @brief Build the greedy catch-up result implied by target verifier rows.
-     *
-     * sampled_verifier_tokens has one row per verifier input token:
-     *   row i is the target sample after forwarding request.draft_tokens[i].
-     *
-     * This is intentionally not the same as stepwise catch-up after a reject.
-     * The rejecting row supplies a correction output token, but the live target
-     * state is only valid through the accepted verifier-input prefix. Callers
-     * must replay any correction suffix before publishing state as fully
-     * decode-equivalent.
-     */
-    MTPDecodeCatchupGreedyResult buildMTPDecodeCatchupGreedyResultFromVerifierRows(
-        const MTPDecodeCatchupGreedyRequest &request,
-        const std::vector<int32_t> &sampled_verifier_tokens);
-
-    /**
      * @brief Run greedy MTP verification through normal one-token decode.
      *
      * This is the canonical shared catch-up implementation for stateful models

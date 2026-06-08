@@ -10,19 +10,16 @@ TEST(Test__MTPVerifierPolicy, StatefulGreedyRunnerUsesDecodeEquivalentSequential
     const MTPVerifierPolicyDecision decision =
         chooseMTPVerifierPolicy(
             MTPVerifierPolicyInput{
-                .runner_requires_decode_equivalent_replay = true,
-                .runner_supports_verifier_state_row_restore = true,
                 .greedy_sampling = true,
             });
 
     EXPECT_EQ(
         decision.path,
         MTPVerifierExecutionPath::DecodeEquivalentSequential);
-    EXPECT_FALSE(decision.allow_verifier_state_row_shortcut);
     EXPECT_TRUE(decision.accepted_all_position_state_requires_replay);
     EXPECT_STREQ(
         decision.reason,
-        "stateful_runner_requires_decode_equivalent_replay");
+        "greedy_uses_shared_decode_equivalent_verifier");
 }
 
 TEST(Test__MTPVerifierPolicy, StatefulSamplingRunnerUsesDecodeEquivalentSequentialPath)
@@ -30,8 +27,6 @@ TEST(Test__MTPVerifierPolicy, StatefulSamplingRunnerUsesDecodeEquivalentSequenti
     const MTPVerifierPolicyDecision decision =
         chooseMTPVerifierPolicy(
             MTPVerifierPolicyInput{
-                .runner_requires_decode_equivalent_replay = true,
-                .runner_supports_verifier_state_row_restore = true,
                 .greedy_sampling = false,
                 .stochastic_verify = true,
             });
@@ -39,72 +34,63 @@ TEST(Test__MTPVerifierPolicy, StatefulSamplingRunnerUsesDecodeEquivalentSequenti
     EXPECT_EQ(
         decision.path,
         MTPVerifierExecutionPath::DecodeEquivalentSequential);
-    EXPECT_FALSE(decision.allow_verifier_state_row_shortcut);
     EXPECT_TRUE(decision.accepted_all_position_state_requires_replay);
     EXPECT_STREQ(
         decision.reason,
-        "stateful_runner_requires_decode_equivalent_replay");
+        "stochastic_uses_shared_decode_equivalent_verifier");
 }
 
-TEST(Test__MTPVerifierPolicy, StatelessRunnerWithRowRestoreMayCommitVerifierRows)
+TEST(Test__MTPVerifierPolicy, GreedyPolicyIsSharedDecodeEquivalentOnly)
 {
     const MTPVerifierPolicyDecision decision =
         chooseMTPVerifierPolicy(
             MTPVerifierPolicyInput{
-                .runner_requires_decode_equivalent_replay = false,
-                .runner_supports_verifier_state_row_restore = true,
                 .greedy_sampling = true,
             });
 
     EXPECT_EQ(
         decision.path,
-        MTPVerifierExecutionPath::AllPositionVerifier);
-    EXPECT_TRUE(decision.allow_verifier_state_row_shortcut);
-    EXPECT_FALSE(decision.accepted_all_position_state_requires_replay);
+        MTPVerifierExecutionPath::DecodeEquivalentSequential);
+    EXPECT_TRUE(decision.accepted_all_position_state_requires_replay);
     EXPECT_STREQ(
         decision.reason,
-        "verifier_prefill_rows_declared_decode_equivalent");
+        "greedy_uses_shared_decode_equivalent_verifier");
 }
 
-TEST(Test__MTPVerifierPolicy, MissingRowRestoreForcesReplayEvenForStatelessRunner)
+TEST(Test__MTPVerifierPolicy, GreedyPenaltiesAreUnsupportedUntilTransactionPathExists)
 {
     const MTPVerifierPolicyDecision decision =
         chooseMTPVerifierPolicy(
             MTPVerifierPolicyInput{
-                .runner_requires_decode_equivalent_replay = false,
-                .runner_supports_verifier_state_row_restore = false,
                 .greedy_sampling = true,
+                .uses_sampling_penalties = true,
             });
 
     EXPECT_EQ(
         decision.path,
-        MTPVerifierExecutionPath::AllPositionVerifier);
-    EXPECT_FALSE(decision.allow_verifier_state_row_shortcut);
+        MTPVerifierExecutionPath::Unsupported);
     EXPECT_TRUE(decision.accepted_all_position_state_requires_replay);
     EXPECT_STREQ(
         decision.reason,
-        "verifier_state_row_restore_not_supported");
+        "greedy_penalty_mtp_requires_new_transaction_path");
 }
 
-TEST(Test__MTPVerifierPolicy, DebugOverrideLeavesStatefulRunnerUnsafeByDesign)
+TEST(Test__MTPVerifierPolicy, NonGreedyWithoutStochasticVerifierIsUnsupported)
 {
     const MTPVerifierPolicyDecision decision =
         chooseMTPVerifierPolicy(
             MTPVerifierPolicyInput{
-                .runner_requires_decode_equivalent_replay = true,
-                .runner_supports_verifier_state_row_restore = true,
-                .greedy_sampling = true,
-                .disable_decode_equivalent_sequential = true,
+                .greedy_sampling = false,
+                .stochastic_verify = false,
             });
 
     EXPECT_EQ(
         decision.path,
-        MTPVerifierExecutionPath::AllPositionVerifier);
-    EXPECT_FALSE(decision.allow_verifier_state_row_shortcut);
+        MTPVerifierExecutionPath::Unsupported);
     EXPECT_TRUE(decision.accepted_all_position_state_requires_replay);
     EXPECT_STREQ(
         decision.reason,
-        "decode_equivalent_replay_debug_override");
+        "sampling_mode_not_supported_by_shared_verifier");
 }
 
 } // namespace llaminar2

@@ -24,6 +24,10 @@ Phase 14 scoreboard for Qwen3.6 MTP and prefix-cache tuning.
 - Stateful Qwen3.6 greedy and stochastic MTP use the shared decode-equivalent
   verifier path. The old accepted-count publication candidate is not promoted
   for stateful rows that require replay.
+- Cleanup slice: public verifier-row restore hooks, the verifier-row catch-up
+  builder, and stale Qwen3.6 shortcut parity cells are removed. LocalTP and
+  GlobalTP now delegate the same single-row shifted-cache commit API used by the
+  retained verifier path. Focused MTP/prefix units are green.
 - Fresh ROCm retained-path profiling shows stochastic fixed depth-1 still pays
   two one-token main forwards per speculative pair. Skipping the redundant
   verifier-base restore when the sidecar preserves main state improved decode

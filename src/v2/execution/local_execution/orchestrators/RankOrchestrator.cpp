@@ -2493,7 +2493,7 @@ namespace llaminar2
             "decode",
             "rank",
             {{"participants", std::to_string(device_runners_.size())}});
-        if (already_appended_tokens < 1 || device_runners_.empty())
+        if (already_appended_tokens < 0 || device_runners_.empty())
             return false;
 
         if (device_runners_.size() == 1)
@@ -3542,41 +3542,6 @@ namespace llaminar2
         truncate_runners(device_runners_);
         truncate_runners(pp_stage_runners_);
         return saw_runner && ok;
-    }
-
-    bool RankOrchestrator::restoreMTPVerifierStateRow(
-        int verifier_row,
-        int target_cached_tokens,
-        int seq_idx)
-    {
-        if (pp_stage_runners_.empty() &&
-            device_runners_.size() == 1 &&
-            device_runners_[0])
-        {
-            return device_runners_[0]->restoreMTPVerifierStateRow(
-                verifier_row,
-                target_cached_tokens,
-                seq_idx);
-        }
-
-        PerfStatsCollector::addCounter("mtp",
-                                       "verifier_state_row_restore_unavailable",
-                                       1.0,
-                                       "decode",
-                                       "rank",
-                                       {{"reason", "multi_participant_rank"}});
-        return false;
-    }
-
-    bool RankOrchestrator::supportsMTPVerifierStateRowRestore() const
-    {
-        if (pp_stage_runners_.empty() &&
-            device_runners_.size() == 1 &&
-            device_runners_[0])
-        {
-            return device_runners_[0]->supportsMTPVerifierStateRowRestore();
-        }
-        return false;
     }
 
     PrefixRuntimeStateSnapshot RankOrchestrator::prefixStateProbe() const

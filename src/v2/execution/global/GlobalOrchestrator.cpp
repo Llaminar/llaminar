@@ -496,6 +496,37 @@ namespace llaminar2
         return saw_runner && ok;
     }
 
+    bool StageRunnerRegistry::commitMTPShiftedRowFromCurrentTerminalHiddenAll(
+        int32_t token,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+                     token,
+                     already_appended_tokens,
+                     allow_speculative_discard,
+                     position_offset_override) &&
+                 ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            ok = compatibility_runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
+                     token,
+                     already_appended_tokens,
+                     allow_speculative_discard,
+                     position_offset_override) &&
+                 ok;
+        }
+        return saw_runner && ok;
+    }
+
     bool StageRunnerRegistry::setComputeAllPositionLogitsAll(bool enabled)
     {
         bool saw_runner = false;
@@ -1282,6 +1313,21 @@ namespace llaminar2
             tokens,
             token_count,
             already_appended_tokens);
+    }
+
+    bool GlobalOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden(
+        int32_t token,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.commitMTPShiftedRowFromCurrentTerminalHiddenAll(
+            token,
+            already_appended_tokens,
+            allow_speculative_discard,
+            position_offset_override);
     }
 
     const float *GlobalOrchestrator::mtpLogits() const

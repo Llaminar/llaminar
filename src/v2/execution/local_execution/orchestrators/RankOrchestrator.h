@@ -567,11 +567,6 @@ namespace llaminar2
         PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
-        bool supportsMTPVerifierStateRowRestore() const override;
-        bool restoreMTPVerifierStateRow(
-            int verifier_row,
-            int target_cached_tokens,
-            int seq_idx = 0) override;
 
         // =====================================================================
         // Hidden State API (for Pipeline Parallelism nesting)

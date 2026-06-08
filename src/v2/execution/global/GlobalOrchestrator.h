@@ -144,6 +144,11 @@ namespace llaminar2
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens);
+        bool commitMTPShiftedRowFromCurrentTerminalHiddenAll(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1);
         bool setComputeAllPositionLogitsAll(bool enabled);
         uint64_t moePlacementEpochAll() const;
         PrefixStateSnapshot captureLivePrefixStateAll(int seq_idx = 0) const;
@@ -269,6 +274,11 @@ namespace llaminar2
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens) override;
+        bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;

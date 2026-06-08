@@ -606,11 +606,16 @@ TEST(Test__MTPSpecDecodeMetadata, UsesExplicitVerifierStateCommitCountForRejecte
 
     MTPDecodeCatchupGreedyRequest request;
     request.draft_tokens = {7, 9, 8};
-    MTPDecodeCatchupGreedyResult result =
-        buildMTPDecodeCatchupGreedyResultFromVerifierRows(
-            request,
-            /*sampled_verifier_tokens=*/{9, 3, 4});
-    ASSERT_TRUE(result.ok) << result.error;
+    MTPDecodeCatchupGreedyResult result;
+    result.ok = true;
+    result.accepted_tokens = {7, 9, 3};
+    result.verifier_tokens = {9, 3};
+    result.all_speculative_accepted = false;
+    result.accepted_speculative_prefix = 1;
+    result.rejected_verified_token = 3;
+    result.main_forward_token_count = 3;
+    result.shifted_commit_count = 3;
+    result.target_verifier_state_commit_count = 2;
 
     MTPSpecDecodeMetadataBatch batch =
         buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
@@ -647,13 +652,17 @@ TEST(Test__MTPSpecDecodeMetadata, StateCommitPlanDoesNotReplayStoppedCorrectionS
     MTPDecodeCatchupGreedyRequest request;
     request.draft_tokens = {7, 9, 8};
     request.stop_tokens = {3};
-    MTPDecodeCatchupGreedyResult result =
-        buildMTPDecodeCatchupGreedyResultFromVerifierRows(
-            request,
-            /*sampled_verifier_tokens=*/{3, -1, -1});
-    ASSERT_TRUE(result.ok) << result.error;
-    ASSERT_TRUE(result.stopped_on_output);
-    ASSERT_EQ(result.target_verifier_state_commit_count, 1);
+    MTPDecodeCatchupGreedyResult result;
+    result.ok = true;
+    result.accepted_tokens = {7, 3};
+    result.verifier_tokens = {3};
+    result.all_speculative_accepted = false;
+    result.stopped_on_output = true;
+    result.accepted_speculative_prefix = 0;
+    result.rejected_verified_token = 3;
+    result.main_forward_token_count = 3;
+    result.shifted_commit_count = 2;
+    result.target_verifier_state_commit_count = 1;
 
     MTPSpecDecodeMetadataBatch batch =
         buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(

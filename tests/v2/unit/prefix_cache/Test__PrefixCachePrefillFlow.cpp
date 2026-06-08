@@ -39,7 +39,22 @@ namespace
                 return true;
             }
             logits_buffer.assign(vocab_size(), -1.0f);
-            logits_buffer[prefill_argmax_token] = 10.0f;
+            int token = prefill_argmax_token;
+            if (seq_len == 1)
+            {
+                if (decode_argmax_index < decode_argmax_tokens.size())
+                {
+                    token = decode_argmax_tokens[decode_argmax_index++];
+                }
+                else if (mtp_enabled)
+                {
+                    const size_t token_index = decode_argmax_index++;
+                    token = token_index < verify_argmax_tokens.size()
+                                ? verify_argmax_tokens[token_index]
+                                : verify_argmax_token;
+                }
+            }
+            logits_buffer[token] = 10.0f;
             syncShiftedRowsToPosition();
             return true;
         }
@@ -132,27 +147,6 @@ namespace
 
         bool supportsMTPSidecarPreservesMainState() const override
         {
-            return true;
-        }
-
-        bool supportsMTPVerifierStateRowRestore() const override
-        {
-            return verifier_row_restore_supported;
-        }
-
-        bool restoreMTPVerifierStateRow(
-            int verifier_row,
-            int target_cached_tokens,
-            int seq_idx = 0) override
-        {
-            (void)seq_idx;
-            if (!verifier_row_restore_supported)
-                return false;
-            ++restore_verifier_row_calls;
-            last_verifier_restore_row = verifier_row;
-            last_verifier_restore_target_tokens = target_cached_tokens;
-            position = target_cached_tokens;
-            syncShiftedRowsToPosition();
             return true;
         }
 
@@ -265,15 +259,16 @@ namespace
         bool all_position_logits_enabled = false;
         bool supports_chunk_schedule = false;
         bool chunk_schedule_ok = true;
-        bool verifier_row_restore_supported = true;
         std::vector<float> logits_buffer = std::vector<float>(16, -1.0f);
         std::vector<float> mtp_logits;
         std::vector<float> all_position_logits;
         std::vector<int> mtp_argmax_tokens;
         std::vector<int> verify_argmax_tokens;
+        std::vector<int> decode_argmax_tokens;
         int prefill_argmax_token = 9;
         int mtp_argmax_token = 11;
         int verify_argmax_token = 11;
+        size_t decode_argmax_index = 0;
         int forward_calls = 0;
         int chunk_schedule_calls = 0;
         int forward_mtp_calls = 0;
@@ -285,9 +280,6 @@ namespace
         int harvest_calls = 0;
         int restore_terminal_calls = 0;
         int restore_live_calls = 0;
-        int restore_verifier_row_calls = 0;
-        int last_verifier_restore_row = -1;
-        int last_verifier_restore_target_tokens = -1;
         int last_mtp_condition_token = -1;
         int restored_tokens = 0;
         int harvested_prompt_token_count = 0;
@@ -623,11 +615,10 @@ TEST(Test__PrefixCachePrefillFlow, FullHitWithMTPCommitsAcceptedVerifierStateWit
     EXPECT_EQ(mock_ptr->forward_mtp_calls, 1);
     EXPECT_EQ(mock_ptr->last_mtp_condition_token, mock_ptr->prefill_argmax_token);
     EXPECT_EQ(mock_ptr->restore_live_calls, 0);
-    EXPECT_EQ(mock_ptr->commit_mtp_calls, 1);
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 2);
     EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
     EXPECT_THAT(mock_ptr->last_commit_tokens,
-                ElementsAre(mock_ptr->prefill_argmax_token,
-                            mock_ptr->mtp_argmax_token));
+                ElementsAre(mock_ptr->mtp_argmax_token));
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_TRUE(probe.prefix_request.hit);
@@ -693,7 +684,7 @@ TEST(Test__PrefixCachePrefillFlow, MTPStatsRecordRejectedDraftToken)
     EXPECT_EQ(probe.mtp_draft_steps, 1u);
     EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
     EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
-    EXPECT_EQ(probe.mtp_rollbacks, 1u);
+    EXPECT_EQ(probe.mtp_rollbacks, 0u);
     EXPECT_EQ(probe.mtp_verifier_runs, 1u);
     EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
 }
@@ -720,9 +711,9 @@ TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeComm
     EXPECT_EQ(mock_ptr->chained_mtp_calls, 2);
     EXPECT_THAT(mock_ptr->chained_mtp_positions, ElementsAre(5, 6));
     EXPECT_EQ(mock_ptr->restore_live_calls, 0);
-    EXPECT_EQ(mock_ptr->commit_mtp_calls, 1);
-    EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
-    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(9, 11, 12, 13));
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 4);
+    EXPECT_EQ(mock_ptr->last_commit_already_appended, 3);
+    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(13));
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_EQ(probe.mtp_draft_steps, 3u);
@@ -763,9 +754,9 @@ TEST(Test__PrefixCachePrefillFlow, FullPrefixTerminalRestoreSupportsChainedMTPDr
     EXPECT_EQ(mock_ptr->chained_mtp_calls, 2);
     EXPECT_THAT(mock_ptr->chained_mtp_positions, ElementsAre(5, 6));
     EXPECT_EQ(mock_ptr->restore_live_calls, 0);
-    EXPECT_EQ(mock_ptr->commit_mtp_calls, 1);
-    EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
-    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(9, 11, 12, 13));
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 4);
+    EXPECT_EQ(mock_ptr->last_commit_already_appended, 3);
+    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(13));
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_TRUE(probe.prefix_request.hit);
@@ -779,7 +770,7 @@ TEST(Test__PrefixCachePrefillFlow, FullPrefixTerminalRestoreSupportsChainedMTPDr
     EXPECT_EQ(probe.mtp_verifier_token_count, 4u);
 }
 
-TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeUsesVerifierRowRestoreOnReject)
+TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeReplaysCorrectionOnReject)
 {
     auto mock = std::make_unique<PrefixFlowMockRunner>();
     auto *mock_ptr = mock.get();
@@ -788,7 +779,7 @@ TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeUses
     mock_ptr->lookup_result.block_size = 2;
     mock_ptr->lookup_result.cached_tokens = 2;
     mock_ptr->mtp_argmax_tokens = {11, 12, 13};
-    mock_ptr->verify_argmax_tokens = {11, 15, 13, 14};
+    mock_ptr->decode_argmax_tokens = {11, 15, 14};
 
     auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true, /*mtp_draft_tokens=*/3);
     ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
@@ -801,11 +792,8 @@ TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeUses
     EXPECT_EQ(mock_ptr->chained_mtp_calls, 2);
     EXPECT_THAT(mock_ptr->chained_mtp_positions, ElementsAre(5, 6));
     EXPECT_EQ(mock_ptr->restore_live_calls, 0);
-    EXPECT_EQ(mock_ptr->restore_verifier_row_calls, 1);
-    EXPECT_EQ(mock_ptr->last_verifier_restore_row, 1);
-    EXPECT_EQ(mock_ptr->last_verifier_restore_target_tokens, 6);
     EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(15));
-    EXPECT_EQ(mock_ptr->commit_mtp_calls, 2);
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 3);
     EXPECT_EQ(mock_ptr->last_commit_already_appended, 2);
     EXPECT_TRUE(mock_ptr->last_commit_allow_speculative_discard);
     EXPECT_EQ(mock_ptr->last_commit_position_offset_override, 4);
@@ -815,9 +803,9 @@ TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeUses
     EXPECT_EQ(probe.mtp_draft_steps, 3u);
     EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
     EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
-    EXPECT_EQ(probe.mtp_rollbacks, 1u);
+    EXPECT_EQ(probe.mtp_rollbacks, 0u);
     EXPECT_EQ(probe.mtp_verifier_runs, 1u);
-    EXPECT_EQ(probe.mtp_verifier_token_count, 4u);
+    EXPECT_EQ(probe.mtp_verifier_token_count, 3u);
 }
 
 TEST(Test__PrefixCachePrefillFlow, ChainedMTPDraftDepthHardFailsWhenRunnerDoesNotSupportIt)
