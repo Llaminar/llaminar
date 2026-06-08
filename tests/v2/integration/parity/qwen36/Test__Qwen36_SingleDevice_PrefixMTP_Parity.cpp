@@ -58,6 +58,11 @@ TEST(Qwen36SingleDevicePrefixMTPParity, MTPFirstTransactionLeavesSequentialState
     runDenseMTPFirstTransactionLeavesSequentialState(singleDeviceCase());
 }
 
+TEST(Qwen36SingleDevicePrefixMTPParity, MTPAcceptedCountPublicationLeavesSequentialState)
+{
+    runDenseMTPAcceptedCountPublicationLeavesSequentialState(singleDeviceCase());
+}
+
 TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
 {
     runDenseDynamicMTPParity(singleDeviceCase(), false);

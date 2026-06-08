@@ -11,6 +11,7 @@
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/mtp/MTPDecodeCatchup.h"
+#include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "kernels/KernelFactory.h"
 #include "loaders/ModelContext.h"
@@ -2033,6 +2034,156 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(shared_next, expected_tokens[4])
             << "Shared stepwise catch-up must leave the main runner in the "
                "same state as sequential decode after the first transaction";
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(base_checkpoint));
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseMTPAcceptedCountPublicationLeavesSequentialState(
+        DensePrefixRestoreParityCase test_case)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+
+        test_case.name += " accepted-count publication leaves sequential state";
+        test_case.decode_steps = std::max(test_case.decode_steps, 8);
+        test_case.max_seq_len = std::max(test_case.max_seq_len, 128);
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_phase138_continuation_snapshots/metadata.txt";
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        ASSERT_GE(expected_tokens.size(), 5u);
+        ASSERT_EQ(expected_tokens[0], 13);
+        ASSERT_EQ(expected_tokens[1], 271);
+        ASSERT_EQ(expected_tokens[2], 248068);
+        ASSERT_EQ(expected_tokens[3], 198);
+        ASSERT_EQ(expected_tokens[4], 8160);
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 3;
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            device,
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(
+            prompt_tokens.data(),
+            static_cast<int>(prompt_tokens.size())));
+        ASSERT_EQ(runner->sampleGreedyOnDevice(), expected_tokens[0]);
+
+        const int base_position = runner->get_position();
+        const PrefixStateSnapshot base_checkpoint = runner->captureLivePrefixState();
+        ASSERT_TRUE(base_checkpoint.valid);
+        ASSERT_TRUE(runner->supportsMTPSpecDecodeStatePublication())
+            << "The direct publication probe must use the accepted-count API, "
+               "not the retired verifier-row restore hook.";
+
+        MTPDecodeCatchupGreedyRequest request;
+        request.draft_tokens = {13, 271, 760, 3841};
+        request.base_sidecar_position = base_position;
+        request.allow_speculative_discard = true;
+        request.verifier_path = "phase138_accepted_count_publication_regression";
+        request.verifier_base_checkpoint = &base_checkpoint;
+
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(
+            request.draft_tokens.data(),
+            static_cast<int>(request.draft_tokens.size())));
+
+        std::vector<int32_t> sampled_verifier_tokens(request.draft_tokens.size(), -1);
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            static_cast<int>(sampled_verifier_tokens.size()),
+            sampled_verifier_tokens.data()));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        ASSERT_EQ(sampled_verifier_tokens[0], expected_tokens[1]);
+        ASSERT_EQ(sampled_verifier_tokens[1], expected_tokens[2]);
+        ASSERT_NE(sampled_verifier_tokens[1], request.draft_tokens[2])
+            << "This regression must exercise correction replay after an "
+               "accepted speculative prefix.";
+
+        MTPDecodeCatchupGreedyResult all_position =
+            buildMTPDecodeCatchupGreedyResultFromVerifierRows(
+                request,
+                sampled_verifier_tokens);
+        ASSERT_TRUE(all_position.ok) << all_position.error;
+        EXPECT_EQ(all_position.accepted_tokens,
+                  (std::vector<int32_t>{13, 271, 248068}));
+        EXPECT_EQ(all_position.target_verifier_state_commit_count, 2);
+
+        MTPSpecDecodeMetadataShape shape;
+        shape.max_requests = 1;
+        shape.max_draft_tokens =
+            static_cast<int>(request.draft_tokens.size());
+        MTPSpecDecodeMetadataBatch batch =
+            buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+                shape,
+                /*request_id=*/0,
+                /*vocab_size=*/model_ctx->vocabSize(),
+                request,
+                all_position);
+        ASSERT_TRUE(batch.ok) << batch.error;
+        MTPSpecDecodeStateCommitPlan commit_plan =
+            buildMTPSpecDecodeStateCommitPlan(batch);
+        ASSERT_TRUE(commit_plan.ok) << commit_plan.error;
+        ASSERT_EQ(commit_plan.accepted_state_counts[0], 2);
+        ASSERT_EQ(commit_plan.accepted_state_slot_indices[0], 1);
+        ASSERT_EQ(commit_plan.correction_replay_counts[0], 1);
+
+        MTPSpecDecodeStatePublicationPlan publication =
+            buildMTPSpecDecodeStatePublicationPlan(
+                commit_plan,
+                /*base_cached_tokens=*/{base_position});
+        ASSERT_TRUE(publication.ok) << publication.error;
+        ASSERT_EQ(publication.target_cached_tokens[0], base_position + 2);
+        ASSERT_TRUE(runner->publishMTPSpecDecodeState(publication));
+
+        const int32_t correction_token = expected_tokens[2];
+        ASSERT_TRUE(runner->forward(&correction_token, 1));
+        const int32_t ready_after_correction = runner->sampleGreedyOnDevice();
+        EXPECT_EQ(ready_after_correction, expected_tokens[3])
+            << "Accepted-count publication plus correction replay must match "
+               "shared stepwise state after the first rejected speculative row.";
+
+        ASSERT_TRUE(runner->forward(&expected_tokens[3], 1));
+        const int32_t next_after_ready = runner->sampleGreedyOnDevice();
+        EXPECT_EQ(next_after_ready, expected_tokens[4])
+            << "Published state must remain sequentially equivalent past the "
+               "immediate correction token.";
 
         ASSERT_TRUE(runner->restoreLivePrefixState(base_checkpoint));
         runner->setSkipLogitsGatherDecode(false);

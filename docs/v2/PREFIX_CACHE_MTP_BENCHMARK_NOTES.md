@@ -32,7 +32,8 @@ Phase 14 scoreboard for Qwen3.6 MTP and prefix-cache tuning.
 - Shared Phase 13.8 publication-plan metadata now derives accepted-state slots,
   target cached-token counts, correction replay spans, and bonus-ready rows
   without mutating live state. The device publication API is a separate opt-in
-  runner seam and is still unpromoted.
+  runner seam; direct/probe dense reject-after-prefix publication now leaves
+  sequential state on CUDA and ROCm, but normal decode still does not select it.
 - CUDA and ROCm direct GDN/short-conv kernel tests now both cover restored
   verifier slot state followed by multi-step continuation replay equivalence.
 - A lagged-terminal-output experiment cut verifier replay calls in half but

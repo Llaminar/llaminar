@@ -82,6 +82,11 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPPhase138ThinkContinuationStageP
     runDenseNoMTPPhase138ThinkContinuationStageParity(cudaSingleDeviceCase());
 }
 
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPAcceptedCountPublicationLeavesSequentialState)
+{
+    runDenseMTPAcceptedCountPublicationLeavesSequentialState(cudaSingleDeviceCase());
+}
+
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleFreshRunnerDeterminism)
 {
     runDenseNoMTPBenchmarkStyleFreshRunnerDeterminism(
