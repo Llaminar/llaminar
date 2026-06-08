@@ -34,8 +34,7 @@ namespace llaminar2
         MTPVerifierPolicyDecision decision;
 
         const bool can_use_decode_equivalent_sequential =
-            input.greedy_sampling &&
-            !input.stochastic_verify &&
+            (input.greedy_sampling || input.stochastic_verify) &&
             !input.uses_sampling_penalties &&
             !input.disable_decode_equivalent_sequential;
 

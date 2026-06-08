@@ -3129,6 +3129,67 @@ namespace
         EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
     }
 
+    TEST_F(Test__PrefillDecodeTransition, StatefulMTPSpeculativeSamplingUsesDecodeEquivalentDeviceVerifier)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::rocm(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false,
+            {},
+            MTPVerifyMode::SpeculativeSampling);
+        mock->enableStochasticDeviceSampling();
+        mock->requireMTPDecodeEquivalentReplay();
+        mock->setDecodeArgmaxScript({
+            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+            MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+        });
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        sampling.top_k = 2;
+        sampling.top_p = 0.95f;
+        sampling.presence_penalty = 0.25f;
+        sampling.seed = 123;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->restoreCount(), 1)
+            << "stateful stochastic verification must restore the verifier base";
+        EXPECT_EQ(mock->setAllPositionCount(), 0)
+            << "stateful stochastic verification must not use all-position verifier rows";
+        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
+        EXPECT_EQ(mock->deviceDistributionBuildCount(), 4)
+            << "first token, MTP draft, sequential target row, and ready token distributions stay compact/device-resident";
+        EXPECT_EQ(mock->deviceDistributionSampleCount(), 3);
+        EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
+        EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2)
+            << "first token and accepted draft must publish shifted MTP rows from sequential terminal hidden";
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_FALSE(probe.mtp_bypassed);
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_accept_tests, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_accepts, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_residual_samples, 0u);
+        EXPECT_EQ(probe.mtp_stochastic_terminal_samples, 1u);
+        EXPECT_EQ(probe.mtp_transaction_commits, 1u);
+        EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
+    }
+
     TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingRejectsWithResidualCorrection)
     {
         auto [runner, mock] = createRunner(

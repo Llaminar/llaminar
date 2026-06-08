@@ -84,8 +84,6 @@ namespace llaminar2
     class ExpertWeightPayloadProvider;
     class PreparedWeightStore;
     class FrozenModelWeightSet;
-    struct MTPSpecDecodeMetadataBatch;
-    class MTPSpecDecodeMetadataWorkspaceBinding;
     class PrefixStateCache;
     class RamPrefixStorageBackend;
     class DiskPrefixStorageBackend;
@@ -235,7 +233,6 @@ namespace llaminar2
         /// hidden row as well as logits; dense prefix-cache reuse can use logits
         /// alone to preserve first-token semantics.
         std::shared_ptr<TensorBase> prefix_terminal_hidden;
-        std::shared_ptr<TensorBase> mtp_base_terminal_hidden;
         std::shared_ptr<TensorBase> prefix_terminal_logits;
 
         /// Per-device KV caches for Pipeline Parallelism
@@ -1528,11 +1525,6 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
-        bool preserveMTPBaseTerminalHiddenForSpecDecode() override;
-        bool commitMTPShiftedRowFromPreservedBaseTerminalHidden(
-            int32_t token,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;
@@ -1937,8 +1929,8 @@ namespace llaminar2
             for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
                 cache.resetSessionState();
             mtp_terminal_hidden_row_select_cache_.resetSessionState();
-            mtp_base_terminal_hidden_copy_cache_.resetSessionState();
             last_pos_offset_ = -1;
+            pending_mtp_logits_stream_ = nullptr;
             cache_stats_ = CacheStats{};
             state_.clear();
             // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
@@ -2031,15 +2023,9 @@ namespace llaminar2
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
         bool requiresMTPDecodeEquivalentVerifierReplay() const override;
-        bool supportsMTPSpecDecodeAcceptedCountPublication() const override;
         bool supportsMTPVerifierStateRowRestore() const override;
         bool restoreMTPVerifierStateRow(
             int verifier_row,
-            int target_cached_tokens,
-            int seq_idx = 0) override;
-        bool restoreMTPVerifierStateFromSpecDecodeMetadata(
-            const MTPSpecDecodeMetadataBatch &batch,
-            int request_index,
             int target_cached_tokens,
             int seq_idx = 0) override;
 
@@ -2485,7 +2471,6 @@ namespace llaminar2
         };
 
         MTPTerminalHiddenRowSelectGraphCache mtp_terminal_hidden_row_select_cache_;
-        MTPTerminalHiddenRowSelectGraphCache mtp_base_terminal_hidden_copy_cache_;
 
         // =========================================================================
         // Full Forward Graph Cache (Decode Optimization)
@@ -2558,9 +2543,6 @@ namespace llaminar2
         void *stochastic_verify_thresholds_dev_ = nullptr;   ///< FP32 [1, 4]
         std::array<int, 4> stochastic_target_top_k_ = {0, 0, 0, 0};
         std::array<int, 3> stochastic_draft_top_k_ = {0, 0, 0};
-
-        /// Persistent graph-facing MTP spec-decode metadata workspace binding.
-        std::unique_ptr<MTPSpecDecodeMetadataWorkspaceBinding> mtp_spec_decode_metadata_workspace_;
 
         /// Owned tensors when using graph-managed allocation
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;
@@ -2738,9 +2720,6 @@ namespace llaminar2
 
         /// Ensure a stable one-row terminal hidden buffer exists for MTP sidecar input.
         bool ensureMTPTerminalHiddenBuffer();
-
-        /// Ensure a stable one-row preserved-base terminal hidden buffer exists.
-        bool ensureMTPBaseTerminalHiddenBuffer();
 
         /// Execute the cached graph-native row select used for MTP terminal hidden refresh.
         bool executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len);

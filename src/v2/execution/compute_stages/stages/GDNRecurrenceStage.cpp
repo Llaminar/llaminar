@@ -227,9 +227,6 @@ namespace llaminar2
         params_.kernel->bindDeinterleaveWorkspace(scratch, scratch_floats);
 
         const int capture_state_size = params_.n_heads * params_.d_k * params_.d_v;
-        verifier_capture_workspace_bound_ = false;
-        speculative_state_work_bound_ = false;
-        verifier_capture_rows_bound_ = 0;
         verifier_capture_state_size_bound_ = capture_state_size;
 
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
@@ -240,15 +237,13 @@ namespace llaminar2
             // clear verifier capture state that may have been bound by an
             // all-position speculative verifier graph; otherwise decode keeps
             // updating scratch state instead of the live recurrent state.
-            params_.kernel->bindVerifierStateCaptureWorkspace(
-                nullptr,
-                0,
-                capture_state_size);
-            params_.kernel->bindSpeculativeStateWorkspace(
-                nullptr,
-                capture_state_size);
+            clearKernelVerifierStateWorkspace();
             return;
         }
+
+        verifier_capture_workspace_bound_ = false;
+        speculative_state_work_bound_ = false;
+        verifier_capture_rows_bound_ = 0;
 
         float *capture = nullptr;
         int capture_rows = 0;
@@ -289,6 +284,25 @@ namespace llaminar2
         params_.kernel->bindSpeculativeStateWorkspace(
             speculative_work,
             capture_state_size);
+    }
+
+    void GDNRecurrenceStage::clearKernelVerifierStateWorkspace()
+    {
+        verifier_capture_workspace_bound_ = false;
+        speculative_state_work_bound_ = false;
+        verifier_capture_rows_bound_ = 0;
+        verifier_capture_state_size_bound_ = params_.n_heads * params_.d_k * params_.d_v;
+
+        if (!params_.kernel)
+            return;
+
+        params_.kernel->bindVerifierStateCaptureWorkspace(
+            nullptr,
+            0,
+            verifier_capture_state_size_bound_);
+        params_.kernel->bindSpeculativeStateWorkspace(
+            nullptr,
+            verifier_capture_state_size_bound_);
     }
 
     int GDNRecurrenceStage::effectivePrefillSeqLen() const
@@ -383,32 +397,6 @@ namespace llaminar2
             params_.recurrence_state,
             row,
             stream ? stream : gpuStream());
-    }
-
-    bool GDNRecurrenceStage::prepareVerifierStatePublication()
-    {
-        if (!hasVerifierStateCapture())
-            return false;
-        bindKernelWorkspace();
-        return ensureVerifierStateCaptureWorkspaceBound();
-    }
-
-    bool GDNRecurrenceStage::publishAcceptedSpeculativeStateFromDeviceMetadata(
-        const int32_t *device_accepted_state_slot_indices,
-        int request_index,
-        void *stream)
-    {
-        if (!hasVerifierStateCapture() || !params_.kernel ||
-            !device_accepted_state_slot_indices ||
-            request_index < 0 || !stream)
-        {
-            return false;
-        }
-        return params_.kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
-            params_.recurrence_state,
-            device_accepted_state_slot_indices,
-            request_index,
-            stream);
     }
 
     size_t GDNRecurrenceStage::deinterleaveScratchFloats(int seq_len) const

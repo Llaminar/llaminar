@@ -383,24 +383,6 @@ namespace llaminar2
                                 const std::function<void(IComputeStage *)> &visitor) const;
 
         /**
-         * @brief Publish accepted speculative verifier state from the cached verifier graph.
-         *
-         * Phase 13.8 graph replay stores per-row verifier state in workspaces
-         * owned by the cached main-verifier graph. Publishing through those
-         * stages avoids using mutable backend-kernel bindings left behind by a
-         * sidecar or shifted-prefill graph.
-         */
-        bool publishAcceptedSpeculativeVerifierStateFromDeviceMetadata(
-            const int32_t *device_accepted_state_slot_indices,
-            int request_index,
-            DeviceId device,
-            int verifier_seq_len,
-            uint64_t moe_placement_epoch,
-            void *stream,
-            int *published_stage_count,
-            std::string *error) const;
-
-        /**
          * @brief Immutable diagnostic snapshot for one cached prefill graph bucket.
          *
          * This is intentionally read-only: callers can observe the warmup,

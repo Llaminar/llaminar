@@ -64,17 +64,6 @@ extern "C"
     void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void rocmGDN_gpu_set_device(int ordinal);
     void rocmGDN_stream_synchronize(void *stream);
-    bool rocmGDN_publish_accepted_speculative_state_from_metadata(
-        float *dst_state,
-        const float *state_snapshots,
-        const int32_t *device_accepted_state_slot_indices,
-        int request_index,
-        int snapshot_stride_floats,
-        int max_snapshot_rows,
-        int state_floats,
-        int device_idx,
-        void *stream);
-
     // QKV deinterleave on device
     bool rocmGDN_deinterleave_qkv(
         const float *merged, float *out_q, float *out_k, float *out_v,
@@ -132,35 +121,6 @@ namespace llaminar2
             else
                 rocmGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
             return true;
-        }
-
-        bool publishAcceptedSpeculativeStateFromDeviceMetadata(
-            float *dst_state,
-            const int32_t *device_accepted_state_slot_indices,
-            int request_index,
-            void *stream) override
-        {
-            (void)dst_state;
-            if (!gpu_state_ || !verifier_state_capture_ ||
-                !device_accepted_state_slot_indices ||
-                request_index < 0 || !stream ||
-                verifier_state_capture_rows_ <= 0 ||
-                verifier_state_capture_size_ != state_size_)
-            {
-                return false;
-            }
-
-            rocmGDN_gpu_set_device(device_ordinal_);
-            return rocmGDN_publish_accepted_speculative_state_from_metadata(
-                gpu_state_,
-                verifier_state_capture_,
-                device_accepted_state_slot_indices,
-                request_index,
-                verifier_state_capture_size_,
-                verifier_state_capture_rows_,
-                state_size_,
-                device_ordinal_,
-                stream);
         }
 
         bool supportsPaddedPrefillRealLength() const override { return true; }

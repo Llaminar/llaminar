@@ -672,6 +672,9 @@ public:
     int capture_rows = 7;
     int capture_state_size = 9;
     int capture_bind_calls = 0;
+    float *speculative_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x2345));
+    int speculative_state_size = 10;
+    int speculative_bind_calls = 0;
 
     void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
     {
@@ -679,6 +682,13 @@ public:
         capture_workspace = workspace;
         capture_rows = rows;
         capture_state_size = state_size;
+    }
+
+    void bindSpeculativeStateWorkspace(float *workspace, int state_size) override
+    {
+        ++speculative_bind_calls;
+        speculative_workspace = workspace;
+        speculative_state_size = state_size;
     }
 
     bool forward(
@@ -698,6 +708,9 @@ public:
     int capture_rows = 11;
     int capture_state_size = 13;
     int capture_bind_calls = 0;
+    float *speculative_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x6789));
+    int speculative_state_size = 14;
+    int speculative_bind_calls = 0;
 
     void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
     {
@@ -705,6 +718,13 @@ public:
         capture_workspace = workspace;
         capture_rows = rows;
         capture_state_size = state_size;
+    }
+
+    void bindSpeculativeStateWorkspace(float *workspace, int state_size) override
+    {
+        ++speculative_bind_calls;
+        speculative_workspace = workspace;
+        speculative_state_size = state_size;
     }
 
     bool chunk_forward(
@@ -749,6 +769,9 @@ TEST(Test__GDNKernels, NonVerifierShortConvStageClearsStaleSpeculativeStateBindi
     EXPECT_EQ(kernel.capture_workspace, nullptr);
     EXPECT_EQ(kernel.capture_rows, 0);
     EXPECT_EQ(kernel.capture_state_size, 48);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 48);
 }
 
 TEST(Test__GDNKernels, NonVerifierRecurrenceStageClearsStaleSpeculativeStateBinding)
@@ -772,6 +795,59 @@ TEST(Test__GDNKernels, NonVerifierRecurrenceStageClearsStaleSpeculativeStateBind
     EXPECT_EQ(kernel.capture_workspace, nullptr);
     EXPECT_EQ(kernel.capture_rows, 0);
     EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 32);
+}
+
+TEST(Test__GDNKernels, ShortConvStageResetClearsStaleSpeculativeStateBinding)
+{
+    RecordingShortConvolution kernel;
+
+    ShortConv1dStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 2;
+    p.channels = 16;
+    p.kernel_size = 4;
+    p.verifier_state_capture_rows = 2;
+    p.kernel = &kernel;
+
+    ShortConv1dStage stage(p);
+    stage.resetSessionState();
+
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    EXPECT_EQ(kernel.capture_workspace, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 0);
+    EXPECT_EQ(kernel.capture_state_size, 48);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 48);
+}
+
+TEST(Test__GDNKernels, RecurrenceStageResetClearsStaleSpeculativeStateBinding)
+{
+    RecordingGatedDeltaNet kernel;
+
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 2;
+    p.n_heads = 2;
+    p.n_k_heads = 2;
+    p.d_k = 4;
+    p.d_v = 4;
+    p.verifier_state_capture_rows = 2;
+    p.kernel = &kernel;
+
+    GDNRecurrenceStage stage(p);
+    stage.resetSessionState();
+
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    EXPECT_EQ(kernel.capture_workspace, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 0);
+    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 32);
 }
 
 TEST(Test__GDNKernels, Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKernelDispatch)

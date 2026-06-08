@@ -22,8 +22,6 @@
 
 namespace llaminar2
 {
-    struct MTPSpecDecodeMetadataBatch;
-
     // Forward declarations
     class TensorBase;
     struct PlacementPlan;
@@ -234,19 +232,6 @@ namespace llaminar2
         virtual bool requiresMTPDecodeEquivalentVerifierReplay() const { return false; }
 
         /**
-         * @brief True when the runner can publish Phase 13.8 accepted-count
-         *        speculative state through graph-owned metadata buffers.
-         *
-         * This is deliberately narrower than a generic "optimized verifier"
-         * hook. It means target verifier effects are held in speculative
-         * GDN/short-conv state slots and only the accepted count is committed to
-         * live request state. Greedy decode-equivalent verification still uses
-         * the shared stepwise oracle until a future backend path proves the same
-         * contract without raw all-position row publication.
-         */
-        virtual bool supportsMTPSpecDecodeAcceptedCountPublication() const { return false; }
-
-        /**
          * @brief Run a chained MTP sidecar step from the previous sidecar hidden.
          *
          * @param draft_condition_token Token whose shifted MTP KV row is appended.
@@ -380,34 +365,6 @@ namespace llaminar2
         {
             (void)token;
             (void)already_appended_tokens;
-            (void)allow_speculative_discard;
-            (void)position_offset_override;
-            return false;
-        }
-
-        /**
-         * @brief Preserve the current target terminal hidden for accepted-count
-         *        spec-decode publication.
-         *
-         * The vLLM-style accepted-count path may run a verifier graph before it
-         * knows how many rows will be committed. It needs an isolated copy of the
-         * base terminal hidden so it can rebuild the first shifted MTP row after
-         * publishing accepted target state and discarding speculative shifted rows.
-         */
-        virtual bool preserveMTPBaseTerminalHiddenForSpecDecode()
-        {
-            return false;
-        }
-
-        /**
-         * @brief Append the first shifted MTP row from the preserved base hidden.
-         */
-        virtual bool commitMTPShiftedRowFromPreservedBaseTerminalHidden(
-            int32_t token,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1)
-        {
-            (void)token;
             (void)allow_speculative_discard;
             (void)position_offset_override;
             return false;
@@ -1150,29 +1107,6 @@ namespace llaminar2
             int seq_idx = 0)
         {
             (void)verifier_row;
-            (void)target_cached_tokens;
-            (void)seq_idx;
-            return false;
-        }
-
-        /**
-         * @brief Upload graph-facing spec-decode metadata and publish accepted verifier state.
-         *
-         * The accepted Phase 13.8 path publishes mutable hybrid state from
-         * accepted-count/speculative state-slot metadata. Implementations must
-         * upload metadata on an explicit stream, publish all participant-local
-         * stateful layers from that device metadata, then truncate
-         * KV/bookkeeping to target_cached_tokens atomically for the request.
-         * Unsupported implementations must return false.
-         */
-        virtual bool restoreMTPVerifierStateFromSpecDecodeMetadata(
-            const MTPSpecDecodeMetadataBatch &batch,
-            int request_index,
-            int target_cached_tokens,
-            int seq_idx = 0)
-        {
-            (void)batch;
-            (void)request_index;
             (void)target_cached_tokens;
             (void)seq_idx;
             return false;

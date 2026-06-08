@@ -106,7 +106,6 @@ namespace llaminar2
         PREFIX_MTP_K_STAGING,
         PREFIX_MTP_V_STAGING,
         PREFIX_TERMINAL_HIDDEN,
-        MTP_BASE_TERMINAL_HIDDEN,
         PREFIX_TERMINAL_LOGITS,
 
         // ── MTP sidecar graph buffers ───────────────────────────────────────
@@ -244,8 +243,6 @@ namespace llaminar2
             return "PREFIX_MTP_V_STAGING";
         case BufferId::PREFIX_TERMINAL_HIDDEN:
             return "PREFIX_TERMINAL_HIDDEN";
-        case BufferId::MTP_BASE_TERMINAL_HIDDEN:
-            return "MTP_BASE_TERMINAL_HIDDEN";
         case BufferId::PREFIX_TERMINAL_LOGITS:
             return "PREFIX_TERMINAL_LOGITS";
         case BufferId::MTP_EMBEDDING:

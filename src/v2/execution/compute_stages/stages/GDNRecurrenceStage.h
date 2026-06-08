@@ -145,7 +145,10 @@ namespace llaminar2
             prefill_bucket_seq_len_ = 0;
             prefill_replay_params_set_ = false;
             if (params_.kernel)
+            {
                 params_.kernel->setGPUStream(nullptr);
+                clearKernelVerifierStateWorkspace();
+            }
         }
 
         bool hasPrefillReplayParams() const override { return true; }
@@ -153,11 +156,6 @@ namespace llaminar2
         bool supportsPaddedPrefillRealLengthContract() const override;
         bool hasVerifierStateCapture() const override;
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
-        bool prepareVerifierStatePublication() override;
-        bool publishAcceptedSpeculativeStateFromDeviceMetadata(
-            const int32_t *device_accepted_state_slot_indices,
-            int request_index,
-            void *stream) override;
         /// @brief Allows cold GPU padded-prefill graph preflight before warmup allocates recurrence state.
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
 
@@ -199,6 +197,7 @@ namespace llaminar2
         void refreshPinnedEffectiveSeqLen();
         void releaseGpuEffectiveSeqLenState();
         void bindKernelWorkspace();
+        void clearKernelVerifierStateWorkspace();
         size_t deinterleaveScratchFloats(int seq_len) const;
         bool ensureGpuDeinterleaveWorkspaceBound(int seq_len) const;
     };

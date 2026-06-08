@@ -853,6 +853,72 @@ namespace
             << "Capture launch and Ready replay both run post-graph callbacks.";
     }
 
+    TEST_F(PrefillGraphCacheExecutionTest, SessionResetKeepsCapturedPrefillReadyForReplay)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+        });
+
+        auto tokens = makeSequentialInts(kExactBucketSeqLen, 1100);
+        ForwardInput input;
+        input.token_ids = tokens.data();
+        input.batch_size = 1;
+        input.seq_len = kExactBucketSeqLen;
+        input.device = device_;
+
+        const auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+            input,
+            debugEnv().execution.prefill_graph_bucket_sizes,
+            kPadTokenId,
+            /*allow_padded_execution=*/false);
+        ASSERT_TRUE(plan) << plan.error;
+
+        ForwardOutput output;
+        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
+
+        ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
+        ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
+        ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
+
+        auto ready = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(ready.has_value());
+        ASSERT_TRUE(ready->prefill_cache_initialized);
+        ASSERT_EQ(ready->phase, PrefillGraphPhase::Ready);
+        const int replay_count_before_reset = ready->replay_count;
+        EXPECT_GE(replay_count_before_reset, 1);
+
+        engine_->resetSessionReplayState();
+
+        auto after_reset = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_reset.has_value());
+        ASSERT_TRUE(after_reset->prefill_cache_initialized);
+        EXPECT_EQ(after_reset->phase, PrefillGraphPhase::Ready)
+            << "Request/session reset must preserve captured prefill graphs; "
+               "otherwise benchmark steady-state iterations repeatedly re-enter "
+               "cold/warmup/capture instead of replaying the warmed graph.";
+        EXPECT_EQ(after_reset->replay_count, replay_count_before_reset);
+        EXPECT_EQ(after_reset->capture_count, ready->capture_count);
+
+        ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
+        expectProbeOutputMatches(*host_, kExactBucketSeqLen);
+
+        auto after_replay = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_replay.has_value());
+        EXPECT_EQ(after_replay->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(after_replay->capture_count, ready->capture_count);
+        EXPECT_EQ(after_replay->replay_count, replay_count_before_reset + 1)
+            << "The first request after session reset should be a Ready replay, "
+               "not a fresh warmup or capture.";
+    }
+
     TEST_F(PrefillGraphCacheExecutionTest, ChunkScheduleFixedPlacementReachesCapturedReplay)
     {
         ScopedDebugEnv env({

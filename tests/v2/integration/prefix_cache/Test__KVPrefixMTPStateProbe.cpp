@@ -33,6 +33,7 @@
 #include <fstream>
 #include <filesystem>
 #include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -377,10 +378,47 @@ namespace
             0);
     }
 
+    std::string formatTokenWindow(
+        const std::vector<int32_t> &tokens,
+        size_t center,
+        size_t radius = 6)
+    {
+        if (tokens.empty())
+            return "[]";
+        const size_t begin = center > radius ? center - radius : 0;
+        const size_t end = std::min(tokens.size(), center + radius + 1);
+        std::ostringstream oss;
+        oss << "[";
+        for (size_t i = begin; i < end; ++i)
+        {
+            if (i != begin)
+                oss << ", ";
+            if (i == center)
+                oss << "*";
+            oss << tokens[i];
+        }
+        oss << "]";
+        return oss.str();
+    }
+
     void runQwen36MTPGpuGraphsStochasticRealModelSmoke(
         GlobalDeviceAddress device,
-        const std::string &backend_name)
+        const std::string &backend_name,
+        size_t decode_token_count = 8,
+        int repeat_cycles = 2,
+        bool deterministic_repeatability = false)
     {
+        ASSERT_GT(decode_token_count, 0u);
+        ASSERT_GE(repeat_cycles, 2);
+
+        std::optional<ScopedDebugEnv> deterministic_env;
+        if (deterministic_repeatability)
+        {
+            deterministic_env.emplace(std::initializer_list<std::pair<const char *, const char *>>{
+                {"LLAMINAR_DETERMINISTIC", "1"},
+            });
+        }
+
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
@@ -402,7 +440,7 @@ namespace
 
         OrchestrationConfig config = OrchestrationConfig::defaults();
         config.model_path = model_path;
-        config.max_seq_len = 32;
+        config.max_seq_len = static_cast<int>(std::max<size_t>(128, decode_token_count + 64));
         config.batch_size = 1;
         config.tp_degree = 1;
         config.pp_degree = 1;
@@ -430,9 +468,82 @@ namespace
         stochastic.presence_penalty = 0.25f;
         stochastic.seed = 123;
 
-        auto result = runner->generate(prompt, 8, stochastic);
+        runner->setSamplingParams(stochastic);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        auto run_benchmark_style_cycle = [&](int cycle) -> std::vector<int32_t>
+        {
+            runner->clearCache();
+            std::vector<int32_t> tokens;
+            if (!runner->prefill(prompt))
+            {
+                ADD_FAILURE() << "cycle " << cycle << ": " << runner->lastError();
+                return tokens;
+            }
+            while (tokens.size() < decode_token_count)
+            {
+                const int remaining = static_cast<int>(decode_token_count - tokens.size());
+                runner->setDecodeStepTokenBudget(remaining);
+                auto step = runner->decodeStep();
+                runner->setDecodeStepTokenBudget(0);
+                if (!step.error.empty())
+                {
+                    ADD_FAILURE() << "cycle " << cycle << ": " << step.error;
+                    return tokens;
+                }
+                if (step.tokens.empty())
+                {
+                    ADD_FAILURE() << "cycle " << cycle
+                                  << ": stochastic MTP benchmark-style decode produced no tokens";
+                    return tokens;
+                }
+                if (step.tokens.size() > static_cast<size_t>(remaining))
+                {
+                    ADD_FAILURE() << "cycle " << cycle
+                                  << ": stochastic MTP decode exceeded remaining token budget";
+                    return tokens;
+                }
+                tokens.insert(tokens.end(), step.tokens.begin(), step.tokens.end());
+            }
+            return tokens;
+        };
+
+        auto warmup_tokens = run_benchmark_style_cycle(-1);
+        ASSERT_EQ(warmup_tokens.size(), decode_token_count)
+            << "stochastic MTP graph replay warmup must complete before repeatability checks";
+
+        auto first_tokens = run_benchmark_style_cycle(0);
+        ASSERT_EQ(first_tokens.size(), decode_token_count);
+
+        PerfStatsCollector::reset();
+        std::vector<int32_t> result_tokens;
+        for (int cycle = 1; cycle < repeat_cycles; ++cycle)
+        {
+            result_tokens = run_benchmark_style_cycle(cycle);
+            ASSERT_EQ(result_tokens.size(), decode_token_count);
+            auto mismatch = std::mismatch(
+                result_tokens.begin(),
+                result_tokens.end(),
+                first_tokens.begin(),
+                first_tokens.end());
+            if (mismatch.first != result_tokens.end() ||
+                mismatch.second != first_tokens.end())
+            {
+                const size_t index = static_cast<size_t>(
+                    std::distance(result_tokens.begin(), mismatch.first));
+                ADD_FAILURE()
+                    << "Deterministic stochastic MTP graph replay must be reproducible after clearCache() "
+                    << "with the same prompt and seed after graph warmup (cycle=" << cycle
+                    << ", first_mismatch_index=" << index << ")\n"
+                    << "result window: " << formatTokenWindow(result_tokens, index) << "\n"
+                    << "first  window: " << formatTokenWindow(first_tokens, index);
+            }
+        }
         const auto snapshot = runner->prefixStateProbe();
         const auto records = PerfStatsCollector::snapshot({"mtp", "forward_graph"});
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
         runner->shutdown();
 
         auto counter = [&](const std::string &name)
@@ -451,8 +562,6 @@ namespace
             return total;
         };
 
-        ASSERT_TRUE(result.error.empty()) << result.error;
-        ASSERT_EQ(result.tokens.size(), 8u);
         EXPECT_TRUE(snapshot.mtp_config_enabled);
         EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
         EXPECT_GE(snapshot.mtp_draft_steps, 1u);
@@ -479,7 +588,9 @@ namespace
         EXPECT_LE(snapshot.mtp_request.stochastic_acceptance_rate, 1.0);
         EXPECT_GE(counter("first_token_stochastic_device_samples"), 1.0);
         EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0);
-        EXPECT_GE(counter("verifier_stochastic_device_distributions"), 2.0);
+        EXPECT_GE(counter("decode_equivalent_stochastic_verifier_runs"), 1.0)
+            << backend_name << " stochastic MTP must verify stateful Qwen through "
+            << "the decode-equivalent replay path, not all-position state publication";
         if (backend_name == "ROCm" || backend_name == "CUDA")
         {
             EXPECT_GE(counter("stochastic_topk_smallk_scratch_distribution_builds"), 2.0)
@@ -494,19 +605,9 @@ namespace
             << backend_name << " stochastic MTP must not sample sidecar drafts from host full logits";
         EXPECT_EQ(counter("verifier_stochastic_distributions"), 0.0)
             << backend_name << " stochastic MTP must not build verifier distributions from host full logits";
-
-        const PerfStatsCollector::Tags verifier_replay_tags = {
-            {"context", "main_verifier"},
-            {"phase", "replay"},
-        };
-        EXPECT_GE(findPerfCounterValue(records,
-                                       "forward_graph",
-                                       "decode_segmented_phase",
-                                       "decode",
-                                       verifier_replay_tags),
-                  1.0)
-            << backend_name << " stochastic MTP must preserve main verifier graph replay state "
-            << "after accepted-count metadata publication";
+        EXPECT_EQ(counter("phase138_stochastic_spec_decode_runs"), 0.0)
+            << backend_name << " stochastic MTP must not use accepted-count publication "
+            << "for stateful Qwen verifier rows that require decode-equivalent replay";
     }
 
     int mpiWorldSize()
@@ -1784,6 +1885,26 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticRealModelSmoke
     runQwen36MTPGpuGraphsStochasticRealModelSmoke(
         GlobalDeviceAddress::rocm(rocm_ordinal),
         "ROCm");
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticClearCacheRepeatabilityLong)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No ROCm device available for Qwen3.6 stochastic MTP GPU-graphs repeatability";
+    }
+    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(rocm_ordinal, 0);
+    ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
+        << "Selected ROCm device ordinal is outside the available device range";
+    runQwen36MTPGpuGraphsStochasticRealModelSmoke(
+        GlobalDeviceAddress::rocm(rocm_ordinal),
+        "ROCm",
+        /*decode_token_count=*/64,
+        /*repeat_cycles=*/4,
+        /*deterministic_repeatability=*/true);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticRealModelSmoke)

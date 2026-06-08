@@ -35,7 +35,6 @@
 #include "../../../kernels/HybridKVCacheConfig.h"
 #include "../../../kernels/IHybridKVCache.h"
 #include "../../compute_stages/stages/MoEExpertComputeStage.h"
-#include "../../mtp/MTPSpecDecodeMetadata.h"
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/ExpertWeightPayloadProvider.h"
 #include "../../../loaders/PreparedWeightStore.h"
@@ -1270,7 +1269,6 @@ namespace llaminar2
             for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
                 cache.invalidate();
             mtp_terminal_hidden_row_select_cache_.invalidate();
-            mtp_base_terminal_hidden_copy_cache_.invalidate();
             for (auto &cache : layer_graph_cache_)
                 cache.invalidate();
             resetKernelDynamicState();
@@ -2341,36 +2339,6 @@ namespace llaminar2
             }
         }
 
-        if (config.mtp.enabled && state_.device_id.is_gpu())
-        {
-            const int max_mtp_draft_tokens = std::max(
-                1,
-                std::max(
-                    config.mtp.draft_tokens,
-                    config.mtp.depth_policy.max_depth));
-            MTPSpecDecodeMetadataShape shape;
-            shape.max_requests = std::max(1, hints.batch_size);
-            shape.max_draft_tokens = max_mtp_draft_tokens;
-
-            if (!mtp_spec_decode_metadata_workspace_)
-            {
-                mtp_spec_decode_metadata_workspace_ =
-                    std::make_unique<MTPSpecDecodeMetadataWorkspaceBinding>(shape);
-            }
-            else
-            {
-                mtp_spec_decode_metadata_workspace_->setShape(shape);
-            }
-
-            extras.push_back(WorkspaceConsumerRequest{
-                mtp_spec_decode_metadata_workspace_.get(),
-                state_.device_id,
-                shape.max_requests,
-                shape.max_draft_tokens,
-                0,
-            });
-        }
-
         WorkspaceBudgetConfig workspace_budget;
         return workspace_allocator_->allocateForGraph(graph, hints, extras, workspace_budget);
     }
@@ -2746,7 +2714,6 @@ namespace llaminar2
         for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
             cache.invalidate();
         mtp_terminal_hidden_row_select_cache_.invalidate();
-        mtp_base_terminal_hidden_copy_cache_.invalidate();
 
         // Clear device contexts
         device_contexts_.clear();
@@ -3801,72 +3768,6 @@ namespace llaminar2
         return register_with_arena();
     }
 
-    bool DeviceGraphOrchestrator::ensureMTPBaseTerminalHiddenBuffer()
-    {
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
-            return true;
-
-        auto bind_with_arena = [&]() -> bool
-        {
-            if (!arena_)
-                return true;
-            if (arena_->isRegistered(BufferId::MTP_BASE_TERMINAL_HIDDEN))
-            {
-                if (arena_->getTensor(BufferId::MTP_BASE_TERMINAL_HIDDEN) ==
-                    state_.mtp_base_terminal_hidden.get())
-                {
-                    return true;
-                }
-                if (!arena_->bindExternalBuffer(BufferId::MTP_BASE_TERMINAL_HIDDEN,
-                                                state_.mtp_base_terminal_hidden.get()))
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to rebind MTP base terminal hidden with BufferArena");
-                    return false;
-                }
-                mtp_base_terminal_hidden_copy_cache_.invalidate();
-                return true;
-            }
-            if (!arena_->registerExternalBuffer(BufferId::MTP_BASE_TERMINAL_HIDDEN,
-                                                state_.mtp_base_terminal_hidden.get()))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register MTP base terminal hidden with BufferArena");
-                return false;
-            }
-            return true;
-        };
-
-        if (state_.mtp_base_terminal_hidden)
-        {
-            const auto &shape = state_.mtp_base_terminal_hidden->shape();
-            if (shape.size() == 2 &&
-                shape[0] >= 1 &&
-                shape[1] >= static_cast<size_t>(state_.d_model))
-            {
-                return bind_with_arena();
-            }
-            mtp_base_terminal_hidden_copy_cache_.invalidate();
-            state_.mtp_base_terminal_hidden.reset();
-        }
-
-        if (!tensor_factory_ || state_.d_model <= 0)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Cannot allocate MTP base terminal hidden buffer without tensor factory/d_model");
-            return false;
-        }
-
-        auto tensor = tensor_factory_->createFP32(
-            {1, static_cast<size_t>(state_.d_model)},
-            state_.device_id);
-        if (!tensor)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate MTP base terminal hidden buffer");
-            return false;
-        }
-
-        state_.mtp_base_terminal_hidden = std::shared_ptr<TensorBase>(tensor.release());
-        return bind_with_arena();
-    }
-
     bool DeviceGraphOrchestrator::executeMTPHiddenRowSelect(
         TensorBase *input,
         BufferId input_buffer_id,
@@ -3986,63 +3887,6 @@ namespace llaminar2
             "mtp_terminal_hidden_row_select",
             row_idx,
             seq_len);
-    }
-
-    bool DeviceGraphOrchestrator::preserveMTPBaseTerminalHiddenForSpecDecode()
-    {
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
-            return true;
-        if (!state_.prefix_terminal_hidden)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Cannot preserve MTP base terminal hidden without terminal hidden state");
-            return false;
-        }
-        if (!ensureMTPBaseTerminalHiddenBuffer())
-            return false;
-        const bool ok = executeMTPHiddenRowSelect(
-            state_.prefix_terminal_hidden.get(),
-            BufferId::PREFIX_TERMINAL_HIDDEN,
-            state_.mtp_base_terminal_hidden.get(),
-            BufferId::MTP_BASE_TERMINAL_HIDDEN,
-            mtp_base_terminal_hidden_copy_cache_,
-            "mtp_base_terminal_hidden_copy",
-            0,
-            1);
-        if (ok)
-        {
-            if (state_.device_id.is_gpu())
-            {
-                IWorkerGPUContext *gpu_ctx = nullptr;
-                void *stream = explicitGPUStreamForOperation("preserveMTPBaseTerminalHidden");
-                if (!stream)
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] MTP base terminal hidden preserve requires an explicit GPU stream");
-                    return false;
-                }
-                try
-                {
-                    gpu_ctx = &GPUDeviceContextPool::instance().getContext(state_.device_id);
-                }
-                catch (const std::exception &e)
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] MTP base terminal hidden preserve could not acquire GPU context: "
-                              << e.what());
-                    return false;
-                }
-                if (!gpu_ctx->synchronizeStreamChecked(stream))
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] MTP base terminal hidden preserve stream synchronization failed");
-                    return false;
-                }
-            }
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "phase138_base_terminal_hidden_preserves",
-                1.0,
-                perfPhaseName(),
-                state_.device_id.toString());
-        }
-        return ok;
     }
 
     bool DeviceGraphOrchestrator::refreshMTPTerminalHiddenState(int seq_len, int batch_size)
@@ -5131,127 +4975,6 @@ namespace llaminar2
             {
                 handleLivePrefixReplayStateAfterMutation(
                     "mtp_shifted_row_sequential_commit_workspace_rebind");
-            }
-        }
-        return true;
-    }
-
-    bool DeviceGraphOrchestrator::commitMTPShiftedRowFromPreservedBaseTerminalHidden(
-        int32_t token,
-        bool allow_speculative_discard,
-        int position_offset_override)
-    {
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
-            return true;
-        if (state_.positions.empty())
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit requires position state");
-            return false;
-        }
-
-        const int position_offset =
-            position_offset_override >= 0
-                ? position_offset_override
-                : state_.positions[0];
-        if (position_offset < 0)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Invalid preserved-base MTP shifted-row commit position_offset="
-                      << position_offset << " override=" << position_offset_override);
-            return false;
-        }
-
-        IKVCache *cache = state_.mtp_kv_caches.empty() ? nullptr : state_.mtp_kv_caches[0].get();
-        if (!cache)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit requires an initialized MTP KV cache");
-            return false;
-        }
-
-        const int expected_cached_tokens = std::max(0, position_offset - 1);
-        int current_cached_tokens =
-            cache->get_cached_tokens(cache->first_layer_index(), 0);
-        if (current_cached_tokens > expected_cached_tokens)
-        {
-            if (!allow_speculative_discard)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit cache has unexpected extra rows: current="
-                          << current_cached_tokens << " expected=" << expected_cached_tokens
-                          << " position_offset=" << position_offset);
-                return false;
-            }
-            void *stream = explicitGPUStreamForOperation("commitMTPShiftedRowFromPreservedBaseTerminalHidden");
-            if (state_.device_id.is_gpu() && !stream)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit requires an explicit GPU stream");
-                return false;
-            }
-            if (!cache->truncateSequence(0, expected_cached_tokens, stream))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit failed to discard speculative rows: current="
-                          << current_cached_tokens << " expected=" << expected_cached_tokens);
-                return false;
-            }
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "speculative_shifted_rows_discarded",
-                static_cast<double>(current_cached_tokens - expected_cached_tokens),
-                perfPhaseName(),
-                state_.device_id.toString());
-            current_cached_tokens = expected_cached_tokens;
-        }
-        if (current_cached_tokens < expected_cached_tokens)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit cache mismatch: current="
-                      << current_cached_tokens << " expected=" << expected_cached_tokens
-                      << " position_offset=" << position_offset);
-            return false;
-        }
-
-        if (!state_.mtp_base_terminal_hidden)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Preserved-base MTP shifted-row commit requires preserved terminal hidden");
-            return false;
-        }
-
-        PerfStatsCollector::ScopedTimer timer(
-            "mtp",
-            "shifted_row_preserved_base_commit",
-            perfPhaseName(),
-            state_.device_id.toString());
-        const uint64_t workspace_generation_before_commit =
-            state_.device_id.is_gpu() ? workspaceGeneration(state_.device_id) : 0;
-
-        if (!executeMTPDepth0(token,
-                              state_.mtp_base_terminal_hidden.get(),
-                              position_offset,
-                              "mtp_decode_preserved_base_catchup",
-                              true,
-                              BufferId::MTP_BASE_TERMINAL_HIDDEN))
-        {
-            return false;
-        }
-
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "shifted_rows_committed",
-            1.0,
-            perfPhaseName(),
-            state_.device_id.toString());
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "shifted_row_preserved_base_commits",
-            1.0,
-            perfPhaseName(),
-            state_.device_id.toString());
-
-        if (state_.device_id.is_gpu())
-        {
-            const uint64_t workspace_generation_after_commit =
-                workspaceGeneration(state_.device_id);
-            if (workspace_generation_after_commit != workspace_generation_before_commit)
-            {
-                handleLivePrefixReplayStateAfterMutation(
-                    "mtp_shifted_row_preserved_base_commit_workspace_rebind");
             }
         }
         return true;
@@ -7806,15 +7529,6 @@ namespace llaminar2
         return restorable_layers > 0;
     }
 
-    bool DeviceGraphOrchestrator::supportsMTPSpecDecodeAcceptedCountPublication() const
-    {
-        return graph_builder_ &&
-               graph_builder_->config().mtp.enabled &&
-               state_.device_id.is_gpu() &&
-               state_.batch_size == 1 &&
-               requiresMTPDecodeEquivalentVerifierReplay();
-    }
-
     bool DeviceGraphOrchestrator::requiresMTPDecodeEquivalentVerifierReplay() const
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled || !state_.kv_cache)
@@ -7944,205 +7658,6 @@ namespace llaminar2
                                        {{"row", std::to_string(verifier_row)},
                                         {"target_cached_tokens", std::to_string(target_cached_tokens)},
                                         {"gdn_layers", std::to_string(restored_layers)}});
-        return true;
-    }
-
-    bool DeviceGraphOrchestrator::restoreMTPVerifierStateFromSpecDecodeMetadata(
-        const MTPSpecDecodeMetadataBatch &batch,
-        int request_index,
-        int target_cached_tokens,
-        int seq_idx)
-    {
-        auto fail = [&](const std::string &reason) -> bool
-        {
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "spec_decode_metadata_state_publication_failures",
-                1.0,
-                "decode",
-                state_.device_id.toString(),
-                {{"reason", reason},
-                 {"request_index", std::to_string(request_index)}});
-            LOG_DEBUG("[DeviceGraphOrchestrator] MTP spec-decode metadata state restore unavailable: "
-                      << reason);
-            return false;
-        };
-
-        if (!state_.device_id.is_gpu())
-        {
-            return fail("gpu_required");
-        }
-        if (!batch.ok)
-        {
-            return fail(std::string("invalid_metadata_batch:") + batch.error);
-        }
-        if (request_index < 0 || request_index >= batch.request_count ||
-            request_index >= static_cast<int>(batch.accepted_state_counts.size()) ||
-            request_index >= static_cast<int>(batch.accepted_state_slot_indices.size()))
-        {
-            return fail("bad_request_index");
-        }
-        if (batch.accepted_state_counts[static_cast<size_t>(request_index)] <= 0)
-        {
-            return fail("no_accepted_state_count");
-        }
-        if (batch.accepted_state_slot_indices[static_cast<size_t>(request_index)] < 0)
-        {
-            return fail("no_accepted_state_slot");
-        }
-        if (!state_.kv_cache || seq_idx < 0 || seq_idx >= state_.batch_size)
-        {
-            return fail("missing_cache_or_bad_sequence");
-        }
-        if (seq_idx >= static_cast<int>(state_.positions.size()) ||
-            seq_idx >= static_cast<int>(state_.sequence_lengths.size()))
-        {
-            return fail("missing_sequence_bookkeeping");
-        }
-        if (target_cached_tokens < 0 ||
-            target_cached_tokens > state_.kv_cache->max_seq_len())
-        {
-            return fail("bad_restore_bounds");
-        }
-        if (!mtp_spec_decode_metadata_workspace_ ||
-            !mtp_spec_decode_metadata_workspace_->hasWorkspace())
-        {
-            return fail("metadata_workspace_not_bound");
-        }
-
-        IBackend *backend = getBackendFor(state_.device_id);
-        if (!backend)
-        {
-            return fail("missing_backend");
-        }
-        void *stream =
-            explicitGPUStreamForOperation("restoreMTPVerifierStateFromSpecDecodeMetadata");
-        if (!stream)
-        {
-            return fail("missing_explicit_gpu_stream");
-        }
-
-        MTPSpecDecodeMetadataUploadResult upload =
-            uploadMTPSpecDecodeMetadataBatch(
-                batch,
-                *mtp_spec_decode_metadata_workspace_,
-                state_.device_id,
-                backend,
-                stream);
-        if (!upload.ok)
-        {
-            return fail(std::string("metadata_upload_failed:") + upload.error);
-        }
-
-        auto *hybrid = dynamic_cast<IHybridKVCache *>(state_.kv_cache.get());
-        if (!hybrid)
-        {
-            return fail("non_hybrid_cache");
-        }
-
-        const auto &ptrs =
-            mtp_spec_decode_metadata_workspace_->devicePointers();
-        if (!ptrs.accepted_state_slot_indices)
-        {
-            return fail("missing_accepted_state_slot_indices_device_buffer");
-        }
-
-        int restored_layers = 0;
-        bool used_graph_publish = false;
-        std::string graph_publish_error;
-        if (forward_engine_)
-        {
-            int published_stages = 0;
-            if (forward_engine_->publishAcceptedSpeculativeVerifierStateFromDeviceMetadata(
-                    ptrs.accepted_state_slot_indices,
-                    request_index,
-                    state_.device_id,
-                    batch.shape.max_draft_tokens,
-                    moePlacementEpoch(),
-                    stream,
-                    &published_stages,
-                    &graph_publish_error))
-            {
-                used_graph_publish = true;
-                restored_layers = std::max(1, published_stages / 2);
-            }
-            else if (graph_publish_error != "no_cached_verifier_graph")
-            {
-                return fail(std::string("graph_metadata_publish_failed:") +
-                            graph_publish_error);
-            }
-        }
-
-        if (!used_graph_publish)
-        {
-            for (int layer = 0; layer < state_.kv_cache->n_layers(); ++layer)
-            {
-                if (!hybrid->isGDNLayer(layer))
-                {
-                    continue;
-                }
-
-                auto *conv_kernel = hybrid->getConvKernel(layer);
-                float *conv_state = hybrid->getConvState(layer);
-                auto *recurrence_kernel = hybrid->getRecurrenceKernel(layer);
-                float *recurrence_state = hybrid->getRecurrenceState(layer);
-                if (!conv_kernel || !conv_state || !recurrence_kernel || !recurrence_state)
-                {
-                    return fail("missing_gdn_state_or_kernel");
-                }
-                if (!conv_kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
-                        conv_state,
-                        ptrs.accepted_state_slot_indices,
-                        request_index,
-                        stream))
-                {
-                    return fail("shortconv_metadata_publish_failed");
-                }
-                if (!recurrence_kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
-                        recurrence_state,
-                        ptrs.accepted_state_slot_indices,
-                        request_index,
-                        stream))
-                {
-                    return fail("recurrence_metadata_publish_failed");
-                }
-                ++restored_layers;
-            }
-        }
-
-        if (restored_layers == 0)
-        {
-            return fail("no_gdn_layers");
-        }
-        if (!state_.kv_cache->truncateSequence(seq_idx, target_cached_tokens, stream))
-        {
-            return fail("main_kv_truncate_failed");
-        }
-
-        state_.positions[seq_idx] = target_cached_tokens;
-        state_.sequence_lengths[seq_idx] = target_cached_tokens;
-        handleLivePrefixReplayStateAfterMutation(
-            "publish_mtp_spec_decode_metadata_state",
-            /*preserve_gpu_replay_state=*/true);
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "spec_decode_metadata_state_publications",
-            1.0,
-            "decode",
-            state_.device_id.toString(),
-            {{"request_index", std::to_string(request_index)},
-             {"accepted_state_count",
-              std::to_string(batch.accepted_state_counts[static_cast<size_t>(request_index)])},
-             {"accepted_state_slot_index",
-              std::to_string(batch.accepted_state_slot_indices[static_cast<size_t>(request_index)])},
-             {"committed_state_row_compat",
-              request_index < static_cast<int>(batch.committed_state_rows.size())
-                  ? std::to_string(batch.committed_state_rows[static_cast<size_t>(request_index)])
-                  : std::string("-1")},
-             {"target_cached_tokens", std::to_string(target_cached_tokens)},
-             {"publish_path", used_graph_publish ? "cached_verifier_graph" : "hybrid_kernel_fallback"},
-             {"bytes_uploaded", std::to_string(upload.bytes_uploaded)},
-             {"gdn_layers", std::to_string(restored_layers)}});
         return true;
     }
 
@@ -8966,7 +8481,7 @@ namespace llaminar2
         for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
             cache.resetSessionState();
         mtp_terminal_hidden_row_select_cache_.resetSessionState();
-        mtp_base_terminal_hidden_copy_cache_.resetSessionState();
+        pending_mtp_logits_stream_ = nullptr;
 
         for (auto &cache : layer_graph_cache_)
         {

@@ -2943,26 +2943,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Publish live conv state from accepted speculative state metadata.
-         *
-         * Phase 13.8 treats the device metadata slot as an accepted-count
-         * publication decision, not a host-selected verifier rollback row. GPU
-         * implementations must require a non-null explicit stream.
-         */
-        virtual bool publishAcceptedSpeculativeStateFromDeviceMetadata(
-            float *state,
-            const int32_t *device_accepted_state_slot_indices,
-            int request_index,
-            void *stream)
-        {
-            (void)state;
-            (void)device_accepted_state_slot_indices;
-            (void)request_index;
-            (void)stream;
-            return false;
-        }
-
-        /**
          * @brief Prefill variant whose state commit length is read from device memory.
          *
          * GPU graph replay reads the current real length from device memory.
@@ -3077,9 +3057,7 @@ namespace llaminar2
          * @brief Bind workspace for speculative verifier recurrence state.
          *
          * Stateful GPU verifier forwards use this caller-owned buffer as the
-         * mutable recurrence state while writing accepted-count-addressable
-         * state slots. Live recurrence state is published only through
-         * publishAcceptedSpeculativeStateFromDeviceMetadata().
+         * mutable recurrence state while writing verifier state slots.
          */
         virtual void bindSpeculativeStateWorkspace(float *workspace, int state_size)
         {
@@ -3241,26 +3219,6 @@ namespace llaminar2
             (void)snapshot_row;
             (void)snapshot_stride_floats;
             (void)state_floats;
-            (void)stream;
-            return false;
-        }
-
-        /**
-         * @brief Publish live recurrence state from accepted speculative state metadata.
-         *
-         * Phase 13.8 treats the device metadata slot as an accepted-count
-         * publication decision, not a host-selected verifier rollback row. GPU
-         * implementations must require a non-null explicit stream.
-         */
-        virtual bool publishAcceptedSpeculativeStateFromDeviceMetadata(
-            float *state,
-            const int32_t *device_accepted_state_slot_indices,
-            int request_index,
-            void *stream)
-        {
-            (void)state;
-            (void)device_accepted_state_slot_indices;
-            (void)request_index;
             (void)stream;
             return false;
         }

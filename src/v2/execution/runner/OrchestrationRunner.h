@@ -511,6 +511,7 @@ namespace llaminar2
         bool mtp_bypassed_{false};
         bool mtp_bypass_recorded_for_request_{false};
         std::string mtp_bypass_reason_;
+        uint64_t request_epoch_{0};
     };
 
 } // namespace llaminar2

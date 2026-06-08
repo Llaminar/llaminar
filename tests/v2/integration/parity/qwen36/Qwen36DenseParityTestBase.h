@@ -3436,51 +3436,74 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_TRUE(PerfStatsCollector::isEnabled())
             << "Phase 13.8 stochastic candidate parity requires perf stats";
         auto mtp_result = mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
-        const auto after_mtp = mtp->prefixStateProbe();
+        ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
+        ASSERT_EQ(mtp_result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
+
+        mtp->clearCache();
+        PerfStatsCollector::reset();
+        auto reused_mtp_result = mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
+        const auto after_reused_mtp = mtp->prefixStateProbe();
         const auto phase138_records = PerfStatsCollector::snapshot({"mtp"});
         mtp->shutdown();
 
-        ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
-        ASSERT_EQ(mtp_result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
-        EXPECT_FALSE(after_mtp.mtp_bypassed) << after_mtp.mtp_bypass_reason;
-        EXPECT_EQ(after_mtp.mtp_request.verify_mode, "speculative-sampling");
-        EXPECT_TRUE(after_mtp.mtp_request.stochastic_verify);
+        ASSERT_TRUE(reused_mtp_result.error.empty()) << reused_mtp_result.error;
+        ASSERT_EQ(reused_mtp_result.tokens.size(), mtp_result.tokens.size());
+        EXPECT_EQ(reused_mtp_result.tokens, mtp_result.tokens)
+            << "Stochastic MTP with the same seed must be reproducible after clearCache()";
+        EXPECT_FALSE(after_reused_mtp.mtp_bypassed) << after_reused_mtp.mtp_bypass_reason;
+        EXPECT_EQ(after_reused_mtp.mtp_request.verify_mode, "speculative-sampling");
+        EXPECT_TRUE(after_reused_mtp.mtp_request.stochastic_verify);
         expectPhase138TransactionUsed(
             test_case,
-            after_mtp,
+            after_reused_mtp,
             test_case.name + " stochastic MTP",
             /*allow_transaction_rollbacks=*/true);
-        EXPECT_GE(after_mtp.mtp_draft_steps, 1u);
-        EXPECT_GE(after_mtp.mtp_verifier_runs, 1u);
-        EXPECT_GE(after_mtp.mtp_verifier_token_count, 2u);
-        EXPECT_GE(after_mtp.mtp_stochastic_accept_tests, 1u);
-        EXPECT_EQ(after_mtp.mtp_stochastic_accept_tests,
-                  after_mtp.mtp_stochastic_accepts +
-                      after_mtp.mtp_stochastic_residual_samples);
-        EXPECT_GE(after_mtp.mtp_stochastic_residual_samples +
-                      after_mtp.mtp_stochastic_terminal_samples,
+        EXPECT_GE(after_reused_mtp.mtp_draft_steps, 1u);
+        EXPECT_GE(after_reused_mtp.mtp_verifier_runs, 1u);
+        EXPECT_GE(after_reused_mtp.mtp_verifier_token_count, 2u);
+        EXPECT_GE(after_reused_mtp.mtp_stochastic_accept_tests, 1u);
+        EXPECT_EQ(after_reused_mtp.mtp_stochastic_accept_tests,
+                  after_reused_mtp.mtp_stochastic_accepts +
+                      after_reused_mtp.mtp_stochastic_residual_samples);
+        EXPECT_GE(after_reused_mtp.mtp_stochastic_residual_samples +
+                      after_reused_mtp.mtp_stochastic_terminal_samples,
                   1u);
-        EXPECT_EQ(after_mtp.mtp_request.stochastic_accept_tests,
-                  after_mtp.mtp_stochastic_accept_tests);
-        EXPECT_EQ(after_mtp.mtp_request.stochastic_accepts,
-                  after_mtp.mtp_stochastic_accepts);
-        EXPECT_EQ(after_mtp.mtp_request.stochastic_residual_samples,
-                  after_mtp.mtp_stochastic_residual_samples);
-        EXPECT_EQ(after_mtp.mtp_request.stochastic_terminal_samples,
-                  after_mtp.mtp_stochastic_terminal_samples);
-        EXPECT_GE(after_mtp.mtp_request.stochastic_acceptance_rate, 0.0);
-        EXPECT_LE(after_mtp.mtp_request.stochastic_acceptance_rate, 1.0);
-        if (after_mtp.mtp_stochastic_accept_tests > 0)
+        EXPECT_EQ(after_reused_mtp.mtp_request.stochastic_accept_tests,
+                  after_reused_mtp.mtp_stochastic_accept_tests);
+        EXPECT_EQ(after_reused_mtp.mtp_request.stochastic_accepts,
+                  after_reused_mtp.mtp_stochastic_accepts);
+        EXPECT_EQ(after_reused_mtp.mtp_request.stochastic_residual_samples,
+                  after_reused_mtp.mtp_stochastic_residual_samples);
+        EXPECT_EQ(after_reused_mtp.mtp_request.stochastic_terminal_samples,
+                  after_reused_mtp.mtp_stochastic_terminal_samples);
+        EXPECT_GE(after_reused_mtp.mtp_request.stochastic_acceptance_rate, 0.0);
+        EXPECT_LE(after_reused_mtp.mtp_request.stochastic_acceptance_rate, 1.0);
+        if (after_reused_mtp.mtp_stochastic_accept_tests > 0)
         {
             const double expected_rate =
-                static_cast<double>(after_mtp.mtp_stochastic_accepts) /
-                static_cast<double>(after_mtp.mtp_stochastic_accept_tests);
-            EXPECT_NEAR(after_mtp.mtp_request.stochastic_acceptance_rate,
+                static_cast<double>(after_reused_mtp.mtp_stochastic_accepts) /
+                static_cast<double>(after_reused_mtp.mtp_stochastic_accept_tests);
+            EXPECT_NEAR(after_reused_mtp.mtp_request.stochastic_acceptance_rate,
                         expected_rate,
                         1e-12);
         }
 
-        const bool used_phase138_stochastic_candidate =
+        const bool used_decode_equivalent_stochastic_verifier =
+            std::any_of(
+                phase138_records.begin(),
+                phase138_records.end(),
+                [](const PerfStatRecord &record)
+                {
+                    return record.kind == PerfStatRecord::Kind::Counter &&
+                           record.domain == "mtp" &&
+                           record.name == "decode_equivalent_stochastic_verifier_runs";
+                });
+        EXPECT_TRUE(used_decode_equivalent_stochastic_verifier)
+            << "Stateful Qwen3.6 stochastic MTP parity must exercise the "
+               "decode-equivalent verifier path\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+
+        const bool used_retired_phase138_stochastic_candidate =
             std::any_of(
                 phase138_records.begin(),
                 phase138_records.end(),
@@ -3490,9 +3513,9 @@ namespace llaminar2::test::parity::qwen36
                            record.domain == "mtp" &&
                            record.name == "phase138_stochastic_spec_decode_runs";
                 });
-        EXPECT_TRUE(used_phase138_stochastic_candidate)
-            << "Stochastic MTP parity must exercise the Phase 13.8 "
-               "accepted-count candidate\n"
+        EXPECT_FALSE(used_retired_phase138_stochastic_candidate)
+            << "Stateful Qwen3.6 stochastic MTP must not use the retired "
+               "accepted-count publication candidate\n"
             << PerfStatsCollector::summaryString({"mtp"});
     }
 

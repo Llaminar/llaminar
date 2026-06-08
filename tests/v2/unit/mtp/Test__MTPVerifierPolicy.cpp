@@ -25,7 +25,7 @@ TEST(Test__MTPVerifierPolicy, StatefulGreedyRunnerUsesDecodeEquivalentSequential
         "stateful_runner_requires_decode_equivalent_replay");
 }
 
-TEST(Test__MTPVerifierPolicy, StatefulSamplingRunnerCannotCommitAllPositionState)
+TEST(Test__MTPVerifierPolicy, StatefulSamplingRunnerUsesDecodeEquivalentSequentialPath)
 {
     const MTPVerifierPolicyDecision decision =
         chooseMTPVerifierPolicy(
@@ -38,12 +38,12 @@ TEST(Test__MTPVerifierPolicy, StatefulSamplingRunnerCannotCommitAllPositionState
 
     EXPECT_EQ(
         decision.path,
-        MTPVerifierExecutionPath::AllPositionVerifier);
+        MTPVerifierExecutionPath::DecodeEquivalentSequential);
     EXPECT_FALSE(decision.allow_verifier_state_row_shortcut);
     EXPECT_TRUE(decision.accepted_all_position_state_requires_replay);
     EXPECT_STREQ(
         decision.reason,
-        "decode_equivalent_replay_unavailable_for_sampling_mode");
+        "stateful_runner_requires_decode_equivalent_replay");
 }
 
 TEST(Test__MTPVerifierPolicy, StatelessRunnerWithRowRestoreMayCommitVerifierRows)

@@ -392,8 +392,6 @@ namespace llaminar2
         void resetSessionState()
         {
             resetReplayState();
-            if (prefill_graph_cache)
-                prefill_graph_cache->invalidateAll(PrefillGraphRejectReason::SessionReset);
             last_prefill_graph_observation = {};
 
             if (graph)

@@ -138,9 +138,6 @@ namespace llaminar2
         params_.kernel->bindScratchWorkspace(scratch, scratch_floats);
 
         const int capture_state_size = params_.channels * std::max(0, params_.kernel_size - 1);
-        verifier_capture_workspace_bound_ = false;
-        speculative_state_work_bound_ = false;
-        verifier_capture_rows_bound_ = 0;
         verifier_capture_state_size_bound_ = capture_state_size;
 
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
@@ -152,15 +149,13 @@ namespace llaminar2
             // previous all-position verifier graph; otherwise the shared
             // kernel keeps running against speculative state scratch and stops
             // publishing real recurrent state.
-            params_.kernel->bindVerifierStateCaptureWorkspace(
-                nullptr,
-                0,
-                capture_state_size);
-            params_.kernel->bindSpeculativeStateWorkspace(
-                nullptr,
-                capture_state_size);
+            clearKernelVerifierStateWorkspace();
             return;
         }
+
+        verifier_capture_workspace_bound_ = false;
+        speculative_state_work_bound_ = false;
+        verifier_capture_rows_bound_ = 0;
 
         float *capture = nullptr;
         int capture_rows = 0;
@@ -201,6 +196,26 @@ namespace llaminar2
         params_.kernel->bindSpeculativeStateWorkspace(
             speculative_work,
             capture_state_size);
+    }
+
+    void ShortConv1dStage::clearKernelVerifierStateWorkspace()
+    {
+        verifier_capture_workspace_bound_ = false;
+        speculative_state_work_bound_ = false;
+        verifier_capture_rows_bound_ = 0;
+        verifier_capture_state_size_bound_ =
+            params_.channels * std::max(0, params_.kernel_size - 1);
+
+        if (!params_.kernel)
+            return;
+
+        params_.kernel->bindVerifierStateCaptureWorkspace(
+            nullptr,
+            0,
+            verifier_capture_state_size_bound_);
+        params_.kernel->bindSpeculativeStateWorkspace(
+            nullptr,
+            verifier_capture_state_size_bound_);
     }
 
     int ShortConv1dStage::effectivePrefillSeqLen() const
@@ -311,32 +326,6 @@ namespace llaminar2
             params_.conv_state,
             row,
             stream ? stream : gpuStream());
-    }
-
-    bool ShortConv1dStage::prepareVerifierStatePublication()
-    {
-        if (!hasVerifierStateCapture())
-            return false;
-        bindKernelWorkspace();
-        return ensureVerifierStateCaptureWorkspaceBound();
-    }
-
-    bool ShortConv1dStage::publishAcceptedSpeculativeStateFromDeviceMetadata(
-        const int32_t *device_accepted_state_slot_indices,
-        int request_index,
-        void *stream)
-    {
-        if (!hasVerifierStateCapture() || !params_.kernel ||
-            !device_accepted_state_slot_indices ||
-            request_index < 0 || !stream)
-        {
-            return false;
-        }
-        return params_.kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
-            params_.conv_state,
-            device_accepted_state_slot_indices,
-            request_index,
-            stream);
     }
 
     bool ShortConv1dStage::ensureGpuEffectiveSeqLenStateInitialized()
