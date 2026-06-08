@@ -144,7 +144,7 @@ namespace llaminar2
             void *out_accepted_device,
             void *out_accept_probability_device = nullptr,
             void *out_accept_threshold_device = nullptr) override;
-        bool enqueueSpeculativeAcceptDistributionsF32DeviceThresholdsBatch(
+        bool enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatch(
             const void *target_token_ids_device,
             const void *target_probs_device,
             const void *draft_token_ids_device,
@@ -153,9 +153,11 @@ namespace llaminar2
             int distribution_stride,
             const int *draft_tokens_host,
             const float *accept_thresholds_host,
+            const float *residual_thresholds_host,
             int row_count,
             int device_id,
             void *stream,
+            void *out_token_device,
             void *out_accepted_device,
             void *out_accept_probability_device = nullptr,
             void *out_accept_threshold_device = nullptr) override;

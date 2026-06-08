@@ -8626,11 +8626,12 @@ namespace llaminar2
         return token >= 0;
     }
 
-    bool DeviceGraphOrchestrator::verifyStochasticAcceptsOnDevice(
+    bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOnDevice(
         int first_target_slot,
         int first_draft_slot,
         const int32_t *draft_tokens,
         const float *accept_thresholds,
+        const float *residual_thresholds,
         int row_count,
         DeviceSpeculativeVerifyResult *out)
     {
@@ -8639,7 +8640,7 @@ namespace llaminar2
             row_count <= 0 ||
             first_target_slot + row_count > static_cast<int>(kStochasticTargetRows) ||
             first_draft_slot + row_count > static_cast<int>(kStochasticDraftRows) ||
-            !draft_tokens || !accept_thresholds || !out)
+            !draft_tokens || !accept_thresholds || !residual_thresholds || !out)
         {
             return false;
         }
@@ -8647,7 +8648,7 @@ namespace llaminar2
         IBackend *backend = getBackendFor(state_.device_id);
         if (!backend)
             return false;
-        void *stream = explicitGPUStreamForOperation("verifyStochasticAcceptsOnDevice");
+        void *stream = explicitGPUStreamForOperation("verifyStochasticDistributionsBatchOnDevice");
         if (!stream)
             return false;
 
@@ -8683,6 +8684,8 @@ namespace llaminar2
         auto *draft_probs =
             static_cast<float *>(stochastic_draft_probs_dev_) +
             static_cast<size_t>(first_draft_slot) * kStochasticDistributionMaxK;
+        auto *out_token_dev =
+            static_cast<int *>(stochastic_verify_tokens_dev_) + first_target_slot;
         auto *out_accepted_dev =
             static_cast<int *>(stochastic_verify_accepted_dev_) + first_target_slot;
         auto *out_accept_prob_dev =
@@ -8690,7 +8693,7 @@ namespace llaminar2
         auto *out_threshold_dev =
             static_cast<float *>(stochastic_verify_thresholds_dev_) + first_target_slot;
 
-        if (!backend->enqueueSpeculativeAcceptDistributionsF32DeviceThresholdsBatch(
+        if (!backend->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatch(
                 target_ids,
                 target_probs,
                 draft_ids,
@@ -8699,9 +8702,11 @@ namespace llaminar2
                 static_cast<int>(kStochasticDistributionMaxK),
                 draft_tokens,
                 accept_thresholds,
+                residual_thresholds,
                 row_count,
                 state_.device_id.gpu_ordinal(),
                 stream,
+                out_token_dev,
                 out_accepted_dev,
                 out_accept_prob_dev,
                 out_threshold_dev))
@@ -8709,10 +8714,14 @@ namespace llaminar2
             return false;
         }
 
+        std::array<int, 4> tokens{};
         std::array<int, 4> accepted{};
         std::array<float, 4> accept_probabilities{};
         std::array<float, 4> thresholds{};
-        if (!backend->deviceToHost(accepted.data(), out_accepted_dev,
+        if (!backend->deviceToHost(tokens.data(), out_token_dev,
+                                   sizeof(int) * static_cast<size_t>(row_count),
+                                   state_.device_id.gpu_ordinal(), stream) ||
+            !backend->deviceToHost(accepted.data(), out_accepted_dev,
                                    sizeof(int) * static_cast<size_t>(row_count),
                                    state_.device_id.gpu_ordinal(), stream) ||
             !backend->deviceToHost(accept_probabilities.data(), out_accept_prob_dev,
@@ -8728,7 +8737,7 @@ namespace llaminar2
         for (int row = 0; row < row_count; ++row)
         {
             out[row].accepted = accepted[static_cast<size_t>(row)] != 0;
-            out[row].token = out[row].accepted ? draft_tokens[row] : -1;
+            out[row].token = tokens[static_cast<size_t>(row)];
             out[row].accept_probability =
                 accept_probabilities[static_cast<size_t>(row)];
             out[row].accept_threshold = thresholds[static_cast<size_t>(row)];
@@ -8736,7 +8745,7 @@ namespace llaminar2
 
         PerfStatsCollector::addCounter(
             "mtp",
-            "stochastic_accept_batch_rows",
+            "stochastic_verify_batch_rows",
             static_cast<double>(row_count),
             "decode",
             state_.device_id.toString(),

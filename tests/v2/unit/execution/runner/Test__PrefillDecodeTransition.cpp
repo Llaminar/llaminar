@@ -608,17 +608,18 @@ namespace
             return out->token >= 0;
         }
 
-        bool verifyStochasticAcceptsOnDevice(
+        bool verifyStochasticDistributionsBatchOnDevice(
             int first_target_slot,
             int first_draft_slot,
             const int32_t *draft_tokens,
             const float *accept_thresholds,
+            const float *residual_thresholds,
             int row_count,
             DeviceSpeculativeVerifyResult *out) override
         {
-            ++device_distribution_accept_batch_count_;
+            ++device_distribution_verify_batch_count_;
             if (!supports_stochastic_device_sampling_ ||
-                !draft_tokens || !accept_thresholds || !out ||
+                !draft_tokens || !accept_thresholds || !residual_thresholds || !out ||
                 first_target_slot < 0 || first_draft_slot < 0 || row_count <= 0)
             {
                 return false;
@@ -645,6 +646,9 @@ namespace
                 out[row].accept_probability = accept_probability;
                 out[row].accept_threshold = accept_thresholds[row];
                 out[row].token = out[row].accepted ? draft_token : -1;
+                if (!out[row].accepted)
+                    out[row].token =
+                        sampleResidualWithThreshold(target, draft, residual_thresholds[row]);
             }
             return true;
         }
@@ -683,7 +687,7 @@ namespace
         int deviceDistributionBuildCount() const { return device_distribution_build_count_; }
         int deviceDistributionSampleCount() const { return device_distribution_sample_count_; }
         int deviceDistributionVerifyCount() const { return device_distribution_verify_count_; }
-        int deviceDistributionAcceptBatchCount() const { return device_distribution_accept_batch_count_; }
+        int deviceDistributionVerifyBatchCount() const { return device_distribution_verify_batch_count_; }
         int lastSampleAllPositionStartRow() const { return last_sample_all_position_start_row_; }
         int lastSampleAllPositionRowCount() const { return last_sample_all_position_row_count_; }
         const PrefixStateSnapshot &lastRestoredSnapshot() const { return last_restored_snapshot_; }
@@ -1109,7 +1113,7 @@ namespace
         int device_distribution_build_count_{0};
         int device_distribution_sample_count_{0};
         int device_distribution_verify_count_{0};
-        int device_distribution_accept_batch_count_{0};
+        int device_distribution_verify_batch_count_{0};
         int last_sample_all_position_start_row_{-1};
         int last_sample_all_position_row_count_{0};
         int last_mtp_condition_token_{-1};
@@ -3061,7 +3065,7 @@ namespace
         EXPECT_EQ(mock->deviceDistributionBuildCount(), 0);
         EXPECT_EQ(mock->deviceDistributionSampleCount(), 0);
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0);
-        EXPECT_EQ(mock->deviceDistributionAcceptBatchCount(), 0);
+        EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 0);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingUsesDeviceResidentVerifierForGPU)
@@ -3105,7 +3109,7 @@ namespace
         EXPECT_EQ(mock->deviceDistributionSampleCount(), 3)
             << "first token, MTP draft, and terminal ready-token sampling should avoid host full-logit sampling";
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0);
-        EXPECT_EQ(mock->deviceDistributionAcceptBatchCount(), 1);
+        EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
         EXPECT_EQ(mock->applyMainPenaltiesCount(), 1);
         EXPECT_EQ(mock->applyMTPPenaltiesCount(), 1);
         EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
@@ -3222,9 +3226,9 @@ namespace
             << "first token, MTP draft, verifier row, and terminal row distributions should stay compact/device-resident";
         EXPECT_EQ(mock->deviceDistributionSampleCount(), 2)
             << "first token and MTP draft sampling should avoid full-logit host sampling";
-        EXPECT_EQ(mock->deviceDistributionAcceptBatchCount(), 1);
-        EXPECT_EQ(mock->deviceDistributionVerifyCount(), 1)
-            << "the first rejected row should still use the single-row residual sampler";
+        EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
+        EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0)
+            << "the first rejected row should use the batched residual-capable verifier";
         EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
 
         const auto probe = runner->prefixStateProbe();

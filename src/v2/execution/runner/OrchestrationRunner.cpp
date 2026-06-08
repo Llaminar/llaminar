@@ -3036,42 +3036,50 @@ namespace llaminar2
 
         std::vector<int32_t> verifier_tokens;
         verifier_tokens.reserve(static_cast<size_t>(speculative_draft_count));
-        std::vector<DeviceSpeculativeVerifyResult> batched_device_accept_results;
-        std::vector<int32_t> batched_device_accept_draft_tokens;
+        std::vector<DeviceSpeculativeVerifyResult> batched_device_verify_results;
+        std::vector<int32_t> batched_device_verify_draft_tokens;
         if (stochastic_verify && stochastic_device_verify)
         {
-            const int accept_row_count =
+            const int verify_row_count =
                 std::max(0, static_cast<int>(draft_tokens.size()) - 1);
-            batched_device_accept_results.resize(static_cast<size_t>(accept_row_count));
-            batched_device_accept_draft_tokens.resize(static_cast<size_t>(accept_row_count));
-            std::vector<float> accept_thresholds(static_cast<size_t>(accept_row_count));
+            batched_device_verify_results.resize(static_cast<size_t>(verify_row_count));
+            batched_device_verify_draft_tokens.resize(static_cast<size_t>(verify_row_count));
+            std::vector<float> accept_thresholds(static_cast<size_t>(verify_row_count));
+            std::vector<float> residual_thresholds(static_cast<size_t>(verify_row_count));
+            std::vector<float> threshold_draws(static_cast<size_t>(verify_row_count + 1));
 
-            Sampler accept_rng = sampler_;
-            for (int row = 0; row < accept_row_count; ++row)
+            Sampler verify_rng = sampler_;
+            for (int draw = 0; draw <= verify_row_count; ++draw)
+                threshold_draws[static_cast<size_t>(draw)] =
+                    verify_rng.random_uniform_01();
+            for (int row = 0; row < verify_row_count; ++row)
             {
-                batched_device_accept_draft_tokens[static_cast<size_t>(row)] =
+                batched_device_verify_draft_tokens[static_cast<size_t>(row)] =
                     draft_tokens[static_cast<size_t>(row + 1)];
                 accept_thresholds[static_cast<size_t>(row)] =
-                    accept_rng.random_uniform_01();
+                    threshold_draws[static_cast<size_t>(row)];
+                residual_thresholds[static_cast<size_t>(row)] =
+                    threshold_draws[static_cast<size_t>(row + 1)];
             }
 
-            if (accept_row_count > 0)
+            if (verify_row_count > 0)
             {
-                if (!runner_->verifyStochasticAcceptsOnDevice(
+                if (!runner_->verifyStochasticDistributionsBatchOnDevice(
                         /*first_target_slot=*/0,
                         /*first_draft_slot=*/0,
-                        batched_device_accept_draft_tokens.data(),
+                        batched_device_verify_draft_tokens.data(),
                         accept_thresholds.data(),
-                        accept_row_count,
-                        batched_device_accept_results.data()))
+                        residual_thresholds.data(),
+                        verify_row_count,
+                        batched_device_verify_results.data()))
                 {
                     return fail_after_checkpoint(
-                        "Device stochastic MTP batched accept verifier failed");
+                        "Device stochastic MTP batched verifier failed");
                 }
                 PerfStatsCollector::addCounter(
                     "mtp",
-                    "stochastic_accept_batch_tests",
-                    static_cast<double>(accept_row_count),
+                    "stochastic_verify_batch_tests",
+                    static_cast<double>(verify_row_count),
                     "decode");
             }
         }
@@ -3091,15 +3099,15 @@ namespace llaminar2
                     }
 
                     const int32_t draft_token = draft_tokens[static_cast<size_t>(draft_idx)];
-                    const float accept_threshold = sampler_.random_uniform_01();
+                    (void)sampler_.random_uniform_01();
                     DeviceSpeculativeVerifyResult verify_result;
                     if (row < 0 ||
-                        row >= static_cast<int>(batched_device_accept_results.size()))
+                        row >= static_cast<int>(batched_device_verify_results.size()))
                     {
-                        return fail_after_checkpoint("Device stochastic MTP batched accept row is incomplete");
+                        return fail_after_checkpoint("Device stochastic MTP batched verifier row is incomplete");
                     }
                     verify_result =
-                        batched_device_accept_results[static_cast<size_t>(row)];
+                        batched_device_verify_results[static_cast<size_t>(row)];
 
                     ++mtp_stats_.stochastic_accept_tests;
                     PerfStatsCollector::addCounter(
@@ -3125,17 +3133,9 @@ namespace llaminar2
                         continue;
                     }
 
-                    const float residual_threshold = sampler_.random_uniform_01();
-                    if (!runner_->verifyStochasticDistributionsOnDevice(
-                            row,
-                            row,
-                            draft_token,
-                            accept_threshold,
-                            residual_threshold,
-                            &verify_result))
-                    {
-                        return fail_after_checkpoint("Device stochastic MTP residual verifier failed");
-                    }
+                    (void)sampler_.random_uniform_01();
+                    if (verify_result.token < 0)
+                        return fail_after_checkpoint("Device stochastic MTP batched residual verifier produced no correction token");
 
                     all_speculative_accepted = false;
                     rejected_verified_token = verify_result.token;

@@ -497,14 +497,17 @@ namespace llaminar2
         int *out_token, int *out_accepted,
         float *out_accept_probability, float *out_accept_threshold,
         int device_idx, void *stream);
-    extern "C" bool rocmOps_speculative_accept_distribution_thresholds_batch_f32(
+    extern "C" bool rocmOps_speculative_verify_distribution_thresholds_batch_f32(
         const int *target_token_ids, const float *target_probs,
         const int *draft_token_ids, const float *draft_probs,
         int k, int distribution_stride,
         int draft_token0, int draft_token1, int draft_token2, int draft_token3,
         float accept_threshold0, float accept_threshold1,
         float accept_threshold2, float accept_threshold3,
+        float residual_threshold0, float residual_threshold1,
+        float residual_threshold2, float residual_threshold3,
         int row_count,
+        int *out_token,
         int *out_accepted,
         float *out_accept_probability,
         float *out_accept_threshold,
@@ -804,7 +807,7 @@ namespace llaminar2
             stream);
     }
 
-    bool ROCmBackend::enqueueSpeculativeAcceptDistributionsF32DeviceThresholdsBatch(
+    bool ROCmBackend::enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatch(
         const void *target_token_ids_device,
         const void *target_probs_device,
         const void *draft_token_ids_device,
@@ -813,9 +816,11 @@ namespace llaminar2
         int distribution_stride,
         const int *draft_tokens_host,
         const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
         int row_count,
         int device_id,
         void *stream,
+        void *out_token_device,
         void *out_accepted_device,
         void *out_accept_probability_device,
         void *out_accept_threshold_device)
@@ -827,21 +832,24 @@ namespace llaminar2
             distribution_stride < top_k ||
             row_count <= 0 || row_count > 4 ||
             !draft_tokens_host || !accept_thresholds_host ||
-            !stream || !out_accepted_device)
+            !residual_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
         {
             return false;
         }
 
         int draft_tokens[4] = {-1, -1, -1, -1};
         float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float residual_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int i = 0; i < row_count; ++i)
         {
             draft_tokens[i] = draft_tokens_host[i];
             accept_thresholds[i] = accept_thresholds_host[i];
+            residual_thresholds[i] = residual_thresholds_host[i];
         }
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
-        return rocmOps_speculative_accept_distribution_thresholds_batch_f32(
+        return rocmOps_speculative_verify_distribution_thresholds_batch_f32(
             static_cast<const int *>(target_token_ids_device),
             static_cast<const float *>(target_probs_device),
             static_cast<const int *>(draft_token_ids_device),
@@ -856,7 +864,12 @@ namespace llaminar2
             accept_thresholds[1],
             accept_thresholds[2],
             accept_thresholds[3],
+            residual_thresholds[0],
+            residual_thresholds[1],
+            residual_thresholds[2],
+            residual_thresholds[3],
             row_count,
+            static_cast<int *>(out_token_device),
             static_cast<int *>(out_accepted_device),
             static_cast<float *>(out_accept_probability_device),
             static_cast<float *>(out_accept_threshold_device),

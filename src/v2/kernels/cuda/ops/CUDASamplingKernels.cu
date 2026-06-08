@@ -689,7 +689,7 @@ __global__ void cuda_speculative_verify_distribution_threshold_kernel(
         out_accept_threshold);
 }
 
-__global__ void cuda_speculative_accept_distribution_thresholds_batch_kernel(
+__global__ void cuda_speculative_verify_distribution_thresholds_batch_kernel(
     const int *__restrict__ target_token_ids,
     const float *__restrict__ target_probs,
     const int *__restrict__ draft_token_ids,
@@ -704,7 +704,12 @@ __global__ void cuda_speculative_accept_distribution_thresholds_batch_kernel(
     float accept_threshold1,
     float accept_threshold2,
     float accept_threshold3,
+    float residual_threshold0,
+    float residual_threshold1,
+    float residual_threshold2,
+    float residual_threshold3,
     int row_count,
+    int *__restrict__ out_token,
     int *__restrict__ out_accepted,
     float *__restrict__ out_accept_probability,
     float *__restrict__ out_accept_threshold)
@@ -715,43 +720,40 @@ __global__ void cuda_speculative_accept_distribution_thresholds_batch_kernel(
 
     int draft_token = draft_token0;
     float accept_threshold = accept_threshold0;
+    float residual_threshold = residual_threshold0;
     if (row == 1)
     {
         draft_token = draft_token1;
         accept_threshold = accept_threshold1;
+        residual_threshold = residual_threshold1;
     }
     else if (row == 2)
     {
         draft_token = draft_token2;
         accept_threshold = accept_threshold2;
+        residual_threshold = residual_threshold2;
     }
     else if (row == 3)
     {
         draft_token = draft_token3;
         accept_threshold = accept_threshold3;
+        residual_threshold = residual_threshold3;
     }
 
     const int offset = row * distribution_stride;
-    const float p = llaminar2::sampling_math::distribution_probability(
+    llaminar2::sampling_math::speculative_verify_with_thresholds(
         target_token_ids + offset,
         target_probs + offset,
-        k,
-        draft_token);
-    const float q = llaminar2::sampling_math::distribution_probability(
         draft_token_ids + offset,
         draft_probs + offset,
         k,
-        draft_token);
-    const float accept_probability =
-        llaminar2::sampling_math::speculative_accept_probability(p, q);
-    const float threshold =
-        llaminar2::sampling_math::clamp_unit_threshold(accept_threshold);
-
-    out_accepted[row] = threshold < accept_probability ? 1 : 0;
-    if (out_accept_probability)
-        out_accept_probability[row] = accept_probability;
-    if (out_accept_threshold)
-        out_accept_threshold[row] = threshold;
+        draft_token,
+        accept_threshold,
+        residual_threshold,
+        out_token + row,
+        out_accepted + row,
+        out_accept_probability ? out_accept_probability + row : nullptr,
+        out_accept_threshold ? out_accept_threshold + row : nullptr);
 }
 
 // ============================================================================
@@ -1144,7 +1146,7 @@ extern "C"
         return true;
     }
 
-    bool cudaOps_speculative_accept_distribution_thresholds_batch_f32(
+    bool cudaOps_speculative_verify_distribution_thresholds_batch_f32(
         const int *target_token_ids,
         const float *target_probs,
         const int *draft_token_ids,
@@ -1159,7 +1161,12 @@ extern "C"
         float accept_threshold1,
         float accept_threshold2,
         float accept_threshold3,
+        float residual_threshold0,
+        float residual_threshold1,
+        float residual_threshold2,
+        float residual_threshold3,
         int row_count,
+        int *out_token,
         int *out_accepted,
         float *out_accept_probability,
         float *out_accept_threshold,
@@ -1171,14 +1178,14 @@ extern "C"
             row_count <= 0 || row_count > 4 ||
             !target_token_ids || !target_probs ||
             !draft_token_ids || !draft_probs ||
-            !out_accepted || !stream)
+            !out_token || !out_accepted || !stream)
         {
             return false;
         }
 
         cudaSetDevice(device_idx);
 
-        cuda_speculative_accept_distribution_thresholds_batch_kernel<<<1, 4, 0, static_cast<cudaStream_t>(stream)>>>(
+        cuda_speculative_verify_distribution_thresholds_batch_kernel<<<1, 4, 0, static_cast<cudaStream_t>(stream)>>>(
             target_token_ids,
             target_probs,
             draft_token_ids,
@@ -1193,7 +1200,12 @@ extern "C"
             accept_threshold1,
             accept_threshold2,
             accept_threshold3,
+            residual_threshold0,
+            residual_threshold1,
+            residual_threshold2,
+            residual_threshold3,
             row_count,
+            out_token,
             out_accepted,
             out_accept_probability,
             out_accept_threshold);
@@ -1201,7 +1213,7 @@ extern "C"
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            fprintf(stderr, "CUDA Speculative Accept Batch FP32 kernel launch failed: %s\n",
+            fprintf(stderr, "CUDA Speculative Verify Batch FP32 kernel launch failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

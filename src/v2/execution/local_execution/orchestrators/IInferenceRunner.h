@@ -748,11 +748,12 @@ namespace llaminar2
             return false;
         }
 
-        virtual bool verifyStochasticAcceptsOnDevice(
+        virtual bool verifyStochasticDistributionsBatchOnDevice(
             int first_target_slot,
             int first_draft_slot,
             const int32_t *draft_tokens,
             const float *accept_thresholds,
+            const float *residual_thresholds,
             int row_count,
             DeviceSpeculativeVerifyResult *out)
         {
@@ -760,6 +761,7 @@ namespace llaminar2
             (void)first_draft_slot;
             (void)draft_tokens;
             (void)accept_thresholds;
+            (void)residual_thresholds;
             (void)row_count;
             (void)out;
             return false;
