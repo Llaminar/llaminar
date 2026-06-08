@@ -106,6 +106,25 @@ namespace llaminar2
         std::vector<int32_t> bonus_ready_state_slot_indices;
     };
 
+    struct MTPSpecDecodeStatePublicationPlan
+    {
+        bool ok = false;
+        std::string error;
+
+        MTPSpecDecodeMetadataShape shape;
+        int request_count = 0;
+
+        std::vector<int32_t> base_cached_tokens;
+        std::vector<int32_t> target_cached_tokens;
+        std::vector<int32_t> accepted_state_counts;
+        std::vector<int32_t> accepted_state_slot_indices;
+        std::vector<int32_t> correction_replay_start_indices;
+        std::vector<int32_t> correction_replay_counts;
+        std::vector<int32_t> bonus_ready_token_rows;
+        std::vector<int32_t> bonus_ready_token_indices;
+        std::vector<int32_t> bonus_ready_state_slot_indices;
+    };
+
     WorkspaceRequirements buildMTPSpecDecodeWorkspaceRequirements(
         const MTPSpecDecodeMetadataShape &shape);
 
@@ -131,6 +150,10 @@ namespace llaminar2
 
     MTPSpecDecodeStateCommitPlan buildMTPSpecDecodeStateCommitPlan(
         const MTPSpecDecodeMetadataBatch &batch);
+
+    MTPSpecDecodeStatePublicationPlan buildMTPSpecDecodeStatePublicationPlan(
+        const MTPSpecDecodeStateCommitPlan &commit_plan,
+        const std::vector<int32_t> &base_cached_tokens);
 
     struct MTPSpecDecodeMetadataDevicePointers
     {

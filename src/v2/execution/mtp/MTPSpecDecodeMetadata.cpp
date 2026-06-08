@@ -48,6 +48,19 @@ namespace llaminar2
             return plan;
         }
 
+        MTPSpecDecodeStatePublicationPlan publicationPlanFailure(
+            const MTPSpecDecodeMetadataShape &shape,
+            int request_count,
+            std::string reason)
+        {
+            MTPSpecDecodeStatePublicationPlan plan;
+            plan.shape = shape;
+            plan.request_count = request_count;
+            plan.ok = false;
+            plan.error = std::move(reason);
+            return plan;
+        }
+
         void fillInvalid(std::vector<int32_t> &values, int count)
         {
             values.assign(
@@ -257,6 +270,158 @@ namespace llaminar2
                 plan.accepted_state_slot_indices[static_cast<size_t>(i)] =
                     accepted_slot_index;
             }
+        }
+
+        return plan;
+    }
+
+    MTPSpecDecodeStatePublicationPlan buildMTPSpecDecodeStatePublicationPlan(
+        const MTPSpecDecodeStateCommitPlan &commit_plan,
+        const std::vector<int32_t> &base_cached_tokens)
+    {
+        const MTPSpecDecodeMetadataShape &shape = commit_plan.shape;
+        if (!commit_plan.ok)
+        {
+            return publicationPlanFailure(
+                shape,
+                commit_plan.request_count,
+                std::string("cannot build publication plan from invalid commit plan: ") +
+                    commit_plan.error);
+        }
+        if (!shape.valid())
+            return publicationPlanFailure(shape, commit_plan.request_count, "invalid MTP spec-decode metadata shape");
+        if (commit_plan.request_count < 0 ||
+            commit_plan.request_count > shape.max_requests)
+        {
+            return publicationPlanFailure(shape, commit_plan.request_count, "request count exceeds metadata shape");
+        }
+        if (static_cast<int>(base_cached_tokens.size()) != commit_plan.request_count)
+        {
+            return publicationPlanFailure(
+                shape,
+                commit_plan.request_count,
+                "base cached-token vector does not match request count");
+        }
+
+        auto has_size = [](const std::vector<int32_t> &values, int required)
+        {
+            return static_cast<int>(values.size()) >= required;
+        };
+        const int requests = shape.max_requests;
+        if (!has_size(commit_plan.accepted_state_counts, requests) ||
+            !has_size(commit_plan.accepted_state_slot_indices, requests) ||
+            !has_size(commit_plan.correction_replay_start_indices, requests) ||
+            !has_size(commit_plan.correction_replay_counts, requests) ||
+            !has_size(commit_plan.bonus_ready_token_rows, requests) ||
+            !has_size(commit_plan.bonus_ready_token_indices, requests) ||
+            !has_size(commit_plan.bonus_ready_state_slot_indices, requests))
+        {
+            return publicationPlanFailure(
+                shape,
+                commit_plan.request_count,
+                "commit plan arrays are undersized");
+        }
+
+        MTPSpecDecodeStatePublicationPlan plan;
+        plan.ok = true;
+        plan.shape = shape;
+        plan.request_count = commit_plan.request_count;
+        fillZero(plan.base_cached_tokens, requests);
+        fillZero(plan.target_cached_tokens, requests);
+        fillZero(plan.accepted_state_counts, requests);
+        fillInvalid(plan.accepted_state_slot_indices, requests);
+        fillInvalid(plan.correction_replay_start_indices, requests);
+        fillZero(plan.correction_replay_counts, requests);
+        fillInvalid(plan.bonus_ready_token_rows, requests);
+        fillInvalid(plan.bonus_ready_token_indices, requests);
+        fillInvalid(plan.bonus_ready_state_slot_indices, requests);
+
+        for (int i = 0; i < commit_plan.request_count; ++i)
+        {
+            const int32_t base_cached = base_cached_tokens[static_cast<size_t>(i)];
+            const int32_t accepted_count =
+                commit_plan.accepted_state_counts[static_cast<size_t>(i)];
+            if (base_cached < 0)
+            {
+                return publicationPlanFailure(
+                    shape,
+                    commit_plan.request_count,
+                    "base cached-token count is negative");
+            }
+            if (accepted_count < 0 ||
+                accepted_count > shape.max_draft_tokens)
+            {
+                return publicationPlanFailure(
+                    shape,
+                    commit_plan.request_count,
+                    "accepted state count is outside metadata shape");
+            }
+
+            const int32_t accepted_slot =
+                commit_plan.accepted_state_slot_indices[static_cast<size_t>(i)];
+            if (accepted_count == 0)
+            {
+                if (accepted_slot != kMTPSpecDecodeInvalidToken)
+                {
+                    return publicationPlanFailure(
+                        shape,
+                        commit_plan.request_count,
+                        "zero accepted state count must not name an accepted state slot");
+                }
+            }
+            else if (accepted_slot < 0 ||
+                     accepted_slot >= shape.maxTargetQueryLen())
+            {
+                return publicationPlanFailure(
+                    shape,
+                    commit_plan.request_count,
+                    "accepted state slot index is outside target query shape");
+            }
+
+            const int32_t correction_start =
+                commit_plan.correction_replay_start_indices[static_cast<size_t>(i)];
+            const int32_t correction_count =
+                commit_plan.correction_replay_counts[static_cast<size_t>(i)];
+            if (correction_count < 0)
+            {
+                return publicationPlanFailure(
+                    shape,
+                    commit_plan.request_count,
+                    "correction replay count is negative");
+            }
+            if (correction_count == 0 &&
+                correction_start != kMTPSpecDecodeInvalidToken)
+            {
+                return publicationPlanFailure(
+                    shape,
+                    commit_plan.request_count,
+                    "zero correction replay count must not name a replay start");
+            }
+            if (correction_count > 0 &&
+                correction_start != accepted_count)
+            {
+                return publicationPlanFailure(
+                    shape,
+                    commit_plan.request_count,
+                    "correction replay must start after the accepted state prefix");
+            }
+
+            plan.base_cached_tokens[static_cast<size_t>(i)] = base_cached;
+            plan.target_cached_tokens[static_cast<size_t>(i)] =
+                base_cached + accepted_count;
+            plan.accepted_state_counts[static_cast<size_t>(i)] = accepted_count;
+            plan.accepted_state_slot_indices[static_cast<size_t>(i)] =
+                accepted_slot;
+            plan.correction_replay_start_indices[static_cast<size_t>(i)] =
+                correction_start;
+            plan.correction_replay_counts[static_cast<size_t>(i)] =
+                correction_count;
+            plan.bonus_ready_token_rows[static_cast<size_t>(i)] =
+                commit_plan.bonus_ready_token_rows[static_cast<size_t>(i)];
+            plan.bonus_ready_token_indices[static_cast<size_t>(i)] =
+                commit_plan.bonus_ready_token_indices[static_cast<size_t>(i)];
+            plan.bonus_ready_state_slot_indices[static_cast<size_t>(i)] =
+                commit_plan.bonus_ready_state_slot_indices[static_cast<size_t>(i)];
         }
 
         return plan;

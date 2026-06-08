@@ -802,6 +802,82 @@ TEST(Test__MTPSpecDecodeMetadata, StateCommitPlanUsesAcceptedPrefixAfterReject)
                 ElementsAre(kMTPSpecDecodeInvalidToken));
 }
 
+TEST(Test__MTPSpecDecodeMetadata, PublicationPlanMapsAcceptedStateCountToTargetCachedTokens)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeRequest accept_all;
+    accept_all.vocab_size = 100;
+    accept_all.draft_tokens = {7, 9, 8};
+    accept_all.sampled_tokens = {7, 9, 8, 4};
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatch(
+            shape,
+            {accept_all},
+            /*committed_output_counts=*/{3},
+            /*stopped_flags=*/{0});
+    ASSERT_TRUE(batch.ok) << batch.error;
+    MTPSpecDecodeStateCommitPlan commit_plan =
+        buildMTPSpecDecodeStateCommitPlan(batch);
+    ASSERT_TRUE(commit_plan.ok) << commit_plan.error;
+
+    MTPSpecDecodeStatePublicationPlan publication =
+        buildMTPSpecDecodeStatePublicationPlan(
+            commit_plan,
+            /*base_cached_tokens=*/{128});
+    ASSERT_TRUE(publication.ok) << publication.error;
+    EXPECT_THAT(publication.base_cached_tokens, ElementsAre(128));
+    EXPECT_THAT(publication.target_cached_tokens, ElementsAre(131));
+    EXPECT_THAT(publication.accepted_state_counts, ElementsAre(3));
+    EXPECT_THAT(publication.accepted_state_slot_indices, ElementsAre(2));
+    EXPECT_THAT(publication.bonus_ready_token_rows, ElementsAre(3));
+    EXPECT_THAT(publication.bonus_ready_state_slot_indices, ElementsAre(3));
+    EXPECT_THAT(publication.correction_replay_counts, ElementsAre(0));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, PublicationPlanCarriesCorrectionReplayAfterRejectedSuffix)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeRequest reject_after_prefix;
+    reject_after_prefix.vocab_size = 100;
+    reject_after_prefix.draft_tokens = {7, 9, 9};
+    reject_after_prefix.sampled_tokens = {
+        7,
+        9,
+        3,
+        kMTPSpecDecodeInvalidToken};
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatch(
+            shape,
+            {reject_after_prefix},
+            /*committed_output_counts=*/{3},
+            /*stopped_flags=*/{0});
+    ASSERT_TRUE(batch.ok) << batch.error;
+    MTPSpecDecodeStateCommitPlan commit_plan =
+        buildMTPSpecDecodeStateCommitPlan(batch);
+    ASSERT_TRUE(commit_plan.ok) << commit_plan.error;
+
+    MTPSpecDecodeStatePublicationPlan publication =
+        buildMTPSpecDecodeStatePublicationPlan(
+            commit_plan,
+            /*base_cached_tokens=*/{64});
+    ASSERT_TRUE(publication.ok) << publication.error;
+    EXPECT_THAT(publication.target_cached_tokens, ElementsAre(66));
+    EXPECT_THAT(publication.accepted_state_counts, ElementsAre(2));
+    EXPECT_THAT(publication.accepted_state_slot_indices, ElementsAre(1));
+    EXPECT_THAT(publication.correction_replay_start_indices, ElementsAre(2));
+    EXPECT_THAT(publication.correction_replay_counts, ElementsAre(1));
+    EXPECT_THAT(publication.bonus_ready_state_slot_indices,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+}
+
 TEST(Test__MTPSpecDecodeMetadata, StateCommitPlanAllowsDiscardedRequestWithoutStateCommit)
 {
     MTPSpecDecodeMetadataShape shape;
@@ -843,6 +919,55 @@ TEST(Test__MTPSpecDecodeMetadata, StateCommitPlanAllowsDiscardedRequestWithoutSt
                 ElementsAre(kMTPSpecDecodeInvalidToken));
     EXPECT_THAT(plan.bonus_ready_state_slot_indices,
                 ElementsAre(kMTPSpecDecodeInvalidToken));
+
+    MTPSpecDecodeStatePublicationPlan publication =
+        buildMTPSpecDecodeStatePublicationPlan(
+            plan,
+            /*base_cached_tokens=*/{42});
+    ASSERT_TRUE(publication.ok) << publication.error;
+    EXPECT_THAT(publication.target_cached_tokens, ElementsAre(42));
+    EXPECT_THAT(publication.accepted_state_counts, ElementsAre(0));
+    EXPECT_THAT(publication.accepted_state_slot_indices,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, PublicationPlanRejectsInvalidBaseAndSlotState)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 2;
+
+    MTPSpecDecodeRequest request;
+    request.vocab_size = 100;
+    request.draft_tokens = {7, 9};
+    request.sampled_tokens = {7, 9, 4};
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatch(
+            shape,
+            {request},
+            /*committed_output_counts=*/{2},
+            /*stopped_flags=*/{0});
+    ASSERT_TRUE(batch.ok) << batch.error;
+    MTPSpecDecodeStateCommitPlan commit_plan =
+        buildMTPSpecDecodeStateCommitPlan(batch);
+    ASSERT_TRUE(commit_plan.ok) << commit_plan.error;
+
+    MTPSpecDecodeStatePublicationPlan publication =
+        buildMTPSpecDecodeStatePublicationPlan(commit_plan, {-1});
+    ASSERT_FALSE(publication.ok);
+    EXPECT_THAT(publication.error, HasSubstr("negative"));
+
+    commit_plan.accepted_state_slot_indices[0] = 7;
+    publication = buildMTPSpecDecodeStatePublicationPlan(commit_plan, {10});
+    ASSERT_FALSE(publication.ok);
+    EXPECT_THAT(publication.error, HasSubstr("slot index"));
+
+    commit_plan.accepted_state_slot_indices[0] = 1;
+    commit_plan.correction_replay_counts[0] = 1;
+    commit_plan.correction_replay_start_indices[0] = 0;
+    publication = buildMTPSpecDecodeStatePublicationPlan(commit_plan, {10});
+    ASSERT_FALSE(publication.ok);
+    EXPECT_THAT(publication.error, HasSubstr("correction replay"));
 }
 
 TEST(Test__MTPSpecDecodeMetadata, PadsUnusedRequestAndTokenSlots)
