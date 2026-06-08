@@ -10,12 +10,12 @@ partial, or not fully measured. Red = fails or lacks required correctness.
 
 | Backend | Model | Sampling | RAG | Latest speed evidence | Main blocker |
 |---|---|---|---|---|---|
-| CUDA | Dense 27B | greedy | Green | d1/d2/d3/dyn 57.25/70.60/79.28/60.73 vs 43.83 tok/s | dynamic conservative |
-| CUDA | Dense 27B | stochastic | Green | d1/d2/d3/dyn 50.97/45.53/45.02/49.61 vs 43.77 tok/s | d2/d3 acceptance cliff |
-| ROCm | Dense 27B | greedy | Green | d1/d2/d3/dyn 42.91/35.01/35.41/40.62 vs 30.07 tok/s | d1 best on default prompt |
-| ROCm | Dense 27B | stochastic | Amber | d1/d2/d3/dyn 31.21/26.96/24.59/31.69 vs 30.22 tok/s | small d1 win; deeper slow |
-| CPU | Dense 27B | greedy | Amber | partial: d1 4.96 vs 4.28 tok/s | full CPU matrix slow |
-| CPU | Dense 27B | stochastic | Amber | not refreshed | host verifier speed gap |
+| CUDA | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 60.09/51.93/89.13/60.28 vs 44.60 | dynamic conservative |
+| CUDA | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 40.69/42.66/37.15/40.67 vs 44.59 | speed-negative short lane |
+| ROCm | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 45.23/31.33/38.70/45.45 vs 31.28 | dynamic stays d1 |
+| ROCm | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 26.94/27.31/25.17/26.88 vs 31.26 | speed-negative |
+| CPU | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 5.02/5.40/8.51/5.16 vs 4.55 | dynamic conservative |
+| CPU | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 3.52/3.62/3.62/3.56 vs 4.62 | rollback path slow |
 | CUDA | MoE 35B | greedy | Amber | fixed d1 crash fixed; standalone d1 80.58 tok/s; old baseline 133.78 | verifier/catch-up cost |
 | CUDA | MoE 35B | stochastic | Amber | old best dynamic 97.86 vs 133.51 tok/s | verifier cost; depth policy |
 | ROCm | MoE 35B | greedy | Amber | old d1 68.09 vs 76.23 tok/s | speed-negative |
@@ -25,10 +25,11 @@ partial, or not fully measured. Red = fails or lacks required correctness.
 
 ## Latest Evidence
 
-- Partial full matrix:
-  `benchmark_results/mtp_vllm_style/20260608T223800Z-full-iteration-matrix-correction-boundary/`.
-  Completed CUDA dense, ROCm dense, CPU dense baseline and d1 before CPU d2 was
-  stopped for runtime. Use this for current dense dashboard cells.
+- Bounded dense device matrix:
+  `benchmark_results/mtp_vllm_style/20260608T231927Z-bounded-dense-device-matrix/`.
+  Completed CUDA/ROCm/CPU dense greedy and stochastic with baseline, fixed
+  d1/d2/d3, and dynamic at 16 decode tokens. Greedy is speed-positive across
+  all three backends; stochastic is speed-negative across all three.
 - CUDA MoE fixed-d1 correction replay lane:
   `benchmark_results/mtp_vllm_style/20260608T-cuda-moe-fixed-d1-correction-boundary/`.
   The former graph-capture crash is fixed; d1 completed at 80.58 tok/s with
@@ -39,7 +40,8 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   kernel dynamic state before correction main-decode replay.
 - Matrix runner now supports bounded sweeps:
   `scripts/run_mtp_iteration_benchmark_matrix.sh --decode-tokens 16 --perfstats`.
-  Full default-length matrix remains the acceptance capture.
+  CPU lanes are still minutes-long even when bounded; full default-length
+  matrix remains the acceptance capture.
 
 ## Target Anchors
 
@@ -54,7 +56,8 @@ llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
 ## Next
 
 1. Run bounded full device matrix each iteration: CUDA/ROCm/CPU, dense/MoE,
-   greedy/stochastic, baseline plus fixed d1/d2/d3 and dynamic.
+   greedy/stochastic, baseline plus fixed d1/d2/d3 and dynamic. Schedule CPU
+   separately if needed, but do not omit it from dashboard evidence.
 2. Use full default matrix for acceptance checkpoints after bounded lanes are
    stable.
 3. Attack MoE verifier/catch-up cost; both CUDA and ROCm MoE remain

@@ -158,6 +158,12 @@ Done:
   evidence shows matched CUDA/ROCm acceptance at 52 accepted and 12 rejected:
   CUDA d1 is 51.29 tok/s and ROCm d1 is 31.31 tok/s. ROCm stochastic is only
   barely speed-positive and remains below the CUDA-class win target.
+- Bounded dense iteration matrix now covers CUDA/ROCm/CPU, greedy/stochastic,
+  baseline, fixed d1/d2/d3, and dynamic at 16 decode tokens. Greedy is
+  speed-positive on all three backends, with best lanes CUDA d3 89.13 vs 44.60
+  tok/s, ROCm d1/dynamic about 45.4 vs 31.3 tok/s, and CPU d3 8.51 vs 4.55
+  tok/s. Stochastic is speed-negative on all three backends on this short
+  seeded lane.
 - CUDA MoE greedy has parity/style coverage.
 - CUDA MoE MTP sidecar M=1 now uses the same grouped-prefill contract as
   verifier M=2..4, avoiding the fragile runtime grouped-decode chain inside
@@ -176,14 +182,13 @@ Done:
 
 Open gaps:
 
-- Real-model dense CPU benchmarks have only partially refreshed after enabling
-  the all-position accepted-count publication path: `cpu:0` dense greedy
-  baseline is 4.28 tok/s and fixed d1 is 4.96 tok/s in the latest partial
-  matrix. Full CPU dense and CPU MoE matrix refreshes remain slow acceptance
-  work.
+- Full default-length CPU dense and CPU MoE matrix refreshes remain slow
+  acceptance work. Bounded CPU dense now has evidence, but the CPU lanes still
+  take minutes even at 16 decode tokens.
 - CPU stochastic accepted-count publication is not yet implemented; CPU
   stochastic currently proves correctness through the decode-equivalent host
-  verifier path and still needs speed evidence.
+  verifier path. Latest bounded evidence is speed-negative: best fixed d3 is
+  3.62 vs 4.62 tok/s and still rolls back.
 - GDN/short-conv speculative-slot publication is available through verifier row
   capture hooks and is now used by the GPU all-position publication path; CPU
   publication and broader benchmark evidence still need to catch up.
