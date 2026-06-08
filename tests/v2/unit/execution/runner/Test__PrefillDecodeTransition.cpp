@@ -26,7 +26,6 @@
 #include "execution/global_pp/GlobalPPTopology.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
-#include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "config/OrchestrationConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -1489,28 +1488,6 @@ namespace
         EXPECT_EQ(probe.mtp_transaction_commits, 1u);
         EXPECT_EQ(probe.mtp_transaction_rollbacks, 0u);
         EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
-    }
-
-    TEST_F(Test__PrefillDecodeTransition, MTPSpecDecodeStatePublicationIsOptIn)
-    {
-        auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
-        (void)runner;
-
-        MTPSpecDecodeStatePublicationPlan plan;
-        plan.ok = true;
-        plan.shape.max_requests = 1;
-        plan.shape.max_draft_tokens = 1;
-        plan.request_count = 1;
-        plan.base_cached_tokens = {5};
-        plan.target_cached_tokens = {6};
-        plan.accepted_state_counts = {1};
-        plan.accepted_state_slot_indices = {0};
-
-        EXPECT_FALSE(mock->supportsMTPSpecDecodeStatePublication());
-        EXPECT_FALSE(mock->publishMTPSpecDecodeState(plan))
-            << "accepted-count publication must be explicitly implemented and proven";
-        EXPECT_EQ(mock->restoreVerifierRowCount(), 0)
-            << "publication must not silently reuse the retired verifier-row restore hook";
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPGreedyPenaltiesUseDevicePenaltyHooks)

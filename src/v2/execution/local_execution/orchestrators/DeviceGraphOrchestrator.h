@@ -2028,10 +2028,6 @@ namespace llaminar2
             int verifier_row,
             int target_cached_tokens,
             int seq_idx = 0) override;
-        bool supportsMTPSpecDecodeStatePublication() const override;
-        bool publishMTPSpecDecodeState(
-            const MTPSpecDecodeStatePublicationPlan &plan,
-            int seq_idx = 0) override;
 
         /**
          * @brief Inspect request-local runtime state for prefix-cache/MTP probes.

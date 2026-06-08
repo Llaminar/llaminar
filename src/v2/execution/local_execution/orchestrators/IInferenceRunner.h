@@ -29,7 +29,6 @@ namespace llaminar2
     struct SamplingParams;
     struct LogitPenalty;
     struct PrefillChunkSchedulerPolicy;
-    struct MTPSpecDecodeStatePublicationPlan;
     class MoERebalanceController;
 
     /**
@@ -1109,38 +1108,6 @@ namespace llaminar2
         {
             (void)verifier_row;
             (void)target_cached_tokens;
-            (void)seq_idx;
-            return false;
-        }
-
-        /**
-         * @brief Whether the runner can publish accepted-count speculative
-         *        decode state through the Phase 13.8 transaction contract.
-         *
-         * This is intentionally distinct from restoreMTPVerifierStateRow().
-         * State publication consumes accepted-count metadata and speculative
-         * state slots; it must not select an arbitrary all-position verifier
-         * row or mutate live state outside the transaction boundary.
-         */
-        virtual bool supportsMTPSpecDecodeStatePublication() const
-        {
-            return false;
-        }
-
-        /**
-         * @brief Publish accepted speculative state to the live runner state.
-         *
-         * Implementations must hard-fail if the plan is invalid, if an explicit
-         * GPU stream/workspace binding is missing, or if the runner cannot prove
-         * decode-equivalent continuation state for every mutable participant.
-         * Unsupported runners return false so the caller stays on the shared
-         * decode-equivalent verifier path.
-         */
-        virtual bool publishMTPSpecDecodeState(
-            const MTPSpecDecodeStatePublicationPlan &plan,
-            int seq_idx = 0)
-        {
-            (void)plan;
             (void)seq_idx;
             return false;
         }

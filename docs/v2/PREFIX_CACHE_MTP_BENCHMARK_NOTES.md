@@ -29,11 +29,11 @@ Phase 14 scoreboard for Qwen3.6 MTP and prefix-cache tuning.
   verifier-base restore when the sidecar preserves main state improved decode
   from 18.98 to 24.83 tok/s; the next speed lever is a proven state transaction
   path that removes the extra replay work.
-- Shared Phase 13.8 publication-plan metadata now derives accepted-state slots,
+- Shared Phase 13.8 transaction-plan metadata derives accepted-state slots,
   target cached-token counts, correction replay spans, and bonus-ready rows
-  without mutating live state. The device publication API is a separate opt-in
-  runner seam; direct/probe dense reject-after-prefix publication now leaves
-  sequential state on CUDA and ROCm, but normal decode still does not select it.
+  without mutating live state. The direct live-publication runner hook and its
+  probe parity cells are removed; future publication work must be introduced as
+  a proven transaction path, not a selectable dead-end shortcut.
 - CUDA and ROCm direct GDN/short-conv kernel tests now both cover restored
   verifier slot state followed by multi-step continuation replay equivalence.
 - A lagged-terminal-output experiment cut verifier replay calls in half but
