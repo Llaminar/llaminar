@@ -870,6 +870,47 @@ namespace llaminar2
         }
 
         /**
+         * @brief Enqueue batched speculative accept tests using caller RNG draws.
+         *
+         * This checks accept/reject decisions for several contiguous target/draft
+         * distribution slots in one launch. It intentionally does not sample a
+         * residual correction token; callers use the single-row verifier for the
+         * first rejected row so stochastic semantics stay identical.
+         */
+        virtual bool enqueueSpeculativeAcceptDistributionsF32DeviceThresholdsBatch(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            const void *draft_token_ids_device,
+            const void *draft_probs_device,
+            int top_k,
+            int distribution_stride,
+            const int *draft_tokens_host,
+            const float *accept_thresholds_host,
+            int row_count,
+            int device_id,
+            void *stream,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr)
+        {
+            (void)target_token_ids_device;
+            (void)target_probs_device;
+            (void)draft_token_ids_device;
+            (void)draft_probs_device;
+            (void)top_k;
+            (void)distribution_stride;
+            (void)draft_tokens_host;
+            (void)accept_thresholds_host;
+            (void)row_count;
+            (void)device_id;
+            (void)stream;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            return false;
+        }
+
+        /**
          * @brief GPU-side sparse logit penalty application
          *
          * Applies a sparse set of additive penalties to logits in-place on the GPU.

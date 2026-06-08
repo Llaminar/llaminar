@@ -10,7 +10,7 @@ plan carries detailed implementation status.
 |---|---|---|---|---:|---:|---|
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 877.55 | 43.81 | current clean baseline |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 726.19 | 87.07 | historical 1.99x target, not accepted |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 727.20 | 36.65 | correct lane, speed-negative |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 727.20 | 36.65 | pre-batch baseline, rebench pending |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, shared stepwise | 609.73 | 38.19 | old blocker, 84.95% acceptance |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.54 | 30.21 | current clean baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 217.10 | 34.40 | failed equivalence, not accepted |
@@ -39,6 +39,10 @@ plan carries detailed implementation status.
   passes `temperature/top_k/top_p/seed` into orchestrated decode for
   `--mtp-verify-mode speculative-sampling`, so stochastic MTP measurements are
   no longer silently greedy.
+- 2026-06-08: CUDA/ROCm stochastic MTP now batches compact-distribution
+  accept tests for draft rows, while residual correction stays on the existing
+  single-row verifier. Focused runner, GPU sampling, CUDA/ROCm graph smoke, and
+  Qwen3.6 stochastic parity tests are green; fresh benchmark capture is next.
 
 ## llama.cpp CUDA Anchors
 

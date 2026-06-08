@@ -2426,6 +2426,13 @@ namespace
         void *d_threshold_verify_flag = nullptr;
         void *d_threshold_verify_probability = nullptr;
         void *d_threshold_verify_threshold = nullptr;
+        void *d_batch_target_ids = nullptr;
+        void *d_batch_target_probs = nullptr;
+        void *d_batch_draft_ids = nullptr;
+        void *d_batch_draft_probs = nullptr;
+        void *d_batch_accept_flags = nullptr;
+        void *d_batch_accept_probabilities = nullptr;
+        void *d_batch_accept_thresholds = nullptr;
 
         auto cleanup = [&]()
         {
@@ -2451,7 +2458,14 @@ namespace
                 d_threshold_verify_token,
                 d_threshold_verify_flag,
                 d_threshold_verify_probability,
-                d_threshold_verify_threshold};
+                d_threshold_verify_threshold,
+                d_batch_target_ids,
+                d_batch_target_probs,
+                d_batch_draft_ids,
+                d_batch_draft_probs,
+                d_batch_accept_flags,
+                d_batch_accept_probabilities,
+                d_batch_accept_thresholds};
             for (void *ptr : ptrs)
             {
                 if (ptr)
@@ -2481,6 +2495,13 @@ namespace
         d_threshold_verify_flag = backend_->allocate(sizeof(int), device_id_);
         d_threshold_verify_probability = backend_->allocate(sizeof(float), device_id_);
         d_threshold_verify_threshold = backend_->allocate(sizeof(float), device_id_);
+        d_batch_target_ids = backend_->allocate(2 * top_k * sizeof(int), device_id_);
+        d_batch_target_probs = backend_->allocate(2 * top_k * sizeof(float), device_id_);
+        d_batch_draft_ids = backend_->allocate(2 * top_k * sizeof(int), device_id_);
+        d_batch_draft_probs = backend_->allocate(2 * top_k * sizeof(float), device_id_);
+        d_batch_accept_flags = backend_->allocate(2 * sizeof(int), device_id_);
+        d_batch_accept_probabilities = backend_->allocate(2 * sizeof(float), device_id_);
+        d_batch_accept_thresholds = backend_->allocate(2 * sizeof(float), device_id_);
 
         ASSERT_NE(d_target_logits, nullptr);
         ASSERT_NE(d_draft_accept_logits, nullptr);
@@ -2504,6 +2525,32 @@ namespace
         ASSERT_NE(d_threshold_verify_flag, nullptr);
         ASSERT_NE(d_threshold_verify_probability, nullptr);
         ASSERT_NE(d_threshold_verify_threshold, nullptr);
+        ASSERT_NE(d_batch_target_ids, nullptr);
+        ASSERT_NE(d_batch_target_probs, nullptr);
+        ASSERT_NE(d_batch_draft_ids, nullptr);
+        ASSERT_NE(d_batch_draft_probs, nullptr);
+        ASSERT_NE(d_batch_accept_flags, nullptr);
+        ASSERT_NE(d_batch_accept_probabilities, nullptr);
+        ASSERT_NE(d_batch_accept_thresholds, nullptr);
+
+        const int batch_draft_tokens[2] = {accept_draft_token, reject_draft_token};
+        const float batch_accept_thresholds[2] = {0.0f, 0.99f};
+        const auto expected_batch_accept =
+            expectedSpeculativeVerifyDistributionWithThresholds(
+                expected_target,
+                expected_draft_accept,
+                accept_draft_token,
+                batch_accept_thresholds[0],
+                0.0f);
+        const auto expected_batch_reject =
+            expectedSpeculativeVerifyDistributionWithThresholds(
+                expected_target,
+                expected_draft_reject,
+                reject_draft_token,
+                batch_accept_thresholds[1],
+                0.0f);
+        ASSERT_EQ(expected_batch_accept.accepted, 1);
+        ASSERT_EQ(expected_batch_reject.accepted, 0);
 
         auto run_capture = [&](IWorkerGPUContext &ctx)
         {
@@ -2586,6 +2633,22 @@ namespace
                     d_threshold_verify_probability,
                     d_threshold_verify_threshold))
                     << "threshold verifier must reject the legacy default/null stream";
+                EXPECT_FALSE(backend_->enqueueSpeculativeAcceptDistributionsF32DeviceThresholdsBatch(
+                    d_batch_target_ids,
+                    d_batch_target_probs,
+                    d_batch_draft_ids,
+                    d_batch_draft_probs,
+                    top_k,
+                    top_k,
+                    batch_draft_tokens,
+                    batch_accept_thresholds,
+                    2,
+                    device_id_,
+                    nullptr,
+                    d_batch_accept_flags,
+                    d_batch_accept_probabilities,
+                    d_batch_accept_thresholds))
+                    << "batched speculative accept verifier must reject the legacy default/null stream";
 
                 auto capture = ctx.createGraphCapture(stream);
                 ASSERT_NE(capture, nullptr);
@@ -2677,6 +2740,61 @@ namespace
                     d_threshold_verify_flag,
                     d_threshold_verify_probability,
                     d_threshold_verify_threshold));
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_target_logits,
+                    static_cast<int>(target_logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    static_cast<int *>(d_batch_target_ids),
+                    static_cast<float *>(d_batch_target_probs)));
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_target_logits,
+                    static_cast<int>(target_logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    static_cast<int *>(d_batch_target_ids) + top_k,
+                    static_cast<float *>(d_batch_target_probs) + top_k));
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_draft_accept_logits,
+                    static_cast<int>(draft_accept_logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    static_cast<int *>(d_batch_draft_ids),
+                    static_cast<float *>(d_batch_draft_probs)));
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_draft_reject_logits,
+                    static_cast<int>(draft_reject_logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    static_cast<int *>(d_batch_draft_ids) + top_k,
+                    static_cast<float *>(d_batch_draft_probs) + top_k));
+                ASSERT_TRUE(backend_->enqueueSpeculativeAcceptDistributionsF32DeviceThresholdsBatch(
+                    d_batch_target_ids,
+                    d_batch_target_probs,
+                    d_batch_draft_ids,
+                    d_batch_draft_probs,
+                    top_k,
+                    top_k,
+                    batch_draft_tokens,
+                    batch_accept_thresholds,
+                    2,
+                    device_id_,
+                    stream,
+                    d_batch_accept_flags,
+                    d_batch_accept_probabilities,
+                    d_batch_accept_thresholds));
                 ASSERT_TRUE(capture->endCapture());
                 ASSERT_TRUE(capture->instantiate());
                 ASSERT_TRUE(capture->launch());
@@ -2710,6 +2828,9 @@ namespace
         int threshold_verify_flag = -1;
         float threshold_verify_probability = -1.0f;
         float threshold_verify_threshold = -1.0f;
+        std::vector<int> batch_accept_flags(2, -1);
+        std::vector<float> batch_accept_probabilities(2, -1.0f);
+        std::vector<float> batch_accept_threshold_results(2, -1.0f);
 
         ASSERT_TRUE(backend_->deviceToHost(target_ids.data(), d_target_ids, top_k * sizeof(int), device_id_));
         ASSERT_TRUE(backend_->deviceToHost(target_probs.data(), d_target_probs, top_k * sizeof(float), device_id_));
@@ -2726,6 +2847,9 @@ namespace
         ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_flag, d_threshold_verify_flag, sizeof(int), device_id_));
         ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_probability, d_threshold_verify_probability, sizeof(float), device_id_));
         ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_threshold, d_threshold_verify_threshold, sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(batch_accept_flags.data(), d_batch_accept_flags, 2 * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(batch_accept_probabilities.data(), d_batch_accept_probabilities, 2 * sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(batch_accept_threshold_results.data(), d_batch_accept_thresholds, 2 * sizeof(float), device_id_));
 
         cleanup();
 
@@ -2764,6 +2888,14 @@ namespace
         EXPECT_EQ(threshold_verify_token, expected_threshold_verify.token_id);
         EXPECT_NEAR(threshold_verify_probability, expected_threshold_verify.accept_probability, 1e-5f);
         EXPECT_NEAR(threshold_verify_threshold, expected_threshold_verify.accept_threshold, 1e-6f);
+
+        EXPECT_EQ(batch_accept_flags[0], expected_batch_accept.accepted);
+        EXPECT_NEAR(batch_accept_probabilities[0], expected_batch_accept.accept_probability, 1e-5f);
+        EXPECT_NEAR(batch_accept_threshold_results[0], expected_batch_accept.accept_threshold, 1e-6f);
+
+        EXPECT_EQ(batch_accept_flags[1], expected_batch_reject.accepted);
+        EXPECT_NEAR(batch_accept_probabilities[1], expected_batch_reject.accept_probability, 1e-5f);
+        EXPECT_NEAR(batch_accept_threshold_results[1], expected_batch_reject.accept_threshold, 1e-6f);
     }
 
     TEST_P(GPUSamplingTest, DRYParity_SimpleRepeat)

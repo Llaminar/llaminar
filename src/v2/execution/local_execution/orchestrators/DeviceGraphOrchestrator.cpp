@@ -8626,6 +8626,124 @@ namespace llaminar2
         return token >= 0;
     }
 
+    bool DeviceGraphOrchestrator::verifyStochasticAcceptsOnDevice(
+        int first_target_slot,
+        int first_draft_slot,
+        const int32_t *draft_tokens,
+        const float *accept_thresholds,
+        int row_count,
+        DeviceSpeculativeVerifyResult *out)
+    {
+        if (!supportsDeviceStochasticMTPVerification() ||
+            first_target_slot < 0 || first_draft_slot < 0 ||
+            row_count <= 0 ||
+            first_target_slot + row_count > static_cast<int>(kStochasticTargetRows) ||
+            first_draft_slot + row_count > static_cast<int>(kStochasticDraftRows) ||
+            !draft_tokens || !accept_thresholds || !out)
+        {
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+        void *stream = explicitGPUStreamForOperation("verifyStochasticAcceptsOnDevice");
+        if (!stream)
+            return false;
+
+        const int target_top_k =
+            stochastic_target_top_k_[static_cast<size_t>(first_target_slot)];
+        if (target_top_k <= 0 ||
+            target_top_k > static_cast<int>(kStochasticDistributionMaxK))
+        {
+            return false;
+        }
+        for (int row = 0; row < row_count; ++row)
+        {
+            const int target_slot = first_target_slot + row;
+            const int draft_slot = first_draft_slot + row;
+            const int draft_top_k =
+                stochastic_draft_top_k_[static_cast<size_t>(draft_slot)];
+            if (stochastic_target_top_k_[static_cast<size_t>(target_slot)] != target_top_k ||
+                draft_top_k != target_top_k)
+            {
+                return false;
+            }
+        }
+
+        auto *target_ids =
+            static_cast<int *>(stochastic_target_token_ids_dev_) +
+            static_cast<size_t>(first_target_slot) * kStochasticDistributionMaxK;
+        auto *target_probs =
+            static_cast<float *>(stochastic_target_probs_dev_) +
+            static_cast<size_t>(first_target_slot) * kStochasticDistributionMaxK;
+        auto *draft_ids =
+            static_cast<int *>(stochastic_draft_token_ids_dev_) +
+            static_cast<size_t>(first_draft_slot) * kStochasticDistributionMaxK;
+        auto *draft_probs =
+            static_cast<float *>(stochastic_draft_probs_dev_) +
+            static_cast<size_t>(first_draft_slot) * kStochasticDistributionMaxK;
+        auto *out_accepted_dev =
+            static_cast<int *>(stochastic_verify_accepted_dev_) + first_target_slot;
+        auto *out_accept_prob_dev =
+            static_cast<float *>(stochastic_verify_accept_probs_dev_) + first_target_slot;
+        auto *out_threshold_dev =
+            static_cast<float *>(stochastic_verify_thresholds_dev_) + first_target_slot;
+
+        if (!backend->enqueueSpeculativeAcceptDistributionsF32DeviceThresholdsBatch(
+                target_ids,
+                target_probs,
+                draft_ids,
+                draft_probs,
+                target_top_k,
+                static_cast<int>(kStochasticDistributionMaxK),
+                draft_tokens,
+                accept_thresholds,
+                row_count,
+                state_.device_id.gpu_ordinal(),
+                stream,
+                out_accepted_dev,
+                out_accept_prob_dev,
+                out_threshold_dev))
+        {
+            return false;
+        }
+
+        std::array<int, 4> accepted{};
+        std::array<float, 4> accept_probabilities{};
+        std::array<float, 4> thresholds{};
+        if (!backend->deviceToHost(accepted.data(), out_accepted_dev,
+                                   sizeof(int) * static_cast<size_t>(row_count),
+                                   state_.device_id.gpu_ordinal(), stream) ||
+            !backend->deviceToHost(accept_probabilities.data(), out_accept_prob_dev,
+                                   sizeof(float) * static_cast<size_t>(row_count),
+                                   state_.device_id.gpu_ordinal(), stream) ||
+            !backend->deviceToHost(thresholds.data(), out_threshold_dev,
+                                   sizeof(float) * static_cast<size_t>(row_count),
+                                   state_.device_id.gpu_ordinal(), stream))
+        {
+            return false;
+        }
+
+        for (int row = 0; row < row_count; ++row)
+        {
+            out[row].accepted = accepted[static_cast<size_t>(row)] != 0;
+            out[row].token = out[row].accepted ? draft_tokens[row] : -1;
+            out[row].accept_probability =
+                accept_probabilities[static_cast<size_t>(row)];
+            out[row].accept_threshold = thresholds[static_cast<size_t>(row)];
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "stochastic_accept_batch_rows",
+            static_cast<double>(row_count),
+            "decode",
+            state_.device_id.toString(),
+            {{"top_k", std::to_string(target_top_k)}});
+        return true;
+    }
+
     // =========================================================================
     // Batch Interface Implementation
     // =========================================================================

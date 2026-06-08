@@ -1889,6 +1889,13 @@ namespace llaminar2
             float accept_threshold,
             float residual_threshold,
             DeviceSpeculativeVerifyResult *out) override;
+        bool verifyStochasticAcceptsOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            int row_count,
+            DeviceSpeculativeVerifyResult *out) override;
 
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)

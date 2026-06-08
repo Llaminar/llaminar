@@ -497,6 +497,18 @@ namespace llaminar2
         int *out_token, int *out_accepted,
         float *out_accept_probability, float *out_accept_threshold,
         int device_idx, void *stream);
+    extern "C" bool rocmOps_speculative_accept_distribution_thresholds_batch_f32(
+        const int *target_token_ids, const float *target_probs,
+        const int *draft_token_ids, const float *draft_probs,
+        int k, int distribution_stride,
+        int draft_token0, int draft_token1, int draft_token2, int draft_token3,
+        float accept_threshold0, float accept_threshold1,
+        float accept_threshold2, float accept_threshold3,
+        int row_count,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int device_idx, void *stream);
 
     bool ROCmBackend::topKF32(const void *data_device, int n, int k, int device_id,
                               float *out_values, int *out_indices, void *stream)
@@ -785,6 +797,66 @@ namespace llaminar2
             accept_threshold,
             residual_threshold,
             static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSpeculativeAcceptDistributionsF32DeviceThresholdsBatch(
+        const void *target_token_ids_device,
+        const void *target_probs_device,
+        const void *draft_token_ids_device,
+        const void *draft_probs_device,
+        int top_k,
+        int distribution_stride,
+        const int *draft_tokens_host,
+        const float *accept_thresholds_host,
+        int row_count,
+        int device_id,
+        void *stream,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_token_ids_device || !target_probs_device ||
+            !draft_token_ids_device || !draft_probs_device ||
+            top_k <= 0 || top_k > 256 ||
+            distribution_stride < top_k ||
+            row_count <= 0 || row_count > 4 ||
+            !draft_tokens_host || !accept_thresholds_host ||
+            !stream || !out_accepted_device)
+        {
+            return false;
+        }
+
+        int draft_tokens[4] = {-1, -1, -1, -1};
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+        {
+            draft_tokens[i] = draft_tokens_host[i];
+            accept_thresholds[i] = accept_thresholds_host[i];
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_speculative_accept_distribution_thresholds_batch_f32(
+            static_cast<const int *>(target_token_ids_device),
+            static_cast<const float *>(target_probs_device),
+            static_cast<const int *>(draft_token_ids_device),
+            static_cast<const float *>(draft_probs_device),
+            top_k,
+            distribution_stride,
+            draft_tokens[0],
+            draft_tokens[1],
+            draft_tokens[2],
+            draft_tokens[3],
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            row_count,
             static_cast<int *>(out_accepted_device),
             static_cast<float *>(out_accept_probability_device),
             static_cast<float *>(out_accept_threshold_device),

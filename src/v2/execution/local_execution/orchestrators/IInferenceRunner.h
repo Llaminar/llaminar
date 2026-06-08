@@ -748,6 +748,23 @@ namespace llaminar2
             return false;
         }
 
+        virtual bool verifyStochasticAcceptsOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            int row_count,
+            DeviceSpeculativeVerifyResult *out)
+        {
+            (void)first_target_slot;
+            (void)first_draft_slot;
+            (void)draft_tokens;
+            (void)accept_thresholds;
+            (void)row_count;
+            (void)out;
+            return false;
+        }
+
         /**
          * @brief Enable GPU-side decode sampling mode
          *

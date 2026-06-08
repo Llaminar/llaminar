@@ -608,6 +608,47 @@ namespace
             return out->token >= 0;
         }
 
+        bool verifyStochasticAcceptsOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            int row_count,
+            DeviceSpeculativeVerifyResult *out) override
+        {
+            ++device_distribution_accept_batch_count_;
+            if (!supports_stochastic_device_sampling_ ||
+                !draft_tokens || !accept_thresholds || !out ||
+                first_target_slot < 0 || first_draft_slot < 0 || row_count <= 0)
+            {
+                return false;
+            }
+
+            for (int row = 0; row < row_count; ++row)
+            {
+                const auto &target =
+                    deviceDistribution(DeviceDistributionBuffer::Target,
+                                       first_target_slot + row);
+                const auto &draft =
+                    deviceDistribution(DeviceDistributionBuffer::Draft,
+                                       first_draft_slot + row);
+                if (target.empty() || draft.empty())
+                    return false;
+
+                const int32_t draft_token = draft_tokens[row];
+                const float p = Sampler::probability_of_token(target, draft_token);
+                const float q = Sampler::probability_of_token(draft, draft_token);
+                const float accept_probability =
+                    Sampler::speculative_accept_probability(p, q);
+                out[row].accepted =
+                    accept_thresholds[row] < accept_probability;
+                out[row].accept_probability = accept_probability;
+                out[row].accept_threshold = accept_thresholds[row];
+                out[row].token = out[row].accepted ? draft_token : -1;
+            }
+            return true;
+        }
+
         // =====================================================================
         // Test inspection methods
         // =====================================================================
@@ -642,6 +683,7 @@ namespace
         int deviceDistributionBuildCount() const { return device_distribution_build_count_; }
         int deviceDistributionSampleCount() const { return device_distribution_sample_count_; }
         int deviceDistributionVerifyCount() const { return device_distribution_verify_count_; }
+        int deviceDistributionAcceptBatchCount() const { return device_distribution_accept_batch_count_; }
         int lastSampleAllPositionStartRow() const { return last_sample_all_position_start_row_; }
         int lastSampleAllPositionRowCount() const { return last_sample_all_position_row_count_; }
         const PrefixStateSnapshot &lastRestoredSnapshot() const { return last_restored_snapshot_; }
@@ -1067,6 +1109,7 @@ namespace
         int device_distribution_build_count_{0};
         int device_distribution_sample_count_{0};
         int device_distribution_verify_count_{0};
+        int device_distribution_accept_batch_count_{0};
         int last_sample_all_position_start_row_{-1};
         int last_sample_all_position_row_count_{0};
         int last_mtp_condition_token_{-1};
@@ -3018,6 +3061,7 @@ namespace
         EXPECT_EQ(mock->deviceDistributionBuildCount(), 0);
         EXPECT_EQ(mock->deviceDistributionSampleCount(), 0);
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0);
+        EXPECT_EQ(mock->deviceDistributionAcceptBatchCount(), 0);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingUsesDeviceResidentVerifierForGPU)
@@ -3060,7 +3104,8 @@ namespace
             << "first token, MTP draft, verifier row, and terminal ready-token distributions should stay compact/device-resident";
         EXPECT_EQ(mock->deviceDistributionSampleCount(), 3)
             << "first token, MTP draft, and terminal ready-token sampling should avoid host full-logit sampling";
-        EXPECT_EQ(mock->deviceDistributionVerifyCount(), 1);
+        EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0);
+        EXPECT_EQ(mock->deviceDistributionAcceptBatchCount(), 1);
         EXPECT_EQ(mock->applyMainPenaltiesCount(), 1);
         EXPECT_EQ(mock->applyMTPPenaltiesCount(), 1);
         EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
@@ -3139,6 +3184,54 @@ namespace
         EXPECT_EQ(probe.mtp_transaction_commits, 1u);
         EXPECT_EQ(probe.mtp_transaction_rollbacks, 1u);
         EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingDeviceVerifierBatchesAcceptThenSamplesResidual)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/false,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::rocm(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false,
+            {},
+            MTPVerifyMode::SpeculativeSampling);
+        mock->enableStochasticDeviceSampling();
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        sampling.top_k = 2;
+        sampling.top_p = 0.95f;
+        sampling.presence_penalty = 0.25f;
+        sampling.seed = 456;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+        EXPECT_EQ(mock->deviceDistributionBuildCount(), 4)
+            << "first token, MTP draft, verifier row, and terminal row distributions should stay compact/device-resident";
+        EXPECT_EQ(mock->deviceDistributionSampleCount(), 2)
+            << "first token and MTP draft sampling should avoid full-logit host sampling";
+        EXPECT_EQ(mock->deviceDistributionAcceptBatchCount(), 1);
+        EXPECT_EQ(mock->deviceDistributionVerifyCount(), 1)
+            << "the first rejected row should still use the single-row residual sampler";
+        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_stochastic_accept_tests, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_accepts, 0u);
+        EXPECT_EQ(probe.mtp_stochastic_residual_samples, 1u);
+        EXPECT_EQ(probe.mtp_transaction_rollbacks, 1u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPPPTopologyFailsBeforePrefillForward)
