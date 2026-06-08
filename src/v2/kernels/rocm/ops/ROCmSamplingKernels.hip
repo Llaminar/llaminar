@@ -26,6 +26,7 @@
 constexpr int TOPK_MAX_K = 256;
 static_assert(TOPK_MAX_K == llaminar2::sampling_math::kMaxTopK,
               "ROCm sampling TOPK_MAX_K must match shared sampling math");
+constexpr int TOPK_SMALL_K_CAP = 32;
 
 // Number of threads per block — one warp on NVIDIA, half wavefront on AMD
 // Using 32 threads keeps register pressure manageable for large k
@@ -175,6 +176,7 @@ __global__ void rocm_topk_f32_kernel(
 // Top-K / Top-P / Temperature Sampling Kernel
 // ============================================================================
 
+template <int K_CAP>
 __global__ void rocm_topk_topp_sample_f32_kernel(
     const float *__restrict__ data,
     int n,
@@ -185,11 +187,14 @@ __global__ void rocm_topk_topp_sample_f32_kernel(
     unsigned long long rng_offset,
     int *__restrict__ out_token)
 {
+    if (k > K_CAP)
+        return;
+
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
 
-    float local_vals[TOPK_MAX_K];
-    int local_idxs[TOPK_MAX_K];
+    float local_vals[K_CAP];
+    int local_idxs[K_CAP];
     int local_count = 0;
 
     for (int i = 0; i < k; ++i)
@@ -238,8 +243,8 @@ __global__ void rocm_topk_topp_sample_f32_kernel(
 
     if (tid == 0)
     {
-        float merged_vals[TOPK_MAX_K];
-        int merged_idxs[TOPK_MAX_K];
+        float merged_vals[K_CAP];
+        int merged_idxs[K_CAP];
         int ptrs[TOPK_THREADS];
         for (int t = 0; t < num_threads; ++t)
             ptrs[t] = 0;
@@ -274,7 +279,7 @@ __global__ void rocm_topk_topp_sample_f32_kernel(
             }
         }
 
-        float weights[TOPK_MAX_K];
+        float weights[K_CAP];
         *out_token = llaminar2::sampling_math::sample_topk_topp_from_sorted_with_threshold(
             merged_vals,
             merged_idxs,
@@ -286,6 +291,7 @@ __global__ void rocm_topk_topp_sample_f32_kernel(
     }
 }
 
+template <int K_CAP>
 __global__ void rocm_topk_topp_distribution_f32_kernel(
     const float *__restrict__ data,
     int n,
@@ -295,11 +301,14 @@ __global__ void rocm_topk_topp_distribution_f32_kernel(
     int *__restrict__ out_token_ids,
     float *__restrict__ out_probs)
 {
+    if (k > K_CAP)
+        return;
+
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
 
-    float local_vals[TOPK_MAX_K];
-    int local_idxs[TOPK_MAX_K];
+    float local_vals[K_CAP];
+    int local_idxs[K_CAP];
     int local_count = 0;
 
     for (int i = 0; i < k; ++i)
@@ -348,8 +357,8 @@ __global__ void rocm_topk_topp_distribution_f32_kernel(
 
     if (tid == 0)
     {
-        float merged_vals[TOPK_MAX_K];
-        int merged_idxs[TOPK_MAX_K];
+        float merged_vals[K_CAP];
+        int merged_idxs[K_CAP];
         int ptrs[TOPK_THREADS];
         for (int t = 0; t < num_threads; ++t)
             ptrs[t] = 0;
@@ -384,7 +393,7 @@ __global__ void rocm_topk_topp_distribution_f32_kernel(
             }
         }
 
-        float weights[TOPK_MAX_K];
+        float weights[K_CAP];
         llaminar2::sampling_math::build_topk_topp_distribution_from_sorted(
             merged_vals,
             merged_idxs,
@@ -626,10 +635,20 @@ bool rocmOps_sample_topk_topp_f32(
     const int threads = TOPK_THREADS;
     const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
 
-    hipLaunchKernelGGL(
-        rocm_topk_topp_sample_f32_kernel,
-        dim3(1), dim3(threads), smem_size, static_cast<hipStream_t>(stream),
-        data, n, k, top_p, temperature, rng_seed, rng_offset, out_token);
+    if (k <= TOPK_SMALL_K_CAP)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_topk_topp_sample_f32_kernel<TOPK_SMALL_K_CAP>),
+            dim3(1), dim3(threads), smem_size, static_cast<hipStream_t>(stream),
+            data, n, k, top_p, temperature, rng_seed, rng_offset, out_token);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_topk_topp_sample_f32_kernel<TOPK_MAX_K>),
+            dim3(1), dim3(threads), smem_size, static_cast<hipStream_t>(stream),
+            data, n, k, top_p, temperature, rng_seed, rng_offset, out_token);
+    }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -663,10 +682,20 @@ bool rocmOps_topk_topp_distribution_f32(
     const int threads = TOPK_THREADS;
     const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
 
-    hipLaunchKernelGGL(
-        rocm_topk_topp_distribution_f32_kernel,
-        dim3(1), dim3(threads), smem_size, static_cast<hipStream_t>(stream),
-        data, n, k, top_p, temperature, out_token_ids, out_probs);
+    if (k <= TOPK_SMALL_K_CAP)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_topk_topp_distribution_f32_kernel<TOPK_SMALL_K_CAP>),
+            dim3(1), dim3(threads), smem_size, static_cast<hipStream_t>(stream),
+            data, n, k, top_p, temperature, out_token_ids, out_probs);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_topk_topp_distribution_f32_kernel<TOPK_MAX_K>),
+            dim3(1), dim3(threads), smem_size, static_cast<hipStream_t>(stream),
+            data, n, k, top_p, temperature, out_token_ids, out_probs);
+    }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)

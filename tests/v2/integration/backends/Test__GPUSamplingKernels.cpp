@@ -2359,6 +2359,158 @@ namespace
         }
     }
 
+    TEST_P(GPUSamplingTest, TopKTopP_Qwen36VocabTopK20_GraphCapturedDistributionAndSampleMatchCPU)
+    {
+        constexpr int vocab_size = 248320;
+        constexpr int top_k = 20;
+        constexpr float top_p = 0.95f;
+        constexpr float temperature = 0.6f;
+        constexpr uint64_t seed = 424242;
+        constexpr uint64_t offset = 17;
+        const float threshold = samplingUniform01(seed, offset);
+
+        std::vector<float> logits(static_cast<size_t>(vocab_size));
+        for (int i = 0; i < vocab_size; ++i)
+            logits[static_cast<size_t>(i)] = -18.0f - 0.00037f * static_cast<float>((i * 37) % 997);
+
+        const int hot_tokens[top_k] = {
+            151936, 240001, 17, 248319, 98013,
+            2048, 77777, 123456, 190000, 4096,
+            222222, 31415, 65536, 101010, 88000,
+            54321, 199999, 1, 135791, 246810};
+        for (int rank = 0; rank < top_k; ++rank)
+        {
+            logits[static_cast<size_t>(hot_tokens[rank])] =
+                7.25f - 0.083f * static_cast<float>(rank);
+        }
+
+        const auto expected_distribution =
+            expectedTopKTopPDistribution(logits, top_k, top_p, temperature);
+        const int expected_sample =
+            expectedSampleDistributionWithThreshold(expected_distribution, threshold);
+        const int expected_direct_sample =
+            expectedTopKTopPSample(logits, top_k, top_p, temperature, seed, offset);
+        ASSERT_EQ(expected_direct_sample, expected_sample)
+            << "direct CPU sample and compact-distribution CPU sample should agree";
+
+        void *d_logits = nullptr;
+        void *d_token_ids = nullptr;
+        void *d_probs = nullptr;
+        void *d_sample_token = nullptr;
+        void *d_direct_token = nullptr;
+
+        auto cleanup = [&]()
+        {
+            if (d_logits)
+                backend_->free(d_logits, device_id_);
+            if (d_token_ids)
+                backend_->free(d_token_ids, device_id_);
+            if (d_probs)
+                backend_->free(d_probs, device_id_);
+            if (d_sample_token)
+                backend_->free(d_sample_token, device_id_);
+            if (d_direct_token)
+                backend_->free(d_direct_token, device_id_);
+        };
+
+        d_logits = backend_->allocate(logits.size() * sizeof(float), device_id_);
+        d_token_ids = backend_->allocate(top_k * sizeof(int), device_id_);
+        d_probs = backend_->allocate(top_k * sizeof(float), device_id_);
+        d_sample_token = backend_->allocate(sizeof(int), device_id_);
+        d_direct_token = backend_->allocate(sizeof(int), device_id_);
+        ASSERT_NE(d_logits, nullptr);
+        ASSERT_NE(d_token_ids, nullptr);
+        ASSERT_NE(d_probs, nullptr);
+        ASSERT_NE(d_sample_token, nullptr);
+        ASSERT_NE(d_direct_token, nullptr);
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_logits, logits.data(), logits.size() * sizeof(float), device_id_, stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_logits,
+                    static_cast<int>(logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    d_token_ids,
+                    d_probs));
+                ASSERT_TRUE(backend_->enqueueSampleDistributionF32Device(
+                    d_token_ids,
+                    d_probs,
+                    top_k,
+                    threshold,
+                    device_id_,
+                    stream,
+                    d_sample_token));
+                ASSERT_TRUE(backend_->enqueueSampleTopKTopPF32Device(
+                    d_logits,
+                    static_cast<int>(logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    seed,
+                    offset,
+                    device_id_,
+                    stream,
+                    d_direct_token));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        std::vector<int> gpu_ids(top_k, -1);
+        std::vector<float> gpu_probs(top_k, 0.0f);
+        int sample_token = -1;
+        int direct_token = -1;
+        ASSERT_TRUE(backend_->deviceToHost(gpu_ids.data(), d_token_ids, top_k * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(gpu_probs.data(), d_probs, top_k * sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&sample_token, d_sample_token, sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&direct_token, d_direct_token, sizeof(int), device_id_));
+        cleanup();
+
+        for (int i = 0; i < top_k; ++i)
+        {
+            EXPECT_EQ(gpu_ids[static_cast<size_t>(i)],
+                      expected_distribution[static_cast<size_t>(i)].token_id)
+                << "Qwen3.6 CPU/GPU compact distribution token mismatch at slot " << i;
+            EXPECT_NEAR(gpu_probs[static_cast<size_t>(i)],
+                        expected_distribution[static_cast<size_t>(i)].probability,
+                        1e-5f)
+                << "Qwen3.6 CPU/GPU compact distribution probability mismatch at slot " << i;
+        }
+        EXPECT_EQ(sample_token, expected_sample)
+            << "Qwen3.6 compact distribution sample mismatch";
+        EXPECT_EQ(direct_token, expected_direct_sample)
+            << "Qwen3.6 direct top-k/top-p sample mismatch";
+    }
+
     TEST_P(GPUSamplingTest, SpeculativeVerifyDistributionsAreGraphCapturable)
     {
         const std::vector<float> target_logits = {0.1f, 3.2f, 2.0f, 1.2f,
