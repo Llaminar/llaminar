@@ -31,7 +31,8 @@ Phase 14 scoreboard for Qwen3.6 MTP and prefix-cache tuning.
   path that removes the extra replay work.
 - Shared Phase 13.8 publication-plan metadata now derives accepted-state slots,
   target cached-token counts, correction replay spans, and bonus-ready rows
-  without mutating live state. The device publication path is still unpromoted.
+  without mutating live state. The device publication API is a separate opt-in
+  runner seam and is still unpromoted.
 - A lagged-terminal-output experiment cut verifier replay calls in half but
   paid the same forward as next-step `condition_forward`, leaving ROCm d1 at
   24.86 tok/s. The code was removed; do not retry this as a speed path.
