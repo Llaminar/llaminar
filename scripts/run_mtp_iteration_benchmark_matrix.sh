@@ -23,6 +23,7 @@ Options:
   --models LIST          Comma list: dense,moe
   --modes LIST           Comma list: greedy,stochastic
   --variants LIST        Comma list: baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
+  --seed N               Seed for stochastic rows (default: 123)
   --output-dir DIR       Output directory
   --perfstats            Capture LLAMINAR_PERF_STATS_JSON for MTP variants
   --dry-run              Print commands only
@@ -36,6 +37,7 @@ Environment aliases:
   LLAMINAR_MTP_MATRIX_MODELS
   LLAMINAR_MTP_MATRIX_MODES
   LLAMINAR_MTP_MATRIX_VARIANTS
+  LLAMINAR_MTP_MATRIX_SEED
   LLAMINAR_MTP_MATRIX_RESULTS_DIR
 
 Do not use --no-mpi-bootstrap for this benchmark matrix.
@@ -52,6 +54,7 @@ devices="${LLAMINAR_MTP_MATRIX_DEVICES:-cuda:0,rocm:0,cpu}"
 models="${LLAMINAR_MTP_MATRIX_MODELS:-dense,moe}"
 modes="${LLAMINAR_MTP_MATRIX_MODES:-greedy,stochastic}"
 variants="${LLAMINAR_MTP_MATRIX_VARIANTS:-baseline,fixed_d1,fixed_d2,fixed_d3,dynamic}"
+seed="${LLAMINAR_MTP_MATRIX_SEED:-123}"
 output_dir="${LLAMINAR_MTP_MATRIX_RESULTS_DIR:-}"
 perfstats=0
 dry_run=0
@@ -89,6 +92,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --variants)
       variants="${2:-}"
+      shift 2
+      ;;
+    --seed)
+      seed="${2:-}"
       shift 2
       ;;
     --output-dir)
@@ -147,6 +154,25 @@ model_path_for() {
     moe) echo "${moe_model}" ;;
     *)
       echo "error: unknown model lane '$1'" >&2
+      exit 2
+      ;;
+  esac
+}
+
+mode_args=()
+describe_mode() {
+  local mode="$1"
+  mode_args=()
+
+  case "${mode}" in
+    greedy)
+      mode_args=(--temperature 0 --seed "${seed}")
+      ;;
+    stochastic)
+      mode_args=(--seed "${seed}")
+      ;;
+    *)
+      echo "error: unknown mode '${mode}'" >&2
       exit 2
       ;;
   esac
@@ -216,6 +242,7 @@ metadata_path="${output_dir}/metadata.txt"
   echo "models=${models}"
   echo "modes=${modes}"
   echo "variants=${variants}"
+  echo "seed=${seed}"
   echo "perfstats=${perfstats}"
   echo "extra_args=${extra_args[*]:-}"
   echo
@@ -275,11 +302,8 @@ for model in $(split_csv "${models}"); do
   for device in $(split_csv "${devices}"); do
     device_slug="$(sanitize "${device}")"
     for mode in $(split_csv "${modes}"); do
+      describe_mode "${mode}"
       for variant in $(split_csv "${variants}"); do
-        if [[ "${variant}" == "baseline" && "${mode}" != "greedy" ]]; then
-          continue
-        fi
-
         describe_variant "${mode}" "${variant}"
         stem="${device_slug}-${model}-${mode}-${variant}"
         json_path="${output_dir}/${stem}.json"
@@ -295,6 +319,7 @@ for model in $(split_csv "${models}"); do
           -d "${device}"
           --benchmark-json-output "${json_path}"
         )
+        cmd+=("${mode_args[@]}")
         cmd+=("${variant_args[@]}")
         cmd+=("${extra_args[@]}")
 

@@ -178,13 +178,14 @@ Open gaps:
   stochastic sampler overhead, not sidecar generation. The ROCm MoE
   stage-breakdown parity lane passes but currently takes about 341s, so it is a
   performance/test-duration anomaly to reduce.
-- CUDA MoE has fresh release evidence after verifier replay rebinding and the
-  depth >1 publication fix. Baseline is 132.95 tok/s. Greedy d1/d2/d3 is
-  113.08/93.77/89.92 tok/s; stochastic seed123 d1/d2/d3 is
-  99.50/103.34/96.61 tok/s. Depth >1 no longer crashes on partial-prefix
-  publication, but every CUDA MoE MTP depth is still speed-negative. The
-  remaining blocker is true verifier/catch-up cost and stochastic acceptance,
-  not sidecar generation or replay warmup churn.
+- CUDA MoE stable matrix now covers production greedy and seeded stochastic
+  baselines plus fixed d1/d2/d3 and dynamic depth. Greedy baseline is 133.78
+  tok/s; d1/d2/d3/dynamic are 88.49/94.39/115.94/88.75 tok/s. Stochastic
+  seed123 baseline is 133.51 tok/s; d1/d2/d3/dynamic are
+  91.26/93.72/86.47/97.86 tok/s. Depth >1 no longer crashes on partial-prefix
+  publication, but CUDA MoE MTP remains speed-negative. The remaining blocker
+  is true verifier/catch-up cost; dynamic depth also needs enough evidence or
+  hysteresis tuning to promote during short default runs.
 - CPU MoE stochastic benchmark lane still needs a fresh run.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE MTP is still speed-negative and must reduce verifier/catch-up cost
@@ -301,7 +302,9 @@ This must cover, as applicable:
 Refresh JSON/perf evidence for the depth matrix on every available lane touched
 in the iteration. Standard variants are no-MTP baseline, fixed d1, fixed d2,
 fixed d3, and dynamic depth. Run both greedy and stochastic for dense and MoE
-where the backend lane exists.
+where the backend lane exists. Greedy rows use production runtime settings with
+`--temperature 0`, not `--deterministic`; stochastic rows use a pinned seed,
+default `123`, so acceptance and throughput can be compared across iterations.
 
 ```bash
 cmake --build build_v2_release --parallel
