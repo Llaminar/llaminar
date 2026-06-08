@@ -56,15 +56,49 @@ inline bool selectROCmNativeVNNIDecodeGenerated(
     const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(n, k);
     if (codebook_id == 0) { // CB=0 (Q4_0)
         static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
-            {0x000140000400ULL, {8, 24}}, // CB=0 (Q4_0) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 28.640us
-            {0x000440001400ULL, {8, 24}}, // CB=0 (Q4_0) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 84.800us
+            {0x000140000400ULL, {8, 24}}, // CB=0 (Q4_0) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 28.320us
+            {0x000140001800ULL, {4, 12}}, // CB=0 (Q4_0) 6144x5120 KB4/TW12 Qwen36_GDN_ZProjection 43.680us
+            {0x000140002800ULL, {2, 8}}, // CB=0 (Q4_0) 10240x5120 KB2/TW8 Qwen36_GDN_InnerProjection 63.840us
+            {0x000140004400ULL, {2, 8}}, // CB=0 (Q4_0) 17408x5120 KB2/TW8 Qwen36_FFN_GateUp 82.400us
+            {0x00014003ca00ULL, {1, 8}}, // CB=0 (Q4_0) 248320x5120 KB1/TW8 Qwen36_LM_Head 975.838us
+            {0x000180001400ULL, {8, 24}}, // CB=0 (Q4_0) 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 45.920us
+            {0x000440001400ULL, {8, 24}}, // CB=0 (Q4_0) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 83.680us
         };
         return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
     }
     if (codebook_id == 5) { // CB=5 (Q4_1)
         static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
-            {0x000140000400ULL, {8, 24}}, // CB=5 (Q4_1) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 34.720us
-            {0x000440001400ULL, {8, 24}}, // CB=5 (Q4_1) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 100.960us
+            {0x000140000400ULL, {8, 24}}, // CB=5 (Q4_1) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 34.400us
+            {0x000140001800ULL, {8, 24}}, // CB=5 (Q4_1) 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 51.680us
+            {0x000140002800ULL, {4, 12}}, // CB=5 (Q4_1) 10240x5120 KB4/TW12 Qwen36_GDN_InnerProjection 62.880us
+            {0x000140004400ULL, {4, 12}}, // CB=5 (Q4_1) 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 93.600us
+            {0x00014003ca00ULL, {1, 8}}, // CB=5 (Q4_1) 248320x5120 KB1/TW8 Qwen36_LM_Head 1071.199us
+            {0x000180001400ULL, {8, 24}}, // CB=5 (Q4_1) 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 52.640us
+            {0x000440001400ULL, {8, 24}}, // CB=5 (Q4_1) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 98.720us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 7) { // CB=7 (Q5_1)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x000140000400ULL, {8, 24}}, // CB=7 (Q5_1) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 46.080us
+            {0x000140001800ULL, {8, 24}}, // CB=7 (Q5_1) 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 65.600us
+            {0x000140002800ULL, {8, 24}}, // CB=7 (Q5_1) 10240x5120 KB8/TW24 Qwen36_GDN_InnerProjection 80.640us
+            {0x000140004400ULL, {4, 12}}, // CB=7 (Q5_1) 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 122.239us
+            {0x00014003ca00ULL, {4, 12}}, // CB=7 (Q5_1) 248320x5120 KB4/TW12 Qwen36_LM_Head 1382.718us
+            {0x000180001400ULL, {8, 24}}, // CB=7 (Q5_1) 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 66.560us
+            {0x000440001400ULL, {8, 24}}, // CB=7 (Q5_1) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 141.760us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 8) { // CB=8 (Q6_K)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x000140000400ULL, {8, 24}}, // CB=8 (Q6_K) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 39.360us
+            {0x000140001800ULL, {8, 24}}, // CB=8 (Q6_K) 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 67.040us
+            {0x000140002800ULL, {8, 24}}, // CB=8 (Q6_K) 10240x5120 KB8/TW24 Qwen36_GDN_InnerProjection 82.720us
+            {0x000140004400ULL, {4, 12}}, // CB=8 (Q6_K) 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 126.239us
+            {0x00014003ca00ULL, {1, 8}}, // CB=8 (Q6_K) 248320x5120 KB1/TW8 Qwen36_LM_Head 1520.318us
+            {0x000180001400ULL, {8, 24}}, // CB=8 (Q6_K) 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 65.760us
+            {0x000440001400ULL, {8, 24}}, // CB=8 (Q6_K) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 137.280us
         };
         return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
     }
