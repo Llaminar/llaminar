@@ -3190,6 +3190,86 @@ namespace
         EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
     }
 
+    TEST_F(Test__PrefillDecodeTransition, StatefulMTPSpeculativeSamplingSkipsBaseRestoreWhenSidecarPreservesMainState)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_stochastic_sidecar_preserved_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/false,
+                /*hide_local_logits=*/false,
+                DeviceId::rocm(0),
+                /*mtp_draft_tokens=*/1,
+                /*chained_mtp_support=*/false,
+                /*sidecar_sample_fusion=*/false,
+                {},
+                MTPVerifyMode::SpeculativeSampling);
+            mock->enableStochasticDeviceSampling();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->requireMTPDecodeEquivalentReplay();
+            mock->setDecodeArgmaxScript({
+                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+            });
+
+            SamplingParams sampling;
+            sampling.temperature = 0.8f;
+            sampling.top_k = 2;
+            sampling.top_p = 0.95f;
+            sampling.seed = 123;
+            runner->setSamplingParams(sampling);
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+            EXPECT_EQ(mock->restoreCount(), 0)
+                << "graph-native sidecar execution preserves main verifier state, "
+                   "so stochastic decode-equivalent verification should not restore "
+                   "the same base checkpoint after sidecar draft";
+            EXPECT_EQ(mock->setAllPositionCount(), 0);
+            EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *restore_counter =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "decode_equivalent_sequential_verifier_base_restores");
+            EXPECT_EQ(restore_counter, nullptr);
+            const PerfStatRecord *restore_timer =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Timer,
+                               "decode_equivalent_sequential_verifier_restore_base_checkpoint");
+            EXPECT_EQ(restore_timer, nullptr);
+            const PerfStatRecord *skipped_restore =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "decode_equivalent_sequential_verifier_base_restore_skipped_sidecar_preserved");
+            ASSERT_NE(skipped_restore, nullptr);
+            EXPECT_DOUBLE_EQ(skipped_restore->value, 1.0);
+
+            const PerfStatRecord *verifier_runs =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "decode_equivalent_stochastic_verifier_runs",
+                                       {{"restored_verifier_base", "true"}});
+            ASSERT_NE(verifier_runs, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
     TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingRejectsWithResidualCorrection)
     {
         auto [runner, mock] = createRunner(

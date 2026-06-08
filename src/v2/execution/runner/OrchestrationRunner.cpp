@@ -2591,7 +2591,6 @@ namespace llaminar2
             }
 
             const bool sidecar_preserves_main_state =
-                !stochastic_verify &&
                 runner_->supportsMTPSidecarPreservesMainState();
             bool restored_verifier_base = sidecar_preserves_main_state;
             if (sidecar_preserves_main_state)
