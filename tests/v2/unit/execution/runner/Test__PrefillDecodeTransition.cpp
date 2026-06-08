@@ -265,11 +265,13 @@ namespace
                 last_commit_mtp_tokens_.assign(tokens, tokens + token_count);
             }
             const int catchup_token_count = token_count - already_appended_tokens;
+            const int hidden_source_row_start = already_appended_tokens - 1;
+            const int hidden_source_row_end = hidden_source_row_start + catchup_token_count;
             return token_count <= already_appended_tokens ||
                    (tokens != nullptr &&
                     main_forward_token_count > 0 &&
-                    main_forward_token_count <= token_count &&
-                    catchup_token_count <= main_forward_token_count);
+                    hidden_source_row_start >= 0 &&
+                    hidden_source_row_end <= main_forward_token_count);
         }
 
         bool commitMTPShiftedRowFromCurrentTerminalHidden(
@@ -2380,6 +2382,70 @@ namespace
                                         {"correction_replay_tokens", "1"},
                                         {"accepted_state_count", "1"},
                                         {"target_cached_tokens", "6"}});
+            ASSERT_NE(publication_runs, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, AllPositionSpecPublicationCommitsAcceptedPrefixWithBonusVerifierRow)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_all_position_prefix_reject_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/false,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cpu(),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true);
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPSpecStatePublication();
+            mock->setVerifierAcceptedPrefixScript({1});
+            mock->setDecodeArgmaxScript({MockInferenceRunner::DECODE_ARGMAX_TOKEN});
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const int forward_count_after_prefill = mock->forwardCallCount();
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->setAllPositionCount(), 2);
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
+            EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 3)
+                << "depth-2 all-position verification includes a bonus-ready row";
+            EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2)
+                << "first shifted row plus rejected correction replay are sequential";
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 3)
+                << "accepted verifier prefix must be committed from verifier hidden rows";
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 2)
+                << "the final shifted commit is the rejected correction replay";
+            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 0);
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 2)
+                << "all-position verifier plus one correction replay";
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *publication_runs =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "all_position_state_publication_verifier_runs",
+                                       {{"forward_tokens", "4"},
+                                        {"verifier_rows", "3"},
+                                        {"correction_replay_tokens", "1"},
+                                        {"accepted_state_count", "2"},
+                                        {"target_cached_tokens", "7"}});
             ASSERT_NE(publication_runs, nullptr);
         }
         std::filesystem::remove(export_path);

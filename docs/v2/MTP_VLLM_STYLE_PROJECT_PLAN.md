@@ -118,6 +118,11 @@ Done:
   commits any additional accepted verifier prefix rows before state publication,
   so `MTPSpecKVPublisher` remains an invariant checker/truncater rather than a
   hidden state synthesizer.
+- Depth >1 all-position publication now accepts a target verifier with a bonus
+  row beyond the accepted prefix. Focused `V2_Unit_PrefillDecodeTransition` and
+  `V2_Unit_MTPGraphConstruction` coverage proves partial-prefix publication can
+  commit accepted shifted rows without falling back to sequential verifier
+  replay.
 - Request/session reset now invalidates request-scoped prefill graph captures
   with `PrefillGraphRejectReason::SessionReset`, fixing CUDA reused-runner
   no-MTP determinism after `clearCache()` without relying on logits gather.
@@ -173,11 +178,13 @@ Open gaps:
   stochastic sampler overhead, not sidecar generation. The ROCm MoE
   stage-breakdown parity lane passes but currently takes about 341s, so it is a
   performance/test-duration anomaly to reduce.
-- CUDA MoE has fresh release evidence after verifier replay rebinding:
-  baseline 132.95 tok/s, greedy d1 113.08 tok/s at 85.94% acceptance, and
-  stochastic d1 seed123 99.50 tok/s at 64.06% acceptance. Perf counters show
-  `main_verifier` now reaches graph replay, so the remaining blocker is true
-  verifier/catch-up cost and stochastic acceptance, not replay warmup churn.
+- CUDA MoE has fresh release evidence after verifier replay rebinding and the
+  depth >1 publication fix. Baseline is 132.95 tok/s. Greedy d1/d2/d3 is
+  113.08/93.77/89.92 tok/s; stochastic seed123 d1/d2/d3 is
+  99.50/103.34/96.61 tok/s. Depth >1 no longer crashes on partial-prefix
+  publication, but every CUDA MoE MTP depth is still speed-negative. The
+  remaining blocker is true verifier/catch-up cost and stochastic acceptance,
+  not sidecar generation or replay warmup churn.
 - CPU MoE stochastic benchmark lane still needs a fresh run.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE MTP is still speed-negative and must reduce verifier/catch-up cost
@@ -291,18 +298,23 @@ This must cover, as applicable:
 
 ### Benchmark Gate
 
-Refresh JSON/perf evidence for every available lane touched in the iteration:
+Refresh JSON/perf evidence for the depth matrix on every available lane touched
+in the iteration. Standard variants are no-MTP baseline, fixed d1, fixed d2,
+fixed d3, and dynamic depth. Run both greedy and stochastic for dense and MoE
+where the backend lane exists.
 
 ```bash
 cmake --build build_v2_release --parallel
-./build_v2_release/llaminar2 benchmark -m /opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf -d cuda:0 --benchmark-json-output <out>/cuda_dense_base.json
-./build_v2_release/llaminar2 benchmark -m /opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf -d cuda:0 --mtp --mtp-draft-tokens 1 --mtp-verify-mode greedy --benchmark-json-output <out>/cuda_dense_greedy.json
-./build_v2_release/llaminar2 benchmark -m /opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf -d cuda:0 --mtp --mtp-draft-tokens 1 --mtp-verify-mode speculative-sampling --benchmark-json-output <out>/cuda_dense_stoch.json
+scripts/run_mtp_iteration_benchmark_matrix.sh --perfstats
 ```
 
-Repeat for `rocm:0`, `cpu`, and the MoE model
-`/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf` when that backend is part
-of the slice. Capture `LLAMINAR_PERF_STATS_JSON=<out>/perfstats.json` for at
-least one representative MTP run per backend.
+For narrow iteration loops, keep the same variant shape while selecting the
+lane under active work:
+
+```bash
+scripts/run_mtp_iteration_benchmark_matrix.sh \
+  --devices cuda:0 --models moe --modes greedy,stochastic \
+  --variants baseline,fixed_d1,fixed_d2,fixed_d3,dynamic --perfstats
+```
 
 Update `docs/v2/MTP_VLLM_STYLE_TUNING_DASHBOARD.md` after every benchmark pass.

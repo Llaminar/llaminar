@@ -2309,12 +2309,19 @@ namespace llaminar2
             return true;
         if (!tokens || token_count <= 0)
             return false;
+        const int catchup_token_count = token_count - already_appended_tokens;
+        const int hidden_source_row_start = already_appended_tokens - 1;
+        const int hidden_source_row_end = hidden_source_row_start + catchup_token_count;
         if (main_forward_token_count <= 0 ||
-            main_forward_token_count > token_count ||
-            token_count > main_forward_token_count + 1)
+            hidden_source_row_start < 0 ||
+            hidden_source_row_end > main_forward_token_count)
         {
             LOG_ERROR("RankOrchestrator::commitMTPShiftedRowsFromPartialForward: invalid main_forward_token_count="
-                      << main_forward_token_count << " token_count=" << token_count);
+                      << main_forward_token_count << " token_count=" << token_count
+                      << " already_appended_tokens=" << already_appended_tokens
+                      << " catchup_token_count=" << catchup_token_count
+                      << " hidden_source_row_start=" << hidden_source_row_start
+                      << " hidden_source_row_end=" << hidden_source_row_end);
             return false;
         }
         if (device_runners_.empty())

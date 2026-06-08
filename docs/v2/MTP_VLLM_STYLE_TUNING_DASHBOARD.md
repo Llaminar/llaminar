@@ -21,8 +21,8 @@ RAG rules:
 | ROCm | Dense 27B | stochastic | Amber | yes | seed123 31.31 vs 30.19 tok/s, 1.04x | small win; stochastic stream drift |
 | CPU | Dense 27B | greedy | Amber | yes | not refreshed | CPU state publication/bench gap |
 | CPU | Dense 27B | stochastic | Amber | yes | not refreshed | host verifier is correct, speed unmeasured |
-| CUDA | MoE 35B | greedy | Amber | yes | 113.08 vs 132.95 tok/s, 0.85x | verifier/catch-up cost |
-| CUDA | MoE 35B | stochastic | Amber | yes | seed123 99.50 vs 132.95 tok/s, 0.75x | acceptance + verifier cost |
+| CUDA | MoE 35B | greedy | Amber | yes | best d1 113.08 vs 132.95 tok/s, 0.85x | verifier cost; d2/d3 slower |
+| CUDA | MoE 35B | stochastic | Amber | yes | best d2 seed123 103.34 vs 132.95 tok/s, 0.78x | verifier cost; depth not enough |
 | ROCm | MoE 35B | greedy | Amber | yes | 68.09 vs 76.23 tok/s, 0.89x | speed-negative; verifier/sync cost |
 | ROCm | MoE 35B | stochastic | Amber | yes | 52.57 vs 76.23 tok/s, 0.69x | speed-negative; sampler/sync cost |
 | CPU | MoE 35B | greedy | Amber | partial | not refreshed | vLLM-style CPU publication/bench gap |
@@ -30,24 +30,20 @@ RAG rules:
 
 ## Latest Evidence
 
-- CUDA no-MTP determinism fixed by invalidating request-scoped prefill graph
-  captures on `SessionReset`. Latest evidence: `V2_Unit_` 497/497 and CUDA
-  no-MTP fresh-run determinism parity passed.
-- Phase A all-position publication now explicitly materializes shifted MTP KV
-  rows before state publication. Focused unit gate passed, and GPU stochastic
-  parity passed for dense+MoE on CUDA+ROCm in one command.
+- Phase A accepted-count publication materializes shifted MTP KV rows before
+  state publication; focused unit and GPU stochastic parity gates pass.
 - Fresh dense publication evidence:
   `benchmark_results/mtp_vllm_style/20260608T-dense-publication-refresh/`.
   CUDA greedy d1 is 56.91 tok/s, CUDA stochastic d1 seed123 is 51.29 tok/s,
   ROCm greedy d1 is 41.44 tok/s, ROCm stochastic d1 seed123 is 31.31 tok/s.
   Long seeded stochastic acceptance matches on CUDA/ROCm at 52 accepted and 12
   rejected, but generated streams still differ at a few whitespace-token choices.
-- CUDA MoE replay/publication fix:
-  `benchmark_results/mtp_vllm_style/20260608T-cuda-moe-verifier-replay-rebind-clean/`.
-  Baseline 132.95 tok/s; greedy d1 113.08 tok/s at 85.94% acceptance;
-  stochastic d1 seed123 99.50 tok/s at 64.06% acceptance. Perf counters in
-  sibling `verifier-replay-rebind/` show `main_verifier` now reaches replay
-  (3 warmup, 3 capture, 186 replay) instead of staying in warmup.
+- CUDA MoE evidence: baseline/d1 in
+  `20260608T-cuda-moe-verifier-replay-rebind-clean/`; d2/d3 in
+  `20260608T-cuda-moe-depth-sweep/`. Greedy d1/d2/d3:
+  113.08/93.77/89.92 tok/s. Stochastic seed123 d1/d2/d3:
+  99.50/103.34/96.61 tok/s. d2/d3 partial-prefix publication is fixed and
+  unit-gated, but all depths remain speed-negative.
 - Fresh ROCm MoE evidence:
   `benchmark_results/mtp_vllm_style/20260608T170802Z-rocm-moe/`.
   Baseline 76.23 tok/s; greedy d1 68.09 tok/s at 84.38% acceptance;
@@ -62,8 +58,7 @@ RAG rules:
   sampler-kernel math. The suite now includes Qwen3.6 real-logit-style seeded
   rows with close whitespace/code-token probabilities for both CUDA and ROCm.
 - Dense/MoE parity surfaces remain symmetric across CPU/CUDA/ROCm shared
-  behavior. Latest GPU stochastic verifier gate passed: dense ROCm 28.06s,
-  dense CUDA 26.87s, MoE ROCm 22.33s, MoE CUDA 18.28s.
+  behavior; backend-specific path guards stay separate.
 
 ## Target Anchors
 
@@ -77,6 +72,8 @@ llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
 
 ## Next Dashboard Updates
 
-1. Refresh dense CPU and CPU MoE stochastic benchmark cells.
-2. Re-run the full iteration gate from `MTP_VLLM_STYLE_PROJECT_PLAN.md` before
+1. Use `scripts/run_mtp_iteration_benchmark_matrix.sh` to refresh baseline,
+   fixed d1/d2/d3, and dynamic rows for touched CUDA/ROCm/CPU lanes.
+2. Refresh dense CPU and CPU MoE stochastic benchmark cells.
+3. Re-run the full iteration gate from `MTP_VLLM_STYLE_PROJECT_PLAN.md` before
    any WiP commit.

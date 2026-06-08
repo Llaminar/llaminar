@@ -5139,7 +5139,6 @@ namespace llaminar2
         const int hidden_source_row_start = already_appended_tokens - 1;
         const int hidden_source_row_end = hidden_source_row_start + catchup_token_count;
         if (main_forward_token_count <= 0 ||
-            main_forward_token_count > token_count ||
             hidden_source_row_start < 0 ||
             hidden_source_row_end > main_forward_token_count)
         {

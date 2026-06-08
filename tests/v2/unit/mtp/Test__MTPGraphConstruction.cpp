@@ -2775,7 +2775,7 @@ TEST(Test__MTPGraphConstruction, ChainedSidecarSuffixCommitAllowsCommittedVerifi
         accepted_tokens.data(),
         accepted_verifier_input_count,
         /*already_appended_tokens=*/1,
-        /*main_forward_token_count=*/accepted_verifier_input_count,
+        /*main_forward_token_count=*/static_cast<int>(verifier_tokens.size()),
         /*allow_speculative_discard=*/true,
         /*position_offset_override=*/prefix_position));
 
