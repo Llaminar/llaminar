@@ -30,12 +30,18 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
+#include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -60,6 +66,15 @@ extern "C"
         const float *d_A_fp32,
         int8_t *d_A_int8,
         float *d_scales_blockwise,
+        int M, int K,
+        int rocm_device_id, void *stream,
+        int block_size);
+
+    bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_blockwise,
+        int32_t *d_sums_blockwise,
         int M, int K,
         int rocm_device_id, void *stream,
         int block_size);
@@ -93,6 +108,27 @@ extern "C"
         uint8_t codebook_id,
         int device_id,
         void *stream);
+
+    bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
+        const int8_t *d_A_int8,
+        const uint8_t *const *d_payloads,
+        const uint16_t *const *d_block_scales,
+        const uint16_t *const *d_block_mins,
+        const uint32_t *const *d_block_emins,
+        const float *const *d_biases,
+        float *const *d_outputs,
+        const float *d_scale_A_blockwise,
+        const int32_t *d_sum_A_blockwise,
+        float *const *d_partials,
+        const int *Ns,
+        int num_projections,
+        int M, int K,
+        uint8_t codebook_id,
+        int device_id,
+        void *stream);
+
+    void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
+    void rocmGemv_native_vnni_reset_tuning_overrides();
 }
 #endif
 
@@ -275,11 +311,15 @@ namespace
 
     struct BatchedGDNProjectionResult
     {
+        std::string group_name;
         std::string format_name;
+        std::string variant_name;
         int M = 0;
         int K = 0;
         int projections = 0;
         int total_N = 0;
+        int kb = 0;
+        int target_waves = 0;
         uint8_t codebook_id = 0;
         double min_us = 0.0;
         double mean_us = 0.0;
@@ -317,6 +357,155 @@ namespace
             return reinterpret_cast<const T *>(ptr);
         }
     };
+
+    struct HipStream
+    {
+        hipStream_t stream = nullptr;
+
+        ~HipStream()
+        {
+            if (stream)
+                (void)hipStreamDestroy(stream);
+        }
+
+        bool create()
+        {
+            return hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) == hipSuccess && stream != nullptr;
+        }
+
+        void *asVoid() const
+        {
+            return reinterpret_cast<void *>(stream);
+        }
+    };
+
+    struct BatchedDecodeVariant
+    {
+        std::string name;
+        int kb = 0;
+        int target_waves = 0;
+        bool automatic = true;
+    };
+
+    class BatchedDecodeTuningOverrideGuard
+    {
+    public:
+        explicit BatchedDecodeTuningOverrideGuard(const BatchedDecodeVariant &variant)
+        {
+            if (variant.automatic)
+                rocmGemv_native_vnni_reset_tuning_overrides();
+            else
+                rocmGemv_native_vnni_set_tuning_overrides(variant.kb, variant.target_waves);
+        }
+
+        ~BatchedDecodeTuningOverrideGuard()
+        {
+            rocmGemv_native_vnni_reset_tuning_overrides();
+        }
+    };
+#endif
+
+    static std::string trim(std::string value)
+    {
+        const auto begin = value.find_first_not_of(" \t\n\r");
+        if (begin == std::string::npos)
+            return {};
+        const auto end = value.find_last_not_of(" \t\n\r");
+        return value.substr(begin, end - begin + 1);
+    }
+
+    static std::string toLower(std::string value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        return value;
+    }
+
+    static std::string getEnvString(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return {};
+        return trim(raw);
+    }
+
+    static std::optional<int> getEnvInt(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return std::nullopt;
+        return std::atoi(raw);
+    }
+
+    static std::set<std::string> getEnvCsvSet(const char *name)
+    {
+        std::set<std::string> values;
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return values;
+        std::stringstream stream(raw);
+        std::string token;
+        while (std::getline(stream, token, ','))
+        {
+            token = toLower(trim(token));
+            if (!token.empty())
+                values.insert(token);
+        }
+        return values;
+    }
+
+    static bool shouldRunName(const std::set<std::string> &filters, const std::string &name)
+    {
+        return filters.empty() || filters.count(toLower(name)) != 0;
+    }
+
+#ifdef HAVE_ROCM
+    static BatchedDecodeVariant parseBatchedDecodeVariantToken(std::string token)
+    {
+        token = trim(token);
+        std::string compact;
+        compact.reserve(token.size());
+        for (char c : token)
+        {
+            if (c != '/' && c != '_' && c != '-' && c != ' ')
+                compact.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+
+        if (compact == "AUTO")
+            return BatchedDecodeVariant{"AUTO", 0, 0, true};
+
+        const size_t kb_pos = compact.find("KB");
+        const size_t tw_pos = compact.find("TW");
+        if (kb_pos == std::string::npos || tw_pos == std::string::npos || tw_pos <= kb_pos + 2)
+            throw std::runtime_error("Invalid ROCm NativeVNNI batched decode variant token: " + token);
+
+        const int kb = std::atoi(compact.substr(kb_pos + 2, tw_pos - (kb_pos + 2)).c_str());
+        const int tw = std::atoi(compact.substr(tw_pos + 2).c_str());
+        if (kb <= 0 || tw <= 0 || kb > 64)
+            throw std::runtime_error("Invalid ROCm NativeVNNI batched decode variant values: " + token);
+
+        return BatchedDecodeVariant{"KB" + std::to_string(kb) + "/TW" + std::to_string(tw), kb, tw, false};
+    }
+
+    static std::vector<BatchedDecodeVariant> getBatchedDecodeVariants()
+    {
+        const char *raw = std::getenv("LLAMINAR_ROCM_NVNNI_BATCHED_DECODE_VARIANTS");
+        const std::string spec = (raw && *raw) ? raw : "auto,kb1tw8,kb2tw12,kb4tw12,kb8tw12,kb8tw24";
+
+        std::vector<BatchedDecodeVariant> variants;
+        std::stringstream stream(spec);
+        std::string token;
+        while (std::getline(stream, token, ','))
+        {
+            token = trim(token);
+            if (!token.empty())
+                variants.push_back(parseBatchedDecodeVariantToken(token));
+        }
+        if (variants.empty())
+            variants.push_back(BatchedDecodeVariant{"AUTO", 0, 0, true});
+        return variants;
+    }
 #endif
 
     // =============================================================================
@@ -867,20 +1056,29 @@ namespace
         }
 
         static BatchedGDNProjectionResult benchmarkBatchedGDNProjection(
+            const std::string &group_name,
             const GEMMFormatSpec &fmt,
             const std::vector<int> &projection_Ns,
             int M,
             int K,
-            int device_id)
+            int device_id,
+            const BatchedDecodeVariant &variant = BatchedDecodeVariant{"AUTO", 0, 0, true})
         {
             (void)hipSetDevice(device_id);
-
             BatchedGDNProjectionResult result{};
+            HipStream stream;
+            if (!stream.create())
+                return result;
+
+            result.group_name = group_name;
             result.format_name = fmt.name;
+            result.variant_name = variant.name;
             result.M = M;
             result.K = K;
             result.projections = static_cast<int>(projection_Ns.size());
             result.total_N = std::accumulate(projection_Ns.begin(), projection_Ns.end(), 0);
+            result.kb = variant.kb;
+            result.target_waves = variant.target_waves;
 
             if (projection_Ns.empty() ||
                 projection_Ns.size() > 8 ||
@@ -935,19 +1133,23 @@ namespace
             HipBuffer d_A_int8;
             HipBuffer d_scales_A;
             HipBuffer d_scales_A_blockwise;
+            HipBuffer d_sums_A_blockwise;
             if (!d_A_int8.allocate(static_cast<size_t>(M) * static_cast<size_t>(K) * sizeof(int8_t)) ||
                 !d_scales_A.allocate(static_cast<size_t>(M) * sizeof(float)) ||
-                !d_scales_A_blockwise.allocate(static_cast<size_t>(M) * static_cast<size_t>(K / 32) * sizeof(float)))
+                !d_scales_A_blockwise.allocate(static_cast<size_t>(M) * static_cast<size_t>(K / 32) * sizeof(float)) ||
+                !d_sums_A_blockwise.allocate(static_cast<size_t>(M) * static_cast<size_t>(K / 32) * sizeof(int32_t)))
             {
                 return result;
             }
 
             std::vector<float> row_scales(static_cast<size_t>(M), 1.0f);
-            if (hipMemcpy(
+            if (hipMemcpyAsync(
                     d_scales_A.ptr,
                     row_scales.data(),
                     row_scales.size() * sizeof(float),
-                    hipMemcpyHostToDevice) != hipSuccess)
+                    hipMemcpyHostToDevice,
+                    stream.stream) != hipSuccess ||
+                hipStreamSynchronize(stream.stream) != hipSuccess)
             {
                 return result;
             }
@@ -991,19 +1193,20 @@ namespace
             const float *d_input = reinterpret_cast<const float *>(input_fp32->gpu_data_ptr());
             auto run_once = [&]() -> bool
             {
-                if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                if (!rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
                         d_input,
                         d_A_int8.as<int8_t>(),
                         d_scales_A_blockwise.as<float>(),
+                        d_sums_A_blockwise.as<int32_t>(),
                         M, K,
                         device_id,
-                        nullptr,
+                        stream.asVoid(),
                         32))
                 {
                     return false;
                 }
 
-                return rocmGemv_native_vnni_small_m_batched_fp32(
+                return rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
                     d_A_int8.as<int8_t>(),
                     payload_ptrs.data(),
                     scale_ptrs.data(),
@@ -1012,13 +1215,14 @@ namespace
                     bias_ptrs.data(),
                     output_ptrs.data(),
                     d_scales_A_blockwise.as<float>(),
+                    d_sums_A_blockwise.as<int32_t>(),
                     partial_ptrs.data(),
                     Ns.data(),
                     static_cast<int>(projection_Ns.size()),
                     M, K,
                     result.codebook_id,
                     device_id,
-                    nullptr);
+                    stream.asVoid());
             };
 
             for (int i = 0; i < WARMUP_RUNS; ++i)
@@ -1026,7 +1230,7 @@ namespace
                 if (!run_once())
                     return result;
             }
-            (void)hipDeviceSynchronize();
+            (void)hipStreamSynchronize(stream.stream);
 
             hipEvent_t start = nullptr;
             hipEvent_t stop = nullptr;
@@ -1036,15 +1240,15 @@ namespace
             times_us.reserve(BENCH_RUNS);
             for (int i = 0; i < BENCH_RUNS; ++i)
             {
-                (void)hipDeviceSynchronize();
-                (void)hipEventRecord(start);
+                (void)hipStreamSynchronize(stream.stream);
+                (void)hipEventRecord(start, stream.stream);
                 if (!run_once())
                 {
                     (void)hipEventDestroy(start);
                     (void)hipEventDestroy(stop);
                     return result;
                 }
-                (void)hipEventRecord(stop);
+                (void)hipEventRecord(stop, stream.stream);
                 (void)hipEventSynchronize(stop);
 
                 float ms = 0.0f;
@@ -1060,18 +1264,19 @@ namespace
             double max_us = 0.0;
             computeStats(times_us, result.mean_us, result.min_us, max_us, result.stddev_us);
 
-            if (!rocmQuantGemm_quantizeActivationsBlockwise(
+            if (!rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
                     d_input,
                     d_A_int8.as<int8_t>(),
                     d_scales_A_blockwise.as<float>(),
+                    d_sums_A_blockwise.as<int32_t>(),
                     M, K,
                     device_id,
-                    nullptr,
+                    stream.asVoid(),
                     32))
             {
                 return result;
             }
-            if (!rocmGemv_native_vnni_small_m_batched_fp32(
+            if (!rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
                     d_A_int8.as<int8_t>(),
                     payload_ptrs.data(),
                     scale_ptrs.data(),
@@ -1080,17 +1285,18 @@ namespace
                     bias_ptrs.data(),
                     output_ptrs.data(),
                     d_scales_A_blockwise.as<float>(),
+                    d_sums_A_blockwise.as<int32_t>(),
                     partial_ptrs.data(),
                     Ns.data(),
                     static_cast<int>(projection_Ns.size()),
                     M, K,
                     result.codebook_id,
                     device_id,
-                    nullptr))
+                    stream.asVoid()))
             {
                 return result;
             }
-            (void)hipDeviceSynchronize();
+            (void)hipStreamSynchronize(stream.stream);
 
             float min_cosine = 1.0f;
             for (size_t i = 0; i < projection_Ns.size(); ++i)
@@ -1108,11 +1314,11 @@ namespace
                         M, N, K,
                         result.codebook_id,
                         device_id,
-                        nullptr))
+                        stream.asVoid()))
                 {
                     return result;
                 }
-                (void)hipDeviceSynchronize();
+                (void)hipStreamSynchronize(stream.stream);
                 const float cosine = gpuCosineSimilarity(
                     outputs[i].as<float>(),
                     refs[i].as<float>(),
@@ -1877,6 +2083,8 @@ namespace
         };
 
         const std::vector<GDNProjectionGroup> groups = {
+            {"Qwen36_FFN_Q4K_gate_up", "Q4_K", {17408, 17408}},
+            {"Qwen36_FFN_Q5K_gate_up", "Q5_K", {17408, 17408}},
             {"Qwen36_GDN_Q4K_qkv_z", "Q4_K", {10240, 6144}},
             {"Qwen36_GDN_Q5K_qkv_z", "Q5_K", {10240, 6144}},
             {"Qwen36_GDN_Q4_1_qkv_z_a", "Q4_1", {12288, 6144, 1024}},
@@ -1902,6 +2110,7 @@ namespace
             for (int M : MTP_SMALL_M_VALUES)
             {
                 auto r = benchmarkBatchedGDNProjection(
+                    group.name,
                     *fmt_it,
                     group.projection_Ns,
                     M,
@@ -1957,6 +2166,195 @@ namespace
         }
 
         fprintf(stderr, "\n%s\n", table.to_string().c_str());
+#endif
+    }
+
+    TEST_F(NativeVNNIGEMMPerfTest, TrainerCsv_BatchedProjectionCodebookTagged)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device available";
+
+        struct BatchedProjectionGroup
+        {
+            std::string name;
+            std::string format;
+            std::vector<int> projection_Ns;
+            int K = 5120;
+        };
+
+        const std::vector<BatchedProjectionGroup> groups = {
+            {"Qwen36_FFN_Q4K_gate_up", "Q4_K", {17408, 17408}, 5120},
+            {"Qwen36_FFN_Q5K_gate_up", "Q5_K", {17408, 17408}, 5120},
+            {"Qwen36_GDN_Q4K_qkv_z", "Q4_K", {10240, 6144}, 5120},
+            {"Qwen36_GDN_Q5K_qkv_z", "Q5_K", {10240, 6144}, 5120},
+            {"Qwen36_GDN_Q4_1_qkv_z_a", "Q4_1", {12288, 6144, 1024}, 5120},
+            {"Qwen36_GDN_Q5_1_z_a", "Q5_1", {10240, 1024}, 5120},
+        };
+
+        std::set<std::string> group_filters =
+            getEnvCsvSet("LLAMINAR_ROCM_NVNNI_BATCHED_DECODE_GROUPS");
+        if (group_filters.empty())
+            group_filters.insert("qwen36_ffn_q4k_gate_up");
+        std::set<std::string> format_filters =
+            getEnvCsvSet("LLAMINAR_ROCM_NVNNI_BATCHED_DECODE_FORMATS");
+        const std::set<std::string> m_filters =
+            getEnvCsvSet("LLAMINAR_ROCM_NVNNI_BATCHED_DECODE_M");
+        const int max_cases =
+            std::max(1, getEnvInt("LLAMINAR_ROCM_NVNNI_BATCHED_DECODE_MAX_CASES").value_or(1));
+        const std::string csv_path =
+            getEnvString("LLAMINAR_ROCM_NVNNI_BATCHED_DECODE_CSV");
+        const std::vector<BatchedDecodeVariant> variants = getBatchedDecodeVariants();
+
+        std::FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr)
+                << "Failed to open ROCm NativeVNNI batched decode CSV: " << csv_path;
+            std::fprintf(
+                csv,
+                "backend,phase,format,codebook,shape,n,k,m,projections,total_n,projection_ns,codebooks,variant,kb,target_waves,min_us,mean_us,stddev_us,cosine,correctness_pass,is_best\n");
+        }
+
+        int executed_cases = 0;
+        int executed_rows = 0;
+        for (const auto &group : groups)
+        {
+            if (!shouldRunName(group_filters, group.name))
+                continue;
+            if (!shouldRunName(format_filters, group.format))
+                continue;
+
+            auto fmt_it = std::find_if(
+                GEMM_FORMATS.begin(),
+                GEMM_FORMATS.end(),
+                [&](const GEMMFormatSpec &fmt)
+                {
+                    return fmt.name == group.format;
+                });
+            ASSERT_NE(fmt_it, GEMM_FORMATS.end()) << group.format;
+
+            for (int M : MTP_SMALL_M_VALUES)
+            {
+                if (!m_filters.empty() && m_filters.count(std::to_string(M)) == 0)
+                    continue;
+                if (executed_cases >= max_cases)
+                    break;
+
+                struct VariantRow
+                {
+                    BatchedDecodeVariant variant;
+                    BatchedGDNProjectionResult result;
+                };
+                std::vector<VariantRow> rows;
+                rows.reserve(variants.size());
+                for (const auto &variant : variants)
+                {
+                    BatchedDecodeTuningOverrideGuard guard(variant);
+                    rows.push_back(VariantRow{
+                        variant,
+                        benchmarkBatchedGDNProjection(
+                            group.name,
+                            *fmt_it,
+                            group.projection_Ns,
+                            M,
+                            group.K,
+                            0,
+                            variant)});
+                }
+
+                int best_index = -1;
+                for (size_t row_index = 0; row_index < rows.size(); ++row_index)
+                {
+                    const auto &candidate = rows[row_index].result;
+                    if (!candidate.valid || !candidate.correctness_pass || candidate.min_us <= 0.0)
+                        continue;
+                    if (best_index < 0 ||
+                        candidate.min_us < rows[static_cast<size_t>(best_index)].result.min_us)
+                    {
+                        best_index = static_cast<int>(row_index);
+                    }
+                }
+
+                ASSERT_GE(best_index, 0)
+                    << "No correct ROCm NativeVNNI batched decode variant for "
+                    << group.name << " M=" << M;
+
+                std::ostringstream ns_joined;
+                std::ostringstream codebooks_joined;
+                for (size_t i = 0; i < group.projection_Ns.size(); ++i)
+                {
+                    if (i > 0)
+                    {
+                        ns_joined << '+';
+                        codebooks_joined << '+';
+                    }
+                    ns_joined << group.projection_Ns[i];
+                    codebooks_joined << static_cast<unsigned>(rows[static_cast<size_t>(best_index)].result.codebook_id);
+                }
+
+                if (csv)
+                {
+                    for (size_t row_index = 0; row_index < rows.size(); ++row_index)
+                    {
+                        const auto &row = rows[row_index];
+                        const auto &r = row.result;
+                        std::fprintf(
+                            csv,
+                            "rocm,batched_decode,%s,%u,%s,%d,%d,%d,%d,%d,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.6f,%d,%d\n",
+                            group.format.c_str(),
+                            static_cast<unsigned>(r.codebook_id),
+                            group.name.c_str(),
+                            r.total_N,
+                            r.K,
+                            r.M,
+                            r.projections,
+                            r.total_N,
+                            ns_joined.str().c_str(),
+                            codebooks_joined.str().c_str(),
+                            row.variant.name.c_str(),
+                            row.variant.kb,
+                            row.variant.target_waves,
+                            r.min_us,
+                            r.mean_us,
+                            r.stddev_us,
+                            r.min_cosine_sim,
+                            r.correctness_pass ? 1 : 0,
+                            best_index >= 0 && static_cast<int>(row_index) == best_index ? 1 : 0);
+                        ++executed_rows;
+                    }
+                    std::fflush(csv);
+                }
+
+                const auto &best = rows[static_cast<size_t>(best_index)];
+                std::fprintf(
+                    stderr,
+                    "[ROCmNativeVNNI][BATCHED_DECODE][TRAINER] group=%s format=%s codebook=%u M=%d best=%s time_us=%.3f cosine=%.6f\n",
+                    group.name.c_str(),
+                    group.format.c_str(),
+                    static_cast<unsigned>(best.result.codebook_id),
+                    M,
+                    best.variant.name.c_str(),
+                    best.result.min_us,
+                    best.result.min_cosine_sim);
+                ASSERT_TRUE(best.result.correctness_pass)
+                    << group.name << " M=" << M
+                    << " cosine=" << best.result.min_cosine_sim;
+                ++executed_cases;
+            }
+        }
+
+        if (csv)
+        {
+            std::fclose(csv);
+            ASSERT_GT(executed_rows, 0)
+                << "ROCm NativeVNNI batched decode trainer CSV had no rows.";
+        }
+        ASSERT_GT(executed_cases, 0)
+            << "No ROCm NativeVNNI batched decode trainer cases selected.";
 #endif
     }
 

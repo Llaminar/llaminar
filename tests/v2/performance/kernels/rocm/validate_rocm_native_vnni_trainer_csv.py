@@ -33,6 +33,17 @@ COMMON_REQUIRED = {
 
 PHASE_REQUIRED = {
     "decode": {"weight_bytes", "eff_bw_gbs", "speedup_vs_int8", "variant", "kb", "target_waves", "is_best"},
+    "batched_decode": {
+        "m",
+        "projections",
+        "total_n",
+        "projection_ns",
+        "codebooks",
+        "variant",
+        "kb",
+        "target_waves",
+        "is_best",
+    },
     "prefill": {"category", "m", "variant", "gflops", "is_best"},
 }
 

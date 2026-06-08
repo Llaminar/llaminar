@@ -67,7 +67,10 @@ def _validate_labeled_branches(path: Path, text: str) -> None:
 
 
 def _validate_rocm_decode_graph_safe_kb(path: Path, text: str) -> None:
-    if "ROCmNativeVNNIDecodeDispatchConfig" not in text:
+    if (
+        "ROCmNativeVNNIDecodeDispatchConfig" not in text and
+        "ROCmNativeVNNIBatchedDecodeDispatchConfig" not in text
+    ):
         return
 
     for match in re.finditer(r"\{0x[0-9a-fA-F]+ULL,\s*\{(\d+),\s*(\d+)\}\}", text):
@@ -75,6 +78,17 @@ def _validate_rocm_decode_graph_safe_kb(path: Path, text: str) -> None:
         if kb > ROCM_DECODE_GRAPH_SAFE_KB_CAP:
             raise SystemExit(
                 f"{path}: ROCm NativeVNNI decode generated kb={kb} exceeds "
+                f"graph-safe small-M cap {ROCM_DECODE_GRAPH_SAFE_KB_CAP}"
+            )
+    for match in re.finditer(
+        r"\{\s*\d+\s*,\s*\d+\s*,\s*-?\d+\s*,\s*-?\d+\s*,"
+        r"\s*\{[^{}]*\}\s*,\s*\{[^{}]*\}\s*,\s*\{(\d+)\s*,\s*(\d+)\}\s*\}",
+        text,
+    ):
+        kb = int(match.group(1))
+        if kb > ROCM_DECODE_GRAPH_SAFE_KB_CAP:
+            raise SystemExit(
+                f"{path}: ROCm NativeVNNI batched decode generated kb={kb} exceeds "
                 f"graph-safe small-M cap {ROCM_DECODE_GRAPH_SAFE_KB_CAP}"
             )
 

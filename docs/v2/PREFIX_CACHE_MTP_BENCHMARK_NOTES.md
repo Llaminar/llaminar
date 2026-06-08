@@ -44,6 +44,10 @@ plan carries detailed implementation status.
   shapes for codebooks 0/5/7/8. This improves coverage and keeps parity green,
   but default-lane throughput remains about 35.8 tok/s; verifier forward is
   still the catch-up target at about 41.6 ms versus CUDA's 28.5 ms.
+- ROCm batched small-M verifier dispatch training is now offline-only. The
+  generated candidate looked correct in the perf harness but collapsed
+  real-model stochastic acceptance, so no batched table is promoted without a
+  model-level acceptance/equivalence gate.
 
 ## llama.cpp CUDA Anchors
 

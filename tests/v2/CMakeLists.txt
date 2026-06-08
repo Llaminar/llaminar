@@ -1694,6 +1694,18 @@ set_tests_properties(V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_ROCmNativeVNNIBatchedDecodeTrainerGenerator
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_vnni_batched_decode_trainer_generator.py
+            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/analyze_rocm_native_vnni_batched_decode_trainer.py
+            --dispatch-validator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_batched_decode_smoke.csv
+)
+set_tests_properties(V2_Unit_ROCmNativeVNNIBatchedDecodeTrainerGenerator PROPERTIES
+    LABELS "V2;Unit;ROCm;GEMV;NativeVNNI;Codebook;Trainer;Dispatch;Regression"
+    TIMEOUT 30
+)
+
 # Performance: Q16 Fixed-Scale SIMD Quantization
 add_executable(v2_perf_q16_fixed_scale_simd performance/tensors/Perf__Q16_FixedScaleSIMD.cpp)
 target_link_libraries(v2_perf_q16_fixed_scale_simd
