@@ -137,6 +137,69 @@ namespace
         return reinterpret_cast<const float *>(
             base + offsetof(llaminar2::DeviceMoELayerRuntime, topk_weights));
     }
+
+    bool isHipStreamCapturing(void *stream)
+    {
+        if (!stream)
+            return false;
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        const hipError_t err = hipStreamIsCapturing(static_cast<hipStream_t>(stream), &status);
+        return err == hipSuccess && status == hipStreamCaptureStatusActive;
+    }
+
+    void markDeviceWritten(llaminar2::ITensor *tensor, llaminar2::DeviceId device, void *stream)
+    {
+        if (auto *base = dynamic_cast<llaminar2::TensorBase *>(tensor))
+            base->transitionToWithEvent(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
+        else
+            tensor->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    }
+
+    void markSynced(llaminar2::ITensor *tensor)
+    {
+        tensor->transitionTo(llaminar2::TensorCoherenceState::SYNCED);
+    }
+
+    bool ensureTensorOnDevice(llaminar2::ITensor *tensor,
+                              llaminar2::DeviceId device,
+                              void *stream,
+                              const char *name,
+                              const char *context)
+    {
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " requires an explicit HIP stream for " << name);
+            return false;
+        }
+
+        auto *base = dynamic_cast<llaminar2::TensorBase *>(tensor);
+        if (!base)
+        {
+            if (tensor && tensor->gpu_data_ptr())
+                return true;
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " has no device pointer for non-TensorBase " << name);
+            return false;
+        }
+
+        if (!base->ensureOnDevice(device, stream))
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " failed to place " << name << " on "
+                                         << device.to_string());
+            return false;
+        }
+
+        if (!base->gpu_data_ptr())
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " has null device pointer after upload for " << name);
+            return false;
+        }
+
+        return true;
+    }
 }
 
 // Forward-declare extern "C" bridge functions (defined in ROCmMoEKernels.hip)
@@ -638,9 +701,11 @@ namespace llaminar2
 
     void ROCmMoEKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
-        if (workspace_ == workspace)
+        const uint64_t new_workspace_id = workspace ? workspace->id() : 0;
+        if (workspace_ == workspace && bound_workspace_id_ == new_workspace_id)
             return;
         ROCmKernelBase::bindWorkspace(workspace);
+        bound_workspace_id_ = new_workspace_id;
         clearWorkspaceScratchBindings();
     }
 
@@ -2251,6 +2316,11 @@ namespace llaminar2
             return false;
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel::routeWithTensors] explicit HIP stream is required");
+            return false;
+        }
         hipError_t err;
 
         // D2D: write routing results to output tensors on device.
@@ -2265,28 +2335,25 @@ namespace llaminar2
 
         float *h_idx = nullptr;
         float *h_wt = nullptr;
+        const bool capture_active = isGraphCaptureActive() ||
+                                    (deviceContext() && deviceContext()->isDeviceGraphCaptureActive()) ||
+                                    isHipStreamCapturing(getStream());
         const bool needs_decode_host_topk = (seq_len == 1);
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
         const bool needs_snapshot_host_topk = true;
 #else
         const bool needs_snapshot_host_topk = false;
 #endif
-        const bool needs_host_topk = needs_decode_host_topk || needs_snapshot_host_topk;
-        if (needs_host_topk)
-        {
-            h_idx = static_cast<float *>(output_indices->raw_mutable_data());
-            h_wt = static_cast<float *>(output_weights->raw_mutable_data());
-            if (!h_idx || !h_wt)
-            {
-                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] output tensors have no host storage");
-                return false;
-            }
-        }
+        const bool needs_host_topk = !capture_active && (needs_decode_host_topk || needs_snapshot_host_topk);
 
         // int→float conversion kernel (indices are int on device, tensor stores float)
-        hipMoE_int_to_float(bufs.d_indices, d_idx,
-                            static_cast<int>(bufs.topk_count),
-                            device_ordinal_, getStream());
+        if (!hipMoE_int_to_float(bufs.d_indices, d_idx,
+                                 static_cast<int>(bufs.topk_count),
+                                 device_ordinal_, getStream()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2D index conversion failed");
+            return false;
+        }
 
         err = hipMemcpyAsync(d_wt, bufs.d_weights,
                              bufs.topk_count * sizeof(float),
@@ -2303,6 +2370,14 @@ namespace llaminar2
 
         if (needs_host_topk)
         {
+            h_idx = static_cast<float *>(output_indices->raw_mutable_data());
+            h_wt = static_cast<float *>(output_weights->raw_mutable_data());
+            if (!h_idx || !h_wt)
+            {
+                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] output tensors have no host storage");
+                return false;
+            }
+
             err = hipMemcpyAsync(h_idx, d_idx,
                                  bufs.topk_count * sizeof(float),
                                  hipMemcpyDeviceToHost, stream);
@@ -2323,13 +2398,16 @@ namespace llaminar2
         }
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
-        host_result.router_logits.resize(bufs.logits_count);
-        err = hipMemcpyAsync(host_result.router_logits.data(), bufs.d_logits,
-                             bufs.logits_count * sizeof(float), hipMemcpyDeviceToHost, stream);
-        if (err != hipSuccess)
+        if (!capture_active)
         {
-            LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2H snapshot logits failed: " << hipGetErrorString(err));
-            return false;
+            host_result.router_logits.resize(bufs.logits_count);
+            err = hipMemcpyAsync(host_result.router_logits.data(), bufs.d_logits,
+                                 bufs.logits_count * sizeof(float), hipMemcpyDeviceToHost, stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2H snapshot logits failed: " << hipGetErrorString(err));
+                return false;
+            }
         }
 #endif
 
@@ -2355,8 +2433,9 @@ namespace llaminar2
         }
         else
         {
-            output_indices->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            output_weights->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            const auto device = DeviceId::rocm(device_ordinal_);
+            markDeviceWritten(output_indices, device, getStream());
+            markDeviceWritten(output_weights, device, getStream());
         }
 
         return true;
@@ -2716,6 +2795,13 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "sharedExpertGateFromTensors"))
             return;
 
+        void *stream = getStream();
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!ensureTensorOnDevice(input, device, stream, "input", "sharedExpertGateFromTensors") ||
+            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateFromTensors") ||
+            !ensureTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateFromTensors"))
+            return;
+
         const float *in = static_cast<const float *>(input->gpu_data_ptr());
         const float *gi = static_cast<const float *>(gate_inp->gpu_data_ptr());
         float *so = static_cast<float *>(shared_output->gpu_data_ptr());
@@ -2727,8 +2813,7 @@ namespace llaminar2
         }
 
         sharedExpertGate(in, gi, so, seq_len, d_model);
-        shared_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                    DeviceId::rocm(device_ordinal_));
+        markDeviceWritten(shared_output, device, stream);
     }
 
     void ROCmMoEKernel::swiGLUFromTensors(ITensor *gate, ITensor *up, int count)

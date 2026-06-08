@@ -43,6 +43,11 @@ TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPGreedyMatchesPyTorchDecodeTokens)
     runMoEMTPParity(QWEN36_MOE_PREFIX_MTP_CASE(), false);
 }
 
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPStochasticSamplingVerifierRuns)
+{
+    runMoEStochasticMTPVerifierParity(QWEN36_MOE_PREFIX_MTP_CASE());
+}
+
 TEST(QWEN36_MOE_PREFIX_MTP_SUITE, PrefixCacheMTPRestore)
 {
     runMoEMTPParity(QWEN36_MOE_PREFIX_MTP_CASE(), true);

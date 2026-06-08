@@ -22,11 +22,11 @@ RAG rules:
 | CPU | Dense 27B | greedy | Amber | yes | not refreshed | CPU state publication/bench gap |
 | CPU | Dense 27B | stochastic | Amber | yes | not refreshed | host verifier is correct, speed unmeasured |
 | CUDA | MoE 35B | greedy | Amber | yes | 118.07 vs 131.92 tok/s, 0.90x | low acceptance, verifier replay |
-| CUDA | MoE 35B | stochastic | Red | missing | none | no MoE stochastic parity/bench lane |
+| CUDA | MoE 35B | stochastic | Amber | yes | not refreshed | benchmark lane missing |
 | ROCm | MoE 35B | greedy | Amber | yes | not refreshed | needs full parity/benchmark refresh |
-| ROCm | MoE 35B | stochastic | Red | fails | none | ROCm MoE prefill plus no stochastic lane |
+| ROCm | MoE 35B | stochastic | Amber | yes | not refreshed | benchmark lane missing |
 | CPU | MoE 35B | greedy | Amber | partial | not refreshed | vLLM-style CPU publication/bench gap |
-| CPU | MoE 35B | stochastic | Red | missing | not refreshed | no accepted stochastic MoE CPU lane |
+| CPU | MoE 35B | stochastic | Amber | yes | not refreshed | benchmark lane missing |
 
 ## Latest Evidence
 
@@ -46,9 +46,10 @@ RAG rules:
   `benchmark_results/dense_phase138/20260608T124752Z-postcleanup-cuda-rocm-assessment/`.
 - CUDA MoE fresh runs:
   `benchmark_results/moe_phase138/20260608T_dashboard_moe_greedy/`.
-- ROCm MoE greedy moved off the workspace hard-fail: focused
-  `Qwen36MoEROCmSingleDevicePrefixMTPParity_MTPGreedyMatchesPyTorchDecodeTokens`
-  passed in 210.03s after grouped-prefill workspace sizing was fixed.
+- ROCm MoE moved off the workspace hard-fail/crash path. Root causes fixed:
+  grouped-prefill workspace sizing, singleton MoE scratch ABA after runner
+  rebuilds, and ROCm shared-expert gate wrappers not ensuring device residency
+  on an explicit HIP stream.
 - Dense stochastic profiler: CUDA `decode_equivalent_stochastic_forward_one`
   23.06 ms/call; ROCm 33.39 ms/call. This is the shared reason dense MTP is
   not fast.
@@ -58,9 +59,10 @@ RAG rules:
   each backend exposes the same 18 Qwen3.6 Prefix+MTP tests. Latest stochastic
   verifier gate passed for all three:
   ROCm 26.83s, CUDA 25.74s, CPU 83.40s.
-- MoE Prefix+MTP parity discovery is also symmetric for shared behavior:
-  CPU/CUDA/ROCm each expose the same 14 Qwen3.6 MoE SingleDevice cases.
-  CUDA keeps 2 extra path guards for CUDA-specific fused/grouped kernels.
+- MoE Prefix+MTP parity is symmetric for shared behavior: CPU/CUDA/ROCm each
+  expose the same 15 Qwen3.6 MoE SingleDevice cases. Latest stochastic verifier
+  gate passed in one command: CPU 37.44s, ROCm 20.91s, CUDA 17.77s. CUDA keeps
+  2 extra path guards for CUDA-specific fused/grouped kernels.
 
 ## Target Anchors
 
@@ -74,9 +76,8 @@ llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
 
 ## Next Dashboard Updates
 
-1. Fix ROCm MoE workspace binding and refresh ROCm MoE no-MTP/greedy cells.
-2. Add accepted MoE stochastic parity/benchmark cells for CUDA, ROCm, and CPU.
-3. Refresh dense greedy/stochastic cells on CUDA/ROCm/CPU with the vLLM-style
+1. Refresh ROCm MoE no-MTP/greedy/stochastic benchmark cells.
+2. Refresh dense greedy/stochastic cells on CUDA/ROCm/CPU with the vLLM-style
    publication path and host/device stochastic verifier coverage.
-4. Re-run the full iteration gate from `MTP_VLLM_STYLE_PROJECT_PLAN.md` before
+3. Re-run the full iteration gate from `MTP_VLLM_STYLE_PROJECT_PLAN.md` before
    any WiP commit.

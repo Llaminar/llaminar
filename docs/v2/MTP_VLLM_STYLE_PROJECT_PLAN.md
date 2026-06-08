@@ -126,8 +126,13 @@ Done:
   host for the decode-equivalent verifier path, while GPUs still hard-fail
   without device-resident stochastic verification.
 - MoE CPU/CUDA/ROCm SingleDevice Prefix+MTP parity now shares one declarative
-  14-case test surface for backend-neutral behavior; CUDA-only fused/grouped
-  kernel assertions live in a separate path-guard suite.
+  15-case test surface for backend-neutral behavior, including stochastic
+  verifier reuse after `clearCache()`; CUDA-only fused/grouped kernel assertions
+  live in a separate path-guard suite.
+- ROCm MoE stochastic parity no longer crashes or diverges after runner reuse.
+  The fixed root causes were stale singleton MoE scratch bindings across
+  workspace-manager ABA and ROCm shared-expert gate wrappers reading host-only
+  gate tensors without ensuring device residency on the explicit HIP stream.
 - CUDA MoE greedy has parity/style coverage.
 - The dead verifier-row publication hooks and tests were removed.
 
@@ -141,10 +146,10 @@ Open gaps:
 - GDN/short-conv speculative-slot publication is available through verifier row
   capture hooks, but hybrid/GDN models still require decode-equivalent replay
   until dedicated parity proves the captured-state path.
-- ROCm MoE grouped-prefill workspace sizing is fixed for the focused
-  SingleDevice greedy MTP parity lane; the full ROCm MoE parity/benchmark
-  refresh is still pending.
-- MoE stochastic parity and benchmark lanes do not exist.
+- ROCm MoE grouped-prefill workspace sizing/binding is fixed for focused
+  SingleDevice greedy and stochastic MTP parity lanes; the benchmark refresh is
+  still pending.
+- MoE stochastic benchmark lanes do not exist.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE acceptance regressed in fresh runs and must be explained.
 - Dense CUDA/ROCm real-model MTP parity and benchmark refresh still needs to run
@@ -243,8 +248,9 @@ This must cover, as applicable:
 - Dense CUDA/ROCm GPU graph smokes.
 - MoE CPU/CUDA/ROCm layer-by-layer math prefill/decode parity.
 - MoE CUDA greedy MTP parity/style tests.
-- ROCm MoE ExpertOverlay parity until SingleDevice ROCm MoE is repaired.
-- New MoE stochastic parity tests once implemented.
+- MoE CPU/CUDA/ROCm stochastic verifier parity and deterministic reuse after
+  `clearCache()`.
+- ROCm MoE ExpertOverlay parity remains separate from SingleDevice acceptance.
 
 ### Benchmark Gate
 

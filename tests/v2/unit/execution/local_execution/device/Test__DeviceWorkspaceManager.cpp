@@ -126,6 +126,17 @@ TEST_F(Test__DeviceWorkspaceManager, ConstructionWithZeroBudget)
     EXPECT_FALSE(mgr.isAllocated());
 }
 
+TEST_F(Test__DeviceWorkspaceManager, ManagerIdsAreUniqueAcrossInstances)
+{
+    DeviceWorkspaceManager first(device, budget);
+    DeviceWorkspaceManager second(device, budget);
+
+    EXPECT_NE(first.id(), 0u);
+    EXPECT_NE(second.id(), 0u);
+    EXPECT_NE(first.id(), second.id())
+        << "Kernel workspace scratch caches depend on manager identity, not just host pointer equality";
+}
+
 // ============================================================================
 // Simple Allocation Tests
 // ============================================================================

@@ -15,19 +15,27 @@
 #include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 
 namespace llaminar2
 {
+    namespace
+    {
+        std::atomic<uint64_t> g_next_workspace_manager_id{1};
+    }
 
     // =========================================================================
     // Construction / Destruction
     // =========================================================================
 
     DeviceWorkspaceManager::DeviceWorkspaceManager(DeviceId device, size_t budget_bytes)
-        : device_(device), budget_bytes_(budget_bytes)
+        : device_(device),
+          id_(g_next_workspace_manager_id.fetch_add(1, std::memory_order_relaxed)),
+          budget_bytes_(budget_bytes)
     {
         LOG_DEBUG("[DeviceWorkspaceManager] Created for device " << device_.to_string()
+                                                                 << " id=" << id_
                                                                  << " with budget " << budget_bytes_ << " bytes");
     }
 

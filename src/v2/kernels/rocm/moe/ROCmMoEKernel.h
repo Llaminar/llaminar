@@ -538,6 +538,7 @@ namespace llaminar2
         int prefill_intermediate_cap_ = 0;    ///< Current intermediate capacity
 
         bool scratch_workspace_bound_ = false;
+        uint64_t bound_workspace_id_ = 0;
 
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
     };

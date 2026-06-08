@@ -1028,6 +1028,166 @@ namespace llaminar2::test::parity::qwen36
         }
     }
 
+    inline void runMoEStochasticMTPVerifierParity(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        ScopedMoEParityDeterministicMode deterministic_mode(
+            shouldUseMoEParityDeterministicMode(test_case));
+        ASSERT_EQ(test_case.topology, MoEPrefixParityTopology::SingleDevice)
+            << "MoE stochastic MTP verifier parity is currently single-device only";
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        auto phase_start = parityPhaseStart();
+        loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
+        logMoEParityPhase(test_case, "stochastic-reference-inputs", phase_start);
+
+        constexpr int block_size = 2;
+        const int stochastic_decode_steps = std::max(2, test_case.decode_steps);
+        auto factory = createOrchestrationRunnerFactory();
+
+        SamplingParams stochastic;
+        stochastic.temperature = 0.6f;
+        stochastic.top_k = 20;
+        stochastic.top_p = 0.95f;
+        stochastic.presence_penalty = 0.25f;
+        stochastic.seed = 123;
+
+        auto baseline_config =
+            makeMoEPrefixRestoreConfig(test_case, model_path, false, block_size, false);
+        auto baseline = factory->createFromOrchestrationConfig(baseline_config);
+        ASSERT_NE(baseline, nullptr);
+        phase_start = parityPhaseStart();
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        logMoEParityPhase(test_case, "stochastic-baseline.initialize", phase_start);
+        phase_start = parityPhaseStart();
+        auto baseline_result =
+            baseline->generate(prompt_tokens, stochastic_decode_steps, stochastic);
+        logMoEParityPhase(test_case, "stochastic-baseline.generate", phase_start);
+        const auto baseline_snapshot = baseline->prefixStateProbe();
+        baseline->shutdown();
+
+        ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
+        ASSERT_EQ(baseline_result.tokens.size(),
+                  static_cast<size_t>(stochastic_decode_steps));
+        EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
+        EXPECT_EQ(baseline_snapshot.mtp_stochastic_accept_tests, 0u);
+
+        auto mtp_config =
+            makeMoEPrefixRestoreConfig(test_case, model_path, false, block_size, true, 1);
+        mtp_config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+
+        auto mtp = factory->createFromOrchestrationConfig(mtp_config);
+        ASSERT_NE(mtp, nullptr);
+        phase_start = parityPhaseStart();
+        ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+        logMoEParityPhase(test_case, "stochastic-mtp.initialize", phase_start);
+
+        PerfStatsCollector::reset();
+        ASSERT_TRUE(PerfStatsCollector::isEnabled())
+            << "MoE stochastic MTP verifier parity requires perf stats";
+        phase_start = parityPhaseStart();
+        auto mtp_result =
+            mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
+        logMoEParityPhase(test_case, "stochastic-mtp.first-generate", phase_start);
+        ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
+        ASSERT_EQ(mtp_result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
+
+        mtp->clearCache();
+        PerfStatsCollector::reset();
+        phase_start = parityPhaseStart();
+        auto reused_mtp_result =
+            mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
+        logMoEParityPhase(test_case, "stochastic-mtp.reused-generate", phase_start);
+        const auto after_reused_mtp = mtp->prefixStateProbe();
+        const auto phase138_records = PerfStatsCollector::snapshot({"mtp"});
+        mtp->shutdown();
+
+        ASSERT_TRUE(reused_mtp_result.error.empty()) << reused_mtp_result.error;
+        ASSERT_EQ(reused_mtp_result.tokens.size(), mtp_result.tokens.size());
+        EXPECT_EQ(reused_mtp_result.tokens, mtp_result.tokens)
+            << "MoE stochastic MTP with the same seed must be reproducible after clearCache()";
+        EXPECT_FALSE(after_reused_mtp.mtp_bypassed)
+            << after_reused_mtp.mtp_bypass_reason;
+        EXPECT_EQ(after_reused_mtp.mtp_request.verify_mode, "speculative-sampling");
+        EXPECT_TRUE(after_reused_mtp.mtp_request.stochastic_verify);
+        EXPECT_EQ(after_reused_mtp.mtp_transaction_validation_failures, 0u)
+            << test_case.name
+            << " MoE stochastic MTP hit MTP transaction validation failures";
+        EXPECT_GE(after_reused_mtp.mtp_draft_steps, 1u);
+        EXPECT_GE(after_reused_mtp.mtp_verifier_runs, 1u);
+        EXPECT_GE(after_reused_mtp.mtp_verifier_token_count, 2u);
+        EXPECT_GE(after_reused_mtp.mtp_stochastic_accept_tests, 1u);
+        EXPECT_EQ(after_reused_mtp.mtp_stochastic_accept_tests,
+                  after_reused_mtp.mtp_stochastic_accepts +
+                      after_reused_mtp.mtp_stochastic_residual_samples);
+        EXPECT_GE(after_reused_mtp.mtp_stochastic_residual_samples +
+                      after_reused_mtp.mtp_stochastic_terminal_samples,
+                  1u);
+        EXPECT_EQ(after_reused_mtp.mtp_request.stochastic_accept_tests,
+                  after_reused_mtp.mtp_stochastic_accept_tests);
+        EXPECT_EQ(after_reused_mtp.mtp_request.stochastic_accepts,
+                  after_reused_mtp.mtp_stochastic_accepts);
+        EXPECT_EQ(after_reused_mtp.mtp_request.stochastic_residual_samples,
+                  after_reused_mtp.mtp_stochastic_residual_samples);
+        EXPECT_EQ(after_reused_mtp.mtp_request.stochastic_terminal_samples,
+                  after_reused_mtp.mtp_stochastic_terminal_samples);
+        EXPECT_GE(after_reused_mtp.mtp_request.stochastic_acceptance_rate, 0.0);
+        EXPECT_LE(after_reused_mtp.mtp_request.stochastic_acceptance_rate, 1.0);
+        if (after_reused_mtp.mtp_stochastic_accept_tests > 0)
+        {
+            const double expected_rate =
+                static_cast<double>(after_reused_mtp.mtp_stochastic_accepts) /
+                static_cast<double>(after_reused_mtp.mtp_stochastic_accept_tests);
+            EXPECT_NEAR(after_reused_mtp.mtp_request.stochastic_acceptance_rate,
+                        expected_rate,
+                        1e-12);
+        }
+
+        const bool used_decode_equivalent_stochastic_verifier =
+            std::any_of(
+                phase138_records.begin(),
+                phase138_records.end(),
+                [](const PerfStatRecord &record)
+                {
+                    return record.kind == PerfStatRecord::Kind::Counter &&
+                           record.domain == "mtp" &&
+                           record.name == "decode_equivalent_stochastic_verifier_runs";
+                });
+        EXPECT_TRUE(used_decode_equivalent_stochastic_verifier)
+            << "Stateful Qwen3.6 MoE stochastic MTP parity must exercise the "
+               "decode-equivalent verifier path until vLLM-style MoE state "
+               "publication is accepted\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+
+        const bool used_retired_phase138_stochastic_candidate =
+            std::any_of(
+                phase138_records.begin(),
+                phase138_records.end(),
+                [](const PerfStatRecord &record)
+                {
+                    return record.kind == PerfStatRecord::Kind::Counter &&
+                           record.domain == "mtp" &&
+                           record.name == "phase138_stochastic_spec_decode_runs";
+                });
+        EXPECT_FALSE(used_retired_phase138_stochastic_candidate)
+            << "Stateful Qwen3.6 MoE stochastic MTP must not use the retired "
+               "accepted-count publication candidate\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+    }
+
     inline void runMoEGreedyFreshRunnerDeterminism(
         const MoEPrefixRestoreParityCase &test_case)
     {
