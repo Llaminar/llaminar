@@ -4914,7 +4914,7 @@ namespace llaminar2
                 *verifier_graph->graph,
                 state_.device_id,
                 stream,
-                /*require_captured_stage=*/requiresMTPDecodeEquivalentVerifierReplay());
+                /*require_captured_stage=*/mtpSpecStatePublicationRequiresCapturedStage());
         if (!result.ok)
         {
             return fail(result.error);
@@ -7603,7 +7603,7 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::requiresMTPDecodeEquivalentVerifierReplay() const
+    bool DeviceGraphOrchestrator::mtpSpecStatePublicationRequiresCapturedStage() const
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled || !state_.kv_cache)
         {
@@ -7624,6 +7624,12 @@ namespace llaminar2
             }
         }
         return false;
+    }
+
+    bool DeviceGraphOrchestrator::requiresMTPDecodeEquivalentVerifierReplay() const
+    {
+        return mtpSpecStatePublicationRequiresCapturedStage() &&
+               !supportsMTPSpecStatePublication();
     }
 
     int DeviceGraphOrchestrator::sampleGreedyOnDevice()

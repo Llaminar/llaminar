@@ -113,7 +113,11 @@ Done:
   maps verifier rows to draft tokens, marks the accepted state publication
   prefix, and isolates rejected correction replay.
 - Greedy and stochastic all-position publication have focused runner unit
-  coverage for accept-all and reject-with-correction-replay cases.
+  coverage for accept-all and reject-with-correction-replay cases. The runner
+  now commits the first shifted MTP KV row before the all-position verifier and
+  commits any additional accepted verifier prefix rows before state publication,
+  so `MTPSpecKVPublisher` remains an invariant checker/truncater rather than a
+  hidden state synthesizer.
 - Request/session reset now invalidates request-scoped prefill graph captures
   with `PrefillGraphRejectReason::SessionReset`, fixing CUDA reused-runner
   no-MTP determinism after `clearCache()` without relying on logits gather.
@@ -133,13 +137,15 @@ Done:
   The fixed root causes were stale singleton MoE scratch bindings across
   workspace-manager ABA and ROCm shared-expert gate wrappers reading host-only
   gate tensors without ensuring device residency on the explicit HIP stream.
+- CUDA and ROCm dense/MoE stochastic verifier parity now pass on the same
+  all-position state-publication path.
 - CUDA MoE greedy has parity/style coverage.
 - The dead verifier-row publication hooks and tests were removed.
 
 Open gaps:
 
-- Real-model dense CUDA/ROCm/CPU runs have not yet refreshed after enabling the
-  greedy accepted-count publication path.
+- Real-model dense CUDA/ROCm/CPU benchmarks have not yet refreshed after
+  enabling the all-position accepted-count publication path.
 - CPU stochastic accepted-count publication is not yet implemented; CPU
   stochastic currently proves correctness through the decode-equivalent host
   verifier path and still needs speed evidence.
@@ -147,9 +153,13 @@ Open gaps:
   capture hooks, but hybrid/GDN models still require decode-equivalent replay
   until dedicated parity proves the captured-state path.
 - ROCm MoE grouped-prefill workspace sizing/binding is fixed for focused
-  SingleDevice greedy and stochastic MTP parity lanes; the benchmark refresh is
-  still pending.
-- MoE stochastic benchmark lanes do not exist.
+  SingleDevice greedy and stochastic MTP parity lanes. Fresh real-model
+  benchmarks are speed-negative: greedy d1 is 68.09 vs 76.23 tok/s, stochastic
+  d1 is 52.57 vs 76.23 tok/s. Profiles point at verifier/catch-up replay and
+  stochastic sampler overhead, not sidecar generation. The ROCm MoE
+  stage-breakdown parity lane passes but currently takes about 341s, so it is a
+  performance/test-duration anomaly to reduce.
+- CUDA and CPU MoE stochastic benchmark lanes still need fresh runs.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE acceptance regressed in fresh runs and must be explained.
 - Dense CUDA/ROCm real-model MTP parity and benchmark refresh still needs to run
@@ -194,6 +204,8 @@ Open gaps:
 - Ensure shared/routed expert paths, routing metadata, and expert workspaces are
   graph-native and workspace-declared.
 - Investigate CUDA MoE acceptance regression against old 90%+ captures.
+- Remove the remaining MoE decode-equivalent verifier/catch-up replay cost from
+  CUDA and ROCm before marking MoE MTP speed accepted.
 
 ### Phase E: Benchmark Acceptance
 

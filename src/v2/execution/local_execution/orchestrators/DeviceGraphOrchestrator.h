@@ -2320,6 +2320,7 @@ namespace llaminar2
         mutable std::vector<LiveHybridCheckpointStorageSlot> live_hybrid_checkpoint_storage_pool_;
         bool ensurePrefixCacheReady();
         bool isPrefixCacheMoEModel() const;
+        bool mtpSpecStatePublicationRequiresCapturedStage() const;
         void *explicitGPUStreamForOperation(const char *operation) const;
         void handleLivePrefixReplayStateAfterMutation(
             const char *operation,

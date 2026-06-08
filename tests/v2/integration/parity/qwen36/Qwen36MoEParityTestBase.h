@@ -1156,32 +1156,49 @@ namespace llaminar2::test::parity::qwen36
                         1e-12);
         }
 
-        const bool used_decode_equivalent_stochastic_verifier =
-            std::any_of(
+        auto has_mtp_counter =
+            [&](const char *name) -> bool
+        {
+            return std::any_of(
                 phase138_records.begin(),
                 phase138_records.end(),
-                [](const PerfStatRecord &record)
+                [&](const PerfStatRecord &record)
                 {
                     return record.kind == PerfStatRecord::Kind::Counter &&
                            record.domain == "mtp" &&
-                           record.name == "decode_equivalent_stochastic_verifier_runs";
+                           record.name == name;
                 });
-        EXPECT_TRUE(used_decode_equivalent_stochastic_verifier)
-            << "Stateful Qwen3.6 MoE stochastic MTP parity must exercise the "
-               "decode-equivalent verifier path until vLLM-style MoE state "
-               "publication is accepted\n"
-            << PerfStatsCollector::summaryString({"mtp"});
+        };
+        const bool gpu_case =
+            test_case.required_cuda_devices > 0 ||
+            test_case.required_rocm_devices > 0;
+        const bool used_decode_equivalent_stochastic_verifier =
+            has_mtp_counter("decode_equivalent_stochastic_verifier_runs");
+        const bool used_all_position_publication =
+            has_mtp_counter("all_position_state_publication_verifier_runs") &&
+            has_mtp_counter("spec_state_publications");
+        if (gpu_case)
+        {
+            EXPECT_TRUE(used_all_position_publication)
+                << "GPU Qwen3.6 MoE stochastic MTP must exercise vLLM-style "
+                   "all-position state publication\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
+                << "GPU Qwen3.6 MoE stochastic MTP must not fall back to the "
+                   "decode-equivalent stochastic verifier once publication is "
+                   "available\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+        }
+        else
+        {
+            EXPECT_TRUE(used_decode_equivalent_stochastic_verifier)
+                << "CPU Qwen3.6 MoE stochastic MTP still uses the host "
+                   "decode-equivalent verifier until CPU state publication lands\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+        }
 
         const bool used_retired_phase138_stochastic_candidate =
-            std::any_of(
-                phase138_records.begin(),
-                phase138_records.end(),
-                [](const PerfStatRecord &record)
-                {
-                    return record.kind == PerfStatRecord::Kind::Counter &&
-                           record.domain == "mtp" &&
-                           record.name == "phase138_stochastic_spec_decode_runs";
-                });
+            has_mtp_counter("phase138_stochastic_spec_decode_runs");
         EXPECT_FALSE(used_retired_phase138_stochastic_candidate)
             << "Stateful Qwen3.6 MoE stochastic MTP must not use the retired "
                "accepted-count publication candidate\n"

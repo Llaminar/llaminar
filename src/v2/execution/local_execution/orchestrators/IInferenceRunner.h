@@ -226,9 +226,10 @@ namespace llaminar2
          *
          * Stateful architectures such as hybrid GDN may produce all-position
          * verifier logits whose token rows look plausible while the final
-         * recurrent/conv state is not byte-for-byte decode-equivalent. Returning
-         * true makes the MTP runner use the common sequential verifier replay
-         * path instead of the batched all-position verifier for greedy decode.
+         * recurrent/conv state is not byte-for-byte decode-equivalent unless
+         * verifier-row state is explicitly published. Returning true means the
+         * runner needs the common sequential verifier replay path when it does
+         * not also advertise supportsMTPSpecStatePublication().
          */
         virtual bool requiresMTPDecodeEquivalentVerifierReplay() const { return false; }
 

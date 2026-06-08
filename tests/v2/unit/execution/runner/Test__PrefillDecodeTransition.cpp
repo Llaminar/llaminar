@@ -2234,6 +2234,7 @@ namespace
                 /*mtp_draft_tokens=*/2,
                 /*chained_mtp_support=*/true);
             mock->enableMTPSidecarPreservesMainState();
+            mock->requireMTPDecodeEquivalentReplay();
             mock->enableMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({2});
 
@@ -2252,7 +2253,16 @@ namespace
             EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
             EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 3);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1)
+                << "the first shifted MTP row is committed from terminal hidden before the all-position verifier";
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 2)
+                << "accepted verifier hidden rows should fill the shifted prefix without sequential verifier replay";
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 3);
+            EXPECT_THAT(mock->lastCommitMTPTokens(),
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
             EXPECT_EQ(mock->restoreCount(), 0);
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
                 << "only the all-position verifier graph should run on the main path";
@@ -2330,8 +2340,8 @@ namespace
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1)
-                << "only the rejected correction suffix should be replayed";
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2)
+                << "the first shifted row is committed before the verifier, then only the rejected correction suffix is replayed";
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
                         ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
@@ -2399,6 +2409,7 @@ namespace
                 MTPVerifyMode::SpeculativeSampling);
             mock->enableStochasticDeviceSampling();
             mock->enableMTPSidecarPreservesMainState();
+            mock->requireMTPDecodeEquivalentReplay();
             mock->enableMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({1});
 
@@ -2422,7 +2433,12 @@ namespace
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1)
+                << "the first shifted MTP row is committed before the stochastic all-position verifier";
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 2)
+                << "the accepted stochastic verifier row should fill the shifted prefix without replay";
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 2);
             EXPECT_EQ(mock->restoreCount(), 0);
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1);
             EXPECT_EQ(mock->deviceDistributionBuildCount(), 4)
@@ -2511,7 +2527,7 @@ namespace
 
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 2)
                 << "all-position verifier plus one residual correction replay";

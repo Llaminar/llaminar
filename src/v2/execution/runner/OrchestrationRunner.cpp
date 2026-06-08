@@ -1569,7 +1569,6 @@ namespace llaminar2
             active_sampling_params_.has_penalties() && !stochastic_verify;
         const bool supports_all_position_state_publication =
             runner_->supportsMTPSpecStatePublication() &&
-            !runner_->requiresMTPDecodeEquivalentVerifierReplay() &&
             (!stochastic_verify || stochastic_device_verify);
         const MTPVerifierPolicyDecision verifier_policy =
             chooseMTPVerifierPolicy(
@@ -2498,6 +2497,37 @@ namespace llaminar2
                     "All-position MTP verifier could not restore verifier base checkpoint after sidecar draft");
             }
 
+            const bool first_token_is_stop =
+                std::find(stop_tokens_.begin(),
+                          stop_tokens_.end(),
+                          first_token) != stop_tokens_.end();
+            if (!first_token_is_stop)
+            {
+                bool shifted_commit_ok = false;
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "all_position_initial_shifted_commit",
+                        "decode");
+                    shifted_commit_ok =
+                        runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
+                            first_token,
+                            /*already_appended_tokens=*/0,
+                            /*allow_speculative_discard=*/true,
+                            base_sidecar_position);
+                }
+                if (!shifted_commit_ok)
+                {
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier initial shifted-cache commit failed");
+                }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "all_position_initial_shifted_commits",
+                    1.0,
+                    "decode");
+            }
+
             std::vector<int32_t> sampled_verifier_rows(draft_tokens.size(), -1);
             {
                 PerfStatsCollector::ScopedTimer verifier_timer(
@@ -2778,6 +2808,42 @@ namespace llaminar2
             }
 
             const MTPSpecStepPlan &step = step_plans.steps.front();
+            const int accepted_state_count = std::max(0, step.accepted_count);
+            if (!first_token_is_stop && accepted_state_count > 1)
+            {
+                if (accepted_state_count >
+                    static_cast<int>(catchup.accepted_tokens.size()))
+                {
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier accepted-state publication exceeds committed outputs");
+                }
+                bool shifted_catchup_ok = false;
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "all_position_shifted_prefix_commit",
+                        "decode");
+                    shifted_catchup_ok =
+                        runner_->commitMTPShiftedRowsFromPartialForward(
+                            catchup.accepted_tokens.data(),
+                            accepted_state_count,
+                            /*already_appended_tokens=*/1,
+                            catchup.main_forward_token_count,
+                            /*allow_speculative_discard=*/true,
+                            base_sidecar_position);
+                }
+                if (!shifted_catchup_ok)
+                {
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier shifted-cache accepted-prefix commit failed");
+                }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "all_position_shifted_prefix_commits",
+                    static_cast<double>(accepted_state_count - 1),
+                    "decode");
+            }
+
             std::string publication_error;
             {
                 PerfStatsCollector::ScopedTimer timer(
