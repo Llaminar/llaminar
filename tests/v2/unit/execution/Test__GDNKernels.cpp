@@ -35,13 +35,14 @@
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "execution/compute_stages/IComputeStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/cache/HybridCacheManager.h"
+#include "backends/BackendManager.h"
 #include "kernels/cpu/gdn/CPUShortConvolution.h"
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
 #include "../../mocks/MockComputeStage.h"
 #ifdef HAVE_ROCM
-#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/rocm/ROCmWeightPacker.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
@@ -67,6 +68,12 @@ namespace
     std::unique_ptr<IDeviceContext> makeCPUContext()
     {
         return std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 1);
+    }
+
+    void ensureCPUBackendForWorkspace()
+    {
+        if (!hasCPUBackend())
+            initCPUBackend(-1);
     }
 
     // Helper: create FP32 tensor with given data
@@ -848,6 +855,92 @@ TEST(Test__GDNKernels, RecurrenceStageResetClearsStaleSpeculativeStateBinding)
     EXPECT_EQ(kernel.speculative_bind_calls, 1);
     EXPECT_EQ(kernel.speculative_workspace, nullptr);
     EXPECT_EQ(kernel.speculative_state_size, 32);
+}
+
+TEST(Test__GDNKernels, ShortConvGraphReplayRebindsVerifierWorkspaceAfterSharedKernelClear)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingShortConvolution kernel;
+
+    ShortConv1dStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cpu();
+    verifier_p.seq_len = 2;
+    verifier_p.channels = 16;
+    verifier_p.kernel_size = 4;
+    verifier_p.verifier_state_capture_rows = 2;
+    verifier_p.kernel = &kernel;
+
+    ShortConv1dStage verifier_stage(verifier_p);
+    WorkspaceRequirements reqs = verifier_stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(reqs.has_required_buffers());
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    verifier_stage.bindWorkspace(&workspace);
+    float *verifier_capture = kernel.capture_workspace;
+    ASSERT_NE(verifier_capture, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 48);
+    EXPECT_TRUE(verifier_stage.needsOnGraphReplayed());
+
+    ShortConv1dStage::Params normal_p = verifier_p;
+    normal_p.verifier_state_capture_rows = 0;
+    ShortConv1dStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+    ASSERT_EQ(kernel.capture_rows, 0);
+
+    verifier_stage.onGraphReplayed();
+    EXPECT_EQ(kernel.capture_workspace, verifier_capture)
+        << "Verifier graph replay must restore the shared kernel capture binding before MTP publication";
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 48);
+}
+
+TEST(Test__GDNKernels, RecurrenceGraphReplayRebindsVerifierWorkspaceAfterSharedKernelClear)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingGatedDeltaNet kernel;
+
+    GDNRecurrenceStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cpu();
+    verifier_p.seq_len = 2;
+    verifier_p.n_heads = 2;
+    verifier_p.n_k_heads = 2;
+    verifier_p.d_k = 4;
+    verifier_p.d_v = 4;
+    verifier_p.verifier_state_capture_rows = 2;
+    verifier_p.kernel = &kernel;
+
+    GDNRecurrenceStage verifier_stage(verifier_p);
+    WorkspaceRequirements reqs = verifier_stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(reqs.has_required_buffers());
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    verifier_stage.bindWorkspace(&workspace);
+    float *verifier_capture = kernel.capture_workspace;
+    ASSERT_NE(verifier_capture, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_TRUE(verifier_stage.needsOnGraphReplayed());
+
+    GDNRecurrenceStage::Params normal_p = verifier_p;
+    normal_p.verifier_state_capture_rows = 0;
+    GDNRecurrenceStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+    ASSERT_EQ(kernel.capture_rows, 0);
+
+    verifier_stage.onGraphReplayed();
+    EXPECT_EQ(kernel.capture_workspace, verifier_capture)
+        << "Verifier graph replay must restore the shared kernel capture binding before MTP publication";
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 32);
 }
 
 TEST(Test__GDNKernels, Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKernelDispatch)

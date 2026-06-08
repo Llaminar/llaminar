@@ -143,6 +143,10 @@ Done:
   gate tensors without ensuring device residency on the explicit HIP stream.
 - CUDA and ROCm dense/MoE stochastic verifier parity now pass on the same
   all-position state-publication path.
+- ShortConv1d and GDN recurrence stages now refresh their shared-kernel
+  verifier workspace bindings from `onGraphReplayed()`, so captured verifier
+  graph replay can publish accepted rows after normal/correction graphs have
+  cleared stale bindings. `V2_Unit_GDNKernels` covers this regression.
 - Fresh dense GPU release benchmarks prove the accepted-count path is
   speed-positive for greedy on both CUDA and ROCm: CUDA d1 is 56.91 vs 43.82
   tok/s and ROCm d1 is 41.44 vs 30.19 tok/s. Refreshed long seeded stochastic
@@ -160,8 +164,8 @@ Open gaps:
   stochastic currently proves correctness through the decode-equivalent host
   verifier path and still needs speed evidence.
 - GDN/short-conv speculative-slot publication is available through verifier row
-  capture hooks, but hybrid/GDN models still require decode-equivalent replay
-  until dedicated parity proves the captured-state path.
+  capture hooks and is now used by the GPU all-position publication path; CPU
+  publication and broader benchmark evidence still need to catch up.
 - ROCm MoE grouped-prefill workspace sizing/binding is fixed for focused
   SingleDevice greedy and stochastic MTP parity lanes. Fresh real-model
   benchmarks are speed-negative: greedy d1 is 68.09 vs 76.23 tok/s, stochastic
@@ -169,9 +173,16 @@ Open gaps:
   stochastic sampler overhead, not sidecar generation. The ROCm MoE
   stage-breakdown parity lane passes but currently takes about 341s, so it is a
   performance/test-duration anomaly to reduce.
-- CUDA and CPU MoE stochastic benchmark lanes still need fresh runs.
+- CUDA MoE has fresh release evidence after verifier replay rebinding:
+  baseline 132.95 tok/s, greedy d1 113.08 tok/s at 85.94% acceptance, and
+  stochastic d1 seed123 99.50 tok/s at 64.06% acceptance. Perf counters show
+  `main_verifier` now reaches graph replay, so the remaining blocker is true
+  verifier/catch-up cost and stochastic acceptance, not replay warmup churn.
+- CPU MoE stochastic benchmark lane still needs a fresh run.
 - CPU vLLM-style state publication is not implemented or benchmarked.
-- CUDA MoE acceptance regressed in fresh runs and must be explained.
+- CUDA MoE MTP is still speed-negative and must reduce verifier/catch-up cost
+  before acceptance. Stochastic also needs acceptance-policy tuning or depth
+  policy integration for the default prompt class.
 - CUDA and ROCm dense stochastic MTP now match acceptance under the same seed,
   but the generated token streams still differ at a few real-model samples
   while the real-logit-style sampler fixture passes. This points at full-model

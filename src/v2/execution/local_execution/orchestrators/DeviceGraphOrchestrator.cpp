@@ -4924,7 +4924,14 @@ namespace llaminar2
             state_.positions[0] = plan.target_cached_tokens;
         if (!state_.sequence_lengths.empty())
             state_.sequence_lengths[0] = plan.target_cached_tokens;
-        handleLivePrefixReplayStateAfterMutation("mtp_spec_state_publication");
+        // Publication advances live state to a verifier-captured accepted row but
+        // preserves graph topology, workspace bindings, and dynamic-param update
+        // contracts. Dropping replay state here forces every verifier pass back
+        // to warmup and prevents all-position verifier graph capture from ever
+        // amortizing.
+        handleLivePrefixReplayStateAfterMutation(
+            "mtp_spec_state_publication",
+            /*preserve_gpu_replay_state=*/true);
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -5792,7 +5799,8 @@ namespace llaminar2
             tags["sidecar_replay_state"] = "preserved";
             if (state_.device_id.is_gpu() && preserve_gpu_replay_state)
             {
-                tags["gpu_replay_preserve_reason"] = "verifier_row_restore";
+                tags["gpu_replay_preserve_reason"] =
+                    operation ? operation : "live_prefix_mutation";
             }
         }
         if (!preserve_gpu_replay_state)

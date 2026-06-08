@@ -399,6 +399,14 @@ namespace llaminar2
             stream ? stream : gpuStream());
     }
 
+    void GDNRecurrenceStage::onGraphReplayed()
+    {
+        // GDN hybrid kernels are shared by verifier, correction, and normal decode
+        // graphs. Replay bypasses execute(), so refresh the host-side kernel
+        // workspace binding before MTP publication restores a captured row.
+        bindKernelWorkspace();
+    }
+
     size_t GDNRecurrenceStage::deinterleaveScratchFloats(int seq_len) const
     {
         if (seq_len <= 0 || params_.n_heads <= 0 || params_.d_k <= 0 || params_.d_v <= 0)

@@ -117,6 +117,8 @@ namespace llaminar2
         bool supportsPaddedPrefillRealLengthContract() const override;
         bool hasVerifierStateCapture() const override;
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        void onGraphReplayed() override;
+        bool needsOnGraphReplayed() const override { return params_.kernel != nullptr; }
         // Short conv1d operates fully on-device when GPU is active — graph-capturable
         bool isGraphCapturable() const override { return true; }
 
