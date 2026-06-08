@@ -141,8 +141,9 @@ Open gaps:
 - GDN/short-conv speculative-slot publication is available through verifier row
   capture hooks, but hybrid/GDN models still require decode-equivalent replay
   until dedicated parity proves the captured-state path.
-- ROCm MoE grouped prefill currently fails because `moe_group_active_expert_ids`
-  workspace is under-bound.
+- ROCm MoE grouped-prefill workspace sizing is fixed for the focused
+  SingleDevice greedy MTP parity lane; the full ROCm MoE parity/benchmark
+  refresh is still pending.
 - MoE stochastic parity and benchmark lanes do not exist.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE acceptance regressed in fresh runs and must be explained.

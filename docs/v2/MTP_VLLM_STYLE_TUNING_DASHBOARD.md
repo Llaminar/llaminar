@@ -23,7 +23,7 @@ RAG rules:
 | CPU | Dense 27B | stochastic | Amber | yes | not refreshed | host verifier is correct, speed unmeasured |
 | CUDA | MoE 35B | greedy | Amber | yes | 118.07 vs 131.92 tok/s, 0.90x | low acceptance, verifier replay |
 | CUDA | MoE 35B | stochastic | Red | missing | none | no MoE stochastic parity/bench lane |
-| ROCm | MoE 35B | greedy | Red | fails | no-MTP/MTP fail before decode | grouped-prefill workspace binding |
+| ROCm | MoE 35B | greedy | Amber | yes | not refreshed | needs full parity/benchmark refresh |
 | ROCm | MoE 35B | stochastic | Red | fails | none | ROCm MoE prefill plus no stochastic lane |
 | CPU | MoE 35B | greedy | Amber | partial | not refreshed | vLLM-style CPU publication/bench gap |
 | CPU | MoE 35B | stochastic | Red | missing | not refreshed | no accepted stochastic MoE CPU lane |
@@ -46,9 +46,9 @@ RAG rules:
   `benchmark_results/dense_phase138/20260608T124752Z-postcleanup-cuda-rocm-assessment/`.
 - CUDA MoE fresh runs:
   `benchmark_results/moe_phase138/20260608T_dashboard_moe_greedy/`.
-- ROCm MoE current failure: `moe_group_active_expert_ids` needs 19200 bytes but
-  bound workspace is 1024 bytes in grouped prefill, before decode, with and
-  without MTP.
+- ROCm MoE greedy moved off the workspace hard-fail: focused
+  `Qwen36MoEROCmSingleDevicePrefixMTPParity_MTPGreedyMatchesPyTorchDecodeTokens`
+  passed in 210.03s after grouped-prefill workspace sizing was fixed.
 - Dense stochastic profiler: CUDA `decode_equivalent_stochastic_forward_one`
   23.06 ms/call; ROCm 33.39 ms/call. This is the shared reason dense MTP is
   not fast.
