@@ -480,6 +480,11 @@ namespace
         EXPECT_GE(counter("first_token_stochastic_device_samples"), 1.0);
         EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0);
         EXPECT_GE(counter("verifier_stochastic_device_distributions"), 2.0);
+        if (backend_name == "ROCm")
+        {
+            EXPECT_GE(counter("stochastic_topk_smallk_scratch_distribution_builds"), 2.0)
+                << "ROCm stochastic MTP must use the arena-declared small-k top-k scratch path";
+        }
         EXPECT_GE(counter("stochastic_accept_tests"), 1.0);
         EXPECT_GE(counter("transaction_validation_passes"), 1.0)
             << backend_name << " stochastic MTP must validate at least one Phase 13.8 transaction";

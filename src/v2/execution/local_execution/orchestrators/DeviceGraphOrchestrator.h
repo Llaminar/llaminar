@@ -2549,6 +2549,9 @@ namespace llaminar2
         void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [4, 256]
         void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [3, 256]
         void *stochastic_draft_probs_dev_ = nullptr;      ///< FP32 [3, 256]
+        void *stochastic_topk_partial_vals_dev_ = nullptr; ///< FP32 [partial_blocks, 32]
+        void *stochastic_topk_partial_idxs_dev_ = nullptr; ///< INT32 [partial_blocks, 32]
+        int stochastic_topk_partial_capacity_ = 0;
         void *stochastic_verify_tokens_dev_ = nullptr;    ///< INT32 [1, 4]
         void *stochastic_verify_accepted_dev_ = nullptr;  ///< INT32 [1, 4]
         void *stochastic_verify_accept_probs_dev_ = nullptr; ///< FP32 [1, 4]

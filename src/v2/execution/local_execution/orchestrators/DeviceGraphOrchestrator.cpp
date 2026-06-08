@@ -69,6 +69,11 @@ namespace llaminar2
     namespace
     {
         constexpr size_t kStochasticDistributionMaxK = 256;
+        constexpr size_t kStochasticTopKSmallKCap = 32;
+        constexpr size_t kStochasticTopKPartialBlocks = 128;
+        constexpr size_t kStochasticTopKSmallKThreads = 64;
+        constexpr size_t kStochasticTopKPartialCapacity =
+            kStochasticTopKPartialBlocks * kStochasticTopKSmallKCap;
         constexpr size_t kStochasticTargetRows = 4; // verifier M=2..4 includes terminal row
         constexpr size_t kStochasticDraftRows = 3;  // --mtp-draft-tokens max
 
@@ -1665,6 +1670,16 @@ namespace llaminar2
                                         kStochasticDistributionMaxK,
                                         "FP32",
                                         state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS,
+                                        1,
+                                        kStochasticTopKPartialCapacity,
+                                        "FP32",
+                                        state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS,
+                                        1,
+                                        kStochasticTopKPartialCapacity,
+                                        "INT32",
+                                        state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_VERIFY_TOKENS,
                                         1,
                                         kStochasticTargetRows,
@@ -1723,6 +1738,8 @@ namespace llaminar2
             arena_->isRegistered(BufferId::STOCHASTIC_TARGET_PROBS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_DRAFT_TOKEN_IDS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_DRAFT_PROBS) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_VERIFY_TOKENS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_VERIFY_ACCEPTED) &&
             arena_->isRegistered(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS) &&
@@ -1732,6 +1749,8 @@ namespace llaminar2
             arena_->prepareForWrite(BufferId::STOCHASTIC_TARGET_PROBS, state_.device_id);
             arena_->prepareForWrite(BufferId::STOCHASTIC_DRAFT_TOKEN_IDS, state_.device_id);
             arena_->prepareForWrite(BufferId::STOCHASTIC_DRAFT_PROBS, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS, state_.device_id);
             arena_->prepareForWrite(BufferId::STOCHASTIC_VERIFY_TOKENS, state_.device_id);
             arena_->prepareForWrite(BufferId::STOCHASTIC_VERIFY_ACCEPTED, state_.device_id);
             arena_->prepareForWrite(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS, state_.device_id);
@@ -1745,6 +1764,13 @@ namespace llaminar2
                 arena_->getDevicePtr(BufferId::STOCHASTIC_DRAFT_TOKEN_IDS, state_.device_id);
             stochastic_draft_probs_dev_ =
                 arena_->getDevicePtr(BufferId::STOCHASTIC_DRAFT_PROBS, state_.device_id);
+            stochastic_topk_partial_vals_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS, state_.device_id);
+            stochastic_topk_partial_idxs_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS, state_.device_id);
+            if (stochastic_topk_partial_vals_dev_ && stochastic_topk_partial_idxs_dev_)
+                stochastic_topk_partial_capacity_ =
+                    static_cast<int>(arena_->getCols(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS));
             stochastic_verify_tokens_dev_ =
                 arena_->getDevicePtr(BufferId::STOCHASTIC_VERIFY_TOKENS, state_.device_id);
             stochastic_verify_accepted_dev_ =
@@ -8461,9 +8487,53 @@ namespace llaminar2
             state_.device_id.gpu_ordinal(),
             stream,
             token_ids + slot_offset,
-            probs + slot_offset);
+            probs + slot_offset,
+            stochastic_topk_partial_vals_dev_,
+            stochastic_topk_partial_idxs_dev_,
+            stochastic_topk_partial_capacity_);
         if (ok)
         {
+            const int effective_top_k =
+                std::min(params.top_k, static_cast<int>(cols));
+            size_t partial_blocks =
+                (cols + kStochasticTopKSmallKThreads - 1) /
+                kStochasticTopKSmallKThreads;
+            partial_blocks = std::max<size_t>(partial_blocks, 1);
+            partial_blocks = std::min(partial_blocks, kStochasticTopKPartialBlocks);
+            const bool used_rocm_smallk_scratch =
+                state_.device_id.is_rocm() &&
+                effective_top_k > 0 &&
+                effective_top_k <= static_cast<int>(kStochasticTopKSmallKCap) &&
+                stochastic_topk_partial_vals_dev_ &&
+                stochastic_topk_partial_idxs_dev_ &&
+                stochastic_topk_partial_capacity_ >=
+                    static_cast<int>(partial_blocks * static_cast<size_t>(effective_top_k));
+            if (used_rocm_smallk_scratch)
+            {
+                const char *source_name = "unknown";
+                switch (source)
+                {
+                case DeviceLogitsSource::Main:
+                    source_name = "main";
+                    break;
+                case DeviceLogitsSource::MTP:
+                    source_name = "mtp";
+                    break;
+                case DeviceLogitsSource::AllPosition:
+                    source_name = "all_position";
+                    break;
+                }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "stochastic_topk_smallk_scratch_distribution_builds",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {
+                        {"source", source_name},
+                        {"top_k", std::to_string(effective_top_k)},
+                    });
+            }
             if (buffer == DeviceDistributionBuffer::Target)
                 stochastic_target_top_k_[static_cast<size_t>(slot)] = params.top_k;
             else

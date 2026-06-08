@@ -475,7 +475,9 @@ namespace llaminar2
         int *out_token, int device_idx, void *stream);
     extern "C" bool rocmOps_topk_topp_distribution_f32(
         const float *data, int n, int k, float top_p, float temperature,
-        int *out_token_ids, float *out_probs, int device_idx, void *stream);
+        int *out_token_ids, float *out_probs,
+        float *scratch_values, int *scratch_indices, int scratch_capacity,
+        int device_idx, void *stream);
     extern "C" bool rocmOps_speculative_verify_distribution_f32(
         const int *target_token_ids, const float *target_probs,
         const int *draft_token_ids, const float *draft_probs,
@@ -666,7 +668,10 @@ namespace llaminar2
         int device_id,
         void *stream,
         void *out_token_ids_device,
-        void *out_probs_device)
+        void *out_probs_device,
+        void *scratch_values_device,
+        void *scratch_indices_device,
+        int scratch_capacity)
     {
         if (device_id >= device_count_ || device_id < 0 || !data_device ||
             n <= 0 || top_k <= 0 || !stream || !out_token_ids_device || !out_probs_device)
@@ -688,6 +693,9 @@ namespace llaminar2
             temperature,
             static_cast<int *>(out_token_ids_device),
             static_cast<float *>(out_probs_device),
+            static_cast<float *>(scratch_values_device),
+            static_cast<int *>(scratch_indices_device),
+            scratch_capacity,
             device_id,
             stream);
     }

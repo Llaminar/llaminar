@@ -103,7 +103,10 @@ namespace llaminar2
                                                        int top_k, float top_p, float temperature,
                                                        int device_id, void *stream,
                                                        void *out_token_ids_device,
-                                                       void *out_probs_device) override;
+                                                       void *out_probs_device,
+                                                       void *scratch_values_device = nullptr,
+                                                       void *scratch_indices_device = nullptr,
+                                                       int scratch_capacity = 0) override;
         bool enqueueSampleDistributionF32Device(
             const void *token_ids_device,
             const void *probs_device,

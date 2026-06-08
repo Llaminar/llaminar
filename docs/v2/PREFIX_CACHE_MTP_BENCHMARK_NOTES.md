@@ -12,11 +12,11 @@ plan carries detailed implementation status.
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 726.19 | 87.07 | historical 1.99x target, not accepted |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 727.01 | 36.82 | residual-batch, speed-negative |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic dynamic MTP | 727.40 | 42.43 | effective d1, near baseline |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.54 | 30.21 | current clean baseline |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.54 | 30.21 | clean baseline; stochastic no-MTP 30.06 |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 217.10 | 34.40 | failed equivalence, not accepted |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 217.43 | 19.99 | residual-batch, speed-negative |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic dynamic MTP | 217.92 | 26.37 | effective d1, below baseline |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic fixed d1 MTP | 214.37 | 27.62 | small-k sampler, below baseline |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic dynamic MTP | 215.06 | 35.40 | two-pass top-k, effective d1 |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic fixed d1 MTP | 215.89 | 35.89 | two-pass top-k, 1.19x stochastic baseline |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 76.35 | 31.92 | short-lane baseline |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 73.05 | 54.23 | historical 1.70x target |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | current baseline |
@@ -35,16 +35,16 @@ plan carries detailed implementation status.
   residual correction candidates in one graph-capturable verifier launch; the
   focused runner, GPU sampling, graph-smoke, and Qwen3.6 stochastic parity gates
   are green.
-- Dense default residual-batch stochastic MTP is still speed-negative: CUDA
-  36.82 tok/s at 62.07% acceptance, ROCm 19.99 tok/s at 61.18%.
-- Dynamic stochastic depth avoids the default prompt's fixed-d3 acceptance trap
-  and matches fixed d1: CUDA 42.43 vs 42.37 tok/s, ROCm 26.37 vs 26.71 tok/s.
-- ROCm generated decode dispatch now obeys the graph-safe small-M `kb<=8`
-  contract. The follow-up small-k stochastic sampler specialization keeps the
-  graph-captured Qwen3.6 `top_k=20` path in `k<=32` kernels and raised fixed-d1
-  stochastic ROCm dense decode from 25.92 to 27.62 tok/s. Sampler cost fell from
-  about 9.24 to 8.67 ms/step; verifier forward remains the main blocker at
-  about 41.24 ms.
+- CUDA dense default stochastic accepted-count MTP remains speed-negative:
+  36.82 tok/s at 62.07% acceptance. ROCm moved speed-positive after the
+  two-pass small-k top-k builder: fixed d1 reached 35.89 tok/s and dynamic
+  reached 35.40 tok/s against a 30.06 tok/s stochastic no-MTP baseline.
+- ROCm generated decode dispatch obeys the graph-safe small-M `kb<=8`
+  contract. The graph-captured `top_k=20` path now uses arena-declared
+  scratch for a two-pass `k<=32` distribution builder; focused smoke asserts
+  the scratch counter. Sampler sync fell from 8.57 to 3.36 ms and stochastic
+  verify-batch sync from 12.73 to 2.42 ms. Verifier forward remains the main
+  blocker at about 41.33 ms.
 
 ## llama.cpp CUDA Anchors
 

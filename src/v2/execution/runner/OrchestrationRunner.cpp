@@ -1908,21 +1908,33 @@ namespace llaminar2
             {
                 if (stochastic_device_verify)
                 {
-                    auto penalty_map =
-                        draft_sampler.compute_penalty_map(active_sampling_params_, vocab);
-                    if (!runner_->applyPenaltiesToMTPLogitsOnDevice(penalty_map, vocab))
                     {
-                        return -1;
+                        PerfStatsCollector::ScopedTimer timer(
+                            "mtp",
+                            "sample_mtp_token_stochastic_penalties",
+                            "decode");
+                        auto penalty_map =
+                            draft_sampler.compute_penalty_map(active_sampling_params_, vocab);
+                        if (!runner_->applyPenaltiesToMTPLogitsOnDevice(penalty_map, vocab))
+                        {
+                            return -1;
+                        }
                     }
-                    if (!runner_->buildStochasticDistributionOnDevice(
-                            DeviceLogitsSource::MTP,
-                            0,
-                            DeviceDistributionBuffer::Draft,
-                            draft_idx,
-                            active_sampling_params_,
-                            vocab))
                     {
-                        return -1;
+                        PerfStatsCollector::ScopedTimer timer(
+                            "mtp",
+                            "sample_mtp_token_stochastic_distribution",
+                            "decode");
+                        if (!runner_->buildStochasticDistributionOnDevice(
+                                DeviceLogitsSource::MTP,
+                                0,
+                                DeviceDistributionBuffer::Draft,
+                                draft_idx,
+                                active_sampling_params_,
+                                vocab))
+                        {
+                            return -1;
+                        }
                     }
                     {
                         PerfStatsCollector::ScopedTimer timer("mtp", "sample_mtp_token_stochastic_device", "decode");
@@ -3042,39 +3054,57 @@ namespace llaminar2
         {
             const int verify_row_count =
                 std::max(0, static_cast<int>(draft_tokens.size()) - 1);
-            batched_device_verify_results.resize(static_cast<size_t>(verify_row_count));
-            batched_device_verify_draft_tokens.resize(static_cast<size_t>(verify_row_count));
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_stochastic_prepare_verify_batch",
+                    "decode");
+                batched_device_verify_results.resize(static_cast<size_t>(verify_row_count));
+                batched_device_verify_draft_tokens.resize(static_cast<size_t>(verify_row_count));
+            }
             std::vector<float> accept_thresholds(static_cast<size_t>(verify_row_count));
             std::vector<float> residual_thresholds(static_cast<size_t>(verify_row_count));
-            std::vector<float> threshold_draws(static_cast<size_t>(verify_row_count + 1));
-
-            Sampler verify_rng = sampler_;
-            for (int draw = 0; draw <= verify_row_count; ++draw)
-                threshold_draws[static_cast<size_t>(draw)] =
-                    verify_rng.random_uniform_01();
-            for (int row = 0; row < verify_row_count; ++row)
             {
-                batched_device_verify_draft_tokens[static_cast<size_t>(row)] =
-                    draft_tokens[static_cast<size_t>(row + 1)];
-                accept_thresholds[static_cast<size_t>(row)] =
-                    threshold_draws[static_cast<size_t>(row)];
-                residual_thresholds[static_cast<size_t>(row)] =
-                    threshold_draws[static_cast<size_t>(row + 1)];
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_stochastic_prepare_verify_thresholds",
+                    "decode");
+                std::vector<float> threshold_draws(static_cast<size_t>(verify_row_count + 1));
+
+                Sampler verify_rng = sampler_;
+                for (int draw = 0; draw <= verify_row_count; ++draw)
+                    threshold_draws[static_cast<size_t>(draw)] =
+                        verify_rng.random_uniform_01();
+                for (int row = 0; row < verify_row_count; ++row)
+                {
+                    batched_device_verify_draft_tokens[static_cast<size_t>(row)] =
+                        draft_tokens[static_cast<size_t>(row + 1)];
+                    accept_thresholds[static_cast<size_t>(row)] =
+                        threshold_draws[static_cast<size_t>(row)];
+                    residual_thresholds[static_cast<size_t>(row)] =
+                        threshold_draws[static_cast<size_t>(row + 1)];
+                }
             }
 
             if (verify_row_count > 0)
             {
-                if (!runner_->verifyStochasticDistributionsBatchOnDevice(
-                        /*first_target_slot=*/0,
-                        /*first_draft_slot=*/0,
-                        batched_device_verify_draft_tokens.data(),
-                        accept_thresholds.data(),
-                        residual_thresholds.data(),
-                        verify_row_count,
-                        batched_device_verify_results.data()))
                 {
-                    return fail_after_checkpoint(
-                        "Device stochastic MTP batched verifier failed");
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "phase138_stochastic_verify_batch_device",
+                        "decode");
+                    if (!runner_->verifyStochasticDistributionsBatchOnDevice(
+                            /*first_target_slot=*/0,
+                            /*first_draft_slot=*/0,
+                            batched_device_verify_draft_tokens.data(),
+                            accept_thresholds.data(),
+                            residual_thresholds.data(),
+                            verify_row_count,
+                            batched_device_verify_results.data()))
+                    {
+                        return fail_after_checkpoint(
+                            "Device stochastic MTP batched verifier failed");
+                    }
                 }
                 PerfStatsCollector::addCounter(
                     "mtp",
@@ -3086,29 +3116,104 @@ namespace llaminar2
         int accepted_speculative_prefix = 0;
         bool all_speculative_accepted = true;
         int32_t rejected_verified_token = -1;
-        for (int draft_idx = 1; draft_idx < static_cast<int>(draft_tokens.size()); ++draft_idx)
         {
-            const int row = draft_idx - 1;
-            if (stochastic_verify)
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                stochastic_verify
+                    ? "phase138_stochastic_process_verify_rows"
+                    : "process_greedy_verify_rows",
+                "decode");
+            for (int draft_idx = 1; draft_idx < static_cast<int>(draft_tokens.size()); ++draft_idx)
             {
-                if (stochastic_device_verify)
+                const int row = draft_idx - 1;
+                if (stochastic_verify)
                 {
-                    if (row < 0 || row >= static_cast<int>(draft_tokens.size()) - 1)
+                    if (stochastic_device_verify)
                     {
-                        return fail_after_checkpoint("Device stochastic MTP verifier row is incomplete");
+                        if (row < 0 || row >= static_cast<int>(draft_tokens.size()) - 1)
+                        {
+                            return fail_after_checkpoint("Device stochastic MTP verifier row is incomplete");
+                        }
+
+                        const int32_t draft_token = draft_tokens[static_cast<size_t>(draft_idx)];
+                        (void)sampler_.random_uniform_01();
+                        DeviceSpeculativeVerifyResult verify_result;
+                        if (row < 0 ||
+                            row >= static_cast<int>(batched_device_verify_results.size()))
+                        {
+                            return fail_after_checkpoint("Device stochastic MTP batched verifier row is incomplete");
+                        }
+                        verify_result =
+                            batched_device_verify_results[static_cast<size_t>(row)];
+
+                        ++mtp_stats_.stochastic_accept_tests;
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "stochastic_accept_tests",
+                            1.0,
+                            "decode",
+                            {},
+                            {{"row", std::to_string(row)},
+                             {"draft_token", std::to_string(draft_token)},
+                             {"accept_probability", std::to_string(verify_result.accept_probability)},
+                             {"threshold", std::to_string(verify_result.accept_threshold)},
+                             {"device_resident", "true"}});
+
+                        if (verify_result.accepted)
+                        {
+                            accepted_tokens.push_back(draft_token);
+                            verifier_tokens.push_back(draft_token);
+                            sampled_verifier_tokens[static_cast<size_t>(row)] = draft_token;
+                            ++accepted_speculative_prefix;
+                            ++mtp_stats_.stochastic_accepts;
+                            PerfStatsCollector::addCounter("mtp", "stochastic_accepts", 1.0, "decode");
+                            continue;
+                        }
+
+                        (void)sampler_.random_uniform_01();
+                        if (verify_result.token < 0)
+                            return fail_after_checkpoint("Device stochastic MTP batched residual verifier produced no correction token");
+
+                        all_speculative_accepted = false;
+                        rejected_verified_token = verify_result.token;
+                        sampled_verifier_tokens[static_cast<size_t>(row)] = rejected_verified_token;
+                        verifier_tokens.push_back(rejected_verified_token);
+                        accepted_tokens.push_back(rejected_verified_token);
+                        ++mtp_stats_.stochastic_residual_samples;
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "stochastic_residual_device_samples",
+                            1.0,
+                            "decode",
+                            {},
+                            {{"row", std::to_string(row)},
+                             {"draft_token", std::to_string(draft_token)},
+                             {"correction_token", std::to_string(rejected_verified_token)}});
+                        break;
+                    }
+
+                    if (row < 0 ||
+                        row >= static_cast<int>(target_distributions.size()) ||
+                        row >= static_cast<int>(draft_distributions.size()))
+                    {
+                        return fail_after_checkpoint("Stochastic MTP verifier distributions are incomplete");
                     }
 
                     const int32_t draft_token = draft_tokens[static_cast<size_t>(draft_idx)];
-                    (void)sampler_.random_uniform_01();
-                    DeviceSpeculativeVerifyResult verify_result;
-                    if (row < 0 ||
-                        row >= static_cast<int>(batched_device_verify_results.size()))
+                    const auto &target_distribution = target_distributions[static_cast<size_t>(row)];
+                    const auto &draft_distribution = draft_distributions[static_cast<size_t>(row)];
+                    const float p =
+                        Sampler::probability_of_token(target_distribution, draft_token);
+                    const float q =
+                        Sampler::probability_of_token(draft_distribution, draft_token);
+                    if (!(q > 0.0f))
                     {
-                        return fail_after_checkpoint("Device stochastic MTP batched verifier row is incomplete");
+                        return fail_after_checkpoint("Stochastic MTP draft token missing from sidecar distribution");
                     }
-                    verify_result =
-                        batched_device_verify_results[static_cast<size_t>(row)];
 
+                    const float accept_probability =
+                        Sampler::speculative_accept_probability(p, q);
+                    const float threshold = sampler_.random_uniform_01();
                     ++mtp_stats_.stochastic_accept_tests;
                     PerfStatsCollector::addCounter(
                         "mtp",
@@ -3118,11 +3223,12 @@ namespace llaminar2
                         {},
                         {{"row", std::to_string(row)},
                          {"draft_token", std::to_string(draft_token)},
-                         {"accept_probability", std::to_string(verify_result.accept_probability)},
-                         {"threshold", std::to_string(verify_result.accept_threshold)},
-                         {"device_resident", "true"}});
+                         {"p", std::to_string(p)},
+                         {"q", std::to_string(q)},
+                         {"accept_probability", std::to_string(accept_probability)},
+                         {"threshold", std::to_string(threshold)}});
 
-                    if (verify_result.accepted)
+                    if (threshold < accept_probability)
                     {
                         accepted_tokens.push_back(draft_token);
                         verifier_tokens.push_back(draft_token);
@@ -3133,19 +3239,18 @@ namespace llaminar2
                         continue;
                     }
 
-                    (void)sampler_.random_uniform_01();
-                    if (verify_result.token < 0)
-                        return fail_after_checkpoint("Device stochastic MTP batched residual verifier produced no correction token");
-
                     all_speculative_accepted = false;
-                    rejected_verified_token = verify_result.token;
+                    rejected_verified_token =
+                        sampler_.sample_from_residual_distribution(
+                            target_distribution,
+                            draft_distribution);
                     sampled_verifier_tokens[static_cast<size_t>(row)] = rejected_verified_token;
                     verifier_tokens.push_back(rejected_verified_token);
                     accepted_tokens.push_back(rejected_verified_token);
                     ++mtp_stats_.stochastic_residual_samples;
                     PerfStatsCollector::addCounter(
                         "mtp",
-                        "stochastic_residual_device_samples",
+                        "stochastic_residual_samples",
                         1.0,
                         "decode",
                         {},
@@ -3155,105 +3260,38 @@ namespace llaminar2
                     break;
                 }
 
-                if (row < 0 ||
-                    row >= static_cast<int>(target_distributions.size()) ||
-                    row >= static_cast<int>(draft_distributions.size()))
+                const int32_t verified_token =
+                    (row >= 0 && row < static_cast<int>(sampled_verifier_tokens.size()))
+                        ? sampled_verifier_tokens[static_cast<size_t>(row)]
+                        : -1;
+                if (verified_token < 0)
                 {
-                    return fail_after_checkpoint("Stochastic MTP verifier distributions are incomplete");
+                    return fail_after_checkpoint("All-position logits unavailable after MTP verification");
                 }
-
                 const int32_t draft_token = draft_tokens[static_cast<size_t>(draft_idx)];
-                const auto &target_distribution = target_distributions[static_cast<size_t>(row)];
-                const auto &draft_distribution = draft_distributions[static_cast<size_t>(row)];
-                const float p =
-                    Sampler::probability_of_token(target_distribution, draft_token);
-                const float q =
-                    Sampler::probability_of_token(draft_distribution, draft_token);
-                if (!(q > 0.0f))
-                {
-                    return fail_after_checkpoint("Stochastic MTP draft token missing from sidecar distribution");
-                }
-
-                const float accept_probability =
-                    Sampler::speculative_accept_probability(p, q);
-                const float threshold = sampler_.random_uniform_01();
-                ++mtp_stats_.stochastic_accept_tests;
                 PerfStatsCollector::addCounter(
                     "mtp",
-                    "stochastic_accept_tests",
+                    "greedy_verifier_token",
                     1.0,
                     "decode",
                     {},
                     {{"row", std::to_string(row)},
                      {"draft_token", std::to_string(draft_token)},
-                     {"p", std::to_string(p)},
-                     {"q", std::to_string(q)},
-                     {"accept_probability", std::to_string(accept_probability)},
-                     {"threshold", std::to_string(threshold)}});
+                     {"verified_token", std::to_string(verified_token)}});
+                verifier_tokens.push_back(verified_token);
 
-                if (threshold < accept_probability)
+                if (verified_token == draft_token)
                 {
                     accepted_tokens.push_back(draft_token);
-                    verifier_tokens.push_back(draft_token);
-                    sampled_verifier_tokens[static_cast<size_t>(row)] = draft_token;
                     ++accepted_speculative_prefix;
-                    ++mtp_stats_.stochastic_accepts;
-                    PerfStatsCollector::addCounter("mtp", "stochastic_accepts", 1.0, "decode");
                     continue;
                 }
 
                 all_speculative_accepted = false;
-                rejected_verified_token =
-                    sampler_.sample_from_residual_distribution(
-                        target_distribution,
-                        draft_distribution);
-                sampled_verifier_tokens[static_cast<size_t>(row)] = rejected_verified_token;
-                verifier_tokens.push_back(rejected_verified_token);
-                accepted_tokens.push_back(rejected_verified_token);
-                ++mtp_stats_.stochastic_residual_samples;
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "stochastic_residual_samples",
-                    1.0,
-                    "decode",
-                    {},
-                    {{"row", std::to_string(row)},
-                     {"draft_token", std::to_string(draft_token)},
-                     {"correction_token", std::to_string(rejected_verified_token)}});
+                rejected_verified_token = verified_token;
+                accepted_tokens.push_back(verified_token);
                 break;
             }
-
-            const int32_t verified_token =
-                (row >= 0 && row < static_cast<int>(sampled_verifier_tokens.size()))
-                    ? sampled_verifier_tokens[static_cast<size_t>(row)]
-                    : -1;
-            if (verified_token < 0)
-            {
-                return fail_after_checkpoint("All-position logits unavailable after MTP verification");
-            }
-            const int32_t draft_token = draft_tokens[static_cast<size_t>(draft_idx)];
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "greedy_verifier_token",
-                1.0,
-                "decode",
-                {},
-                {{"row", std::to_string(row)},
-                 {"draft_token", std::to_string(draft_token)},
-                 {"verified_token", std::to_string(verified_token)}});
-            verifier_tokens.push_back(verified_token);
-
-            if (verified_token == draft_token)
-            {
-                accepted_tokens.push_back(draft_token);
-                ++accepted_speculative_prefix;
-                continue;
-            }
-
-            all_speculative_accepted = false;
-            rejected_verified_token = verified_token;
-            accepted_tokens.push_back(verified_token);
-            break;
         }
         if (stochastic_verify && all_speculative_accepted)
         {

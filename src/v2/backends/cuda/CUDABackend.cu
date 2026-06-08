@@ -1126,8 +1126,14 @@ namespace llaminar2
         int device_id,
         void *stream,
         void *out_token_ids_device,
-        void *out_probs_device)
+        void *out_probs_device,
+        void *scratch_values_device,
+        void *scratch_indices_device,
+        int scratch_capacity)
     {
+        (void)scratch_values_device;
+        (void)scratch_indices_device;
+        (void)scratch_capacity;
         if (device_id >= device_count_ || device_id < 0 || !data_device ||
             n <= 0 || top_k <= 0 || !stream || !out_token_ids_device || !out_probs_device)
         {
