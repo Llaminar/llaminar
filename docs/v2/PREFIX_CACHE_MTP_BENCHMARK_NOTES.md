@@ -11,7 +11,8 @@ plan carries detailed implementation status.
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 877.55 | 43.81 | current clean baseline |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 726.19 | 87.07 | historical 1.99x target, not accepted |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 727.01 | 36.82 | residual-batch, speed-negative |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic dynamic MTP | 727.40 | 42.43 | effective d1, near baseline |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic fixed d1 MTP | 707.96 | 54.60 | two-pass top-k, near l.cpp d1 |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic dynamic MTP | 706.09 | 55.80 | two-pass top-k, effective d1 |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.54 | 30.21 | clean baseline; stochastic no-MTP 30.06 |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 217.10 | 34.40 | failed equivalence, not accepted |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 217.43 | 19.99 | residual-batch, speed-negative |
@@ -35,16 +36,15 @@ plan carries detailed implementation status.
   residual correction candidates in one graph-capturable verifier launch; the
   focused runner, GPU sampling, graph-smoke, and Qwen3.6 stochastic parity gates
   are green.
-- CUDA dense default stochastic accepted-count MTP remains speed-negative:
-  36.82 tok/s at 62.07% acceptance. ROCm moved speed-positive after the
-  two-pass small-k top-k builder: fixed d1 reached 35.89 tok/s and dynamic
-  reached 35.40 tok/s against a 30.06 tok/s stochastic no-MTP baseline.
-- ROCm generated decode dispatch obeys the graph-safe small-M `kb<=8`
-  contract. The graph-captured `top_k=20` path now uses arena-declared
-  scratch for a two-pass `k<=32` distribution builder; focused smoke asserts
-  the scratch counter. Sampler sync fell from 8.57 to 3.36 ms and stochastic
-  verify-batch sync from 12.73 to 2.42 ms. Verifier forward remains the main
-  blocker at about 41.33 ms.
+- CUDA and ROCm now both use arena-declared scratch for graph-captured
+  two-pass `top_k<=32` distribution building; focused CUDA/ROCm smokes assert
+  the scratch counter. CUDA fixed d1/dynamic reached 54.60/55.80 tok/s,
+  essentially matching the llama.cpp d1 anchor. ROCm fixed d1/dynamic reached
+  35.89/35.40 tok/s against a 30.06 tok/s stochastic no-MTP baseline.
+- Next dense target is verifier-forward cost and ROCm catch-up. ROCm sampler
+  sync fell from 8.57 to 3.36 ms and stochastic verify-batch sync from 12.73
+  to 2.42 ms; verifier forward remains about 41.33 ms. CUDA verifier forward
+  is about 28.46 ms with scratch sampling active.
 
 ## llama.cpp CUDA Anchors
 

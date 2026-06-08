@@ -8500,15 +8500,15 @@ namespace llaminar2
                 kStochasticTopKSmallKThreads;
             partial_blocks = std::max<size_t>(partial_blocks, 1);
             partial_blocks = std::min(partial_blocks, kStochasticTopKPartialBlocks);
-            const bool used_rocm_smallk_scratch =
-                state_.device_id.is_rocm() &&
+            const bool used_gpu_smallk_scratch =
+                state_.device_id.is_gpu() &&
                 effective_top_k > 0 &&
                 effective_top_k <= static_cast<int>(kStochasticTopKSmallKCap) &&
                 stochastic_topk_partial_vals_dev_ &&
                 stochastic_topk_partial_idxs_dev_ &&
                 stochastic_topk_partial_capacity_ >=
                     static_cast<int>(partial_blocks * static_cast<size_t>(effective_top_k));
-            if (used_rocm_smallk_scratch)
+            if (used_gpu_smallk_scratch)
             {
                 const char *source_name = "unknown";
                 switch (source)

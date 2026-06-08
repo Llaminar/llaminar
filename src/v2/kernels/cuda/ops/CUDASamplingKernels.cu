@@ -23,6 +23,9 @@
 // Maximum k supported by the top-k kernel
 constexpr int TOPK_MAX_K = 256;
 constexpr int TOPK_THREADS = 32;
+constexpr int TOPK_SMALL_K_CAP = 32;
+constexpr int TOPK_SMALL_K_PARTIAL_BLOCKS = 128;
+constexpr int TOPK_SMALL_K_THREADS = 64;
 static_assert(TOPK_MAX_K == llaminar2::sampling_math::kMaxTopK,
               "CUDA sampling TOPK_MAX_K must match shared sampling math");
 
@@ -495,6 +498,232 @@ __global__ void cuda_topk_topp_sample_f32_kernel(
             top_p,
             temperature,
             llaminar2::sampling_math::uniform01(rng_seed, rng_offset),
+            weights);
+    }
+}
+
+template <int K_CAP>
+__global__ void cuda_topk_smallk_partials_f32_kernel(
+    const float *__restrict__ data,
+    int n,
+    int k,
+    float *__restrict__ partial_values,
+    int *__restrict__ partial_indices)
+{
+    if (k > K_CAP)
+        return;
+
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+    const int block_start =
+        static_cast<int>((static_cast<long long>(blockIdx.x) * n) / gridDim.x);
+    const int block_end =
+        static_cast<int>((static_cast<long long>(blockIdx.x + 1) * n) / gridDim.x);
+
+    float local_vals[K_CAP];
+    int local_idxs[K_CAP];
+    int local_count = 0;
+
+    for (int i = 0; i < k; ++i)
+    {
+        local_vals[i] = -FLT_MAX;
+        local_idxs[i] = -1;
+    }
+
+    for (int i = block_start + tid; i < block_end; i += num_threads)
+    {
+        const float val = data[i];
+        if (local_count >= k && val <= local_vals[k - 1])
+            continue;
+
+        int pos = (local_count < k) ? local_count : k - 1;
+        for (int j = pos - 1; j >= 0; --j)
+        {
+            if (val > local_vals[j])
+            {
+                local_vals[j + 1] = local_vals[j];
+                local_idxs[j + 1] = local_idxs[j];
+                pos = j;
+            }
+            else
+            {
+                break;
+            }
+        }
+        local_vals[pos] = val;
+        local_idxs[pos] = i;
+        if (local_count < k)
+            ++local_count;
+    }
+
+    extern __shared__ char shared_mem[];
+    float *s_vals = reinterpret_cast<float *>(shared_mem);
+    int *s_idxs = reinterpret_cast<int *>(shared_mem + num_threads * k * sizeof(float));
+
+    const int base = tid * k;
+    for (int i = 0; i < k; ++i)
+    {
+        s_vals[base + i] = local_vals[i];
+        s_idxs[base + i] = local_idxs[i];
+    }
+    __syncthreads();
+
+    if (tid == 0)
+    {
+        int ptrs[TOPK_SMALL_K_THREADS];
+        for (int t = 0; t < num_threads; ++t)
+            ptrs[t] = 0;
+
+        const int out_base = blockIdx.x * k;
+        for (int out_i = 0; out_i < k; ++out_i)
+        {
+            float best_val = -FLT_MAX;
+            int best_thread = -1;
+            for (int t = 0; t < num_threads; ++t)
+            {
+                if (ptrs[t] < k)
+                {
+                    const float v = s_vals[t * k + ptrs[t]];
+                    if (v > best_val)
+                    {
+                        best_val = v;
+                        best_thread = t;
+                    }
+                }
+            }
+
+            if (best_thread >= 0)
+            {
+                partial_values[out_base + out_i] = best_val;
+                partial_indices[out_base + out_i] =
+                    s_idxs[best_thread * k + ptrs[best_thread]];
+                ++ptrs[best_thread];
+            }
+            else
+            {
+                partial_values[out_base + out_i] = -FLT_MAX;
+                partial_indices[out_base + out_i] = -1;
+            }
+        }
+    }
+}
+
+template <int K_CAP>
+__global__ void cuda_topk_topp_distribution_from_partials_f32_kernel(
+    const float *__restrict__ partial_values,
+    const int *__restrict__ partial_indices,
+    int partial_blocks,
+    int k,
+    float top_p,
+    float temperature,
+    int *__restrict__ out_token_ids,
+    float *__restrict__ out_probs)
+{
+    if (k > K_CAP)
+        return;
+
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+    const int candidate_count = partial_blocks * k;
+
+    float local_vals[K_CAP];
+    int local_idxs[K_CAP];
+    int local_count = 0;
+
+    for (int i = 0; i < k; ++i)
+    {
+        local_vals[i] = -FLT_MAX;
+        local_idxs[i] = -1;
+    }
+
+    for (int i = tid; i < candidate_count; i += num_threads)
+    {
+        const int idx = partial_indices[i];
+        if (idx < 0)
+            continue;
+        const float val = partial_values[i];
+        if (local_count >= k && val <= local_vals[k - 1])
+            continue;
+
+        int pos = (local_count < k) ? local_count : k - 1;
+        for (int j = pos - 1; j >= 0; --j)
+        {
+            if (val > local_vals[j])
+            {
+                local_vals[j + 1] = local_vals[j];
+                local_idxs[j + 1] = local_idxs[j];
+                pos = j;
+            }
+            else
+            {
+                break;
+            }
+        }
+        local_vals[pos] = val;
+        local_idxs[pos] = idx;
+        if (local_count < k)
+            ++local_count;
+    }
+
+    extern __shared__ char shared_mem[];
+    float *s_vals = reinterpret_cast<float *>(shared_mem);
+    int *s_idxs = reinterpret_cast<int *>(shared_mem + num_threads * k * sizeof(float));
+
+    const int base = tid * k;
+    for (int i = 0; i < k; ++i)
+    {
+        s_vals[base + i] = local_vals[i];
+        s_idxs[base + i] = local_idxs[i];
+    }
+    __syncthreads();
+
+    if (tid == 0)
+    {
+        float merged_vals[K_CAP];
+        int merged_idxs[K_CAP];
+        int ptrs[TOPK_SMALL_K_THREADS];
+        for (int t = 0; t < num_threads; ++t)
+            ptrs[t] = 0;
+
+        for (int out_i = 0; out_i < k; ++out_i)
+        {
+            float best_val = -FLT_MAX;
+            int best_thread = -1;
+            for (int t = 0; t < num_threads; ++t)
+            {
+                if (ptrs[t] < k)
+                {
+                    const float v = s_vals[t * k + ptrs[t]];
+                    if (v > best_val)
+                    {
+                        best_val = v;
+                        best_thread = t;
+                    }
+                }
+            }
+
+            if (best_thread >= 0)
+            {
+                merged_vals[out_i] = best_val;
+                merged_idxs[out_i] = s_idxs[best_thread * k + ptrs[best_thread]];
+                ++ptrs[best_thread];
+            }
+            else
+            {
+                merged_vals[out_i] = -FLT_MAX;
+                merged_idxs[out_i] = -1;
+            }
+        }
+
+        float weights[K_CAP];
+        llaminar2::sampling_math::build_topk_topp_distribution_from_sorted(
+            merged_vals,
+            merged_idxs,
+            k,
+            top_p,
+            temperature,
+            out_token_ids,
+            out_probs,
             weights);
     }
 }
@@ -992,6 +1221,9 @@ extern "C"
         float temperature,
         int *out_token_ids,
         float *out_probs,
+        float *scratch_values,
+        int *scratch_indices,
+        int scratch_capacity,
         int device_idx,
         void *stream)
     {
@@ -1002,11 +1234,60 @@ extern "C"
             k = n;
 
         cudaSetDevice(device_idx);
+        cudaStream_t s = static_cast<cudaStream_t>(stream);
+
+        if (k <= TOPK_SMALL_K_CAP &&
+            scratch_values &&
+            scratch_indices)
+        {
+            const int threads = TOPK_SMALL_K_THREADS;
+            int partial_blocks = (n + threads - 1) / threads;
+            if (partial_blocks < 1)
+                partial_blocks = 1;
+            if (partial_blocks > TOPK_SMALL_K_PARTIAL_BLOCKS)
+                partial_blocks = TOPK_SMALL_K_PARTIAL_BLOCKS;
+            const int required_scratch = partial_blocks * k;
+            if (scratch_capacity >= required_scratch)
+            {
+                const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
+                cuda_topk_smallk_partials_f32_kernel<TOPK_SMALL_K_CAP>
+                    <<<partial_blocks, threads, smem_size, s>>>(
+                        data, n, k, scratch_values, scratch_indices);
+
+                cudaError_t err = cudaGetLastError();
+                if (err != cudaSuccess)
+                {
+                    fprintf(stderr, "CUDA small-k Top-K partial FP32 kernel launch failed: %s\n",
+                            cudaGetErrorString(err));
+                    return false;
+                }
+
+                cuda_topk_topp_distribution_from_partials_f32_kernel<TOPK_SMALL_K_CAP>
+                    <<<1, threads, smem_size, s>>>(
+                        scratch_values,
+                        scratch_indices,
+                        partial_blocks,
+                        k,
+                        top_p,
+                        temperature,
+                        out_token_ids,
+                        out_probs);
+
+                err = cudaGetLastError();
+                if (err != cudaSuccess)
+                {
+                    fprintf(stderr, "CUDA small-k Top-K/Top-P Distribution FP32 kernel launch failed: %s\n",
+                            cudaGetErrorString(err));
+                    return false;
+                }
+                return true;
+            }
+        }
 
         const int threads = TOPK_THREADS;
         const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
 
-        cuda_topk_topp_distribution_f32_kernel<<<1, threads, smem_size, static_cast<cudaStream_t>(stream)>>>(
+        cuda_topk_topp_distribution_f32_kernel<<<1, threads, smem_size, s>>>(
             data, n, k, top_p, temperature, out_token_ids, out_probs);
 
         cudaError_t err = cudaGetLastError();
