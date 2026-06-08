@@ -676,6 +676,17 @@ namespace llaminar2
         }
 
         /**
+         * @brief Rebind stage-owned verifier state publication workspaces.
+         *
+         * Some backend kernel objects are shared across cached graph shapes and
+         * carry mutable workspace pointers. Before publishing accepted
+         * speculative state from a cached verifier graph, the owning stage must
+         * restore those pointers to the graph's declared workspace rather than
+         * whatever graph ran most recently.
+         */
+        virtual bool prepareVerifierStatePublication() { return true; }
+
+        /**
          * @brief Publish mutable verifier state using device-side accepted-state slots.
          *
          * Phase 13.8 spec-decode transactions compute accepted state-slot

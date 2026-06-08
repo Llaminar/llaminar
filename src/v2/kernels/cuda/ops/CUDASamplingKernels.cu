@@ -23,7 +23,7 @@
 // Maximum k supported by the top-k kernel
 constexpr int TOPK_MAX_K = 256;
 constexpr int TOPK_THREADS = 32;
-constexpr int TOPK_SMALL_K_CAP = 32;
+constexpr int TOPK_SMALL_K_CAP = 64;
 constexpr int TOPK_SMALL_K_PARTIAL_BLOCKS = 128;
 constexpr int TOPK_SMALL_K_THREADS = 64;
 static_assert(TOPK_MAX_K == llaminar2::sampling_math::kMaxTopK,

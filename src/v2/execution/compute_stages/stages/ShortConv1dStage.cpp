@@ -313,6 +313,14 @@ namespace llaminar2
             stream ? stream : gpuStream());
     }
 
+    bool ShortConv1dStage::prepareVerifierStatePublication()
+    {
+        if (!hasVerifierStateCapture())
+            return false;
+        bindKernelWorkspace();
+        return ensureVerifierStateCaptureWorkspaceBound();
+    }
+
     bool ShortConv1dStage::publishAcceptedSpeculativeStateFromDeviceMetadata(
         const int32_t *device_accepted_state_slot_indices,
         int request_index,

@@ -26,7 +26,7 @@
 constexpr int TOPK_MAX_K = 256;
 static_assert(TOPK_MAX_K == llaminar2::sampling_math::kMaxTopK,
               "ROCm sampling TOPK_MAX_K must match shared sampling math");
-constexpr int TOPK_SMALL_K_CAP = 32;
+constexpr int TOPK_SMALL_K_CAP = 64;
 constexpr int TOPK_SMALL_K_PARTIAL_BLOCKS = 128;
 constexpr int TOPK_SMALL_K_THREADS = 64;
 

@@ -385,6 +385,14 @@ namespace llaminar2
             stream ? stream : gpuStream());
     }
 
+    bool GDNRecurrenceStage::prepareVerifierStatePublication()
+    {
+        if (!hasVerifierStateCapture())
+            return false;
+        bindKernelWorkspace();
+        return ensureVerifierStateCaptureWorkspaceBound();
+    }
+
     bool GDNRecurrenceStage::publishAcceptedSpeculativeStateFromDeviceMetadata(
         const int32_t *device_accepted_state_slot_indices,
         int request_index,

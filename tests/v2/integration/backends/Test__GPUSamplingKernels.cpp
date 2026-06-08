@@ -2359,10 +2359,10 @@ namespace
         }
     }
 
-    TEST_P(GPUSamplingTest, TopKTopP_Qwen36VocabTopK20_GraphCapturedDistributionAndSampleMatchCPU)
+    TEST_P(GPUSamplingTest, TopKTopP_Qwen36VocabTopK40_GraphCapturedDistributionAndSampleMatchCPU)
     {
         constexpr int vocab_size = 248320;
-        constexpr int top_k = 20;
+        constexpr int top_k = 40;
         constexpr float top_p = 0.95f;
         constexpr float temperature = 0.6f;
         constexpr uint64_t seed = 424242;
@@ -2377,7 +2377,11 @@ namespace
             151936, 240001, 17, 248319, 98013,
             2048, 77777, 123456, 190000, 4096,
             222222, 31415, 65536, 101010, 88000,
-            54321, 199999, 1, 135791, 246810};
+            54321, 199999, 1, 135791, 246810,
+            271, 13962, 96304, 3710, 5839,
+            5077, 1414, 248068, 248069, 27775,
+            2144, 3766, 16545, 2972, 51121,
+            22527, 6157, 5757, 159034, 1503};
         for (int rank = 0; rank < top_k; ++rank)
         {
             logits[static_cast<size_t>(hot_tokens[rank])] =

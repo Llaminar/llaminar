@@ -153,6 +153,7 @@ namespace llaminar2
         bool supportsPaddedPrefillRealLengthContract() const override;
         bool hasVerifierStateCapture() const override;
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        bool prepareVerifierStatePublication() override;
         bool publishAcceptedSpeculativeStateFromDeviceMetadata(
             const int32_t *device_accepted_state_slot_indices,
             int request_index,

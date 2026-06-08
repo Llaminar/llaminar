@@ -492,7 +492,8 @@ namespace llaminar2
             1.0,
             "decode",
             ctx ? ctx->deviceId().toString() : std::string{},
-            {{"phase", phase_name}});
+            {{"context", segment_cache.perf_context},
+             {"phase", phase_name}});
 
         auto mark_arena_write_dirty = [&](BufferId id, DeviceId device)
         {

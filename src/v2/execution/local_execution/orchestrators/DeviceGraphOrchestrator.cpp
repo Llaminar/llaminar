@@ -69,7 +69,7 @@ namespace llaminar2
     namespace
     {
         constexpr size_t kStochasticDistributionMaxK = 256;
-        constexpr size_t kStochasticTopKSmallKCap = 32;
+        constexpr size_t kStochasticTopKSmallKCap = 64;
         constexpr size_t kStochasticTopKPartialBlocks = 128;
         constexpr size_t kStochasticTopKSmallKThreads = 64;
         constexpr size_t kStochasticTopKPartialCapacity =
@@ -8048,38 +8048,66 @@ namespace llaminar2
         }
 
         int restored_layers = 0;
-        for (int layer = 0; layer < state_.kv_cache->n_layers(); ++layer)
+        bool used_graph_publish = false;
+        std::string graph_publish_error;
+        if (forward_engine_)
         {
-            if (!hybrid->isGDNLayer(layer))
+            int published_stages = 0;
+            if (forward_engine_->publishAcceptedSpeculativeVerifierStateFromDeviceMetadata(
+                    ptrs.accepted_state_slot_indices,
+                    request_index,
+                    state_.device_id,
+                    batch.shape.max_draft_tokens,
+                    moePlacementEpoch(),
+                    stream,
+                    &published_stages,
+                    &graph_publish_error))
             {
-                continue;
+                used_graph_publish = true;
+                restored_layers = std::max(1, published_stages / 2);
             }
+            else if (graph_publish_error != "no_cached_verifier_graph")
+            {
+                return fail(std::string("graph_metadata_publish_failed:") +
+                            graph_publish_error);
+            }
+        }
 
-            auto *conv_kernel = hybrid->getConvKernel(layer);
-            float *conv_state = hybrid->getConvState(layer);
-            auto *recurrence_kernel = hybrid->getRecurrenceKernel(layer);
-            float *recurrence_state = hybrid->getRecurrenceState(layer);
-            if (!conv_kernel || !conv_state || !recurrence_kernel || !recurrence_state)
+        if (!used_graph_publish)
+        {
+            for (int layer = 0; layer < state_.kv_cache->n_layers(); ++layer)
             {
-                return fail("missing_gdn_state_or_kernel");
+                if (!hybrid->isGDNLayer(layer))
+                {
+                    continue;
+                }
+
+                auto *conv_kernel = hybrid->getConvKernel(layer);
+                float *conv_state = hybrid->getConvState(layer);
+                auto *recurrence_kernel = hybrid->getRecurrenceKernel(layer);
+                float *recurrence_state = hybrid->getRecurrenceState(layer);
+                if (!conv_kernel || !conv_state || !recurrence_kernel || !recurrence_state)
+                {
+                    return fail("missing_gdn_state_or_kernel");
+                }
+                if (!conv_kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
+                        conv_state,
+                        ptrs.accepted_state_slot_indices,
+                        request_index,
+                        stream))
+                {
+                    return fail("shortconv_metadata_publish_failed");
+                }
+                if (!recurrence_kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
+                        recurrence_state,
+                        ptrs.accepted_state_slot_indices,
+                        request_index,
+                        stream))
+                {
+                    return fail("recurrence_metadata_publish_failed");
+                }
+                ++restored_layers;
             }
-            if (!conv_kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
-                    conv_state,
-                    ptrs.accepted_state_slot_indices,
-                    request_index,
-                    stream))
-            {
-                return fail("shortconv_metadata_publish_failed");
-            }
-            if (!recurrence_kernel->publishAcceptedSpeculativeStateFromDeviceMetadata(
-                    recurrence_state,
-                    ptrs.accepted_state_slot_indices,
-                    request_index,
-                    stream))
-            {
-                return fail("recurrence_metadata_publish_failed");
-            }
-            ++restored_layers;
         }
 
         if (restored_layers == 0)
@@ -8095,7 +8123,7 @@ namespace llaminar2
         state_.sequence_lengths[seq_idx] = target_cached_tokens;
         handleLivePrefixReplayStateAfterMutation(
             "publish_mtp_spec_decode_metadata_state",
-            /*preserve_gpu_replay_state=*/false);
+            /*preserve_gpu_replay_state=*/true);
         PerfStatsCollector::addCounter(
             "mtp",
             "spec_decode_metadata_state_publications",
@@ -8112,6 +8140,7 @@ namespace llaminar2
                   ? std::to_string(batch.committed_state_rows[static_cast<size_t>(request_index)])
                   : std::string("-1")},
              {"target_cached_tokens", std::to_string(target_cached_tokens)},
+             {"publish_path", used_graph_publish ? "cached_verifier_graph" : "hybrid_kernel_fallback"},
              {"bytes_uploaded", std::to_string(upload.bytes_uploaded)},
              {"gdn_layers", std::to_string(restored_layers)}});
         return true;

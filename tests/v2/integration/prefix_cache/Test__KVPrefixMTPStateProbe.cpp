@@ -386,7 +386,7 @@ namespace
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
             {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
             {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_stochastic_mtp_stats.json"},
-            {"LLAMINAR_PERF_STATS_FILTER", "mtp"},
+            {"LLAMINAR_PERF_STATS_FILTER", "mtp,forward_graph"},
         });
         PerfStatsCollector::reset();
 
@@ -430,9 +430,9 @@ namespace
         stochastic.presence_penalty = 0.25f;
         stochastic.seed = 123;
 
-        auto result = runner->generate(prompt, 6, stochastic);
+        auto result = runner->generate(prompt, 8, stochastic);
         const auto snapshot = runner->prefixStateProbe();
-        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        const auto records = PerfStatsCollector::snapshot({"mtp", "forward_graph"});
         runner->shutdown();
 
         auto counter = [&](const std::string &name)
@@ -452,7 +452,7 @@ namespace
         };
 
         ASSERT_TRUE(result.error.empty()) << result.error;
-        ASSERT_EQ(result.tokens.size(), 6u);
+        ASSERT_EQ(result.tokens.size(), 8u);
         EXPECT_TRUE(snapshot.mtp_config_enabled);
         EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
         EXPECT_GE(snapshot.mtp_draft_steps, 1u);
@@ -494,6 +494,19 @@ namespace
             << backend_name << " stochastic MTP must not sample sidecar drafts from host full logits";
         EXPECT_EQ(counter("verifier_stochastic_distributions"), 0.0)
             << backend_name << " stochastic MTP must not build verifier distributions from host full logits";
+
+        const PerfStatsCollector::Tags verifier_replay_tags = {
+            {"context", "main_verifier"},
+            {"phase", "replay"},
+        };
+        EXPECT_GE(findPerfCounterValue(records,
+                                       "forward_graph",
+                                       "decode_segmented_phase",
+                                       "decode",
+                                       verifier_replay_tags),
+                  1.0)
+            << backend_name << " stochastic MTP must preserve main verifier graph replay state "
+            << "after accepted-count metadata publication";
     }
 
     int mpiWorldSize()
