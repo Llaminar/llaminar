@@ -8,14 +8,14 @@ plan carries detailed implementation status.
 
 | Scope | Device | Model | Mode | Prefill tok/s | Decode tok/s | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 708.33 | 41.73 | current promoted-path baseline |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 direct candidate | 602.79 | 67.92 | historical target, not accepted |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 609.73 | 38.19 | old blocker, 84.95% acceptance |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.21 | 31.10 | current promoted-path baseline |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 direct candidate | 218.27 | 36.14 | historical target, not accepted |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | fixed d1 MTP, Phase 13.8 direct candidate | 218.24 | 39.84 | historical target, not accepted |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 877.55 | 43.81 | current clean baseline |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 726.19 | 87.07 | historical 1.99x target, not accepted |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 727.20 | 36.65 | correct lane, speed-negative |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, shared stepwise | 609.73 | 38.19 | old blocker, 84.95% acceptance |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.54 | 30.21 | current clean baseline |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 217.10 | 34.40 | failed equivalence, not accepted |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 76.35 | 31.92 | short-lane baseline |
-| Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 direct | 73.05 | 54.23 | 1.70x, 88.57% acceptance |
+| Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 73.05 | 54.23 | historical 1.70x target |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | current baseline |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1946.82 | 148.50 | speed-positive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
@@ -23,17 +23,18 @@ plan carries detailed implementation status.
 
 ## Current Findings
 
-- Phase 13.8 vLLM-style transaction is the active dense SingleDevice GPU
-  design. The direct-candidate numbers above are historical targets until fresh
-  greedy and stochastic accepted-count benchmarks replace them.
+- Phase 13.8 vLLM-style transaction remains the active dense SingleDevice GPU
+  design. Retired selected-row numbers above are speed targets only, not
+  acceptance evidence.
 - Sequential verifier MTP is the old blocker: correct but speed-negative because
   accepted speculative tokens paid repeated decode-equivalent verifier forwards.
-- Dead raw all-position and sidecar-chain shortcut code/tests are removed. Live
-  work goes through `gdn_speculative_state_slots*`, explicit accepted-count
-  publication, shifted-row commit, suffix forward, and ready-token handoff.
-- Source-owned parity covers CUDA/ROCm depth-3 normal decode, depth-3 prefix
-  restore, stop-token, continuation, reject, benchmark-style, and stochastic
-  Phase 13.8 cells with zero transaction validation failures.
+- Dead raw all-position and sidecar-chain shortcut code/tests are removed.
+  Retained work goes through `gdn_speculative_state_slots*`, explicit
+  accepted-count publication, shifted-row commit, suffix forward, and
+  ready-token handoff.
+- Source-owned parity covers CUDA/ROCm depth-3 normal decode, prefix restore,
+  benchmark-style fixed depth, and stochastic Phase 13.8 cells. The ROCm
+  selected-row equivalence failure is the reason that path was removed.
 - Benchmark mode now preserves greedy deterministic defaults for normal runs but
   passes `temperature/top_k/top_p/seed` into orchestrated decode for
   `--mtp-verify-mode speculative-sampling`, so stochastic MTP measurements are

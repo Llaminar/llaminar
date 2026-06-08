@@ -890,30 +890,6 @@ TEST_F(Test__DeviceGraphOrchestrator, LogitsReturnsNullptrWhenNotInitialized)
     EXPECT_EQ(orchestrator->logits(), nullptr);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, VllmStyleSpecDecodeCandidateHardFailsOutsidePromotedPolicy)
-{
-    ScopedEnv candidate(
-        "LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE",
-        "vllm_style_spec_decode");
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
-
-    EXPECT_STREQ(orchestrator->optimizedMTPDecodeCatchupGreedyName(),
-                 "vllm_style_spec_decode");
-
-    MTPDecodeCatchupGreedyRequest request;
-    request.draft_tokens = {7, 9, 8};
-    MTPDecodeCatchupGreedyResult result =
-        orchestrator->runOptimizedMTPDecodeCatchupGreedy(
-            request,
-            []() -> int32_t { return 9; });
-
-    EXPECT_FALSE(result.ok);
-    EXPECT_NE(result.error.find("vllm_style_spec_decode is not promoted for hybrid GDN"),
-              std::string::npos);
-    EXPECT_NE(result.error.find("accepted-count speculative state-slot publication"),
-              std::string::npos);
-}
-
 TEST_F(Test__DeviceGraphOrchestrator, SpecDecodeMetadataStateRestoreHardFailsWithoutState)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);

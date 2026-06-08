@@ -2023,11 +2023,7 @@ namespace llaminar2
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
         bool requiresMTPDecodeEquivalentVerifierReplay() const override;
-        bool supportsOptimizedMTPDecodeCatchupGreedy() const override;
-        const char *optimizedMTPDecodeCatchupGreedyName() const override;
-        MTPDecodeCatchupGreedyResult runOptimizedMTPDecodeCatchupGreedy(
-            const MTPDecodeCatchupGreedyRequest &request,
-            const MTPDecodeCatchupGreedySampler &sample_after_forward) override;
+        bool supportsMTPSpecDecodeAcceptedCountPublication() const override;
         bool supportsMTPVerifierStateRowRestore() const override;
         bool restoreMTPVerifierStateRow(
             int verifier_row,
@@ -2331,7 +2327,6 @@ namespace llaminar2
         mutable std::vector<LiveHybridCheckpointStorageSlot> live_hybrid_checkpoint_storage_pool_;
         bool ensurePrefixCacheReady();
         bool isPrefixCacheMoEModel() const;
-        bool supportsPromotedVllmStyleSpecDecodeSingleDeviceDense() const;
         void *explicitGPUStreamForOperation(const char *operation) const;
         void handleLivePrefixReplayStateAfterMutation(
             const char *operation,

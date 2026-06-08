@@ -234,43 +234,17 @@ namespace llaminar2
         virtual bool requiresMTPDecodeEquivalentVerifierReplay() const { return false; }
 
         /**
-         * @brief True when the runner provides a backend-native implementation
-         *        of the shared decode-equivalent catch-up contract.
+         * @brief True when the runner can publish Phase 13.8 accepted-count
+         *        speculative state through graph-owned metadata buffers.
          *
-         * The optimized path must produce the same result and live-state
-         * effects as runSharedStepwiseMTPDecodeCatchupGreedy(). Returning true
-         * makes OrchestrationRunner call runOptimizedMTPDecodeCatchupGreedy()
-         * for greedy decode-equivalent verification.
+         * This is deliberately narrower than a generic "optimized verifier"
+         * hook. It means target verifier effects are held in speculative
+         * GDN/short-conv state slots and only the accepted count is committed to
+         * live request state. Greedy decode-equivalent verification still uses
+         * the shared stepwise oracle until a future backend path proves the same
+         * contract without raw all-position row publication.
          */
-        virtual bool supportsOptimizedMTPDecodeCatchupGreedy() const { return false; }
-
-        /**
-         * @brief Stable counter tag for the optimized catch-up implementation.
-         */
-        virtual const char *optimizedMTPDecodeCatchupGreedyName() const
-        {
-            return "optimized";
-        }
-
-        /**
-         * @brief Run the backend-native optimized catch-up implementation.
-         *
-         * Implementations must preserve the MTPDecodeCatchupGreedyResult
-         * contract and leave runner state decode-equivalent to the shared
-         * stepwise oracle. The default body is a hard failure so an accidental
-         * capability advertisement cannot silently fall back inside the hook.
-         */
-        virtual MTPDecodeCatchupGreedyResult runOptimizedMTPDecodeCatchupGreedy(
-            const MTPDecodeCatchupGreedyRequest &request,
-            const MTPDecodeCatchupGreedySampler &sample_after_forward)
-        {
-            (void)request;
-            (void)sample_after_forward;
-            MTPDecodeCatchupGreedyResult result;
-            result.ok = false;
-            result.error = "runner advertised optimized MTP decode catch-up without implementation";
-            return result;
-        }
+        virtual bool supportsMTPSpecDecodeAcceptedCountPublication() const { return false; }
 
         /**
          * @brief Run a chained MTP sidecar step from the previous sidecar hidden.

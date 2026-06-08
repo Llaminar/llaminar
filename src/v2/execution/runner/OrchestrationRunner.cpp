@@ -1882,43 +1882,10 @@ namespace llaminar2
         std::vector<PrefixStateSnapshot> sidecar_checkpoints;
         sidecar_checkpoints.reserve(1);
         bool post_sidecar_checkpoint_requires_verifier_row_restore = false;
-        std::optional<PrefixStateSnapshot> optimized_catchup_verifier_base_payload;
-        const bool runner_supports_phase138_optimized_catchup =
-            runner_->supportsOptimizedMTPDecodeCatchupGreedy();
-        const char *phase138_optimized_catchup_name =
-            runner_supports_phase138_optimized_catchup
-                ? runner_->optimizedMTPDecodeCatchupGreedyName()
-                : nullptr;
-        const bool phase138_vllm_style_candidate =
-            phase138_optimized_catchup_name &&
-            std::strcmp(phase138_optimized_catchup_name, "vllm_style_spec_decode") == 0;
         const bool use_phase138_stochastic_accepted_count_publish =
             stochastic_verify &&
             stochastic_device_verify &&
-            phase138_vllm_style_candidate;
-        if (!stochastic_verify &&
-            !use_sampling_penalties &&
-            runner_supports_phase138_optimized_catchup)
-        {
-            PerfStatsCollector::ScopedTimer timer(
-                "mtp",
-                "capture_phase138_optimized_catchup_payload_base",
-                "decode");
-            optimized_catchup_verifier_base_payload = runner_->captureLivePrefixState();
-            if (!optimized_catchup_verifier_base_payload->valid)
-            {
-                return fail_after_checkpoint(
-                    "MTP Phase 13.8 optimized catch-up could not capture payload verifier base");
-            }
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "phase138_optimized_catchup_payload_base_captures",
-                1.0,
-                "decode",
-                {},
-                {{"cached_tokens",
-                  std::to_string(optimized_catchup_verifier_base_payload->cached_tokens)}});
-        }
+            runner_->supportsMTPSpecDecodeAcceptedCountPublication();
         if (use_phase138_stochastic_accepted_count_publish)
         {
             PerfStatsCollector::ScopedTimer timer(
@@ -2697,149 +2664,14 @@ namespace llaminar2
             catchup_request.base_sidecar_position = base_sidecar_position;
             catchup_request.allow_speculative_discard = true;
             catchup_request.verifier_path = "decode_equivalent_catchup";
-            catchup_request.verifier_base_checkpoint =
-                optimized_catchup_verifier_base_payload
-                    ? &*optimized_catchup_verifier_base_payload
-                    : &verifier_base_checkpoint;
+            catchup_request.verifier_base_checkpoint = &verifier_base_checkpoint;
 
-            const bool use_optimized_catchup =
-                runner_->supportsOptimizedMTPDecodeCatchupGreedy();
-            const char *phase138_equivalence_env =
-                std::getenv("LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK");
-            const bool phase138_equivalence_check =
-                use_optimized_catchup &&
-                phase138_equivalence_env &&
-                (std::string(phase138_equivalence_env) == "1" ||
-                 std::string(phase138_equivalence_env) == "true" ||
-                 std::string(phase138_equivalence_env) == "TRUE");
             std::string catchup_implementation = "shared_stepwise";
-            MTPDecodeCatchupGreedyResult catchup;
-            if (use_optimized_catchup)
-            {
-                const char *name = runner_->optimizedMTPDecodeCatchupGreedyName();
-                if (name && name[0] != '\0')
-                    catchup_implementation = name;
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "decode_equivalent_optimized_catchup_selected",
-                    1.0,
-                    "decode",
-                    {},
-                    {{"implementation", catchup_implementation},
-                     {"draft_tokens", std::to_string(draft_tokens.size())}});
-                if (phase138_equivalence_check)
-                {
-                    MTPDecodeCatchupGreedyResult candidate =
-                        runner_->runOptimizedMTPDecodeCatchupGreedy(
-                            catchup_request,
-                            sample_after_forward);
-                    if (!candidate.ok)
-                    {
-                        catchup = std::move(candidate);
-                    }
-                    else
-                    {
-                        const bool candidate_rejected_without_ready =
-                            !candidate.all_speculative_accepted &&
-                            !candidate.stopped_on_output &&
-                            candidate.ready_token < 0;
-                        if (candidate_rejected_without_ready)
-                        {
-                            catchup.ok = false;
-                            catchup.error =
-                                "MTP Phase 13.8 optimized catch-up returned a rejected transaction without a ready token";
-                        }
-                        if (catchup.error.empty())
-                        {
-                            const PrefixStateSnapshot *equivalence_base =
-                                catchup_request.verifier_base_checkpoint
-                                    ? catchup_request.verifier_base_checkpoint
-                                    : &verifier_base_checkpoint;
-                            PrefixRuntimeStateSnapshot candidate_state =
-                                runner_->prefixStateProbe();
-                            if (!runner_->restoreLivePrefixState(*equivalence_base))
-                            {
-                                catchup.ok = false;
-                                catchup.error =
-                                    "MTP Phase 13.8 equivalence check could not restore exact verifier base after candidate";
-                            }
-                            else
-                            {
-                                MTPDecodeCatchupGreedyRequest oracle_request =
-                                    catchup_request;
-                                oracle_request.implementation_name =
-                                    "shared_stepwise_equivalence_oracle";
-                                MTPDecodeCatchupGreedyResult oracle =
-                                    runSharedStepwiseMTPDecodeCatchupGreedy(
-                                        *runner_,
-                                        oracle_request,
-                                        sample_after_forward);
-                                PrefixRuntimeStateSnapshot oracle_state =
-                                    runner_->prefixStateProbe();
-                                if (!oracle.ok)
-                                {
-                                    catchup = std::move(oracle);
-                                }
-                                else
-                                {
-                                    MTPDecodeCatchupGreedyEquivalence result_eq =
-                                        compareMTPDecodeCatchupGreedyResults(
-                                            oracle,
-                                            candidate);
-                                    MTPStateValidationResult state_eq =
-                                        compareMTPRuntimeStateSnapshots(
-                                            oracle_state,
-                                            candidate_state);
-                                    if (!result_eq.ok)
-                                    {
-                                        catchup.ok = false;
-                                        catchup.error =
-                                            std::string("MTP Phase 13.8 catch-up result equivalence failed: ") +
-                                            result_eq.error +
-                                            "; runtime_state_equivalence=" +
-                                            (state_eq.ok ? std::string("ok") : state_eq.reason);
-                                    }
-                                    else if (!state_eq.ok)
-                                    {
-                                        catchup.ok = false;
-                                        catchup.error =
-                                            std::string("MTP Phase 13.8 runtime state equivalence failed: ") +
-                                            state_eq.reason;
-                                    }
-                                    else
-                                    {
-                                        PerfStatsCollector::addCounter(
-                                            "mtp",
-                                            "phase138_spec_decode_equivalence_matches",
-                                            1.0,
-                                            "decode",
-                                            {},
-                                            {{"implementation", catchup_implementation},
-                                             {"draft_tokens", std::to_string(draft_tokens.size())},
-                                             {"candidate_forward_tokens", std::to_string(candidate.main_forward_token_count)},
-                                             {"oracle_forward_tokens", std::to_string(oracle.main_forward_token_count)}});
-                                        catchup = std::move(oracle);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    catchup = runner_->runOptimizedMTPDecodeCatchupGreedy(
-                        catchup_request,
-                        sample_after_forward);
-                }
-            }
-            else
-            {
-                catchup =
-                    runSharedStepwiseMTPDecodeCatchupGreedy(
-                        *runner_,
-                        catchup_request,
-                        sample_after_forward);
-            }
+            MTPDecodeCatchupGreedyResult catchup =
+                runSharedStepwiseMTPDecodeCatchupGreedy(
+                    *runner_,
+                    catchup_request,
+                    sample_after_forward);
             if (!catchup.ok)
             {
                 return fail_after_checkpoint(catchup.error);
@@ -3547,7 +3379,7 @@ namespace llaminar2
             phase138_request.base_sidecar_position = base_sidecar_position;
             phase138_request.allow_speculative_discard = true;
             phase138_request.verifier_path = "phase138_stochastic_spec_decode";
-            phase138_request.implementation_name = "vllm_style_spec_decode";
+            phase138_request.implementation_name = "accepted_count_spec_decode";
             phase138_request.verifier_base_checkpoint = &verifier_base_checkpoint;
 
             MTPDecodeCatchupGreedyResult phase138_result;
@@ -3740,7 +3572,7 @@ namespace llaminar2
 
             if (auto tx_error = validate_spec_decode_transaction(
                     "phase138_stochastic_spec_decode",
-                    "vllm_style_spec_decode",
+                    "accepted_count_spec_decode",
                     draft_tokens,
                     accepted_tokens,
                     phase138_ready_token,

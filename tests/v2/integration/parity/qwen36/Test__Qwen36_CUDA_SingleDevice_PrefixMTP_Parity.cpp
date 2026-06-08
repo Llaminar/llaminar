@@ -72,21 +72,6 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPBenchmarkPromptFixedDepth3Matches
     runDenseBenchmarkStyleFixedMTPParity(cudaSingleDeviceCase(), 3);
 }
 
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidateEquivalence)
-{
-    runDensePhase138VllmStyleCandidateEquivalence(cudaSingleDeviceCase(), 2);
-}
-
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidatePrefixRestoreEquivalence)
-{
-    runDensePhase138VllmStyleCandidatePrefixRestoreEquivalence(cudaSingleDeviceCase(), 3);
-}
-
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidateStopTokenEquivalence)
-{
-    runDensePhase138VllmStyleCandidateStopTokenEquivalence(cudaSingleDeviceCase(), 2);
-}
-
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPPhase138ContinuationMatchesPyTorch)
 {
     runDenseNoMTPPhase138ContinuationMatchesPyTorch(cudaSingleDeviceCase(), 8);
@@ -95,11 +80,6 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPPhase138ContinuationMatchesPyTo
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPPhase138ThinkContinuationStageParity)
 {
     runDenseNoMTPPhase138ThinkContinuationStageParity(cudaSingleDeviceCase());
-}
-
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidateContinuationEquivalence)
-{
-    runDensePhase138VllmStyleCandidateContinuationEquivalence(cudaSingleDeviceCase(), 3, 8);
 }
 
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleFreshRunnerDeterminism)
