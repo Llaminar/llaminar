@@ -33,6 +33,8 @@ Phase 14 scoreboard for Qwen3.6 MTP and prefix-cache tuning.
   target cached-token counts, correction replay spans, and bonus-ready rows
   without mutating live state. The device publication API is a separate opt-in
   runner seam and is still unpromoted.
+- CUDA and ROCm direct GDN/short-conv kernel tests now both cover restored
+  verifier slot state followed by multi-step continuation replay equivalence.
 - A lagged-terminal-output experiment cut verifier replay calls in half but
   paid the same forward as next-step `condition_forward`, leaving ROCm d1 at
   24.86 tok/s. The code was removed; do not retry this as a speed path.

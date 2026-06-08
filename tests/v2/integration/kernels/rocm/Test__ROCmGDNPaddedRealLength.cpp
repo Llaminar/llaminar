@@ -571,6 +571,134 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAccep
         << "ROCm verifier capture must not mutate live recurrence state before publication";
 }
 
+TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiStepReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int n_heads = 2;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int accepted_rows = 4;
+    constexpr int continuation_rows = 4;
+    constexpr int verifier_len = accepted_rows + continuation_rows;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr size_t verifier_output_elems =
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(v_stride);
+    constexpr size_t continuation_output_elems =
+        static_cast<size_t>(continuation_rows) * static_cast<size_t>(v_stride);
+
+    const auto Q = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, 0.0023f, 0.0f, 0.0023f);
+    const auto K = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, -0.0017f, 0.0f, -0.0017f);
+    const auto V = makeSequenceRows(verifier_len, v_stride, verifier_len, verifier_len, 0.0029f, 0.0f, 0.0029f);
+    const auto alpha = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, 0.019f, 0.0f, 0.019f);
+    const auto beta = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, -0.017f, 0.0f, -0.017f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.00073f);
+    const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    HipFloatBuffer d_Q(Q);
+    HipFloatBuffer d_K(K);
+    HipFloatBuffer d_V(V);
+    HipFloatBuffer d_alpha(alpha);
+    HipFloatBuffer d_beta(beta);
+    HipFloatBuffer d_Q_cont(Q);
+    HipFloatBuffer d_K_cont(K);
+    HipFloatBuffer d_V_cont(V);
+    HipFloatBuffer d_alpha_cont(alpha);
+    HipFloatBuffer d_beta_cont(beta);
+    HipFloatBuffer d_Q_ref(Q);
+    HipFloatBuffer d_K_ref(K);
+    HipFloatBuffer d_V_ref(V);
+    HipFloatBuffer d_alpha_ref(alpha);
+    HipFloatBuffer d_beta_ref(beta);
+    HipFloatBuffer d_A_log(A_log);
+    HipFloatBuffer d_dt_bias(dt_bias);
+    HipFloatBuffer d_verifier_out(verifier_output_elems, 0.0f);
+    HipFloatBuffer d_restored_continuation(continuation_output_elems, 0.0f);
+    HipFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(v_stride), 0.0f);
+    HipFloatBuffer d_ref_continuation(continuation_output_elems, 0.0f);
+    HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+    HipFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    HipStreamHandle stream;
+
+    ROCmGatedDeltaNet verifier_kernel(0);
+    verifier_kernel.allocateGPUState(state_floats);
+    verifier_kernel.setGPUStream(stream.stream);
+    verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
+    ASSERT_TRUE(verifier_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(verifier_kernel.chunk_forward(
+        d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_verifier_out.ptr, nullptr,
+        verifier_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+        nullptr, accepted_rows - 1, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
+    for (int row = 0; row < continuation_rows; ++row)
+    {
+        const int source_row = accepted_rows + row;
+        ASSERT_TRUE(verifier_kernel.recurrent_step(
+            d_Q_cont.ptr + static_cast<size_t>(source_row) * qk_stride,
+            d_K_cont.ptr + static_cast<size_t>(source_row) * qk_stride,
+            d_V_cont.ptr + static_cast<size_t>(source_row) * v_stride,
+            d_alpha_cont.ptr + static_cast<size_t>(source_row) * n_heads,
+            d_beta_cont.ptr + static_cast<size_t>(source_row) * n_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_restored_continuation.ptr + static_cast<size_t>(row) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(restored recurrence continuation)");
+    std::vector<float> restored_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(restored_state.data(), nullptr, stream.stream));
+
+    ROCmGatedDeltaNet ref_kernel(0);
+    ref_kernel.allocateGPUState(state_floats);
+    ref_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(ref_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(ref_kernel.chunk_forward(
+        d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_ref_prefix.ptr, nullptr,
+        accepted_rows, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    for (int row = 0; row < continuation_rows; ++row)
+    {
+        const int source_row = accepted_rows + row;
+        ASSERT_TRUE(ref_kernel.recurrent_step(
+            d_Q_ref.ptr + static_cast<size_t>(source_row) * qk_stride,
+            d_K_ref.ptr + static_cast<size_t>(source_row) * qk_stride,
+            d_V_ref.ptr + static_cast<size_t>(source_row) * v_stride,
+            d_alpha_ref.ptr + static_cast<size_t>(source_row) * n_heads,
+            d_beta_ref.ptr + static_cast<size_t>(source_row) * n_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_ref_continuation.ptr + static_cast<size_t>(row) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(reference recurrence continuation)");
+    std::vector<float> ref_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(ref_kernel.exportState(ref_state.data(), nullptr, stream.stream));
+
+    const auto restored = d_restored_continuation.toHost();
+    const auto ref = d_ref_continuation.toHost();
+    const auto out_diff = diffStats(restored, ref, 0, restored.size());
+    const auto state_diff = diffStats(restored_state, ref_state, 0, restored_state.size());
+    EXPECT_LT(out_diff.first, 2e-4f);
+    EXPECT_LT(out_diff.second, 1e-4);
+    EXPECT_LT(state_diff.first, 2e-4f);
+    EXPECT_LT(state_diff.second, 1e-4);
+}
+
 TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseReplay)
 {
     if (!hasROCm())
