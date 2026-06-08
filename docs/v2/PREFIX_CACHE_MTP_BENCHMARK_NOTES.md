@@ -6,12 +6,10 @@ Phase 14 scoreboard for Qwen3.6 MTP and prefix-cache tuning.
 
 | Scope | Device | Model | Mode | Prefill tok/s | Decode tok/s | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 877.55 | 43.81 | clean baseline |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic fixed d1 | 707.96 | 54.60 | top-k small path, accepted short smoke |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic dynamic | 706.09 | 55.80 | effective d1 |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.17 | 30.14 | fresh retained baseline |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic fixed d1 | 216.79 | 24.83 | sidecar-base restore skipped, 82.81% accept |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic dynamic | 216.55 | 24.84 | held depth 1, no updates |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 879.86 | 43.74 | post-cleanup baseline |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic fixed d1 | 742.25 | 39.60 | retained path, 89.06% accept |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.82 | 30.21 | post-cleanup baseline |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic fixed d1 | 216.96 | 24.79 | retained path, 95.31% accept |
 | Dense qbf, c64/n48 | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 | 73.05 | 54.23 | historical target only |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | clean baseline |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 | 1946.82 | 148.50 | speed-positive |
@@ -28,6 +26,11 @@ Phase 14 scoreboard for Qwen3.6 MTP and prefix-cache tuning.
   builder, and stale Qwen3.6 shortcut parity cells are removed. LocalTP and
   GlobalTP now delegate the same single-row shifted-cache commit API used by the
   retained verifier path. Focused MTP/prefix units are green.
+- Post-cleanup dense default assessment: CUDA is not currently fast either.
+  CUDA d1 is 0.91x baseline and ROCm d1 is 0.82x baseline. Profiled captures
+  show the common bottleneck is `decode_equivalent_stochastic_forward_one`:
+  about 23.1 ms/call on CUDA and 33.4 ms/call on ROCm, paid twice per d1
+  speculative pair through the retained shared verifier path.
 - Fresh ROCm retained-path profiling shows stochastic fixed depth-1 still pays
   two one-token main forwards per speculative pair. Skipping the redundant
   verifier-base restore when the sidecar preserves main state improved decode
