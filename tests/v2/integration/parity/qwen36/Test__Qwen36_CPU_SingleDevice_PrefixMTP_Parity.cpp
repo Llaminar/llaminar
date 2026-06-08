@@ -21,30 +21,9 @@ namespace
     }
 }
 
-TEST(Qwen36CPUSingleDevicePrefixMTPParity, PrefixRestoreFullHit)
-{
-    runDensePrefixRestoreParity(cpuSingleDeviceCase(), PrefixRestoreParityMode::FullHit);
-}
-
-TEST(Qwen36CPUSingleDevicePrefixMTPParity, PrefixRestorePartialHit)
-{
-    runDensePrefixRestoreParity(cpuSingleDeviceCase(), PrefixRestoreParityMode::PartialHit);
-}
-
-TEST(Qwen36CPUSingleDevicePrefixMTPParity, SplitPrefillMatchesPyTorchDecodeTokens)
-{
-    runDenseSplitPrefillParity(cpuSingleDeviceCase(), 4);
-}
-
-TEST(Qwen36CPUSingleDevicePrefixMTPParity, MTPGreedyMatchesPyTorchDecodeTokens)
-{
-    runDenseMTPParity(cpuSingleDeviceCase(), false);
-}
-
-TEST(Qwen36CPUSingleDevicePrefixMTPParity, PrefixCacheMTPRestore)
-{
-    runDenseMTPParity(cpuSingleDeviceCase(), true);
-}
+#define QWEN36_DENSE_PREFIX_MTP_SUITE Qwen36CPUSingleDevicePrefixMTPParity
+#define QWEN36_DENSE_PREFIX_MTP_CASE cpuSingleDeviceCase
+#include "Qwen36DenseSingleDevicePrefixMTPParityTests.inc"
 
 int main(int argc, char **argv)
 {

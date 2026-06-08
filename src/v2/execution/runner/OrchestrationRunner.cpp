@@ -16,6 +16,7 @@
 #include "../mtp/MTPDecodeCatchup.h"
 #include "../mtp/MTPSpecDecodeMetadata.h"
 #include "../mtp/MTPSpecDecodeTransaction.h"
+#include "../mtp/MTPSpecStateContract.h"
 #include "../mtp/MTPVerifierPolicy.h"
 #include "../mtp/MTPWeightManifest.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
@@ -55,6 +56,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
@@ -98,6 +100,39 @@ namespace llaminar2
                    a.dry_allowed_length == b.dry_allowed_length &&
                    a.dry_penalty_last_n == b.dry_penalty_last_n &&
                    a.dry_sequence_breakers == b.dry_sequence_breakers;
+        }
+
+        int sampleDistributionWithThreshold(
+            const std::vector<SamplingDistributionEntry> &distribution,
+            float threshold)
+        {
+            if (distribution.empty())
+                return -1;
+
+            const float clamped_threshold =
+                std::clamp(threshold, 0.0f, std::nextafter(1.0f, 0.0f));
+            float cumulative = 0.0f;
+            int fallback_token = -1;
+            for (const auto &entry : distribution)
+            {
+                if (entry.token_id < 0 || !(entry.probability > 0.0f))
+                    continue;
+                cumulative += entry.probability;
+                fallback_token = entry.token_id;
+                if (clamped_threshold <= cumulative)
+                    return entry.token_id;
+            }
+            return fallback_token;
+        }
+
+        int sampleResidualDistributionWithThreshold(
+            const std::vector<SamplingDistributionEntry> &target,
+            const std::vector<SamplingDistributionEntry> &draft,
+            float threshold)
+        {
+            return sampleDistributionWithThreshold(
+                Sampler::residual_distribution(target, draft),
+                threshold);
         }
 
         void synchronizeRunnerPrimaryDeviceBeforeRelease(const IInferenceRunner *runner)
@@ -1527,14 +1562,23 @@ namespace llaminar2
             stochastic_verify &&
             runner_->primaryDeviceId().is_gpu() &&
             runner_->supportsDeviceStochasticMTPVerification();
+        const bool stochastic_host_verify =
+            stochastic_verify &&
+            !runner_->primaryDeviceId().is_gpu();
         const bool use_sampling_penalties =
             active_sampling_params_.has_penalties() && !stochastic_verify;
+        const bool supports_all_position_state_publication =
+            runner_->supportsMTPSpecStatePublication() &&
+            !runner_->requiresMTPDecodeEquivalentVerifierReplay() &&
+            (!stochastic_verify || stochastic_device_verify);
         const MTPVerifierPolicyDecision verifier_policy =
             chooseMTPVerifierPolicy(
                 MTPVerifierPolicyInput{
                     .greedy_sampling = active_sampling_params_.is_greedy(),
                     .stochastic_verify = stochastic_verify,
                     .uses_sampling_penalties = use_sampling_penalties,
+                    .supports_spec_state_publication =
+                        supports_all_position_state_publication,
                 });
         if (verifier_policy.path == MTPVerifierExecutionPath::Unsupported)
         {
@@ -1779,7 +1823,7 @@ namespace llaminar2
         }
 
         const bool verify_commit_replay_check =
-            DebugEnv::isTruthyEnvValue(std::getenv("LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK")) &&
+            DebugEnv::isTruthyEnv("LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK") &&
             !stochastic_verify &&
             !use_sampling_penalties &&
             active_sampling_params_.is_greedy();
@@ -1803,6 +1847,8 @@ namespace llaminar2
 
         std::vector<PrefixStateSnapshot> sidecar_checkpoints;
         sidecar_checkpoints.reserve(1);
+        std::vector<std::vector<SamplingDistributionEntry>> host_mtp_draft_distributions(
+            static_cast<size_t>(std::max(0, speculative_draft_count)));
 
         auto sample_mtp_token = [&](int draft_idx) -> int32_t
         {
@@ -1864,6 +1910,12 @@ namespace llaminar2
                         mtp_logits,
                         static_cast<size_t>(vocab),
                         active_sampling_params_);
+                if (draft_idx >= 0 &&
+                    draft_idx < static_cast<int>(host_mtp_draft_distributions.size()))
+                {
+                    host_mtp_draft_distributions[static_cast<size_t>(draft_idx)] =
+                        distribution;
+                }
                 {
                     PerfStatsCollector::ScopedTimer timer("mtp", "sample_mtp_token_stochastic", "decode");
                     token = draft_sampler.sample_from_distribution(distribution);
@@ -2012,7 +2064,7 @@ namespace llaminar2
             return fail_after_checkpoint("MTP sidecar stream flush failed before verification");
         }
 
-        if (DebugEnv::isTruthyEnvValue(std::getenv("LLAMINAR_MTP_VERIFY_SIDECAR_PRESERVES_MAIN_STATE")))
+        if (DebugEnv::isTruthyEnv("LLAMINAR_MTP_VERIFY_SIDECAR_PRESERVES_MAIN_STATE"))
         {
             auto join_debug_tokens = [](const std::vector<int32_t> &tokens) -> std::string
             {
@@ -2178,7 +2230,7 @@ namespace llaminar2
 
             int continuation_check_depth = 1;
             if (const char *depth_env =
-                    std::getenv("LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_DEPTH"))
+                    DebugEnv::envValue("LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_DEPTH"))
             {
                 char *end = nullptr;
                 const long parsed = std::strtol(depth_env, &end, 10);
@@ -2385,6 +2437,637 @@ namespace llaminar2
             return std::nullopt;
         };
 
+        const bool use_all_position_state_publication_greedy_verifier =
+            verifier_policy.path ==
+            MTPVerifierExecutionPath::AllPositionStatePublication;
+        if (use_all_position_state_publication_greedy_verifier)
+        {
+            if (sidecar_checkpoints.empty())
+            {
+                return fail_after_checkpoint(
+                    "All-position MTP verifier requires a post-sidecar checkpoint");
+            }
+
+            const PrefixStateSnapshot &sidecar_checkpoint =
+                sidecar_checkpoints.front();
+            if (!sidecar_checkpoint.valid)
+            {
+                return fail_after_checkpoint(
+                    "All-position MTP verifier received an invalid post-sidecar checkpoint");
+            }
+
+            const bool sidecar_preserves_main_state =
+                runner_->supportsMTPSidecarPreservesMainState();
+            bool restored_verifier_base = sidecar_preserves_main_state;
+            if (sidecar_preserves_main_state)
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "all_position_verifier_base_restore_skipped_sidecar_preserved",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"draft_tokens", std::to_string(draft_tokens.size())},
+                     {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)},
+                     {"discarded_sidecar_checkpoint", sidecar_checkpoint.valid ? "true" : "false"}});
+            }
+            else
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "all_position_verifier_restore_base_checkpoint",
+                    "decode");
+                restored_verifier_base =
+                    runner_->restoreLivePrefixState(verifier_base_checkpoint);
+                if (restored_verifier_base)
+                {
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "all_position_verifier_base_restores",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"draft_tokens", std::to_string(draft_tokens.size())},
+                         {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)},
+                         {"discarded_sidecar_checkpoint", sidecar_checkpoint.valid ? "true" : "false"}});
+                }
+            }
+            if (!restored_verifier_base)
+            {
+                return fail_after_checkpoint(
+                    "All-position MTP verifier could not restore verifier base checkpoint after sidecar draft");
+            }
+
+            std::vector<int32_t> sampled_verifier_rows(draft_tokens.size(), -1);
+            {
+                PerfStatsCollector::ScopedTimer verifier_timer(
+                    "mtp",
+                    "verifier_forward",
+                    "decode",
+                    {},
+                    {{"implementation", "all_position_state_publication"},
+                     {"verifier_path", "all_position_state_publication"}});
+                if (!runner_->setComputeAllPositionLogits(true))
+                {
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier could not enable all-position logits");
+                }
+                if (!runner_->forward(
+                        draft_tokens.data(),
+                        static_cast<int>(draft_tokens.size())))
+                {
+                    runner_->setComputeAllPositionLogits(false);
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier forward failed");
+                }
+                if (!runner_->setComputeAllPositionLogits(false))
+                {
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier could not disable all-position logits");
+                }
+            }
+
+            MTPDecodeCatchupGreedyRequest catchup_request;
+            catchup_request.draft_tokens = draft_tokens;
+            catchup_request.stop_tokens = stop_tokens_;
+            catchup_request.base_sidecar_position = base_sidecar_position;
+            catchup_request.allow_speculative_discard = true;
+            catchup_request.verifier_path = "all_position_state_publication";
+            catchup_request.implementation_name = "all_position_state_publication";
+            catchup_request.verifier_base_checkpoint = &verifier_base_checkpoint;
+
+            Sampler all_position_stochastic_penalty_sampler = sampler_;
+            MTPDecodeCatchupGreedyResult catchup;
+            if (stochastic_verify)
+            {
+                if (!stochastic_device_verify)
+                {
+                    return fail_after_checkpoint(
+                        "All-position stochastic MTP verifier requires device-resident distribution verification");
+                }
+
+                catchup.ok = true;
+                catchup.accepted_tokens.reserve(draft_tokens.size());
+                catchup.verifier_tokens.reserve(draft_tokens.size());
+                catchup.main_forward_token_count =
+                    static_cast<int>(draft_tokens.size());
+                catchup.accepted_tokens.push_back(first_token);
+                catchup.target_verifier_state_commit_count = 1;
+                all_position_stochastic_penalty_sampler.record_token(first_token);
+
+                if (std::find(stop_tokens_.begin(),
+                              stop_tokens_.end(),
+                              first_token) != stop_tokens_.end())
+                {
+                    catchup.stopped_on_output = true;
+                }
+
+                auto build_all_position_target_distribution =
+                    [&](int row, int slot) -> bool
+                {
+                    auto penalty_map =
+                        all_position_stochastic_penalty_sampler
+                            .compute_penalty_map(active_sampling_params_, vocab);
+                    if (!runner_->applyPenaltiesToAllPositionLogitsOnDeviceRow(
+                            row,
+                            penalty_map,
+                            vocab))
+                    {
+                        return false;
+                    }
+                    return runner_->buildStochasticDistributionOnDevice(
+                        DeviceLogitsSource::AllPosition,
+                        row,
+                        DeviceDistributionBuffer::Target,
+                        slot,
+                        active_sampling_params_,
+                        vocab);
+                };
+
+                for (int draft_idx = 1;
+                     !catchup.stopped_on_output &&
+                     draft_idx < static_cast<int>(draft_tokens.size());
+                     ++draft_idx)
+                {
+                    const int row = draft_idx - 1;
+                    if (!build_all_position_target_distribution(row, row))
+                    {
+                        return fail_after_checkpoint(
+                            "All-position stochastic MTP target distribution build failed");
+                    }
+
+                    const int32_t draft_token =
+                        draft_tokens[static_cast<size_t>(draft_idx)];
+                    const float accept_threshold = sampler_.random_uniform_01();
+                    const float residual_threshold = sampler_.random_uniform_01();
+                    DeviceSpeculativeVerifyResult verify_result;
+                    if (!runner_->verifyStochasticDistributionsBatchOnDevice(
+                            /*first_target_slot=*/row,
+                            /*first_draft_slot=*/row,
+                            &draft_token,
+                            &accept_threshold,
+                            &residual_threshold,
+                            /*row_count=*/1,
+                            &verify_result))
+                    {
+                        return fail_after_checkpoint(
+                            "All-position stochastic MTP device verifier failed");
+                    }
+
+                    ++mtp_stats_.stochastic_accept_tests;
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_accept_tests",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"row", std::to_string(row)},
+                         {"draft_token", std::to_string(draft_token)},
+                         {"accept_probability", std::to_string(verify_result.accept_probability)},
+                         {"threshold", std::to_string(verify_result.accept_threshold)},
+                         {"device_resident", "true"},
+                         {"verifier_path", "all_position_state_publication"}});
+
+                    int32_t output_token = -1;
+                    if (verify_result.accepted)
+                    {
+                        output_token = draft_token;
+                        sampled_verifier_rows[static_cast<size_t>(row)] =
+                            draft_token;
+                        catchup.verifier_tokens.push_back(draft_token);
+                        ++catchup.accepted_speculative_prefix;
+                        ++mtp_stats_.stochastic_accepts;
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "stochastic_accepts",
+                            1.0,
+                            "decode",
+                            {},
+                            {{"verifier_path", "all_position_state_publication"}});
+                    }
+                    else
+                    {
+                        output_token = verify_result.token;
+                        if (output_token < 0)
+                        {
+                            return fail_after_checkpoint(
+                                "All-position stochastic MTP residual verifier produced no correction token");
+                        }
+                        sampled_verifier_rows[static_cast<size_t>(row)] =
+                            output_token;
+                        catchup.all_speculative_accepted = false;
+                        catchup.rejected_verified_token = output_token;
+                        catchup.verifier_tokens.push_back(output_token);
+                        ++mtp_stats_.stochastic_residual_samples;
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "stochastic_residual_device_samples",
+                            1.0,
+                            "decode",
+                            {},
+                            {{"row", std::to_string(row)},
+                             {"draft_token", std::to_string(draft_token)},
+                             {"correction_token", std::to_string(output_token)},
+                             {"verifier_path", "all_position_state_publication"}});
+                    }
+
+                    catchup.accepted_tokens.push_back(output_token);
+                    all_position_stochastic_penalty_sampler.record_token(output_token);
+                    if (std::find(stop_tokens_.begin(),
+                                  stop_tokens_.end(),
+                                  output_token) != stop_tokens_.end())
+                    {
+                        catchup.stopped_on_output = true;
+                        break;
+                    }
+                    if (!verify_result.accepted)
+                        break;
+                }
+
+                catchup.target_verifier_state_commit_count =
+                    std::min<int>(
+                        static_cast<int>(draft_tokens.size()),
+                        catchup.accepted_speculative_prefix + 1);
+
+                if (!catchup.stopped_on_output &&
+                    catchup.all_speculative_accepted)
+                {
+                    const int bonus_row =
+                        static_cast<int>(draft_tokens.size()) - 1;
+                    if (!build_all_position_target_distribution(
+                            bonus_row,
+                            bonus_row))
+                    {
+                        return fail_after_checkpoint(
+                            "All-position stochastic MTP bonus distribution build failed");
+                    }
+                    catchup.ready_token =
+                        runner_->sampleStochasticDistributionOnDevice(
+                            DeviceDistributionBuffer::Target,
+                            bonus_row,
+                            sampler_.random_uniform_01());
+                    if (catchup.ready_token < 0)
+                    {
+                        return fail_after_checkpoint(
+                            "All-position stochastic MTP bonus ready-token sampling failed");
+                    }
+                    sampled_verifier_rows[static_cast<size_t>(bonus_row)] =
+                        catchup.ready_token;
+                    ++mtp_stats_.stochastic_terminal_samples;
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_terminal_device_samples",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"verifier_path", "all_position_state_publication"}});
+                }
+                catchup.shifted_commit_count =
+                    static_cast<int>(catchup.accepted_tokens.size());
+            }
+            else
+            {
+                PerfStatsCollector::ScopedTimer sample_timer(
+                    "mtp",
+                    "all_position_verifier_sample_rows",
+                    "decode");
+                if (!runner_->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                        0,
+                        static_cast<int>(sampled_verifier_rows.size()),
+                        sampled_verifier_rows.data()))
+                {
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier could not sample verifier rows");
+                }
+                catchup = buildAllPositionMTPDecodeCatchupGreedyResult(
+                    catchup_request,
+                    sampled_verifier_rows);
+            }
+            if (!catchup.ok)
+                return fail_after_checkpoint(catchup.error);
+
+            MTPSpecDecodeMetadataShape metadata_shape;
+            metadata_shape.max_requests = 1;
+            metadata_shape.max_draft_tokens =
+                static_cast<int>(draft_tokens.size());
+            MTPSpecDecodeMetadataBatch metadata =
+                buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+                    metadata_shape,
+                    /*request_id=*/0,
+                    vocab,
+                    catchup_request,
+                    catchup);
+            if (!metadata.ok)
+            {
+                return fail_after_checkpoint(
+                    std::string("All-position MTP verifier metadata failed: ") +
+                    metadata.error);
+            }
+            MTPSpecStepPlanBatch step_plans =
+                buildMTPSpecStepPlans(
+                    metadata,
+                    std::vector<int32_t>{
+                        static_cast<int32_t>(
+                            verifier_base_checkpoint.cached_tokens)});
+            if (!step_plans.ok || step_plans.steps.size() != 1)
+            {
+                return fail_after_checkpoint(
+                    std::string("All-position MTP verifier step-plan failed: ") +
+                    (step_plans.ok ? std::string("missing step")
+                                   : step_plans.error));
+            }
+
+            const MTPSpecStepPlan &step = step_plans.steps.front();
+            std::string publication_error;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "all_position_publish_accepted_state",
+                    "decode");
+                if (!runner_->publishAcceptedMTPSpecState(
+                        step,
+                        &publication_error))
+                {
+                    return fail_after_checkpoint(
+                        std::string("All-position MTP verifier state publication failed: ") +
+                        publication_error);
+                }
+            }
+
+            int correction_forward_count = 0;
+            if (step.requiresCorrectionReplay())
+            {
+                const int replay_start = step.correction_replay_start_index;
+                const int replay_count = step.correction_replay_count;
+                if (replay_start < 0 ||
+                    replay_start + replay_count >
+                        static_cast<int>(catchup.accepted_tokens.size()))
+                {
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier correction replay plan is outside committed outputs");
+                }
+                for (int i = 0; i < replay_count; ++i)
+                {
+                    const int token_index = replay_start + i;
+                    const int32_t replay_token =
+                        catchup.accepted_tokens[static_cast<size_t>(token_index)];
+                    bool shifted_commit_ok = false;
+                    {
+                        PerfStatsCollector::ScopedTimer timer(
+                            "mtp",
+                            "all_position_correction_shifted_commit",
+                            "decode");
+                        shifted_commit_ok =
+                            runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
+                                replay_token,
+                                token_index,
+                                /*allow_speculative_discard=*/true,
+                                base_sidecar_position);
+                    }
+                    if (!shifted_commit_ok)
+                    {
+                        return fail_after_checkpoint(
+                            "All-position MTP verifier correction shifted-cache commit failed");
+                    }
+
+                    int forward_token = static_cast<int>(replay_token);
+                    bool forward_ok = false;
+                    {
+                        PerfStatsCollector::ScopedTimer timer(
+                            "mtp",
+                            "all_position_correction_forward",
+                            "decode");
+                        forward_ok = runner_->forward(&forward_token, 1);
+                    }
+                    if (!forward_ok)
+                    {
+                        return fail_after_checkpoint(
+                            "All-position MTP verifier correction replay forward failed");
+                    }
+                    ++correction_forward_count;
+                }
+
+                if (!catchup.stopped_on_output)
+                {
+                    int32_t ready = -1;
+                    if (stochastic_verify)
+                    {
+                        auto penalty_map =
+                            all_position_stochastic_penalty_sampler
+                                .compute_penalty_map(
+                                    active_sampling_params_,
+                                    vocab);
+                        if (!runner_->applyPenaltiesOnDevice(
+                                penalty_map,
+                                vocab))
+                        {
+                            return fail_after_checkpoint(
+                                "All-position stochastic MTP correction ready-token penalty application failed");
+                        }
+                        if (!runner_->buildStochasticDistributionOnDevice(
+                                DeviceLogitsSource::Main,
+                                0,
+                                DeviceDistributionBuffer::Target,
+                                0,
+                                active_sampling_params_,
+                                vocab))
+                        {
+                            return fail_after_checkpoint(
+                                "All-position stochastic MTP correction ready-token distribution build failed");
+                        }
+                        ready = runner_->sampleStochasticDistributionOnDevice(
+                            DeviceDistributionBuffer::Target,
+                            0,
+                            sampler_.random_uniform_01());
+                        if (ready >= 0)
+                        {
+                            PerfStatsCollector::addCounter(
+                                "mtp",
+                                "phase138_stochastic_correction_ready_samples",
+                                1.0,
+                                "decode",
+                                {},
+                                {{"verifier_path", "all_position_state_publication"}});
+                        }
+                    }
+                    else
+                    {
+                        ready = runner_->sampleGreedyOnDevice();
+                        if (ready < 0)
+                        {
+                            const float *main_logits = runner_->logits();
+                            if (!main_logits)
+                            {
+                                return fail_after_checkpoint(
+                                    "All-position MTP verifier correction replay produced no ready logits");
+                            }
+                            PerfStatsCollector::ScopedTimer timer(
+                                "mtp",
+                                "all_position_correction_ready_sample_host",
+                                "decode");
+                            ready = sampler_.sample(
+                                main_logits,
+                                static_cast<size_t>(vocab),
+                                active_sampling_params_);
+                        }
+                    }
+                    if (ready < 0)
+                    {
+                        return fail_after_checkpoint(
+                            "All-position MTP verifier correction ready-token sampling failed");
+                    }
+                    catchup.ready_token = ready;
+                }
+            }
+
+            std::vector<int32_t> accepted_tokens =
+                std::move(catchup.accepted_tokens);
+            std::vector<int32_t> verifier_tokens =
+                std::move(catchup.verifier_tokens);
+            const bool all_speculative_accepted =
+                catchup.all_speculative_accepted;
+            const int accepted_speculative_prefix =
+                catchup.accepted_speculative_prefix;
+            const int32_t rejected_verified_token =
+                catchup.rejected_verified_token;
+            const int32_t ready_token = catchup.ready_token;
+            const bool stopped_on_output = catchup.stopped_on_output;
+            const int main_forward_token_count =
+                catchup.main_forward_token_count + correction_forward_count;
+            result.is_complete = result.is_complete || stopped_on_output;
+
+            if (!all_speculative_accepted &&
+                !stopped_on_output &&
+                ready_token < 0)
+            {
+                return fail_after_checkpoint(
+                    "All-position MTP verifier rejected without replaying correction state or producing a ready token");
+            }
+
+            if (auto tx_error = validate_spec_decode_transaction(
+                    "all_position_state_publication_verifier",
+                    "all_position_state_publication",
+                    draft_tokens,
+                    accepted_tokens,
+                    stopped_on_output || ready_token < 0
+                        ? std::optional<int32_t>{}
+                        : std::optional<int32_t>{ready_token},
+                    all_speculative_accepted,
+                    stopped_on_output,
+                    accepted_speculative_prefix))
+            {
+                return fail_after_checkpoint(*tx_error);
+            }
+
+            ++mtp_stats_.verifier_runs;
+            mtp_stats_.verifier_token_count +=
+                static_cast<uint64_t>(main_forward_token_count);
+            PerfStatsCollector::addCounter("mtp", "verifier_runs", 1.0, "decode");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "verifier_tokens",
+                static_cast<double>(main_forward_token_count),
+                "decode");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "all_position_state_publication_verifier_runs",
+                1.0,
+                "decode",
+                {},
+                {{"forward_tokens", std::to_string(main_forward_token_count)},
+                 {"verifier_rows", std::to_string(sampled_verifier_rows.size())},
+                 {"correction_replay_tokens", std::to_string(correction_forward_count)},
+                 {"draft_tokens", std::to_string(draft_tokens.size())},
+                 {"accepted_state_count", std::to_string(step.accepted_count)},
+                 {"target_cached_tokens", std::to_string(step.target_cached_tokens)},
+                 {"restored_verifier_base", restored_verifier_base ? "true" : "false"}});
+
+            recordMTPDepthObservation(
+                requested_speculative_draft_count,
+                speculative_draft_count,
+                accepted_speculative_prefix,
+                draft_count_budget_limited,
+                /*rollback=*/false);
+
+            if (!all_speculative_accepted)
+            {
+                ++mtp_stats_.rejected_tokens;
+                PerfStatsCollector::addCounter("mtp", "rejected_tokens", 1.0, "decode");
+            }
+
+            if (accepted_speculative_prefix > 0)
+            {
+                mtp_stats_.accepted_tokens +=
+                    static_cast<uint64_t>(accepted_speculative_prefix);
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "accepted_tokens",
+                    static_cast<double>(accepted_speculative_prefix),
+                    "decode");
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "accepted_second_draft_tokens",
+                    accepted_speculative_prefix > 0 ? 1.0 : 0.0,
+                    "decode");
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "output_tokens",
+                static_cast<double>(accepted_tokens.size()),
+                "decode");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "acceptance_trace",
+                1.0,
+                "decode",
+                {},
+                {{"draft_step", std::to_string(mtp_stats_.draft_steps)},
+                 {"condition_token", std::to_string(condition_token)},
+                 {"first_token", std::to_string(first_token)},
+                 {"draft_tokens", join_tokens(draft_tokens)},
+                 {"verifier_tokens", join_tokens(verifier_tokens)},
+                 {"all_position_rows", join_tokens(sampled_verifier_rows)},
+                 {"rejected_verified_token", std::to_string(rejected_verified_token)},
+                 {"accepted_speculative_prefix", std::to_string(accepted_speculative_prefix)},
+                 {"all_speculative_accepted", all_speculative_accepted ? "true" : "false"},
+                 {"verifier_state_matches_output", "true"},
+                 {"verifier_path", "all_position_state_publication"},
+                 {"catchup_implementation", "all_position_state_publication"},
+                 {"decode_equivalent_replay_required", "false"},
+                 {"correction_replay_tokens", std::to_string(correction_forward_count)},
+                 {"output_tokens", std::to_string(accepted_tokens.size())},
+                 {"ready_token", std::to_string(ready_token)},
+                 {"used_ready_logits", use_ready_logits ? "true" : "false"}});
+
+            if (!stopped_on_output && ready_token >= 0)
+            {
+                if (auto mismatch = verify_committed_prefix_replay(
+                        "all_position_state_publication_verifier",
+                        accepted_tokens,
+                        ready_token))
+                {
+                    return fail_after_checkpoint(*mismatch);
+                }
+            }
+
+            if (auto commit_error = commit_mtp_transaction_outputs(
+                    "all_position_state_publication_verifier",
+                    verifier_base_checkpoint,
+                    accepted_tokens,
+                    stopped_on_output || ready_token < 0
+                        ? std::optional<int32_t>{}
+                        : std::optional<int32_t>{ready_token},
+                    /*terminal_logits_ready=*/!stopped_on_output && ready_token >= 0,
+                    /*is_complete=*/stopped_on_output,
+                    PrefixStateProvenance::VerifierPrefillRowsDecodeEquivalent,
+                    /*state_advanced=*/true))
+            {
+                return fail_after_checkpoint(*commit_error);
+            }
+
+            return result;
+        }
+
         const bool use_decode_equivalent_sequential_greedy_verifier =
             verifier_policy.path ==
             MTPVerifierExecutionPath::DecodeEquivalentSequential;
@@ -2447,7 +3130,7 @@ namespace llaminar2
 
             if (stochastic_verify)
             {
-                if (!stochastic_device_verify)
+                if (runner_->primaryDeviceId().is_gpu() && !stochastic_device_verify)
                 {
                     return fail_after_checkpoint(
                         "Decode-equivalent stochastic MTP verifier requires device-resident distribution verification");
@@ -2466,6 +3149,7 @@ namespace llaminar2
                 int32_t ready_token = -1;
                 int main_forward_token_count = 0;
                 int shifted_commit_count = 0;
+                std::vector<SamplingDistributionEntry> host_target_distribution;
 
                 auto commit_shifted_before_forward =
                     [&](int32_t token, int token_index) -> bool
@@ -2510,6 +3194,25 @@ namespace llaminar2
                 Sampler verifier_penalty_sampler = sampler_;
                 auto build_target_distribution = [&]() -> bool
                 {
+                    if (stochastic_host_verify)
+                    {
+                        const float *main_logits = runner_->logits();
+                        if (!main_logits)
+                            return false;
+                        PerfStatsCollector::ScopedTimer timer(
+                            "mtp",
+                            "decode_equivalent_stochastic_host_target_distribution",
+                            "decode",
+                            {},
+                            {{"implementation", "shared_stepwise_stochastic"}});
+                        host_target_distribution =
+                            verifier_penalty_sampler.compute_distribution(
+                                main_logits,
+                                static_cast<size_t>(vocab),
+                                active_sampling_params_);
+                        return !host_target_distribution.empty();
+                    }
+
                     auto penalty_map =
                         verifier_penalty_sampler.compute_penalty_map(
                             active_sampling_params_,
@@ -2556,17 +3259,53 @@ namespace llaminar2
                     const float accept_threshold = sampler_.random_uniform_01();
                     const float residual_threshold = sampler_.random_uniform_01();
                     DeviceSpeculativeVerifyResult verify_result;
-                    if (!runner_->verifyStochasticDistributionsBatchOnDevice(
-                            /*first_target_slot=*/0,
-                            /*first_draft_slot=*/row,
-                            &draft_token,
-                            &accept_threshold,
-                            &residual_threshold,
-                            /*row_count=*/1,
-                            &verify_result))
+                    if (stochastic_device_verify)
                     {
-                        return fail_after_checkpoint(
-                            "Decode-equivalent stochastic MTP device verifier failed");
+                        if (!runner_->verifyStochasticDistributionsBatchOnDevice(
+                                /*first_target_slot=*/0,
+                                /*first_draft_slot=*/row,
+                                &draft_token,
+                                &accept_threshold,
+                                &residual_threshold,
+                                /*row_count=*/1,
+                                &verify_result))
+                        {
+                            return fail_after_checkpoint(
+                                "Decode-equivalent stochastic MTP device verifier failed");
+                        }
+                    }
+                    else
+                    {
+                        if (row < 0 ||
+                            row >= static_cast<int>(host_mtp_draft_distributions.size()) ||
+                            host_mtp_draft_distributions[static_cast<size_t>(row)].empty() ||
+                            host_target_distribution.empty())
+                        {
+                            return fail_after_checkpoint(
+                                "Decode-equivalent stochastic MTP host verifier missing distributions");
+                        }
+                        const auto &draft_distribution =
+                            host_mtp_draft_distributions[static_cast<size_t>(row)];
+                        const float p =
+                            Sampler::probability_of_token(host_target_distribution, draft_token);
+                        const float q =
+                            Sampler::probability_of_token(draft_distribution, draft_token);
+                        verify_result.accept_probability =
+                            Sampler::speculative_accept_probability(p, q);
+                        verify_result.accept_threshold = accept_threshold;
+                        verify_result.accepted =
+                            accept_threshold < verify_result.accept_probability;
+                        verify_result.token = verify_result.accepted
+                                                  ? draft_token
+                                                  : sampleResidualDistributionWithThreshold(
+                                                        host_target_distribution,
+                                                        draft_distribution,
+                                                        residual_threshold);
+                        if (verify_result.token < 0)
+                        {
+                            return fail_after_checkpoint(
+                                "Decode-equivalent stochastic MTP host residual verifier failed");
+                        }
                     }
 
                     ++mtp_stats_.stochastic_accept_tests;
@@ -2580,7 +3319,7 @@ namespace llaminar2
                          {"draft_token", std::to_string(draft_token)},
                          {"accept_probability", std::to_string(verify_result.accept_probability)},
                          {"threshold", std::to_string(verify_result.accept_threshold)},
-                         {"device_resident", "true"},
+                         {"device_resident", stochastic_device_verify ? "true" : "false"},
                          {"verifier_path", "decode_equivalent_stochastic"}});
 
                     int32_t output_token = -1;
@@ -2612,7 +3351,9 @@ namespace llaminar2
                         ++mtp_stats_.stochastic_residual_samples;
                         PerfStatsCollector::addCounter(
                             "mtp",
-                            "stochastic_residual_device_samples",
+                            stochastic_device_verify
+                                ? "stochastic_residual_device_samples"
+                                : "stochastic_residual_host_samples",
                             1.0,
                             "decode",
                             {},
@@ -2655,10 +3396,14 @@ namespace llaminar2
                         return fail_after_checkpoint(
                             "Decode-equivalent stochastic MTP ready-token distribution build failed");
                     }
-                    ready_token = runner_->sampleStochasticDistributionOnDevice(
-                        DeviceDistributionBuffer::Target,
-                        0,
-                        sampler_.random_uniform_01());
+                    ready_token = stochastic_device_verify
+                                      ? runner_->sampleStochasticDistributionOnDevice(
+                                            DeviceDistributionBuffer::Target,
+                                            0,
+                                            sampler_.random_uniform_01())
+                                      : sampleDistributionWithThreshold(
+                                            host_target_distribution,
+                                            sampler_.random_uniform_01());
                     if (ready_token < 0)
                     {
                         return fail_after_checkpoint(
@@ -2669,7 +3414,9 @@ namespace llaminar2
                         ++mtp_stats_.stochastic_terminal_samples;
                         PerfStatsCollector::addCounter(
                             "mtp",
-                            "stochastic_terminal_device_samples",
+                            stochastic_device_verify
+                                ? "stochastic_terminal_device_samples"
+                                : "stochastic_terminal_host_samples",
                             1.0,
                             "decode",
                             {},

@@ -23,6 +23,7 @@
 #include "tensors/KernelSnapshotInfo.h"
 #include "backends/ComputeBackend.h"
 #include "backends/DeviceId.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "../../utils/TestTensorFactory.h"
@@ -82,6 +83,8 @@ protected:
         auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
         if (ws_consumer)
             ws_consumer->bindWorkspace(workspace.get());
+
+        kernel->setGPUStream(GPUDeviceContextPool::instance().getContext(device).defaultStream());
 
         return {std::move(kernel), std::move(workspace)};
     }
@@ -367,6 +370,7 @@ TEST_F(Test__KernelDynamicStateLifecycle, Factory_ResetClearsGPUEmbeddingDynamic
     auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(cached);
     ASSERT_NE(ws_consumer, nullptr);
     ws_consumer->bindWorkspace(workspace.get());
+    cached->setGPUStream(GPUDeviceContextPool::instance().getContext(device).defaultStream());
 
     // Activate dynamic state (simulates prefill preloading token IDs)
     std::vector<int> tokens = {1, 5, 10};

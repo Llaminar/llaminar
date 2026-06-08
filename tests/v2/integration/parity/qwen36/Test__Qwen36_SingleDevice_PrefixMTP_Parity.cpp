@@ -18,93 +18,9 @@ namespace
     }
 }
 
-TEST(Qwen36SingleDevicePrefixMTPParity, PrefixRestoreFullHit)
-{
-    runDensePrefixRestoreParity(singleDeviceCase(), PrefixRestoreParityMode::FullHit);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, PrefixRestorePartialHit)
-{
-    runDensePrefixRestoreParity(singleDeviceCase(), PrefixRestoreParityMode::PartialHit);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, SplitPrefillMatchesPyTorchDecodeTokens)
-{
-    runDenseSplitPrefillParity(singleDeviceCase(), 4);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyMatchesPyTorchDecodeTokens)
-{
-    runDenseMTPParity(singleDeviceCase(), false);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyDepth3MatchesPyTorchDecodeTokens)
-{
-    runDenseMTPParity(singleDeviceCase(), false, 3);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, NoMTPPhase138ContinuationMatchesPyTorch)
-{
-    runDenseNoMTPPhase138ContinuationMatchesPyTorch(singleDeviceCase(), 8);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, NoMTPPhase138ThinkContinuationStageParity)
-{
-    runDenseNoMTPPhase138ThinkContinuationStageParity(singleDeviceCase());
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, MTPFirstTransactionLeavesSequentialState)
-{
-    runDenseMTPFirstTransactionLeavesSequentialState(singleDeviceCase());
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
-{
-    runDenseDynamicMTPParity(singleDeviceCase(), false);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, MTPBenchmarkPromptDynamicDepthMatchesPyTorchDecodeTokens)
-{
-    runDenseBenchmarkStyleDynamicMTPParitySinglePass(singleDeviceCase());
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, MTPBenchmarkPromptFixedDepth1MatchesPyTorchDecodeTokens)
-{
-    runDenseBenchmarkStyleFixedMTPParity(singleDeviceCase(), 1);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, MTPBenchmarkPromptFixedDepth3MatchesPyTorchDecodeTokens)
-{
-    runDenseBenchmarkStyleFixedMTPParity(singleDeviceCase(), 3);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, PrefixCacheMTPRestore)
-{
-    runDenseMTPParity(singleDeviceCase(), true);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, PrefixCacheMTPDynamicDepthRestore)
-{
-    runDenseDynamicMTPParity(singleDeviceCase(), true);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, MTPStochasticSamplingVerifierRuns)
-{
-    runDenseStochasticMTPVerifierParity(singleDeviceCase());
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, OneRowRestoreLongPrefixMatchesSequential)
-{
-    runDenseOneRowRestoreLongPrefixMatchesSequential(singleDeviceCase());
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, NoMTPBenchmarkStyleFreshRunnerDeterminism)
-{
-    runDenseNoMTPBenchmarkStyleFreshRunnerDeterminism(
-        singleDeviceCase(),
-        /*decode_token_budget=*/128,
-        /*reused_cycle_count=*/4);
-}
+#define QWEN36_DENSE_PREFIX_MTP_SUITE Qwen36SingleDevicePrefixMTPParity
+#define QWEN36_DENSE_PREFIX_MTP_CASE singleDeviceCase
+#include "Qwen36DenseSingleDevicePrefixMTPParityTests.inc"
 
 int main(int argc, char **argv)
 {

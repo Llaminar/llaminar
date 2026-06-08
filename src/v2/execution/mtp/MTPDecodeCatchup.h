@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,28 @@ namespace llaminar2
     MTPDecodeCatchupGreedyEquivalence compareMTPDecodeCatchupGreedyResults(
         const MTPDecodeCatchupGreedyResult &oracle,
         const MTPDecodeCatchupGreedyResult &candidate);
+
+    /**
+     * @brief Build the greedy catch-up contract from one all-position verifier
+     * forward.
+     *
+     * The verifier rows are the sampled target-model tokens for each input row
+     * in request.draft_tokens. Row 0 verifies request.draft_tokens[1], row N-2
+     * verifies request.draft_tokens[N-1], and row N-1 is the bonus ready token
+     * when every speculative token is accepted.
+     *
+     * After a rejection, the correcting token is sampled from the rejecting
+     * row but has not itself been forwarded by the all-position verifier. The
+     * result therefore publishes only the accepted verifier-input prefix and
+     * leaves target_verifier_state_commit_count smaller than
+     * accepted_tokens.size(). A caller that has already replayed the correction
+     * token can pass correction_replay_ready_token to make the token stream
+     * fully comparable with stepwise decode.
+     */
+    MTPDecodeCatchupGreedyResult buildAllPositionMTPDecodeCatchupGreedyResult(
+        const MTPDecodeCatchupGreedyRequest &request,
+        const std::vector<int32_t> &sampled_verifier_rows,
+        std::optional<int32_t> correction_replay_ready_token = std::nullopt);
 
     /**
      * @brief Run greedy MTP verification through normal one-token decode.

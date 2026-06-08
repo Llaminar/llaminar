@@ -28,6 +28,7 @@ namespace llaminar2
     struct GraphExecutorStats;
     struct SamplingParams;
     struct LogitPenalty;
+    struct MTPSpecStepPlan;
     struct PrefillChunkSchedulerPolicy;
     class MoERebalanceController;
 
@@ -230,6 +231,31 @@ namespace llaminar2
          * path instead of the batched all-position verifier for greedy decode.
          */
         virtual bool requiresMTPDecodeEquivalentVerifierReplay() const { return false; }
+
+        /**
+         * @brief True when the runner implements vLLM-style accepted-count
+         *        publication from the most recent target verifier graph.
+         */
+        virtual bool supportsMTPSpecStatePublication() const { return false; }
+
+        /**
+         * @brief Publish the accepted verifier state prefix into live model state.
+         *
+         * Implementations must fail loudly unless the most recent verifier graph
+         * is the graph that produced `plan.draft_count` all-position state rows.
+         * `plan.target_rows` is the metadata transaction length, including the
+         * bonus-ready sampled-token slot. GPU implementations must use an
+         * explicit non-null stream for every publication kernel.
+         */
+        virtual bool publishAcceptedMTPSpecState(
+            const MTPSpecStepPlan &plan,
+            std::string *error = nullptr)
+        {
+            (void)plan;
+            if (error)
+                *error = "runner does not support MTP spec-state publication";
+            return false;
+        }
 
         /**
          * @brief Run a chained MTP sidecar step from the previous sidecar hidden.

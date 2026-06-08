@@ -10,20 +10,20 @@ using namespace llaminar2::test::parity::qwen36;
 
 namespace
 {
-    DensePrefixRestoreParityCase cudaSingleDeviceCase()
+    DensePrefixRestoreParityCase rocmSingleDeviceCase()
     {
         auto test_case = qwen36DensePrefixParityCase(
-            "Qwen3.6 dense CUDA SingleDevice parity",
+            "Qwen3.6 dense ROCm SingleDevice parity",
             DensePrefixParityTopology::SingleDevice);
-        test_case.devices = {GlobalDeviceAddress::cuda(0)};
-        test_case.required_cuda_devices = 1;
-        test_case.required_rocm_devices = 0;
+        test_case.devices = {GlobalDeviceAddress::rocm(0)};
+        test_case.required_cuda_devices = 0;
+        test_case.required_rocm_devices = 1;
         return test_case;
     }
 }
 
-#define QWEN36_DENSE_PREFIX_MTP_SUITE Qwen36CUDASingleDevicePrefixMTPParity
-#define QWEN36_DENSE_PREFIX_MTP_CASE cudaSingleDeviceCase
+#define QWEN36_DENSE_PREFIX_MTP_SUITE Qwen36ROCmSingleDevicePrefixMTPParity
+#define QWEN36_DENSE_PREFIX_MTP_CASE rocmSingleDeviceCase
 #include "Qwen36DenseSingleDevicePrefixMTPParityTests.inc"
 
 int main(int argc, char **argv)

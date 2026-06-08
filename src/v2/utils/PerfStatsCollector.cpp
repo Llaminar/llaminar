@@ -112,13 +112,13 @@ namespace llaminar2
 
         bool isSummaryRequested()
         {
-            return !isFalseyEnvValue(std::getenv("LLAMINAR_PERF_STATS_TABLE")) ||
-                   !isFalseyEnvValue(std::getenv("LLAMINAR_PERF_STATS_SUMMARY"));
+            return !isFalseyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_TABLE")) ||
+                   !isFalseyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_SUMMARY"));
         }
 
         size_t summaryLimitFromEnv()
         {
-            const char *env = std::getenv("LLAMINAR_PERF_STATS_TABLE_LIMIT");
+            const char *env = DebugEnv::envValue("LLAMINAR_PERF_STATS_TABLE_LIMIT");
             if (!env)
                 return 120;
             const std::string normalized = normalizedEnvValue(env);
@@ -134,7 +134,7 @@ namespace llaminar2
 
         std::string exportPathFromEnv(const char *env_name, const char *default_path)
         {
-            const char *value = std::getenv(env_name);
+            const char *value = DebugEnv::envValue(env_name);
             if (!value || isFalseyEnvValue(value))
                 return {};
             if (isTruthyEnvValue(value))
@@ -152,7 +152,7 @@ namespace llaminar2
         std::vector<std::string> filterListFromEnv()
         {
             std::vector<std::string> filters;
-            const char *env = std::getenv("LLAMINAR_PERF_STATS_FILTER");
+            const char *env = DebugEnv::envValue("LLAMINAR_PERF_STATS_FILTER");
             if (!env)
                 return filters;
 
@@ -186,7 +186,7 @@ namespace llaminar2
 
         bool perfStatsGpuStageTimingRequested()
         {
-            return isTruthyEnvValue(std::getenv("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING")) ||
+            return isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING")) ||
                    filterRequestsStageGpuTiming();
         }
 

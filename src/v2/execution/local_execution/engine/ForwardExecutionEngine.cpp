@@ -66,6 +66,19 @@ namespace llaminar2
             return real_seq_len > 0 && bucket_seq_len > 0 && real_seq_len < bucket_seq_len;
         }
 
+        void *executionStreamForCache(const ForwardGraphCache &cache)
+        {
+            if (cache.applied_stream)
+                return cache.applied_stream;
+            if (cache.segment_cache.capture_stream)
+                return cache.segment_cache.capture_stream;
+            if (cache.gpu_stream)
+                return cache.gpu_stream;
+            if (cache.prefill_capture_stream.stream)
+                return cache.prefill_capture_stream.stream;
+            return nullptr;
+        }
+
         /// @brief Return the absolute chunk offset for raw server-style inputs.
         int effectiveTokenOffset(const ForwardInput &input)
         {
@@ -677,6 +690,8 @@ namespace llaminar2
         ForwardOutput &output,
         IForwardExecutionHost &host)
     {
+        last_executed_forward_graph_ = {};
+
         auto start = std::chrono::high_resolution_clock::now();
 
         const int first_position = input.position_ids ? input.position_ids[0] : input.position_offset;
@@ -882,6 +897,8 @@ namespace llaminar2
             touchBucketedPrefillForwardCache(forward_signature, *active_forward_cache);
             const bool success = executeCacheHit(effective_input, output, *active_forward_cache, host,
                                                  is_decode, start);
+            if (success)
+                recordLastExecutedForwardGraph(forward_signature, /*cache_hit=*/true);
             if (success && forward_signature.is_bucketed_prefill)
                 enforceBucketedPrefillForwardCapacity(&forward_signature);
             return success;
@@ -914,9 +931,42 @@ namespace llaminar2
             build_input.bucket_seq_len = forward_signature.bucket_seq_len;
         }
 
-        return executeCacheMiss(build_input, output, forward_signature, build_cache,
-                                should_cache_after_build, host, is_decode,
-                                has_unified_pp, start);
+        const bool success = executeCacheMiss(build_input, output, forward_signature, build_cache,
+                                              should_cache_after_build, host, is_decode,
+                                              has_unified_pp, start);
+        if (success && build_cache && build_cache->valid)
+            recordLastExecutedForwardGraph(forward_signature, /*cache_hit=*/false);
+        return success;
+    }
+
+    void ForwardExecutionEngine::recordLastExecutedForwardGraph(
+        const ForwardGraphSignature &signature,
+        bool cache_hit)
+    {
+        last_executed_forward_graph_.valid = true;
+        last_executed_forward_graph_.signature = signature;
+        last_executed_forward_graph_.cache_hit = cache_hit;
+    }
+
+    std::optional<ForwardExecutionEngine::LastExecutedForwardGraphView>
+    ForwardExecutionEngine::lastExecutedForwardGraph()
+    {
+        if (!last_executed_forward_graph_.valid)
+            return std::nullopt;
+
+        auto it = cache_.find(last_executed_forward_graph_.signature);
+        if (it == cache_.end() || !it->second.valid || !it->second.graph)
+            return std::nullopt;
+
+        LastExecutedForwardGraphView view;
+        view.graph = it->second.graph.get();
+        view.signature = last_executed_forward_graph_.signature;
+        view.device = view.signature.device;
+        view.stream = executionStreamForCache(it->second);
+        view.cache_hit = last_executed_forward_graph_.cache_hit;
+        view.is_decode = view.signature.decode;
+        view.all_position_logits = view.signature.all_position_logits;
+        return view;
     }
 
     // =========================================================================

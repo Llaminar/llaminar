@@ -6,6 +6,7 @@ namespace llaminar2
     enum class MTPVerifierExecutionPath
     {
         Unsupported,
+        AllPositionStatePublication,
         DecodeEquivalentSequential,
     };
 
@@ -14,6 +15,7 @@ namespace llaminar2
         bool greedy_sampling = false;
         bool stochastic_verify = false;
         bool uses_sampling_penalties = false;
+        bool supports_spec_state_publication = false;
     };
 
     struct MTPVerifierPolicyDecision
@@ -29,8 +31,22 @@ namespace llaminar2
     {
         MTPVerifierPolicyDecision decision;
 
+        const bool supported_sampling_mode =
+            input.greedy_sampling || input.stochastic_verify;
+        if (supported_sampling_mode &&
+            !input.uses_sampling_penalties &&
+            input.supports_spec_state_publication)
+        {
+            decision.path = MTPVerifierExecutionPath::AllPositionStatePublication;
+            decision.accepted_all_position_state_requires_replay = false;
+            decision.reason = input.stochastic_verify
+                                  ? "stochastic_uses_all_position_state_publication"
+                                  : "greedy_uses_all_position_state_publication";
+            return decision;
+        }
+
         const bool use_decode_equivalent_sequential =
-            (input.greedy_sampling || input.stochastic_verify) &&
+            supported_sampling_mode &&
             !input.uses_sampling_penalties;
         if (use_decode_equivalent_sequential)
         {

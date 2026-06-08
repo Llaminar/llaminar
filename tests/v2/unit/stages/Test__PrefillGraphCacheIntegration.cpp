@@ -149,7 +149,7 @@ TEST(Test__PrefillGraphCacheIntegration, InvalidateAllClearsPrefillCache)
     EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Cold);
 }
 
-TEST(Test__PrefillGraphCacheIntegration, SessionResetPreservesPrefillCache)
+TEST(Test__PrefillGraphCacheIntegration, SessionResetInvalidatesPrefillCacheEntries)
 {
     ForwardGraphCache cache;
 
@@ -168,9 +168,10 @@ TEST(Test__PrefillGraphCacheIntegration, SessionResetPreservesPrefillCache)
     cache.resetSessionState();
 
     EXPECT_NE(cache.prefill_graph_cache, nullptr);
-    EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Warmup)
-        << "Request/session reset must preserve the prefill graph lifecycle so "
-           "benchmark warmup can advance Warmup -> Ready and steady-state runs can replay";
+    EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Cold)
+        << "Request/session reset clears KV/GDN state, so captured prefill graph entries "
+           "must be rebuilt before the next prompt can replay them";
+    EXPECT_EQ(cache.prefill_graph_cache->lastInvalidationReason(), PrefillGraphRejectReason::SessionReset);
 }
 
 TEST(Test__PrefillGraphCacheIntegration, WorkspaceRebindInvalidatesPrefillCache)

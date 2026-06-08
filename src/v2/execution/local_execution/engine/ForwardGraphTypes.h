@@ -384,14 +384,15 @@ namespace llaminar2
          * @brief Reset request-scoped state while preserving reusable graph objects.
          *
          * This is the request-boundary counterpart to invalidate(): it keeps the
-         * cached ComputeGraph, stable token buffers, workspace bindings, and
-         * prefill graph entries, but clears stage/kernels' dynamic metadata and
-         * decode replay lifecycle state so the next prompt starts from cleared
-         * KV/GDN model state.
+         * cached ComputeGraph, stable token buffers, and workspace bindings, but
+         * clears stage/kernels' dynamic metadata and all captured executable
+         * state so the next prompt starts from cleared KV/GDN model state.
          */
         void resetSessionState()
         {
             resetReplayState();
+            if (prefill_graph_cache)
+                prefill_graph_cache->invalidateAll(PrefillGraphRejectReason::SessionReset);
             last_prefill_graph_observation = {};
 
             if (graph)

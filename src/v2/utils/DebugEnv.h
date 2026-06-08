@@ -3379,6 +3379,11 @@ namespace llaminar2
         /// (env: LLAMINAR_VRAM_TRACE=1)
         bool vram_trace = false;
 
+        static const char *envValue(const char *name)
+        {
+            return name ? std::getenv(name) : nullptr;
+        }
+
         static std::string normalizedEnvValue(const char *value)
         {
             if (!value)
@@ -3411,6 +3416,16 @@ namespace llaminar2
         {
             const std::string normalized = normalizedEnvValue(value);
             return normalized.empty() || normalized == "0" || normalized == "false" || normalized == "off" || normalized == "no";
+        }
+
+        static bool isTruthyEnv(const char *name)
+        {
+            return isTruthyEnvValue(envValue(name));
+        }
+
+        static bool isFalseyEnv(const char *name)
+        {
+            return isFalseyEnvValue(envValue(name));
         }
 
         void reloadMoEExpertOverlayEnv()

@@ -420,6 +420,59 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, FourTokenAllPositionVerifierUsesDec
         << "M=4 verifier continuations should be eligible for decode graph capture";
 }
 
+TEST_F(Test__ForwardExecutionEngineAdvanced, AllPositionVerifierExposesLastExecutedGraphView)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+    host.all_position_logits = true;
+
+    ForwardOutput output{};
+
+    TestInput verifier1(4, 1, DeviceId::cpu(), /*position_offset=*/128);
+    ASSERT_TRUE(engine.execute(verifier1.input, output, host));
+
+    auto first_view = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(first_view.has_value());
+    ASSERT_TRUE(*first_view);
+    EXPECT_EQ(first_view->graph->size(), 3u);
+    EXPECT_FALSE(first_view->cache_hit);
+    EXPECT_TRUE(first_view->is_decode);
+    EXPECT_TRUE(first_view->all_position_logits);
+    EXPECT_EQ(first_view->signature.seq_len, 4);
+    EXPECT_EQ(first_view->device, DeviceId::cpu());
+
+    TestInput verifier2(4, 1, DeviceId::cpu(), /*position_offset=*/132);
+    ASSERT_TRUE(engine.execute(verifier2.input, output, host));
+
+    auto second_view = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(second_view.has_value());
+    ASSERT_TRUE(*second_view);
+    EXPECT_TRUE(second_view->cache_hit);
+    EXPECT_TRUE(second_view->is_decode);
+    EXPECT_TRUE(second_view->all_position_logits);
+    EXPECT_EQ(second_view->signature.seq_len, 4);
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, FailedForwardClearsLastExecutedGraphView)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+    host.all_position_logits = true;
+
+    ForwardOutput output{};
+
+    TestInput verifier(4, 1, DeviceId::cpu(), /*position_offset=*/128);
+    ASSERT_TRUE(engine.execute(verifier.input, output, host));
+    ASSERT_TRUE(engine.lastExecutedForwardGraph().has_value());
+
+    host.build_should_fail = true;
+    TestInput failing_prefill(8, 1, DeviceId::cpu(), /*position_offset=*/0);
+    EXPECT_FALSE(engine.execute(failing_prefill.input, output, host));
+    EXPECT_FALSE(engine.lastExecutedForwardGraph().has_value());
+}
+
 TEST_F(Test__ForwardExecutionEngineAdvanced, ThreeTokenAllPositionVerifierUsesDecodeCache)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);

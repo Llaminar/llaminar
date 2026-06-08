@@ -98,6 +98,9 @@ namespace llaminar2
 
             const std::size_t tokens = static_cast<std::size_t>(max_seq_len);
             const std::size_t total_slots = tokens * static_cast<std::size_t>(top_k);
+            const std::size_t active_expert_id_slots = std::max(
+                total_slots,
+                static_cast<std::size_t>(num_experts));
             const int max_dim = std::max(d_model, intermediate);
             const int max_blocks = ceilDiv(max_dim, 32);
             const int d_model_blocks = ceilDiv(d_model, 32);
@@ -111,7 +114,7 @@ namespace llaminar2
             add(reqs, GROUP_ORIGINAL_TO_GROUPED, total_slots * sizeof(int));
             add(reqs, GROUP_ORIGINAL_EXPERT_IDS, total_slots * sizeof(int));
             add(reqs, GROUP_WEIGHTS, total_slots * sizeof(float));
-            add(reqs, GROUP_ACTIVE_EXPERT_IDS, static_cast<std::size_t>(num_experts) * sizeof(int));
+            add(reqs, GROUP_ACTIVE_EXPERT_IDS, active_expert_id_slots * sizeof(int));
             add(reqs, GROUP_OFFSETS, static_cast<std::size_t>(num_experts) * sizeof(int));
             add(reqs, GROUP_COUNTS, static_cast<std::size_t>(num_experts) * sizeof(int));
             add(reqs, GROUP_WRITE_HEADS, static_cast<std::size_t>(num_experts) * sizeof(int));

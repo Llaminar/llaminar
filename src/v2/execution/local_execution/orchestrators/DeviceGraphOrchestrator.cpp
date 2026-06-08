@@ -35,6 +35,8 @@
 #include "../../../kernels/HybridKVCacheConfig.h"
 #include "../../../kernels/IHybridKVCache.h"
 #include "../../compute_stages/stages/MoEExpertComputeStage.h"
+#include "../../mtp/MTPSpecKVPublisher.h"
+#include "../../mtp/MTPSpecStatePublisher.h"
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/ExpertWeightPayloadProvider.h"
 #include "../../../loaders/PreparedWeightStore.h"
@@ -194,7 +196,7 @@ namespace llaminar2
 
         bool prefixCacheTraceEnabled()
         {
-            const char *value = std::getenv("LLAMINAR_PREFIX_CACHE_TRACE");
+            const char *value = DebugEnv::envValue("LLAMINAR_PREFIX_CACHE_TRACE");
             return value && value[0] != '\0' && value[0] != '0';
         }
 
@@ -340,7 +342,7 @@ namespace llaminar2
 
         bool isTruthyProfilingEnv(const char *name)
         {
-            const char *value = std::getenv(name);
+            const char *value = DebugEnv::envValue(name);
             if (!value)
                 return false;
             if (std::strcmp(value, "0") == 0 ||
@@ -4822,6 +4824,120 @@ namespace llaminar2
                       << state_.device_id.toString() << ": " << e.what());
             return false;
         }
+    }
+
+    bool DeviceGraphOrchestrator::supportsMTPSpecStatePublication() const
+    {
+        return graph_builder_ && graph_builder_->config().mtp.enabled &&
+               state_.kv_cache != nullptr && !state_.mtp_kv_caches.empty();
+    }
+
+    bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(
+        const MTPSpecStepPlan &plan,
+        std::string *error)
+    {
+        auto fail = [&](std::string reason) -> bool
+        {
+            if (error)
+                *error = reason;
+            LOG_ERROR("[DeviceGraphOrchestrator] " << reason);
+            return false;
+        };
+
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        {
+            return fail("MTP spec-state publication requires an MTP-enabled graph builder");
+        }
+        if (!forward_engine_)
+        {
+            return fail("MTP spec-state publication requires an initialized forward engine");
+        }
+
+        auto verifier_graph = forward_engine_->lastExecutedForwardGraph();
+        if (!verifier_graph || !*verifier_graph || !verifier_graph->graph)
+        {
+            return fail("MTP spec-state publication has no cached verifier graph from the last forward");
+        }
+        if (!verifier_graph->is_decode || !verifier_graph->all_position_logits)
+        {
+            return fail("MTP spec-state publication requires the last forward to be an all-position verifier decode graph");
+        }
+        if (verifier_graph->signature.seq_len != plan.draft_count)
+        {
+            std::ostringstream msg;
+            msg << "MTP spec-state publication verifier-row mismatch: plan="
+                << plan.draft_count << " graph=" << verifier_graph->signature.seq_len
+                << " metadata_target_rows=" << plan.target_rows;
+            return fail(msg.str());
+        }
+
+        void *stream = verifier_graph->stream;
+        if (state_.device_id.is_gpu() && !stream)
+        {
+            stream = explicitGPUStreamForOperation("mtp_spec_state_publication");
+        }
+        if (state_.device_id.is_gpu() && !stream)
+        {
+            return fail("MTP spec-state publication could not resolve an explicit GPU stream");
+        }
+
+        if (!state_.kv_cache)
+        {
+            return fail("MTP spec-state publication requires an initialized main KV cache");
+        }
+        std::vector<IKVCache *> mtp_caches;
+        mtp_caches.reserve(state_.mtp_kv_caches.size());
+        for (const auto &cache : state_.mtp_kv_caches)
+        {
+            if (!cache)
+            {
+                return fail("MTP spec-state publication requires initialized MTP KV caches");
+            }
+            mtp_caches.push_back(cache.get());
+        }
+
+        MTPSpecKVPublicationResult kv_result =
+            publishAcceptedMTPSpecKVState(
+                plan,
+                *state_.kv_cache,
+                mtp_caches,
+                /*seq_idx=*/0,
+                stream);
+        if (!kv_result.ok)
+        {
+            return fail(kv_result.error);
+        }
+
+        MTPSpecStatePublicationResult result =
+            llaminar2::publishAcceptedMTPSpecState(
+                plan,
+                *verifier_graph->graph,
+                state_.device_id,
+                stream,
+                /*require_captured_stage=*/requiresMTPDecodeEquivalentVerifierReplay());
+        if (!result.ok)
+        {
+            return fail(result.error);
+        }
+
+        if (!state_.positions.empty())
+            state_.positions[0] = plan.target_cached_tokens;
+        if (!state_.sequence_lengths.empty())
+            state_.sequence_lengths[0] = plan.target_cached_tokens;
+        handleLivePrefixReplayStateAfterMutation("mtp_spec_state_publication");
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "spec_state_publications",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"accepted_count", std::to_string(result.accepted_count)},
+             {"main_kv_tokens", std::to_string(kv_result.main_truncated_tokens)},
+             {"restored_stages", std::to_string(result.restored_stage_count)},
+             {"skipped_stages", std::to_string(result.skipped_stage_count)},
+             {"target_rows", std::to_string(plan.target_rows)}});
+        return true;
     }
 
     bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromLastForward(

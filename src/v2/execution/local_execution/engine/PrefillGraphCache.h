@@ -173,6 +173,9 @@ namespace llaminar2
         /// Get lifetime successful capture count for a key, including recaptures.
         uint64_t captureCount(const PrefillGraphCacheKey &key) const;
 
+        /// Get the most recent invalidation reason for diagnostics and regression tests.
+        PrefillGraphRejectReason lastInvalidationReason() const { return last_invalidation_reason_; }
+
     private:
         void touchEntry(PrefillGraphEntry &entry);
         void enforceCapacity(const PrefillGraphCacheKey *exempt_key = nullptr);

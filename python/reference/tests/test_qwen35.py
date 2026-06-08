@@ -578,7 +578,7 @@ class TestQwen35HookRegistration:
         # The exact count depends on the number of pipeline stages captured.
         # This is a regression guard — if hooks change, update this count
         # after verifying correctness.
-        assert len(tiny_model._hook_handles) == 49
+        assert len(tiny_model._hook_handles) == 55
 
     def test_gdn_hooks_capture_on_linear_layers(self, tiny_model):
         """GDN-specific stages should fire only on linear attention layers."""
@@ -588,6 +588,8 @@ class TestQwen35HookRegistration:
             capture_stages=[
                 PipelineStage.QKV_PROJECTION,
                 PipelineStage.GDN_CONV1D_OUTPUT,
+                PipelineStage.GDN_ALPHA,
+                PipelineStage.GDN_BETA,
                 PipelineStage.GDN_DELTA_RULE_OUTPUT,
                 PipelineStage.GDN_NORM_GATE_OUTPUT,
             ],

@@ -302,6 +302,30 @@ namespace llaminar2
                      ForwardOutput &output,
                      IForwardExecutionHost &host);
 
+        struct LastExecutedForwardGraphView
+        {
+            ComputeGraph *graph = nullptr;
+            ForwardGraphSignature signature;
+            DeviceId device = DeviceId::invalid();
+            void *stream = nullptr;
+            bool cache_hit = false;
+            bool is_decode = false;
+            bool all_position_logits = false;
+
+            explicit operator bool() const { return graph != nullptr; }
+        };
+
+        /**
+         * @brief Return the cached forward graph used by the most recent
+         *        successful cached execution.
+         *
+         * MTP accepted-state publication needs the exact verifier graph that
+         * just produced `draft_count + 1` target rows. This view is intentionally
+         * narrow and returns empty for uncached or failed forwards so callers do
+         * not accidentally publish from stale graph-cache entries.
+         */
+        std::optional<LastExecutedForwardGraphView> lastExecutedForwardGraph();
+
         /**
          * @brief Execute one prepared bucketed prefill chunk.
          *
@@ -435,6 +459,17 @@ namespace llaminar2
         ForwardPassProfiler &forwardPassProfiler() { return forward_pass_profiler_; }
 
     private:
+        struct LastExecutedForwardGraphState
+        {
+            bool valid = false;
+            ForwardGraphSignature signature;
+            bool cache_hit = false;
+        };
+
+        void recordLastExecutedForwardGraph(
+            const ForwardGraphSignature &signature,
+            bool cache_hit);
+
         // ----- Cache HIT execution path -----
         bool executeCacheHit(
             const ForwardInput &input,
@@ -491,6 +526,7 @@ namespace llaminar2
         std::unordered_map<ForwardGraphSignature, ForwardGraphCache, ForwardGraphSignatureHash> cache_;
         uint64_t bucketed_prefill_forward_access_counter_ = 0;
         uint64_t bucketed_prefill_forward_eviction_count_ = 0;
+        LastExecutedForwardGraphState last_executed_forward_graph_;
 
         // ----- Mutable execution flags -----
         bool suppress_timeline_ = false;

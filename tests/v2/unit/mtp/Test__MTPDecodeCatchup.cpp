@@ -217,6 +217,157 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseRejectsAndForwardsCorrectionForReadyT
     EXPECT_THAT(runner.committed_indices, ElementsAre(0, 1, 2));
 }
 
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierAcceptsAllAndMatchesStepwiseOracle)
+{
+    FakeCatchupRunner runner;
+    ScriptedSampler sampler({9, 8, 6, 4});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8, 6};
+
+    MTPDecodeCatchupGreedyResult oracle =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+    ASSERT_TRUE(oracle.ok) << oracle.error;
+
+    MTPDecodeCatchupGreedyResult candidate =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 8, 6, 4});
+
+    ASSERT_TRUE(candidate.ok) << candidate.error;
+    EXPECT_EQ(candidate.target_verifier_state_commit_count, 4);
+    EXPECT_EQ(candidate.main_forward_token_count, 4);
+
+    MTPDecodeCatchupGreedyEquivalence eq =
+        compareMTPDecodeCatchupGreedyResults(oracle, candidate);
+    EXPECT_TRUE(eq.ok) << eq.error;
+}
+
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierRejectsAndMarksCorrectionReplayBoundary)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 9};
+
+    MTPDecodeCatchupGreedyResult candidate =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 3, 123});
+
+    ASSERT_TRUE(candidate.ok) << candidate.error;
+    EXPECT_THAT(candidate.accepted_tokens, ElementsAre(7, 9, 3));
+    EXPECT_THAT(candidate.verifier_tokens, ElementsAre(9, 3));
+    EXPECT_FALSE(candidate.all_speculative_accepted);
+    EXPECT_EQ(candidate.accepted_speculative_prefix, 1);
+    EXPECT_EQ(candidate.rejected_verified_token, 3);
+    EXPECT_EQ(candidate.ready_token, -1)
+        << "the correction token has not been forwarded yet";
+    EXPECT_EQ(candidate.target_verifier_state_commit_count, 2)
+        << "only the accepted verifier-input prefix is publishable";
+    EXPECT_EQ(candidate.shifted_commit_count, 3);
+}
+
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierWithCorrectionReplayMatchesStepwiseOracle)
+{
+    FakeCatchupRunner runner;
+    ScriptedSampler sampler({9, 3, 5});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 9};
+
+    MTPDecodeCatchupGreedyResult oracle =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+    ASSERT_TRUE(oracle.ok) << oracle.error;
+
+    MTPDecodeCatchupGreedyResult candidate =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 3, 123},
+            /*correction_replay_ready_token=*/5);
+
+    ASSERT_TRUE(candidate.ok) << candidate.error;
+    EXPECT_EQ(candidate.target_verifier_state_commit_count, 2);
+    EXPECT_EQ(candidate.main_forward_token_count, 4)
+        << "one all-position verifier graph plus one correction replay row";
+
+    MTPDecodeCatchupGreedyEquivalence eq =
+        compareMTPDecodeCatchupGreedyResults(oracle, candidate);
+    EXPECT_TRUE(eq.ok) << eq.error;
+}
+
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierStopsOnAcceptedTokenWithoutReadyToken)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {9};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 5, 123});
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(9));
+    EXPECT_TRUE(result.stopped_on_output);
+    EXPECT_EQ(result.ready_token, -1);
+    EXPECT_EQ(result.target_verifier_state_commit_count, 2);
+}
+
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierStopsOnRejectedCorrectionWithoutReplay)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {3};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{3, 5, 123});
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 3));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(3));
+    EXPECT_TRUE(result.stopped_on_output);
+    EXPECT_FALSE(result.all_speculative_accepted);
+    EXPECT_EQ(result.rejected_verified_token, 3);
+    EXPECT_EQ(result.ready_token, -1);
+    EXPECT_EQ(result.target_verifier_state_commit_count, 1);
+}
+
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierHardFailsOnRowCountMismatch)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 8});
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("row count mismatch"));
+}
+
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierHardFailsOnInvalidComparedToken)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{-1, 4});
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("invalid token"));
+}
+
 TEST(Test__MTPDecodeCatchup, EquivalenceAllowsCandidateWithFewerMainForwards)
 {
     MTPDecodeCatchupGreedyResult oracle;

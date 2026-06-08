@@ -134,6 +134,137 @@ namespace llaminar2
         return equivalenceSuccess();
     }
 
+    MTPDecodeCatchupGreedyResult buildAllPositionMTPDecodeCatchupGreedyResult(
+        const MTPDecodeCatchupGreedyRequest &request,
+        const std::vector<int32_t> &sampled_verifier_rows,
+        std::optional<int32_t> correction_replay_ready_token)
+    {
+        MTPDecodeCatchupGreedyResult result;
+        result.accepted_tokens.reserve(request.draft_tokens.size());
+        result.verifier_tokens.reserve(request.draft_tokens.size());
+
+        auto fail = [&](std::string reason) -> MTPDecodeCatchupGreedyResult
+        {
+            result.ok = false;
+            result.error = std::move(reason);
+            return result;
+        };
+
+        if (request.draft_tokens.empty())
+            return fail("all-position MTP verifier received no draft tokens");
+        if (sampled_verifier_rows.size() != request.draft_tokens.size())
+        {
+            std::ostringstream msg;
+            msg << "all-position MTP verifier row count mismatch: rows="
+                << sampled_verifier_rows.size()
+                << ", draft_tokens=" << request.draft_tokens.size();
+            return fail(msg.str());
+        }
+        if (correction_replay_ready_token.has_value() &&
+            *correction_replay_ready_token < 0)
+        {
+            return fail("all-position MTP verifier received an invalid correction replay ready token");
+        }
+
+        result.main_forward_token_count =
+            static_cast<int>(sampled_verifier_rows.size());
+
+        const int32_t first_token = request.draft_tokens.front();
+        result.accepted_tokens.push_back(first_token);
+        result.target_verifier_state_commit_count = 1;
+
+        if (tokenIsStop(request.stop_tokens, first_token))
+        {
+            result.stopped_on_output = true;
+            result.shifted_commit_count =
+                static_cast<int>(result.accepted_tokens.size());
+            result.ok = true;
+            result.debug_trace =
+                "first token stopped output; published_state_count=1";
+            return result;
+        }
+
+        for (int draft_idx = 1;
+             draft_idx < static_cast<int>(request.draft_tokens.size());
+             ++draft_idx)
+        {
+            const int row = draft_idx - 1;
+            const int32_t verifier_token =
+                sampled_verifier_rows[static_cast<size_t>(row)];
+            if (verifier_token < 0)
+            {
+                std::ostringstream msg;
+                msg << "all-position MTP verifier sampled an invalid token at row "
+                    << row;
+                return fail(msg.str());
+            }
+
+            const int32_t draft_token =
+                request.draft_tokens[static_cast<size_t>(draft_idx)];
+            result.verifier_tokens.push_back(verifier_token);
+
+            const bool accepted = verifier_token == draft_token;
+            const int32_t output_token = accepted ? draft_token : verifier_token;
+            if (accepted)
+            {
+                ++result.accepted_speculative_prefix;
+            }
+            else
+            {
+                result.all_speculative_accepted = false;
+                result.rejected_verified_token = verifier_token;
+            }
+
+            result.accepted_tokens.push_back(output_token);
+
+            if (tokenIsStop(request.stop_tokens, output_token))
+            {
+                result.stopped_on_output = true;
+                break;
+            }
+            if (!accepted)
+                break;
+        }
+
+        result.target_verifier_state_commit_count =
+            std::min<int>(
+                static_cast<int>(request.draft_tokens.size()),
+                result.accepted_speculative_prefix + 1);
+
+        if (!result.stopped_on_output)
+        {
+            if (result.all_speculative_accepted)
+            {
+                const int32_t ready =
+                    sampled_verifier_rows.back();
+                if (ready < 0)
+                    return fail("all-position MTP verifier sampled an invalid bonus ready token");
+                result.ready_token = ready;
+            }
+            else if (correction_replay_ready_token.has_value())
+            {
+                result.ready_token = *correction_replay_ready_token;
+                ++result.main_forward_token_count;
+            }
+        }
+
+        result.shifted_commit_count =
+            static_cast<int>(result.accepted_tokens.size());
+        result.ok = true;
+        std::ostringstream trace;
+        trace << "all_position_rows=" << sampled_verifier_rows.size()
+              << ", accepted_tokens=[" << joinTokens(result.accepted_tokens)
+              << "], verifier_tokens=[" << joinTokens(result.verifier_tokens)
+              << "], publish_state_count="
+              << result.target_verifier_state_commit_count
+              << ", correction_ready="
+              << (correction_replay_ready_token.has_value()
+                      ? std::to_string(*correction_replay_ready_token)
+                      : std::string("none"));
+        result.debug_trace = trace.str();
+        return result;
+    }
+
     MTPDecodeCatchupGreedyResult runSharedStepwiseMTPDecodeCatchupGreedy(
         IInferenceRunner &runner,
         const MTPDecodeCatchupGreedyRequest &request,

@@ -1509,6 +1509,10 @@ namespace llaminar2
             int position_id,
             int32_t *out_token) override;
         bool flushPendingMTPWork() override;
+        bool supportsMTPSpecStatePublication() const override;
+        bool publishAcceptedMTPSpecState(
+            const MTPSpecStepPlan &plan,
+            std::string *error = nullptr) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,

@@ -308,6 +308,7 @@ namespace llaminar2
             return static_cast<int>(values.size()) >= required;
         };
         const int requests = shape.max_requests;
+        const int target_slots = requests * shape.maxTargetQueryLen();
         if (!has_size(commit_plan.accepted_state_counts, requests) ||
             !has_size(commit_plan.accepted_state_slot_indices, requests) ||
             !has_size(commit_plan.correction_replay_start_indices, requests) ||
@@ -370,12 +371,12 @@ namespace llaminar2
                 }
             }
             else if (accepted_slot < 0 ||
-                     accepted_slot >= shape.maxTargetQueryLen())
+                     accepted_slot >= target_slots)
             {
                 return publicationPlanFailure(
                     shape,
                     commit_plan.request_count,
-                    "accepted state slot index is outside target query shape");
+                    "accepted state slot index is outside batch target slots");
             }
 
             const int32_t correction_start =
@@ -404,6 +405,35 @@ namespace llaminar2
                     shape,
                     commit_plan.request_count,
                     "correction replay must start after the accepted state prefix");
+            }
+
+            const int32_t bonus_row =
+                commit_plan.bonus_ready_token_rows[static_cast<size_t>(i)];
+            const int32_t bonus_index =
+                commit_plan.bonus_ready_token_indices[static_cast<size_t>(i)];
+            const int32_t bonus_slot =
+                commit_plan.bonus_ready_state_slot_indices[static_cast<size_t>(i)];
+            if (bonus_row == kMTPSpecDecodeInvalidToken)
+            {
+                if (bonus_index != kMTPSpecDecodeInvalidToken ||
+                    bonus_slot != kMTPSpecDecodeInvalidToken)
+                {
+                    return publicationPlanFailure(
+                        shape,
+                        commit_plan.request_count,
+                        "bonus ready-token fields must be all invalid or all present");
+                }
+            }
+            else if (bonus_row < 0 ||
+                     bonus_row >= shape.maxTargetQueryLen() ||
+                     bonus_index < 0 ||
+                     bonus_slot < 0 ||
+                     bonus_slot >= target_slots)
+            {
+                return publicationPlanFailure(
+                    shape,
+                    commit_plan.request_count,
+                    "bonus ready-token state is outside batch target slots");
             }
 
             plan.base_cached_tokens[static_cast<size_t>(i)] = base_cached;

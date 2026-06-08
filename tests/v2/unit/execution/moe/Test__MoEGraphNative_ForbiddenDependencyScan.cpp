@@ -403,7 +403,7 @@ namespace llaminar2::test
             {"void ROCmMoEKernel::sharedExpertGate", "void ROCmMoEKernel::swiGLU"},
             {"void ROCmMoEKernel::swiGLU", "void ROCmMoEKernel::weightedAdd"},
             {"void ROCmMoEKernel::weightedAdd", "void ROCmMoEKernel::allocateHistogramBuffers"},
-            {"bool ROCmMoEKernel::groupTokensByExpertDevice", "void ROCmMoEKernel::ensureStagingCapacity"},
+            {"bool ROCmMoEKernel::groupTokensByExpertDevice", "bool ROCmMoEKernel::ensureStagingCapacity"},
             {"void ROCmMoEKernel::zeroBuffer", "void ROCmMoEKernel::gatherTokenBatchFromTensors"},
             {"void ROCmMoEKernel::gatherTokenBatchFromTensors", "void ROCmMoEKernel::scatterAddWeightedFromTensors"},
             {"void ROCmMoEKernel::scatterAddWeightedFromTensors", "void ROCmMoEKernel::sharedExpertGateFromTensors"},
@@ -698,13 +698,16 @@ namespace llaminar2::test
         ASSERT_NE(execute_end, std::string::npos);
         const std::string execute_body = contents.substr(execute_start, execute_end - execute_start);
 
-        const size_t grouped_decode = execute_body.find("if (tryGroupedDecode(kernel, d_model, intermediate))");
+        const size_t grouped_decode = execute_body.find("if (grouped_decode_required)");
         ASSERT_NE(grouped_decode, std::string::npos);
+        const size_t grouped_call = execute_body.find("tryGroupedDecode(kernel, d_model, intermediate)", grouped_decode);
+        ASSERT_NE(grouped_call, std::string::npos);
         const size_t publish = execute_body.find("markGpuTensorWritten(params_.output, params_.device_id, gpuStream())",
                                                  grouped_decode);
         const size_t return_true = execute_body.find("return true;", grouped_decode);
         ASSERT_NE(publish, std::string::npos);
         ASSERT_NE(return_true, std::string::npos);
+        EXPECT_LT(grouped_call, publish);
         EXPECT_LT(publish, return_true);
     }
 

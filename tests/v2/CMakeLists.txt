@@ -5329,6 +5329,24 @@ if(ZLIB_FOUND)
         TIMEOUT 2400
     )
 
+    add_executable(v2_integration_parity_qwen36_rocm_single_device_prefix_mtp
+        integration/parity/qwen36/Test__Qwen36_ROCm_SingleDevice_PrefixMTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36_rocm_single_device_prefix_mtp
+        llaminar2_core GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen36_rocm_single_device_prefix_mtp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen36_rocm_single_device_prefix_mtp
+        TEST_PREFIX V2_Integration_Parity_Qwen36_ROCm_SingleDevice
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;ROCm;GPU;SingleDevice;PyTorch"
+        MPI_PROCS 1
+        TIMEOUT 1800
+    )
+
     add_executable(v2_integration_parity_qwen36_cuda_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_CUDA_SingleDevice_PrefixMTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -5400,19 +5418,37 @@ if(ZLIB_FOUND)
         TIMEOUT 2400
     )
 
-    add_executable(v2_integration_parity_qwen36moe_single_device_prefix_mtp
-        integration/parity/qwen36/Test__Qwen36MoE_SingleDevice_PrefixMTP_Parity.cpp
+    add_executable(v2_integration_parity_qwen36moe_cpu_single_device_prefix_mtp
+        integration/parity/qwen36/Test__Qwen36MoE_CPU_SingleDevice_PrefixMTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen36moe_single_device_prefix_mtp
+    target_link_libraries(v2_integration_parity_qwen36moe_cpu_single_device_prefix_mtp
         llaminar2_core GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen36moe_single_device_prefix_mtp PRIVATE
+    target_include_directories(v2_integration_parity_qwen36moe_cpu_single_device_prefix_mtp PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen36moe_single_device_prefix_mtp
-        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_SingleDevice
+    discover_v2_parity_tests(v2_integration_parity_qwen36moe_cpu_single_device_prefix_mtp
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_CPU_SingleDevice
+        LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;CPU;SingleDevice;PyTorch"
+        MPI_PROCS 1
+        TIMEOUT 2400
+    )
+
+    add_executable(v2_integration_parity_qwen36moe_rocm_single_device_prefix_mtp
+        integration/parity/qwen36/Test__Qwen36MoE_ROCm_SingleDevice_PrefixMTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36moe_rocm_single_device_prefix_mtp
+        llaminar2_core GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen36moe_rocm_single_device_prefix_mtp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen36moe_rocm_single_device_prefix_mtp
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_ROCm_SingleDevice
         LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;ROCm;GPU;SingleDevice;PyTorch"
         MPI_PROCS 1
         TIMEOUT 2400
@@ -6273,6 +6309,30 @@ target_include_directories(v2_test_mtp_spec_decode_metadata PRIVATE
 add_v2_test(V2_Unit_MTPSpecDecodeMetadata
     COMMAND $<TARGET_FILE:v2_test_mtp_spec_decode_metadata>
     LABELS "V2;Unit;MTP;SpecDecode;Metadata;Workspace"
+    MPI_PROCS 1
+)
+
+# Test: vLLM-style MTP spec-step state publication contract
+add_executable(v2_test_mtp_spec_state_contract unit/mtp/Test__MTPSpecStateContract.cpp)
+target_link_libraries(v2_test_mtp_spec_state_contract llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
+target_include_directories(v2_test_mtp_spec_state_contract PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPSpecStateContract
+    COMMAND $<TARGET_FILE:v2_test_mtp_spec_state_contract>
+    LABELS "V2;Unit;MTP;SpecDecode;StateContract"
+    MPI_PROCS 1
+)
+
+# Test: vLLM-style MTP accepted-count KV publication contract
+add_executable(v2_test_mtp_spec_kv_publisher unit/mtp/Test__MTPSpecKVPublisher.cpp)
+target_link_libraries(v2_test_mtp_spec_kv_publisher llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
+target_include_directories(v2_test_mtp_spec_kv_publisher PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPSpecKVPublisher
+    COMMAND $<TARGET_FILE:v2_test_mtp_spec_kv_publisher>
+    LABELS "V2;Unit;MTP;SpecDecode;KVPublisher"
     MPI_PROCS 1
 )
 
