@@ -11,10 +11,11 @@ plan carries detailed implementation status.
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 877.55 | 43.81 | current clean baseline |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 726.19 | 87.07 | historical 1.99x target, not accepted |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 727.01 | 36.82 | residual-batch, speed-negative |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, shared stepwise | 609.73 | 38.19 | old blocker, 84.95% acceptance |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic dynamic MTP | 727.40 | 42.43 | effective d1, near baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.54 | 30.21 | current clean baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 217.10 | 34.40 | failed equivalence, not accepted |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 217.43 | 19.99 | residual-batch, speed-negative |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic dynamic MTP | 217.92 | 26.37 | effective d1, below baseline |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 76.35 | 31.92 | short-lane baseline |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 73.05 | 54.23 | historical 1.70x target |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | current baseline |
@@ -24,30 +25,26 @@ plan carries detailed implementation status.
 
 ## Current Findings
 
-- Phase 13.8 vLLM-style transaction remains the active dense SingleDevice GPU
-  design. Retired selected-row numbers above are speed targets only, not
-  acceptance evidence.
-- Sequential verifier MTP is the old blocker: correct but speed-negative because
-  accepted speculative tokens paid repeated decode-equivalent verifier forwards.
+- Phase 13.8 remains the vLLM-style accepted-count transaction path. Retired
+  selected-row numbers are speed targets only, not acceptance evidence.
 - Dead raw all-position and sidecar-chain shortcut code/tests are removed.
-  Retained work goes through `gdn_speculative_state_slots*`, explicit
-  accepted-count publication, shifted-row commit, suffix forward, and
-  ready-token handoff.
-- Source-owned parity covers CUDA/ROCm depth-3 normal decode, prefix restore,
-  benchmark-style fixed depth, and stochastic Phase 13.8 cells. The ROCm
-  selected-row equivalence failure is the reason that path was removed.
-- Benchmark mode now preserves greedy deterministic defaults for normal runs but
-  passes `temperature/top_k/top_p/seed` into orchestrated decode for
-  `--mtp-verify-mode speculative-sampling`, so stochastic MTP measurements are
-  no longer silently greedy.
-- 2026-06-08: CUDA/ROCm stochastic MTP now batches compact-distribution
-  accept decisions plus candidate residual correction tokens for draft rows in
-  one graph-capturable verifier launch. Focused runner, GPU sampling,
-  CUDA/ROCm graph smoke, and Qwen3.6 stochastic parity tests are green.
-- Residual-batch stochastic dense default benchmarks are still speed-negative:
-  CUDA 36.82 tok/s at 62.07% acceptance, ROCm 19.99 tok/s at 61.18%
-  acceptance. Next tuning target is verifier cost or acceptance behavior, not
-  accept/residual sampling launch overhead.
+  Retained work uses speculative state slots, accepted-count publication,
+  shifted-row commit, correction suffix forward, and ready-token handoff.
+- CUDA/ROCm stochastic MTP now batches compact-distribution accept decisions and
+  residual correction candidates in one graph-capturable verifier launch; the
+  focused runner, GPU sampling, graph-smoke, and Qwen3.6 stochastic parity gates
+  are green.
+- Dense default residual-batch stochastic MTP is still speed-negative: CUDA
+  36.82 tok/s at 62.07% acceptance, ROCm 19.99 tok/s at 61.18%.
+- Dynamic stochastic depth avoids the default prompt's fixed-d3 acceptance trap
+  and matches fixed d1: CUDA 42.43 vs 42.37 tok/s, ROCm 26.37 vs 26.71 tok/s.
+- ROCm generated decode dispatch now obeys the graph-safe small-M `kb<=8`
+  contract. A profiled fixed-d1 stochastic rerun completed at 215.32 prefill /
+  25.92 decode tok/s with 84.38% acceptance; counters show FFN-down verifier
+  using `kb=8,target_waves=24`. Verifier forward improved to about 41.51 ms,
+  but stochastic sampling still costs about 9.24 ms/step.
+- Next target: verifier/sampler cost, especially stochastic GPU sampling, GEMM,
+  fused gate/up, and GDN projection/recurrence.
 
 ## llama.cpp CUDA Anchors
 

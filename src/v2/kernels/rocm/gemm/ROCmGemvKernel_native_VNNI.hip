@@ -3629,8 +3629,18 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     const auto& rocm_env = llaminar2::debugEnv().rocm;
     const int api_kb_override = g_native_vnni_kb_override.load(std::memory_order_relaxed);
     const int api_waves_override = g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
-    const int kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
-    const int waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+    const int explicit_kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
+    const int explicit_waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+    const auto generated_cfg =
+        resolveNativeVNNIDecodeGeneratedRuntimeConfig(static_cast<uint8_t>(FMT), N, K);
+    const int kb_override =
+        (explicit_kb_override > 0)
+            ? explicit_kb_override
+            : (generated_cfg.has_generated ? generated_cfg.kb : -1);
+    const int waves_override =
+        (explicit_waves_override > 0)
+            ? explicit_waves_override
+            : (generated_cfg.has_generated ? generated_cfg.target_waves_per_cu : -1);
     const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
     const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
     const bool use_atomic_reduce = !deterministic && (graph_capture_enabled || rocm_env.nvnni_atomic_reduce);
@@ -3797,8 +3807,20 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     const auto& rocm_env = llaminar2::debugEnv().rocm;
     const int api_kb_override = g_native_vnni_kb_override.load(std::memory_order_relaxed);
     const int api_waves_override = g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
-    const int kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
-    const int waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+    const int explicit_kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
+    const int explicit_waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+    const auto generated_cfg =
+        num_projections == 1
+            ? resolveNativeVNNIDecodeGeneratedRuntimeConfig(static_cast<uint8_t>(FMT), Ns[0], K)
+            : NativeVNNIDecodeGeneratedRuntimeConfig{};
+    const int kb_override =
+        (explicit_kb_override > 0)
+            ? explicit_kb_override
+            : (generated_cfg.has_generated ? generated_cfg.kb : -1);
+    const int waves_override =
+        (explicit_waves_override > 0)
+            ? explicit_waves_override
+            : (generated_cfg.has_generated ? generated_cfg.target_waves_per_cu : -1);
     const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
     const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
     const bool use_atomic_reduce = !deterministic && (graph_capture_enabled || rocm_env.nvnni_atomic_reduce);
@@ -4063,8 +4085,20 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     const auto& rocm_env = llaminar2::debugEnv().rocm;
     const int api_kb_override = g_native_vnni_kb_override.load(std::memory_order_relaxed);
     const int api_waves_override = g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
-    const int kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
-    const int waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+    const int explicit_kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
+    const int explicit_waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+    const auto generated_cfg =
+        num_projections == 1
+            ? resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_ids[0], Ns[0], K)
+            : NativeVNNIDecodeGeneratedRuntimeConfig{};
+    const int kb_override =
+        (explicit_kb_override > 0)
+            ? explicit_kb_override
+            : (generated_cfg.has_generated ? generated_cfg.kb : -1);
+    const int waves_override =
+        (explicit_waves_override > 0)
+            ? explicit_waves_override
+            : (generated_cfg.has_generated ? generated_cfg.target_waves_per_cu : -1);
     const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
     const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
     const bool use_atomic_reduce = !deterministic && (graph_capture_enabled || rocm_env.nvnni_atomic_reduce);

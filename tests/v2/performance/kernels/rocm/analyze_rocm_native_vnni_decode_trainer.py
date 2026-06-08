@@ -41,6 +41,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", nargs="+", required=True, help="ROCm decode trainer CSV path(s)")
     parser.add_argument("--output", required=True, help="Generated C++ include path")
     parser.add_argument("--summary", default=None, help="Human-readable summary path")
+    parser.add_argument(
+        "--max-generated-kb",
+        type=int,
+        default=8,
+        help=(
+            "Maximum KB split allowed in generated decode dispatch. This must match "
+            "the graph-safe native-VNNI small-M verifier cap."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -66,7 +75,12 @@ def _to_float(path: Path, row_index: int, column: str, value: str) -> float:
         raise SystemExit(f"{path}:{row_index}: invalid {column}={value!r}") from exc
 
 
-def parse_variant(path: Path, row_index: int, row: dict[str, str]) -> tuple[int, int] | None:
+def parse_variant(
+    path: Path,
+    row_index: int,
+    row: dict[str, str],
+    max_generated_kb: int,
+) -> tuple[int, int] | None:
     variant = (row.get("variant") or "").strip().upper()
     kb = _to_int(path, row_index, "kb", row.get("kb", ""))
     target_waves = _to_int(path, row_index, "target_waves", row.get("target_waves", ""))
@@ -89,10 +103,15 @@ def parse_variant(path: Path, row_index: int, row: dict[str, str]) -> tuple[int,
         raise SystemExit(f"{path}:{row_index}: generated decode variants need positive kb and target_waves")
     if parsed_kb > 64:
         raise SystemExit(f"{path}:{row_index}: decode kb={parsed_kb} exceeds kernel cap 64")
+    if parsed_kb > max_generated_kb:
+        return None
     return parsed_kb, parsed_tw
 
 
-def load_decode_rows(paths: list[str]) -> list[DecodeRow]:
+def load_decode_rows(paths: list[str], max_generated_kb: int) -> list[DecodeRow]:
+    if max_generated_kb <= 0:
+        raise SystemExit("--max-generated-kb must be positive")
+
     best_by_key: dict[tuple[int, int, int], DecodeRow] = {}
     for raw_path in paths:
         path = Path(raw_path)
@@ -104,8 +123,6 @@ def load_decode_rows(paths: list[str]) -> list[DecodeRow]:
                 if (row.get("phase") or "").strip() != "decode":
                     continue
                 if _to_int(path, row_index, "correctness_pass", row.get("correctness_pass", "")) != 1:
-                    continue
-                if _to_int(path, row_index, "is_best", row.get("is_best", "0")) != 1:
                     continue
 
                 fmt = (row.get("format") or "").strip().upper()
@@ -119,7 +136,7 @@ def load_decode_rows(paths: list[str]) -> list[DecodeRow]:
                         f"expected {expected_codebook}, found {codebook}"
                     )
 
-                parsed_variant = parse_variant(path, row_index, row)
+                parsed_variant = parse_variant(path, row_index, row, max_generated_kb)
                 if parsed_variant is None:
                     continue
                 kb, target_waves = parsed_variant
@@ -250,9 +267,9 @@ def emit_summary(rows: list[DecodeRow], summary_path: Path) -> None:
 
 def main() -> int:
     args = parse_args()
-    rows = load_decode_rows(args.input)
+    rows = load_decode_rows(args.input, args.max_generated_kb)
     if not rows:
-        raise SystemExit("no generated ROCm NativeVNNI decode rows; all best rows were AUTO or invalid")
+        raise SystemExit("no generated ROCm NativeVNNI decode rows; no correct rows fit the generated KB cap")
     output = Path(args.output)
     emit_cpp(rows, output)
     if args.summary:

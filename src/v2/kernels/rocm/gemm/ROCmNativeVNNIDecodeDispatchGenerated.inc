@@ -56,15 +56,15 @@ inline bool selectROCmNativeVNNIDecodeGenerated(
     const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(n, k);
     if (codebook_id == 0) { // CB=0 (Q4_0)
         static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
-            {0x000140000400ULL, {16, 24}}, // CB=0 (Q4_0) 1024x5120 KB16/TW24 Qwen36_GDN_TimeProjection 25.120us
+            {0x000140000400ULL, {8, 24}}, // CB=0 (Q4_0) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 28.640us
             {0x000440001400ULL, {8, 24}}, // CB=0 (Q4_0) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 84.800us
         };
         return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
     }
     if (codebook_id == 5) { // CB=5 (Q4_1)
         static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
-            {0x000140000400ULL, {16, 24}}, // CB=5 (Q4_1) 1024x5120 KB16/TW24 Qwen36_GDN_TimeProjection 27.840us
-            {0x000440001400ULL, {16, 24}}, // CB=5 (Q4_1) 5120x17408 KB16/TW24 Qwen36_FFN_DownProjection 96.480us
+            {0x000140000400ULL, {8, 24}}, // CB=5 (Q4_1) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 34.720us
+            {0x000440001400ULL, {8, 24}}, // CB=5 (Q4_1) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 100.960us
         };
         return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
     }

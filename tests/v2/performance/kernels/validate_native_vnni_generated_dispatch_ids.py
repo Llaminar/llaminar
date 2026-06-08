@@ -14,6 +14,8 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from native_vnni_codebooks import CODEBOOK_TO_FORMAT  # noqa: E402
 
+ROCM_DECODE_GRAPH_SAFE_KB_CAP = 8
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -64,6 +66,19 @@ def _validate_labeled_branches(path: Path, text: str) -> None:
                 )
 
 
+def _validate_rocm_decode_graph_safe_kb(path: Path, text: str) -> None:
+    if "ROCmNativeVNNIDecodeDispatchConfig" not in text:
+        return
+
+    for match in re.finditer(r"\{0x[0-9a-fA-F]+ULL,\s*\{(\d+),\s*(\d+)\}\}", text):
+        kb = int(match.group(1))
+        if kb > ROCM_DECODE_GRAPH_SAFE_KB_CAP:
+            raise SystemExit(
+                f"{path}: ROCm NativeVNNI decode generated kb={kb} exceeds "
+                f"graph-safe small-M cap {ROCM_DECODE_GRAPH_SAFE_KB_CAP}"
+            )
+
+
 def validate_file(path: Path) -> int:
     if not path.is_file():
         raise SystemExit(f"generated include not found: {path}")
@@ -82,6 +97,7 @@ def validate_file(path: Path) -> int:
         )
 
     _validate_labeled_branches(path, text)
+    _validate_rocm_decode_graph_safe_kb(path, text)
     return len(codebooks)
 
 
