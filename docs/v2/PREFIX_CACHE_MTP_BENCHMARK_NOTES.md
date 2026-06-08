@@ -1,7 +1,6 @@
 # Prefix Cache And MTP Benchmark Notes
 
-Concise Phase 14 scoreboard for Qwen3.6 MTP/prefix-cache tuning. Raw run
-history stays in `benchmark_results/` and `/tmp/llaminar-mtp-bench`.
+Phase 14 scoreboard for Qwen3.6 MTP/prefix-cache tuning.
 
 ## Headline Matrix
 
@@ -15,8 +14,8 @@ history stays in `benchmark_results/` and `/tmp/llaminar-mtp-bench`.
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.90 | 30.16 | dispatch-refresh baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 217.10 | 34.40 | failed equivalence, not accepted |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic accepted-count MTP | 217.43 | 19.99 | residual-batch, speed-negative |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic fixed d1 MTP | 213.91 | 34.40 | graph-owned publish, top-k40 fast path |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic dynamic MTP | 211.95 | 31.51 | top-k40, noisy effective d1 |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic fixed d1 MTP | 213-214 | 34.4-36.1 | top-k40 64 partials; acceptance noisy |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic dynamic MTP | 211.95 | 31.51 | top-k40, effective d1 |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 76.35 | 31.92 | short-lane baseline |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 MTP | 73.05 | 54.23 | historical 1.70x target |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | current baseline |
@@ -39,12 +38,14 @@ history stays in `benchmark_results/` and `/tmp/llaminar-mtp-bench`.
   llama.cpp d1 anchor.
 - Accepted verifier state is now published through cached verifier graph stages
   after rebinding declared workspaces, avoiding stale shared-kernel capture
-  bindings. ROCm/CUDA smokes and stochastic parity are green with zero failures.
-- ROCm generated NativeVNNI decode dispatch now covers Qwen3.6 hot verifier
-  shapes for codebooks 0/5/7/8. This improves coverage and keeps parity green,
-  but default top-k40 throughput is 34.40 tok/s fixed d1 and 31.51 dynamic;
-  verifier forward remains the catch-up target at about 37 ms versus CUDA's
-  28.5 ms. A diagnostic top-k20 run reached 37.04/38.24 fixed/dynamic tok/s.
+  bindings; ROCm/CUDA smokes and stochastic parity are green.
+- ROCm NativeVNNI decode dispatch covers Qwen3.6 hot verifier shapes for
+  codebooks 0/5/7/8. Top-k40 keeps a 64-block small-k partial cap; 32 blocks
+  regressed to 34.00 tok/s. Same-seed production runs varied from 84.38% to
+  96.88% acceptance, moving decode from 34.38 to 36.12 tok/s; deterministic mode
+  gave 87.50% acceptance but only 29.39 tok/s. Treat ROCm top-k40 as noisy until
+  repeatability is tightened. Verifier forward remains the
+  catch-up target at about 37 ms versus CUDA's 28.5 ms.
 - ROCm batched small-M verifier dispatch training is now offline-only. The
   generated candidate looked correct in the perf harness but collapsed
   real-model stochastic acceptance, so no batched table is promoted without a
@@ -67,7 +68,7 @@ history stays in `benchmark_results/` and `/tmp/llaminar-mtp-bench`.
 ## Retained Actions
 
 - Finish Phase 13.8 by broadening the shared transaction path across stop,
-  prefix, continuation, MoE, and TP/PP cases, then tune CUDA and ROCm
+  prefix, continuation, MoE, and TP/PP, then tune CUDA and ROCm
   greedy/stochastic MTP until both post comparable wins or any remaining gap is
   trace-backed. Do not restore raw all-position verifier shortcut code.
 - Keep CUDA MoE 148.5 tok/s and ROCm MoE 42.04 tok/s as current ratchets.

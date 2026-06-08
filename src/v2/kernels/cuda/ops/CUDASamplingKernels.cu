@@ -25,9 +25,17 @@ constexpr int TOPK_MAX_K = 256;
 constexpr int TOPK_THREADS = 32;
 constexpr int TOPK_SMALL_K_CAP = 64;
 constexpr int TOPK_SMALL_K_PARTIAL_BLOCKS = 128;
+// Qwen-style top_k=40/64 distributions still benefit from wider partial
+// reductions; 32 blocks regressed the ROCm fixed-depth-1 MTP lane.
+constexpr int TOPK_SMALL_K_WIDE_PARTIAL_BLOCKS = 64;
 constexpr int TOPK_SMALL_K_THREADS = 64;
 static_assert(TOPK_MAX_K == llaminar2::sampling_math::kMaxTopK,
               "CUDA sampling TOPK_MAX_K must match shared sampling math");
+
+constexpr int topkSmallKPartialBlockCap(int k)
+{
+    return k > 32 ? TOPK_SMALL_K_WIDE_PARTIAL_BLOCKS : TOPK_SMALL_K_PARTIAL_BLOCKS;
+}
 
 // ── Argmax multi-block reduction tuning ─────────────────────────────────────
 // Threads per block for both reduction passes. Must be a power of two because
@@ -1244,8 +1252,9 @@ extern "C"
             int partial_blocks = (n + threads - 1) / threads;
             if (partial_blocks < 1)
                 partial_blocks = 1;
-            if (partial_blocks > TOPK_SMALL_K_PARTIAL_BLOCKS)
-                partial_blocks = TOPK_SMALL_K_PARTIAL_BLOCKS;
+            const int partial_block_cap = topkSmallKPartialBlockCap(k);
+            if (partial_blocks > partial_block_cap)
+                partial_blocks = partial_block_cap;
             const int required_scratch = partial_blocks * k;
             if (scratch_capacity >= required_scratch)
             {
