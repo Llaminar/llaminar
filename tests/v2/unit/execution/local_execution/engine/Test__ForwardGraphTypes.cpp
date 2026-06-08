@@ -910,6 +910,8 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags expected_tags = {
+        {"first_stage", "gemm"},
+        {"last_stage", "lm_head"},
         {"type", "capturable"},
         {"stage_count", "3"}};
     EXPECT_EQ(findTimerCount(records, "segmented_replay_graph_launch", expected_tags), 1u);
@@ -943,6 +945,8 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags expected_tags = {
         {"context", "main_verifier"},
+        {"first_stage", "embedding"},
+        {"last_stage", "lm_head"},
         {"type", "capturable"},
         {"stage_count", "3"}};
     EXPECT_EQ(findTimerCount(records, "segmented_replay_graph_launch", expected_tags), 1u);
@@ -1032,7 +1036,9 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
     const PerfStatsCollector::Tags stage_segment_tags = {
         {"attribution", "gpu_event"},
         {"context", "main_verifier"},
+        {"first_stage", "verifier_graph"},
         {"graph_capture_scope", "segmented_replay_events"},
+        {"last_stage", "verifier_graph"},
         {"segment_index", "0"},
         {"source", "segmented_graph_capture"},
         {"stage_count", "1"},
@@ -1102,7 +1108,9 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
     const PerfStatsCollector::Tags segment_tags = {
         {"attribution", "gpu_event"},
         {"context", "main_decode"},
+        {"first_stage", "captured_decode_graph"},
         {"graph_capture_scope", "segmented_replay_events"},
+        {"last_stage", "captured_decode_graph"},
         {"segment_index", "0"},
         {"source", "segmented_graph_capture"},
         {"stage_count", "1"},
@@ -1173,7 +1181,9 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
     const PerfStatsCollector::Tags segment_tags = {
         {"attribution", "gpu_event"},
         {"context", "mtp_decode_sidecar"},
+        {"first_stage", "sidecar_graph"},
         {"graph_capture_scope", "segmented_replay_events"},
+        {"last_stage", "sidecar_graph"},
         {"segment_index", "0"},
         {"source", "segmented_graph_capture"},
         {"stage_count", "1"},

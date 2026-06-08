@@ -2443,8 +2443,8 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
     constexpr int seq_len = 1;
     constexpr int top_k = 8;
     constexpr int num_experts = 8;
-    constexpr int d_model = 256;
-    constexpr int intermediate = 256;
+    constexpr int d_model = 2048;
+    constexpr int intermediate = 512;
     const auto device = llaminar2::DeviceId::cuda(0);
 
     std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;

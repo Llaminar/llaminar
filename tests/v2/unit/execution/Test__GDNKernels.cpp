@@ -807,6 +807,64 @@ TEST(Test__GDNKernels, NonVerifierRecurrenceStageClearsStaleSpeculativeStateBind
     EXPECT_EQ(kernel.speculative_state_size, 32);
 }
 
+TEST(Test__GDNKernels, CPUShortConvVerifierStageOwnsHostCaptureSlotsWhenWorkspaceUnbound)
+{
+    RecordingShortConvolution kernel;
+    std::vector<float> conv_state(48, 0.0f);
+
+    ShortConv1dStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 2;
+    p.channels = 16;
+    p.kernel_size = 4;
+    p.verifier_state_capture_rows = 2;
+    p.conv_state = conv_state.data();
+    p.kernel = &kernel;
+
+    ShortConv1dStage stage(p);
+    stage.bindWorkspace(nullptr);
+
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    ASSERT_NE(kernel.capture_workspace, nullptr);
+    EXPECT_NE(kernel.capture_workspace, conv_state.data());
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 48);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 48);
+    EXPECT_TRUE(stage.hasVerifierStateCapture());
+}
+
+TEST(Test__GDNKernels, CPURecurrenceVerifierStageOwnsHostCaptureSlotsWhenWorkspaceUnbound)
+{
+    RecordingGatedDeltaNet kernel;
+    std::vector<float> recurrence_state(32, 0.0f);
+
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 2;
+    p.n_heads = 2;
+    p.n_k_heads = 2;
+    p.d_k = 4;
+    p.d_v = 4;
+    p.verifier_state_capture_rows = 2;
+    p.recurrence_state = recurrence_state.data();
+    p.kernel = &kernel;
+
+    GDNRecurrenceStage stage(p);
+    stage.bindWorkspace(nullptr);
+
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    ASSERT_NE(kernel.capture_workspace, nullptr);
+    EXPECT_NE(kernel.capture_workspace, recurrence_state.data());
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 32);
+    EXPECT_TRUE(stage.hasVerifierStateCapture());
+}
+
 TEST(Test__GDNKernels, ShortConvStageResetClearsStaleSpeculativeStateBinding)
 {
     RecordingShortConvolution kernel;

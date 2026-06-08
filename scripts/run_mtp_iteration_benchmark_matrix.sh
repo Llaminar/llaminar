@@ -10,7 +10,7 @@ Runs the standard MTP iteration benchmark matrix and writes one benchmark JSON/l
 per lane plus summary.tsv.
 
 Default matrix:
-  devices:  cuda:0,rocm:0,cpu
+  devices:  cuda:0,rocm:0,cpu:0
   models:   dense,moe
   modes:    greedy,stochastic
   variants: baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
@@ -19,11 +19,12 @@ Options:
   --binary PATH          llaminar2 binary (default: build_v2_release/llaminar2)
   --dense-model PATH     Dense Qwen3.6 GGUF
   --moe-model PATH       MoE Qwen3.6 GGUF
-  --devices LIST         Comma list, e.g. cuda:0,rocm:0,cpu
+  --devices LIST         Comma list, e.g. cuda:0,rocm:0,cpu:0
   --models LIST          Comma list: dense,moe
   --modes LIST           Comma list: greedy,stochastic
   --variants LIST        Comma list: baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
   --seed N               Seed for stochastic rows (default: 123)
+  --decode-tokens N      Override benchmark decode tokens via --n-predict N
   --output-dir DIR       Output directory
   --perfstats            Capture LLAMINAR_PERF_STATS_JSON for MTP variants
   --dry-run              Print commands only
@@ -38,6 +39,7 @@ Environment aliases:
   LLAMINAR_MTP_MATRIX_MODES
   LLAMINAR_MTP_MATRIX_VARIANTS
   LLAMINAR_MTP_MATRIX_SEED
+  LLAMINAR_MTP_MATRIX_DECODE_TOKENS
   LLAMINAR_MTP_MATRIX_RESULTS_DIR
 
 Do not use --no-mpi-bootstrap for this benchmark matrix.
@@ -50,11 +52,12 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 binary_path="${LLAMINAR_LL2_BIN:-${repo_root}/build_v2_release/llaminar2}"
 dense_model="${LLAMINAR_MTP_MATRIX_DENSE_MODEL:-/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf}"
 moe_model="${LLAMINAR_MTP_MATRIX_MOE_MODEL:-/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf}"
-devices="${LLAMINAR_MTP_MATRIX_DEVICES:-cuda:0,rocm:0,cpu}"
+devices="${LLAMINAR_MTP_MATRIX_DEVICES:-cuda:0,rocm:0,cpu:0}"
 models="${LLAMINAR_MTP_MATRIX_MODELS:-dense,moe}"
 modes="${LLAMINAR_MTP_MATRIX_MODES:-greedy,stochastic}"
 variants="${LLAMINAR_MTP_MATRIX_VARIANTS:-baseline,fixed_d1,fixed_d2,fixed_d3,dynamic}"
 seed="${LLAMINAR_MTP_MATRIX_SEED:-123}"
+decode_tokens="${LLAMINAR_MTP_MATRIX_DECODE_TOKENS:-}"
 output_dir="${LLAMINAR_MTP_MATRIX_RESULTS_DIR:-}"
 perfstats=0
 dry_run=0
@@ -98,6 +101,10 @@ while [[ $# -gt 0 ]]; do
       seed="${2:-}"
       shift 2
       ;;
+    --decode-tokens)
+      decode_tokens="${2:-}"
+      shift 2
+      ;;
     --output-dir)
       output_dir="${2:-}"
       shift 2
@@ -139,6 +146,11 @@ for extra_arg in "${extra_args[@]}"; do
     exit 2
   fi
 done
+
+if [[ -n "${decode_tokens}" && ! "${decode_tokens}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --decode-tokens must be a positive integer, got: ${decode_tokens}" >&2
+  exit 2
+fi
 
 split_csv() {
   echo "$1" | tr ',' ' '
@@ -243,13 +255,14 @@ metadata_path="${output_dir}/metadata.txt"
   echo "modes=${modes}"
   echo "variants=${variants}"
   echo "seed=${seed}"
+  echo "decode_tokens=${decode_tokens:-default}"
   echo "perfstats=${perfstats}"
   echo "extra_args=${extra_args[*]:-}"
   echo
   git -C "${repo_root}" status --short || true
 } > "${metadata_path}"
 
-printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tjson\tperfstats\n' > "${summary_path}"
+printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tjson\tperfstats\n' > "${summary_path}"
 : > "${commands_path}"
 
 append_summary() {
@@ -259,6 +272,7 @@ append_summary() {
   local variant="$4"
   local json_path="$5"
   local perf_path="$6"
+  local baseline_decode_tps="${7:-0}"
   jq -r \
     --arg device "${device}" \
     --arg model "${model}" \
@@ -266,6 +280,7 @@ append_summary() {
     --arg variant "${variant}" \
     --arg json "${json_path}" \
     --arg perf "${perf_path}" \
+    --argjson baseline_decode_tps "${baseline_decode_tps}" \
     '[
       $device,
       $model,
@@ -273,6 +288,7 @@ append_summary() {
       $variant,
       (.success // false),
       (.throughput_tokens_per_sec.decode // 0),
+      (if $baseline_decode_tps > 0 then ((.throughput_tokens_per_sec.decode // 0) / $baseline_decode_tps) else 0 end),
       (.throughput_tokens_per_sec.overall // 0),
       (.tokens.prefill // 0),
       (.tokens.decode // 0),
@@ -291,6 +307,7 @@ append_summary() {
 }
 
 log_level="${LLAMINAR_LOG_LEVEL:-ERROR}"
+declare -A baseline_decode_tps_by_lane=()
 
 for model in $(split_csv "${models}"); do
   model_path="$(model_path_for "${model}")"
@@ -319,6 +336,9 @@ for model in $(split_csv "${models}"); do
           -d "${device}"
           --benchmark-json-output "${json_path}"
         )
+        if [[ -n "${decode_tokens}" ]]; then
+          cmd+=(--n-predict "${decode_tokens}")
+        fi
         cmd+=("${mode_args[@]}")
         cmd+=("${variant_args[@]}")
         cmd+=("${extra_args[@]}")
@@ -358,7 +378,15 @@ for model in $(split_csv "${models}"); do
           fi
         fi
 
-        append_summary "${device}" "${model}" "${mode}" "${variant}" "${json_path}" "${perf_path}"
+        lane_key="${device}|${model}|${mode}"
+        decode_tps="$(jq -r '(.throughput_tokens_per_sec.decode // 0)' "${json_path}")"
+        baseline_decode_tps="${baseline_decode_tps_by_lane[${lane_key}]:-0}"
+        if [[ "${variant}" == "baseline" ]]; then
+          baseline_decode_tps="${decode_tps}"
+          baseline_decode_tps_by_lane["${lane_key}"]="${decode_tps}"
+        fi
+
+        append_summary "${device}" "${model}" "${mode}" "${variant}" "${json_path}" "${perf_path}" "${baseline_decode_tps}"
         tail -n 8 "${log_path}" || true
       done
     done

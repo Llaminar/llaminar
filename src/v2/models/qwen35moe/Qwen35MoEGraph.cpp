@@ -653,6 +653,13 @@ namespace llaminar2
                                  : "layer" + std::to_string(layer_idx) + "_";
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
+        auto forceCudaSmallMMoEPrefill = [&](DeviceId candidate)
+        {
+            return candidate.is_cuda() &&
+                   total_tokens >= 1 &&
+                   total_tokens <= 4 &&
+                   (config_.compute_all_position_logits || mtp_sidecar_context);
+        };
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
         auto overlay_runtime_plan = runtimePlanForGraph(config_);
@@ -759,9 +766,7 @@ namespace llaminar2
             route_params.decode_histogram = mtp_sidecar_context ? nullptr : config_.moe.decode_histogram;
             route_params.moe_runtime_table = moe_runtime_table;
             route_params.force_grouped_verifier_prefill_for_decode =
-                config_.compute_all_position_logits &&
-                total_tokens == 1 &&
-                device.is_cuda();
+                forceCudaSmallMMoEPrefill(device) && total_tokens == 1;
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
             route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
@@ -817,9 +822,7 @@ namespace llaminar2
                 expert_params.expert_mask = std::move(expert_mask);
                 expert_params.moe_runtime_table = moe_runtime_table;
                 expert_params.force_grouped_verifier_prefill_for_decode =
-                    config_.compute_all_position_logits &&
-                    total_tokens == 1 &&
-                    stage_device.is_cuda();
+                    forceCudaSmallMMoEPrefill(stage_device) && total_tokens == 1;
 
                 if (config_.moe.expert_mode == MoEExpertMode::ExpertParallel &&
                     expert_params.expert_mask.empty())
@@ -1433,9 +1436,7 @@ namespace llaminar2
             shared_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
             shared_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
             shared_params.force_grouped_verifier_prefill_for_decode =
-                config_.compute_all_position_logits &&
-                total_tokens == 1 &&
-                shared_device.is_cuda();
+                forceCudaSmallMMoEPrefill(shared_device);
             shared_params.prepared_ref_gate = preparedRefForGraphWeight(
                 layer_bindings.shared_expert_gate, shared_device);
             shared_params.prepared_ref_up = preparedRefForGraphWeight(
@@ -1505,7 +1506,6 @@ namespace llaminar2
                 add_params.input_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
                 add_params.residual_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
                 add_params.output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
-                add_params.graph_capture_boundary_before = true;
 
                 graph.addNode(prefix + "moe_combine",
                               ComputeStageFactory::createResidualAdd(add_params),
@@ -1528,7 +1528,6 @@ namespace llaminar2
                     copy_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                     copy_params.input_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
                     copy_params.output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
-                    copy_params.graph_capture_boundary_before = true;
 
                     graph.addNode(prefix + "moe_combine",
                                   ComputeStageFactory::createResidualAdd(copy_params),

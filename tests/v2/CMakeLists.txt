@@ -11815,6 +11815,15 @@ add_v2_test(V2_Unit_ShmemSpinBackend_NP8
     TIMEOUT 30
     RESOURCE_LOCK "ShmemSpin"
 )
+if(TEST V2_Unit_ShmemSpinBackend)
+    set_tests_properties(
+        V2_Unit_ShmemSpinBackend
+        V2_Unit_ShmemSpinBackend_NP4
+        V2_Unit_ShmemSpinBackend_NP8
+        PROPERTIES
+            RUN_SERIAL TRUE
+    )
+endif()
 
 # =============================================================================
 # GPU Weight Loading Pipeline - Phase 1 Foundation

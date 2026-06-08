@@ -55,6 +55,11 @@ namespace llaminar2
             PerfStatsCollector::Tags tags{
                 {"type", segmentTypeName(segment)},
                 {"stage_count", std::to_string(segment.stage_names.size())}};
+            if (!segment.stage_names.empty())
+            {
+                tags.emplace("first_stage", segment.stage_names.front());
+                tags.emplace("last_stage", segment.stage_names.back());
+            }
             addContextTag(tags, perf_context);
             return tags;
         }

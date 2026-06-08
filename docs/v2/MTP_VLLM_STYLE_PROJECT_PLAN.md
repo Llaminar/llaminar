@@ -159,12 +159,28 @@ Done:
   CUDA d1 is 51.29 tok/s and ROCm d1 is 31.31 tok/s. ROCm stochastic is only
   barely speed-positive and remains below the CUDA-class win target.
 - CUDA MoE greedy has parity/style coverage.
+- CUDA MoE MTP sidecar M=1 now uses the same grouped-prefill contract as
+  verifier M=2..4, avoiding the fragile runtime grouped-decode chain inside
+  captured MTP sidecar graphs. The former fixed-d3 Release crash repro passes,
+  and compute-sanitizer reports 0 errors on that lane.
+- CUDA MoE rejected-token correction replay now treats accepted-state
+  publication as a graph replay-state boundary. Accept-all steps may preserve
+  captured verifier replay, but steps that require correction replay reset
+  captured GPU replay and kernel dynamic state before the following main decode
+  graph. `Qwen36MoECUDASingleDevicePrefixMTPPathGuards.Depth1CorrectionReplayResetsCapturedStateBoundary`
+  covers the former fixed-d1 crash.
+- `scripts/run_mtp_iteration_benchmark_matrix.sh` now has `--decode-tokens N`
+  for bounded all-device iteration sweeps. The default remains the full
+  benchmark decode length.
 - The dead verifier-row publication hooks and tests were removed.
 
 Open gaps:
 
-- Real-model dense CPU benchmarks have not yet refreshed after enabling the
-  all-position accepted-count publication path.
+- Real-model dense CPU benchmarks have only partially refreshed after enabling
+  the all-position accepted-count publication path: `cpu:0` dense greedy
+  baseline is 4.28 tok/s and fixed d1 is 4.96 tok/s in the latest partial
+  matrix. Full CPU dense and CPU MoE matrix refreshes remain slow acceptance
+  work.
 - CPU stochastic accepted-count publication is not yet implemented; CPU
   stochastic currently proves correctness through the decode-equivalent host
   verifier path and still needs speed evidence.
@@ -183,9 +199,10 @@ Open gaps:
   tok/s; d1/d2/d3/dynamic are 88.49/94.39/115.94/88.75 tok/s. Stochastic
   seed123 baseline is 133.51 tok/s; d1/d2/d3/dynamic are
   91.26/93.72/86.47/97.86 tok/s. Depth >1 no longer crashes on partial-prefix
-  publication, but CUDA MoE MTP remains speed-negative. The remaining blocker
-  is true verifier/catch-up cost; dynamic depth also needs enough evidence or
-  hysteresis tuning to promote during short default runs.
+  publication or MTP sidecar graph replay, but CUDA MoE MTP remains
+  speed-negative. The remaining blocker is true verifier/catch-up cost;
+  dynamic depth also needs enough evidence or hysteresis tuning to promote
+  during short default runs.
 - CPU MoE stochastic benchmark lane still needs a fresh run.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE MTP is still speed-negative and must reduce verifier/catch-up cost
@@ -299,20 +316,34 @@ This must cover, as applicable:
 
 ### Benchmark Gate
 
-Refresh JSON/perf evidence for the depth matrix on every available lane touched
-in the iteration. Standard variants are no-MTP baseline, fixed d1, fixed d2,
-fixed d3, and dynamic depth. Run both greedy and stochastic for dense and MoE
-where the backend lane exists. Greedy rows use production runtime settings with
-`--temperature 0`, not `--deterministic`; stochastic rows use a pinned seed,
-default `123`, so acceptance and throughput can be compared across iterations.
+Refresh JSON/perf evidence for the SingleDevice device matrix on every tuning
+iteration: CUDA, ROCm, and CPU; dense and MoE; greedy and stochastic; no-MTP
+baseline, fixed d1, fixed d2, fixed d3, and dynamic depth. Greedy rows use
+production runtime settings with `--temperature 0`, not `--deterministic`;
+stochastic rows use a pinned seed, default `123`, so acceptance and throughput
+can be compared across iterations. The generated `summary.tsv` includes
+`speedup_vs_baseline` for every MTP row.
+
+Use `cpu:0` for the SingleDevice CPU lane. Bare `cpu` auto-selects two-socket
+CPU TP and belongs to a later multi-device/TP matrix, not this gate.
 
 ```bash
 cmake --build build_v2_release --parallel
 scripts/run_mtp_iteration_benchmark_matrix.sh --perfstats
 ```
 
-For narrow iteration loops, keep the same variant shape while selecting the
-lane under active work:
+The full default matrix is the acceptance capture. For inner-loop tuning, keep
+the same device/model/mode/variant shape but bound the decode length so CPU and
+MoE lanes remain practical:
+
+```bash
+scripts/run_mtp_iteration_benchmark_matrix.sh \
+  --decode-tokens 16 --perfstats
+```
+
+For narrow diagnostic loops, keep the same variant shape while selecting the
+lane under active work. These runs can guide a fix, but they do not replace the
+bounded or full matrix capture for iteration evidence:
 
 ```bash
 scripts/run_mtp_iteration_benchmark_matrix.sh \

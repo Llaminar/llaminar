@@ -689,7 +689,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDAEmbeddingDoesNotUploadDynamicTokens
     EXPECT_NE(apply_tensor.find("Token ID upload requires an explicit non-null stream"), std::string::npos);
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoECombineStartsFreshGraphSegment)
+TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoECombineDoesNotForceFreshGraphSegment)
 {
     const auto residual_source = readFile(repoRoot() / "src/v2/execution/compute_stages/stages/ResidualAddStage.h");
     EXPECT_NE(residual_source.find("graph_capture_boundary_before"), std::string::npos)
@@ -702,11 +702,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoECombineStartsFreshGraphSegment
         "// Stage 5: Combine expert output + shared expert output",
         "// Stage 6: Explicit residual");
 
-    EXPECT_NE(combine_section.find("add_params.graph_capture_boundary_before = true"), std::string::npos)
-        << "MoE combine joins routed and shared expert branches and must not be fused into "
-           "the same captured segment as the preceding MoE runtime/scratch stages.";
-    EXPECT_NE(combine_section.find("copy_params.graph_capture_boundary_before = true"), std::string::npos)
-        << "The no-shared-expert copy form of MoE combine has the same graph-boundary contract.";
+    EXPECT_EQ(combine_section.find("add_params.graph_capture_boundary_before = true"), std::string::npos)
+        << "MoE combine should stay in the fused captured graph. Reintroducing this boundary "
+           "splits Qwen3.6 MoE verifier replay into one graph segment per layer.";
+    EXPECT_EQ(combine_section.find("copy_params.graph_capture_boundary_before = true"), std::string::npos)
+        << "The no-shared-expert copy form must not reintroduce per-layer graph segmentation either.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, LiveHybridCheckpointStorageUsesReusablePool)

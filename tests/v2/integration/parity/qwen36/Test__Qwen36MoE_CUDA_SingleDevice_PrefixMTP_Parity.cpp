@@ -112,6 +112,61 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, MTPBenchmarkStyleUsesFusedVer
     PerfStatsCollector::reset();
 }
 
+TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, Depth1CorrectionReplayResetsCapturedStateBoundary)
+{
+    ScopedEnvironmentValues perf_stats_enabled({
+        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+    });
+    PerfStatsCollector::reset();
+    runMoEMTPBenchmarkStyleSkipGatherParity(
+        cudaSingleDeviceBenchmarkPromptCase(),
+        16,
+        1,
+        {},
+        true);
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    auto tag_equals = [](const PerfStatRecord &record,
+                         const char *key,
+                         const char *value) -> bool
+    {
+        const auto it = record.tags.find(key);
+        return it != record.tags.end() && it->second == value;
+    };
+
+    const auto reset_boundary = std::find_if(
+        records.begin(),
+        records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            return record.kind == PerfStatRecord::Kind::Counter &&
+                   record.domain == "mtp" &&
+                   record.name == "live_prefix_replay_state_after_mutation" &&
+                   tag_equals(record, "operation", "mtp_spec_state_publication") &&
+                   tag_equals(record, "replay_state", "reset") &&
+                   tag_equals(record, "kernel_dynamic_state", "reset");
+        });
+    ASSERT_NE(reset_boundary, records.end())
+        << "CUDA MoE depth-1 MTP correction replay must reset captured replay "
+        << "and kernel dynamic state after accepted-state publication. "
+        << "Preserving verifier replay state across this rejected-token boundary "
+        << "can leave the following main decode graph with stale captured state.\n"
+        << PerfStatsCollector::summaryString({"mtp"});
+
+    const auto correction_forward = std::find_if(
+        records.begin(),
+        records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            return record.domain == "mtp" &&
+                   record.name == "all_position_correction_forward";
+        });
+    ASSERT_NE(correction_forward, records.end())
+        << "Regression case did not exercise all-position correction replay.\n"
+        << PerfStatsCollector::summaryString({"mtp"});
+    PerfStatsCollector::reset();
+}
+
 TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, NoMTPBenchmarkStyleUsesGroupedDecodePath)
 {
     ScopedEnvironmentValues perf_stats_enabled({

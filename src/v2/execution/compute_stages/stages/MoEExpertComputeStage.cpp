@@ -2504,7 +2504,8 @@ namespace llaminar2
     {
         return params_.device_id.is_cuda() &&
                params_.force_grouped_verifier_prefill_for_decode &&
-               params_.seq_len == 1 &&
+               params_.seq_len >= 1 &&
+               params_.seq_len <= 4 &&
                supportsGroupedPrefillExecutionBackend(params_.device_id);
     }
 

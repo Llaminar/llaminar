@@ -26,6 +26,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
@@ -138,6 +139,7 @@ namespace llaminar2
         bool speculative_state_work_bound_ = false;
         int verifier_capture_rows_bound_ = 0;
         int verifier_capture_state_size_bound_ = 0;
+        std::vector<float> host_verifier_state_slots_;
 
         int effectivePrefillSeqLen() const;
         bool shouldUseRealLengthContract() const;

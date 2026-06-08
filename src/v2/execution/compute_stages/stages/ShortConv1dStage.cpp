@@ -172,6 +172,15 @@ namespace llaminar2
                     available_floats / static_cast<size_t>(capture_state_size)));
             }
         }
+        else if (!params_.device_id.is_gpu() && capture_state_size > 0)
+        {
+            const int max_rows = std::max(1, params_.seq_len);
+            capture_rows = std::min(speculative_slot_rows, max_rows);
+            const size_t required_floats =
+                static_cast<size_t>(capture_rows) * static_cast<size_t>(capture_state_size);
+            host_verifier_state_slots_.resize(required_floats);
+            capture = host_verifier_state_slots_.empty() ? nullptr : host_verifier_state_slots_.data();
+        }
         verifier_capture_workspace_bound_ =
             capture != nullptr && capture_rows > 0 && capture_state_size > 0;
         verifier_capture_rows_bound_ = capture_rows;

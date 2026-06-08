@@ -4924,14 +4924,14 @@ namespace llaminar2
             state_.positions[0] = plan.target_cached_tokens;
         if (!state_.sequence_lengths.empty())
             state_.sequence_lengths[0] = plan.target_cached_tokens;
-        // Publication advances live state to a verifier-captured accepted row but
-        // preserves graph topology, workspace bindings, and dynamic-param update
-        // contracts. Dropping replay state here forces every verifier pass back
-        // to warmup and prevents all-position verifier graph capture from ever
-        // amortizing.
+        // Publication advances live state to a verifier-captured accepted row.
+        // Accept-all steps can keep captured verifier replay warm. Rejected
+        // steps immediately enter correction replay, which executes a main
+        // decode graph from the newly published state; stale captured replay
+        // or kernel dynamic state from the verifier boundary is unsafe there.
         handleLivePrefixReplayStateAfterMutation(
             "mtp_spec_state_publication",
-            /*preserve_gpu_replay_state=*/true);
+            /*preserve_gpu_replay_state=*/!plan.requiresCorrectionReplay());
 
         PerfStatsCollector::addCounter(
             "mtp",

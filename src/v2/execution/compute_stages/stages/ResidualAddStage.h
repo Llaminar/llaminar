@@ -49,10 +49,10 @@ namespace llaminar2
             std::optional<BufferId> residual_buffer_id;
             std::optional<BufferId> output_buffer_id;
 
-            // Some graph joins need a capture boundary even though residual add
-            // itself is graph-capturable. MoE combine uses this to keep routed
-            // expert/shared-expert runtime scratch in a preceding segment while
-            // still capturing the combine kernel.
+            // Some backend-specific graph joins may need a capture boundary
+            // even though residual add itself is graph-capturable. This should
+            // stay opt-in: forcing boundaries on hot-path MoE combine splits
+            // verifier replay into one graph launch per layer.
             bool graph_capture_boundary_before = false;
         };
 
