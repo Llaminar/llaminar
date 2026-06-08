@@ -11,7 +11,7 @@ Phase 14 scoreboard for Qwen3.6 MTP and prefix-cache tuning.
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | stochastic dynamic | 706.09 | 55.80 | effective d1 |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.17 | 30.14 | fresh retained baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic fixed d1 | 216.79 | 24.83 | sidecar-base restore skipped, 82.81% accept |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic dynamic | n/a | n/a | refresh after state path lands |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | stochastic dynamic | 216.55 | 24.84 | held depth 1, no updates |
 | Dense qbf, c64/n48 | ROCm | Qwen3.6 27B Q4_K_S | retired selected-row d3 | 73.05 | 54.23 | historical target only |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | clean baseline |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 | 1946.82 | 148.50 | speed-positive |
