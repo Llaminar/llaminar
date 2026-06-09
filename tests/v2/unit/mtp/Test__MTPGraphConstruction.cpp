@@ -3031,6 +3031,64 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
     PerfStatsCollector::reset();
 }
 
+TEST(Test__MTPGraphConstruction, CPUReplayObservationsTrackLiveStateEpochAcrossRestore)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    orchestrator.setWeights(fixture.modelWeights());
+    PreparedWeightStore prepared_store;
+    ASSERT_NO_THROW(prepareDenseForwardWeights(orchestrator, *graph_builder, prepared_store, DeviceId::cpu()));
+
+    const int first_token = 1;
+    ASSERT_NE(orchestrator.forward(&first_token, 1, 1), nullptr);
+    const uint64_t epoch_after_decode =
+        orchestrator.forwardReplayLiveStateEpoch();
+    const auto observations_after_decode =
+        orchestrator.forwardReplayCacheObservations();
+    ASSERT_FALSE(observations_after_decode.empty());
+    EXPECT_TRUE(std::any_of(
+        observations_after_decode.begin(),
+        observations_after_decode.end(),
+        [](const ForwardExecutionEngine::ReplayCacheObservation &observation)
+        {
+            return observation.valid &&
+                   observation.signature.decode &&
+                   !observation.signature.all_position_logits;
+        }))
+        << "A one-token forward should populate the ordinary decode graph-cache identity.";
+    for (const auto &observation : observations_after_decode)
+    {
+        EXPECT_EQ(observation.segmented_capture_live_state_epoch, 0u)
+            << "CPU has no segmented GPU replay stamp.";
+        EXPECT_FALSE(observation.requires_live_state_epoch_recapture)
+            << "CPU replay-cache identities must not be marked stale by GPU epoch logic.";
+    }
+
+    PrefixStateSnapshot checkpoint = orchestrator.captureLivePrefixCheckpoint();
+    ASSERT_TRUE(checkpoint.valid);
+    ASSERT_TRUE(orchestrator.restoreLivePrefixState(checkpoint));
+    EXPECT_GT(orchestrator.forwardReplayLiveStateEpoch(), epoch_after_decode);
+
+    const auto observations_after_restore =
+        orchestrator.forwardReplayCacheObservations();
+    ASSERT_EQ(observations_after_restore.size(), observations_after_decode.size());
+    for (const auto &observation : observations_after_restore)
+    {
+        EXPECT_TRUE(observation.valid);
+        EXPECT_EQ(observation.segmented_capture_live_state_epoch, 0u);
+        EXPECT_FALSE(observation.requires_live_state_epoch_recapture)
+            << "State-versioned replay must be a no-op for CPU graph identities.";
+    }
+}
+
 TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEReplayState)
 {
     DeviceManager::instance().initialize(-1, false);

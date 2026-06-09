@@ -4980,6 +4980,16 @@ namespace llaminar2
         return true;
     }
 
+    std::vector<ForwardExecutionEngine::ReplayCacheObservation>
+    DeviceGraphOrchestrator::forwardReplayCacheObservations() const
+    {
+        if (!forward_engine_)
+        {
+            return {};
+        }
+        return forward_engine_->replayCacheObservations(live_replay_state_epoch_);
+    }
+
     bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromLastForward(
         const int32_t *tokens,
         int token_count,

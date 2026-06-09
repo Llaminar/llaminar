@@ -1530,6 +1530,12 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
+        uint64_t forwardReplayLiveStateEpoch() const
+        {
+            return live_replay_state_epoch_;
+        }
+        std::vector<ForwardExecutionEngine::ReplayCacheObservation>
+            forwardReplayCacheObservations() const;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;

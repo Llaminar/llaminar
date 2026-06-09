@@ -207,6 +207,12 @@ Done:
   verifier replay only for stream rebinding. The bounded deep correctness gate
   passed on CPU/CUDA/ROCm dense and MoE depth-3 greedy plus stochastic verifier
   parity.
+- `DeviceGraphOrchestrator` now exposes read-only live replay-state epoch and
+  replay-cache observations, wired to the orchestrator's current epoch. A
+  focused CPU unit proves live checkpoint restore advances the state-version
+  contract without marking CPU graph-cache identities stale, and the same deep
+  CPU/CUDA/ROCm dense+MoE depth-3 greedy/stochastic verifier parity guard passed
+  after the diagnostic hook landed.
 - Rejected-token all-position publication no longer runs an expensive same-step
   correction main forward. The runner now emits the correction token, commits
   its shifted MTP row from current terminal hidden so the sidecar cache remains
