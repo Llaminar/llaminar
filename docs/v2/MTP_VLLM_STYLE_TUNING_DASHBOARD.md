@@ -16,12 +16,12 @@ partial, or not fully measured. Red = fails or lacks required correctness.
 | ROCm | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 26.94/27.31/25.17/26.88 vs 31.26 | speed-negative |
 | CPU | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 5.02/5.40/8.51/5.16 vs 4.55 | dynamic conservative |
 | CPU | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 3.52/3.62/3.62/3.56 vs 4.62 | rollback path slow |
-| CUDA | MoE 35B | greedy | Amber | fixed d1 crash fixed; standalone d1 80.58 tok/s; old baseline 133.78 | verifier/catch-up cost |
-| CUDA | MoE 35B | stochastic | Amber | old best dynamic 97.86 vs 133.51 tok/s | verifier cost; depth policy |
-| ROCm | MoE 35B | greedy | Amber | old d1 68.09 vs 76.23 tok/s | speed-negative |
-| ROCm | MoE 35B | stochastic | Amber | old d1 52.57 vs 76.23 tok/s | sampler/verifier overhead |
-| CPU | MoE 35B | greedy | Amber | not refreshed | CPU publication/bench gap |
-| CPU | MoE 35B | stochastic | Amber | not refreshed | CPU publication/bench gap |
+| CUDA | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 59.20/61.11/72.41/54.91 vs 110.71 | verifier/catch-up cost |
+| CUDA | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 68.72/50.76/52.93/63.58 vs 111.26 | stochastic verifier cost |
+| ROCm | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 35.39/36.13/38.21/35.68 vs 64.29 | verifier/catch-up cost |
+| ROCm | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 32.69/28.76/29.78/32.35 vs 64.26 | sampler/verifier overhead |
+| CPU | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 10.81/11.57/12.85/10.85 vs 17.55 | CPU publication/catch-up |
+| CPU | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 12.30/12.25/12.19/12.28 vs 18.14 | host verifier overhead |
 
 ## Latest Evidence
 
@@ -30,10 +30,13 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   Completed CUDA/ROCm/CPU dense greedy and stochastic with baseline, fixed
   d1/d2/d3, and dynamic at 16 decode tokens. Greedy is speed-positive across
   all three backends; stochastic is speed-negative across all three.
-- CUDA MoE fixed-d1 correction replay lane:
-  `benchmark_results/mtp_vllm_style/20260608T-cuda-moe-fixed-d1-correction-boundary/`.
-  The former graph-capture crash is fixed; d1 completed at 80.58 tok/s with
-  85.94% acceptance.
+- Bounded MoE GPU matrix:
+  `benchmark_results/mtp_vllm_style/20260609T003150Z-bounded-gpu-moe-matrix-after-cuda-fix/`.
+  CUDA/ROCm greedy and stochastic baseline, d1/d2/d3, and dynamic all completed.
+  CUDA graph-capture crash is fixed, but every MoE MTP lane is speed-negative.
+- Bounded MoE CPU matrix:
+  `benchmark_results/mtp_vllm_style/20260609T003744Z-bounded-cpu-moe-matrix-after-cuda-fix/`.
+  CPU greedy/stochastic lanes completed. MTP is also speed-negative there.
 - Regression:
   `Qwen36MoECUDASingleDevicePrefixMTPPathGuards.Depth1CorrectionReplayResetsCapturedStateBoundary`
   proves rejected-token accepted-state publication resets captured replay and
@@ -55,10 +58,11 @@ llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
 
 ## Next
 
-1. Run bounded full device matrix each iteration: CUDA/ROCm/CPU, dense/MoE,
+1. Run the bounded device matrix every iteration: CUDA/ROCm/CPU, dense/MoE,
    greedy/stochastic, baseline plus fixed d1/d2/d3 and dynamic. Schedule CPU
-   separately if needed, but do not omit it from dashboard evidence.
+   separately if needed; record crashes/timeouts explicitly instead of leaving
+   stale numbers.
 2. Use full default matrix for acceptance checkpoints after bounded lanes are
    stable.
-3. Attack MoE verifier/catch-up cost; both CUDA and ROCm MoE remain
-   speed-negative.
+3. Attack MoE verifier/catch-up cost; CUDA, ROCm, and CPU MoE are functional
+   but speed-negative.

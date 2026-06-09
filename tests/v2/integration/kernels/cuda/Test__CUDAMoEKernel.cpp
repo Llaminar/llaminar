@@ -2845,6 +2845,149 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
 #endif
 }
 
+TEST_F(Test__CUDAMoEKernel, RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpertTable)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    ScopedCudaMoEGemmConfig gemm_config;
+    gemm_config.set(
+        /*gateup_kpart=*/true,
+        /*gateup_kparts=*/16,
+        /*down_kpart=*/true,
+        /*down_kparts=*/16);
+
+    using llaminar2::DeviceMoERuntimeTable;
+    constexpr int num_layers = 1;
+    constexpr int seq_len = 1;
+    constexpr int top_k = 8;
+    constexpr int num_experts = 256;
+    constexpr int d_model = 32;
+    constexpr int intermediate = 32;
+    constexpr size_t descriptor_bytes = 4096;
+    const auto device = llaminar2::DeviceId::cuda(0);
+
+    std::vector<CudaAllocation> payloads;
+    std::vector<CudaAllocation> scales;
+    payloads.reserve(static_cast<size_t>(num_experts * 3));
+    scales.reserve(static_cast<size_t>(num_experts * 3));
+
+    auto add_desc = [&](int rows, int cols)
+    {
+        payloads.emplace_back(descriptor_bytes);
+        scales.emplace_back(descriptor_bytes);
+        EXPECT_EQ(cudaMemsetAsync(payloads.back().get(), 0, descriptor_bytes, stream_), cudaSuccess);
+
+        const int scale_count = rows * (cols / 32);
+        std::vector<uint16_t> host_scales(static_cast<size_t>(scale_count), 0x3c00u);
+        EXPECT_EQ(cudaMemcpyAsync(scales.back().get(), host_scales.data(),
+                                  host_scales.size() * sizeof(uint16_t),
+                                  cudaMemcpyHostToDevice, stream_),
+                  cudaSuccess);
+        return makeCudaNativeDesc(payloads.back(), scales.back(), rows, cols);
+    };
+
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    gate_descs.reserve(num_experts);
+    up_descs.reserve(num_experts);
+    down_descs.reserve(num_experts);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        gate_descs.push_back(add_desc(intermediate, d_model));
+        up_descs.push_back(add_desc(intermediate, d_model));
+        down_descs.push_back(add_desc(d_model, intermediate));
+    }
+
+    const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(gateup_table, 0);
+    const int down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+        down_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(down_table, 0);
+
+    DeviceMoERuntimeTable::Config cuda_config;
+    cuda_config.device_id = device;
+    cuda_config.num_layers = num_layers;
+    cuda_config.num_experts = num_experts;
+    cuda_config.top_k = top_k;
+    cuda_config.mirror_to_device = true;
+    DeviceMoERuntimeTable cuda_table(cuda_config);
+    auto *runtime_layer = cuda_table.deviceLayerState(0);
+    ASSERT_NE(runtime_layer, nullptr);
+
+    std::vector<float> hidden_values(static_cast<size_t>(d_model), 1.0f);
+    std::vector<float> router_values(static_cast<size_t>(num_experts) * static_cast<size_t>(d_model));
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        const float value = static_cast<float>(expert + 1) * 0.001f;
+        for (int i = 0; i < d_model; ++i)
+            router_values[static_cast<size_t>(expert) * d_model + i] = value;
+    }
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto router = makeTensor({num_experts, d_model}, router_values);
+    auto route_indices = makeZeros({top_k});
+    auto route_weights = makeZeros({top_k});
+    auto output = makeZeros({d_model});
+
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        runtime_layer, hidden.get(), router.get(), d_model, num_experts, top_k,
+        true, route_indices.get(), route_weights.get(),
+        /*write_legacy_outputs=*/true, /*update_runtime_histogram=*/true));
+    ASSERT_TRUE(cuda_kernel_->groupedExpertDecodeFromRuntime(
+        runtime_layer, hidden.get(), gateup_table, down_table, top_k,
+        output.get(), d_model, intermediate));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    bool captured_route = false;
+    bool captured_fused = false;
+    {
+        llaminar2::GraphCaptureGuard capture_guard(/*host_bookkeeping=*/true);
+        captured_route = cuda_kernel_->decodeRouteSelect(
+            runtime_layer, hidden.get(), router.get(), d_model, num_experts, top_k,
+            true, route_indices.get(), route_weights.get(),
+            /*write_legacy_outputs=*/true, /*update_runtime_histogram=*/true);
+        captured_fused = cuda_kernel_->groupedExpertDecodeFromRuntime(
+            runtime_layer, hidden.get(), gateup_table, down_table, top_k,
+            output.get(), d_model, intermediate);
+    }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
+    EXPECT_TRUE(captured_route);
+    EXPECT_TRUE(captured_fused);
+    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
+    ASSERT_NE(graph, nullptr);
+
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    for (int replay = 0; replay < 3; ++replay)
+        ASSERT_EQ(cudaGraphLaunch(graph_exec, stream_), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    llaminar2::DeviceMoELayerRuntime host_runtime{};
+    ASSERT_EQ(cudaMemcpy(&host_runtime, runtime_layer, sizeof(host_runtime), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    for (int k = 0; k < top_k; ++k)
+    {
+        EXPECT_GE(host_runtime.topk_expert_ids[k], 0);
+        EXPECT_LT(host_runtime.topk_expert_ids[k], num_experts);
+    }
+
+    const float *output_data = output->data();
+    for (size_t i = 0; i < output->numel(); ++i)
+        ASSERT_TRUE(std::isfinite(output_data[i])) << "output element " << i;
+
+    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCaptures)
 {
 #ifndef HAVE_CUDA

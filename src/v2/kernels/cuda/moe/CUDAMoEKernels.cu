@@ -14,6 +14,7 @@
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "utils/DebugEnv.h"
 
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1829,6 +1830,7 @@ namespace
         int num_active,
         int N,
         int K,
+        int num_experts,
         int k_partitions)
     {
         constexpr int kTileN = 64;
@@ -1847,6 +1849,13 @@ namespace
 
         const int expert_id = expert_ids[slot];
         if (expert_id < 0)
+        {
+            gate_partials[partial_index] = 0.0f;
+            up_partials[partial_index] = 0.0f;
+            return;
+        }
+        assert(expert_id < num_experts);
+        if (expert_id >= num_experts)
         {
             gate_partials[partial_index] = 0.0f;
             up_partials[partial_index] = 0.0f;
@@ -2009,6 +2018,7 @@ namespace
         int num_active,
         int N,
         int K,
+        int num_experts,
         int k_partitions)
     {
         constexpr int kTileN = 64;
@@ -2042,6 +2052,9 @@ namespace
         {
             const int expert_id = expert_ids[slot];
             if (expert_id < 0)
+                continue;
+            assert(expert_id < num_experts);
+            if (expert_id >= num_experts)
                 continue;
 
             const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
@@ -2498,6 +2511,7 @@ extern "C"
         int num_active,
         int N,
         int K,
+        int num_experts,
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
@@ -2508,7 +2522,8 @@ extern "C"
         if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
             !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
             !d_gate_partials || !d_up_partials ||
-            num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0 || !valid_k_partitions)
+            num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 ||
+            (K % 32) != 0 || !valid_k_partitions)
         {
             std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart] invalid arguments\n");
             return false;
@@ -2533,7 +2548,7 @@ extern "C"
 #define LAUNCH_GROUPED_GATE_UP_KPART(CB)                                                            \
     grouped_native_vnni_gate_up_kpart_decode_kernel<CB><<<partial_grid, block, 0, cuda_stream>>>(   \
         d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table, d_expert_ids,           \
-        d_gate_partials, d_up_partials, num_active, N, K, k_partitions)
+        d_gate_partials, d_up_partials, num_active, N, K, num_experts, k_partitions)
 
         switch (codebook_id)
         {
@@ -2655,6 +2670,7 @@ extern "C"
         int num_active,
         int d_model,
         int intermediate,
+        int num_experts,
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
@@ -2665,8 +2681,8 @@ extern "C"
              k_partitions == 16);
         if (!d_gate_ptrs || !d_up_ptrs || !d_desc_table || !d_expert_ids || !d_weights ||
             !d_swiglu_int8 || !d_swiglu_scales || !d_down_partials || !d_output ||
-            num_active <= 0 || d_model <= 0 || intermediate <= 0 || (intermediate % 32) != 0 ||
-            !valid_k_partitions)
+            num_active <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 ||
+            (intermediate % 32) != 0 || !valid_k_partitions)
         {
             std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart] invalid arguments\n");
             return false;
@@ -2692,7 +2708,7 @@ extern "C"
 #define LAUNCH_GROUPED_DOWN_KPART(CB)                                                            \
     grouped_native_vnni_down_kpart_decode_kernel<CB><<<scatter_grid, block, 0, cuda_stream>>>(   \
         d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,                   \
-        d_down_partials, num_active, N, K, k_partitions)
+        d_down_partials, num_active, N, K, num_experts, k_partitions)
 
         switch (codebook_id)
         {

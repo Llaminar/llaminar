@@ -583,6 +583,7 @@ extern "C"
         int num_active,
         int intermediate,
         int d_model,
+        int num_experts,
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
@@ -617,6 +618,7 @@ extern "C"
         int num_active,
         int d_model,
         int intermediate,
+        int num_experts,
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
@@ -1201,17 +1203,14 @@ namespace llaminar2
               k_partitions == 16))
             return false;
 
-        // Fast path: the existing partial buffer already covers the requested shape.
+        // The down split-K kernel accumulates all routed experts inside each K-part
+        // and writes a single [k_partitions][d_model] partial buffer.
         if (d_grouped_down_partials_ &&
             grouped_down_kpart_partitions_cap_ >= k_partitions &&
-            grouped_down_kpart_d_model_cap_ >= d_model &&
-            grouped_down_kpart_slots_cap_ >= slots)
+            grouped_down_kpart_d_model_cap_ >= d_model)
             return true;
 
-        // The down partials buffer is [slots][k_partitions][d_model] floats
-        // (the output dimension is d_model, not intermediate).
         const size_t partial_count =
-            static_cast<size_t>(slots) *
             static_cast<size_t>(k_partitions) *
             static_cast<size_t>(d_model);
         void *down_partials = nullptr;
@@ -1228,7 +1227,7 @@ namespace llaminar2
         d_grouped_down_partials_ = static_cast<float *>(down_partials);
         grouped_down_kpart_partitions_cap_ = k_partitions;
         grouped_down_kpart_d_model_cap_ = d_model;
-        grouped_down_kpart_slots_cap_ = slots;
+        grouped_down_kpart_slots_cap_ = 1;
         return true;
     }
 
@@ -2633,6 +2632,7 @@ namespace llaminar2
                                   num_active,
                                   intermediate,
                                   d_model,
+                                  table.num_experts,
                                   table.codebook_id,
                                   k_partitions,
                                   device_ordinal_,
@@ -2753,6 +2753,7 @@ namespace llaminar2
                   num_active,
                   d_model,
                   intermediate,
+                  table.num_experts,
                   table.codebook_id,
                   k_partitions,
                   device_ordinal_,
@@ -2905,6 +2906,7 @@ namespace llaminar2
                                          top_k,
                                          intermediate,
                                          d_model,
+                                         gateup_table.num_experts,
                                          gateup_table.codebook_id,
                                          gateup_k_partitions,
                                          device_ordinal_,
@@ -2941,6 +2943,7 @@ namespace llaminar2
                                        top_k,
                                        d_model,
                                        intermediate,
+                                       down_table.num_experts,
                                        down_table.codebook_id,
                                        down_k_partitions,
                                        device_ordinal_,
@@ -3092,6 +3095,7 @@ namespace llaminar2
                                   top_k,
                                   intermediate,
                                   d_model,
+                                  table.num_experts,
                                   table.codebook_id,
                                   k_partitions,
                                   device_ordinal_,
@@ -3225,6 +3229,7 @@ namespace llaminar2
                   top_k,
                   d_model,
                   intermediate,
+                  table.num_experts,
                   table.codebook_id,
                   k_partitions,
                   device_ordinal_,

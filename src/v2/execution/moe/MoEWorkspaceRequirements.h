@@ -129,7 +129,6 @@ namespace llaminar2
             constexpr int kMaxGateUpPartitions = 32;
             constexpr int kMaxDownPartitions = 16;
             const std::size_t decode_slots = static_cast<std::size_t>(top_k);
-            const std::size_t verifier_down_slots = (max_seq_len <= 4) ? total_slots : 1;
 
             add(reqs, DECODE_HIDDEN_INT8, static_cast<std::size_t>(d_model) * sizeof(int8_t));
             add(reqs, DECODE_HIDDEN_SCALES, static_cast<std::size_t>(d_model_blocks) * sizeof(float));
@@ -138,7 +137,7 @@ namespace llaminar2
             add(reqs, GATEUP_UP_PARTIALS,
                 decode_slots * kMaxGateUpPartitions * static_cast<std::size_t>(intermediate) * sizeof(float));
             add(reqs, DOWN_PARTIALS,
-                verifier_down_slots * kMaxDownPartitions * static_cast<std::size_t>(d_model) * sizeof(float));
+                kMaxDownPartitions * static_cast<std::size_t>(d_model) * sizeof(float));
             add(reqs, DECODE_SWIGLU_INT8,
                 decode_slots * static_cast<std::size_t>(intermediate) * sizeof(int8_t));
             add(reqs, DECODE_SWIGLU_SCALES,

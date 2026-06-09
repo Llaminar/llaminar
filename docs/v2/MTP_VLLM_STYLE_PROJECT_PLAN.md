@@ -175,16 +175,30 @@ Done:
   captured GPU replay and kernel dynamic state before the following main decode
   graph. `Qwen36MoECUDASingleDevicePrefixMTPPathGuards.Depth1CorrectionReplayResetsCapturedStateBoundary`
   covers the former fixed-d1 crash.
+- CUDA MoE graph-captured no-MTP baseline decode crash is fixed. Root cause was
+  a split-K down-partials workspace contract mismatch plus missing expert-id
+  upper-bound guards in CUDA MoE grouped k-part kernels. The focused regression
+  `RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpertTable` now captures
+  route selection plus fused grouped expert decode against a Qwen3.6-scale
+  expert table.
 - `scripts/run_mtp_iteration_benchmark_matrix.sh` now has `--decode-tokens N`
   for bounded all-device iteration sweeps. The default remains the full
   benchmark decode length.
+- Bounded MoE iteration matrix now covers CUDA/ROCm/CPU, greedy/stochastic,
+  baseline, fixed d1/d2/d3, and dynamic at 16 decode tokens. All lanes are
+  functionally green, including CUDA and ROCm stochastic. Every MoE MTP lane is
+  still speed-negative against its same-run baseline. Best bounded greedy lanes
+  are CUDA d3 72.41 vs 110.71 tok/s, ROCm d3 38.21 vs 64.29 tok/s, and CPU d3
+  12.85 vs 17.55 tok/s. Best bounded stochastic lanes are CUDA d1 68.72 vs
+  111.26 tok/s, ROCm d1 32.69 vs 64.26 tok/s, and CPU d1/dynamic about 12.3 vs
+  18.14 tok/s.
 - The dead verifier-row publication hooks and tests were removed.
 
 Open gaps:
 
 - Full default-length CPU dense and CPU MoE matrix refreshes remain slow
-  acceptance work. Bounded CPU dense now has evidence, but the CPU lanes still
-  take minutes even at 16 decode tokens.
+  acceptance work. Bounded CPU dense and MoE now have evidence, but the CPU
+  lanes still take minutes even at 16 decode tokens.
 - CPU stochastic accepted-count publication is not yet implemented; CPU
   stochastic currently proves correctness through the decode-equivalent host
   verifier path. Latest bounded evidence is speed-negative: best fixed d3 is
@@ -192,23 +206,10 @@ Open gaps:
 - GDN/short-conv speculative-slot publication is available through verifier row
   capture hooks and is now used by the GPU all-position publication path; CPU
   publication and broader benchmark evidence still need to catch up.
-- ROCm MoE grouped-prefill workspace sizing/binding is fixed for focused
-  SingleDevice greedy and stochastic MTP parity lanes. Fresh real-model
-  benchmarks are speed-negative: greedy d1 is 68.09 vs 76.23 tok/s, stochastic
-  d1 is 52.57 vs 76.23 tok/s. Profiles point at verifier/catch-up replay and
-  stochastic sampler overhead, not sidecar generation. The ROCm MoE
-  stage-breakdown parity lane passes but currently takes about 341s, so it is a
-  performance/test-duration anomaly to reduce.
-- CUDA MoE stable matrix now covers production greedy and seeded stochastic
-  baselines plus fixed d1/d2/d3 and dynamic depth. Greedy baseline is 133.78
-  tok/s; d1/d2/d3/dynamic are 88.49/94.39/115.94/88.75 tok/s. Stochastic
-  seed123 baseline is 133.51 tok/s; d1/d2/d3/dynamic are
-  91.26/93.72/86.47/97.86 tok/s. Depth >1 no longer crashes on partial-prefix
-  publication or MTP sidecar graph replay, but CUDA MoE MTP remains
-  speed-negative. The remaining blocker is true verifier/catch-up cost;
-  dynamic depth also needs enough evidence or hysteresis tuning to promote
-  during short default runs.
-- CPU MoE stochastic benchmark lane still needs a fresh run.
+- CUDA/ROCm/CPU MoE bounded matrices are functionally green for greedy and
+  stochastic, but MTP is speed-negative everywhere. The common blocker is true
+  verifier/catch-up cost. Dynamic depth also needs enough evidence or hysteresis
+  tuning to promote during short default runs.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE MTP is still speed-negative and must reduce verifier/catch-up cost
   before acceptance. Stochastic also needs acceptance-policy tuning or depth
@@ -319,11 +320,12 @@ This must cover, as applicable:
   `clearCache()`.
 - ROCm MoE ExpertOverlay parity remains separate from SingleDevice acceptance.
 
-### Benchmark Gate
+### Mandatory Benchmark Matrix Gate
 
-Refresh JSON/perf evidence for the SingleDevice device matrix on every tuning
-iteration: CUDA, ROCm, and CPU; dense and MoE; greedy and stochastic; no-MTP
-baseline, fixed d1, fixed d2, fixed d3, and dynamic depth. Greedy rows use
+Refresh JSON/perf evidence for the same SingleDevice device matrix on every
+tuning iteration: CUDA, ROCm, and CPU; dense and MoE; greedy and stochastic;
+no-MTP baseline, fixed d1, fixed d2, fixed d3, and dynamic depth. This matrix is
+the normal tuning instrument, not an occasional acceptance run. Greedy rows use
 production runtime settings with `--temperature 0`, not `--deterministic`;
 stochastic rows use a pinned seed, default `123`, so acceptance and throughput
 can be compared across iterations. The generated `summary.tsv` includes
@@ -357,3 +359,6 @@ scripts/run_mtp_iteration_benchmark_matrix.sh \
 ```
 
 Update `docs/v2/MTP_VLLM_STYLE_TUNING_DASHBOARD.md` after every benchmark pass.
+If a row cannot run because of hardware availability, build failure, timeout, or
+runtime crash, record that explicit reason in the dashboard instead of leaving
+the row stale.
