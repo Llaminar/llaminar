@@ -141,15 +141,28 @@ def summarize(path: Path | None) -> dict[str, float | int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("perfstats", nargs="?", type=Path)
+    parser.add_argument("perfstats", nargs="*", type=Path)
     parser.add_argument("--format", choices=("tsv", "json"), default="tsv")
     args = parser.parse_args()
 
-    summary = summarize(args.perfstats)
+    if len(args.perfstats) <= 1:
+        summary = summarize(args.perfstats[0] if args.perfstats else None)
+        if args.format == "json":
+            print(json.dumps(summary, sort_keys=True))
+        else:
+            print("\t".join(str(summary[field]) for field in FIELDS))
+        return 0
+
+    summaries = [
+        {"path": str(path), **summarize(path)}
+        for path in args.perfstats
+    ]
     if args.format == "json":
-        print(json.dumps(summary, sort_keys=True))
+        print(json.dumps(summaries, sort_keys=True))
     else:
-        print("\t".join(str(summary[field]) for field in FIELDS))
+        print("\t".join(("path", *FIELDS)))
+        for summary in summaries:
+            print("\t".join(str(summary[field]) for field in ("path", *FIELDS)))
     return 0
 
 

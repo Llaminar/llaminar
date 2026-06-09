@@ -2266,6 +2266,8 @@ namespace
                                     MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                     MockInferenceRunner::MTP_ARGMAX_TOKEN));
             EXPECT_EQ(mock->restoreCount(), 0);
+            EXPECT_EQ(mock->captureCheckpointCount(), 1)
+                << "all-position publication does not consume the old post-sidecar checkpoint";
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
                 << "only the all-position verifier graph should run on the main path";
 
@@ -2302,6 +2304,19 @@ namespace
                                         {"accepted_state_count", "3"},
                                         {"target_cached_tokens", "8"}});
             ASSERT_NE(publication_runs, nullptr);
+
+            const PerfStatRecord *post_sidecar_capture =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Timer,
+                               "capture_post_sidecar_prefix_state");
+            EXPECT_EQ(post_sidecar_capture, nullptr);
+
+            const PerfStatRecord *skipped_post_sidecar_capture =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "post_sidecar_checkpoint_skipped_all_position_publication");
+            ASSERT_NE(skipped_post_sidecar_capture, nullptr);
+            EXPECT_DOUBLE_EQ(skipped_post_sidecar_capture->value, 1.0);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

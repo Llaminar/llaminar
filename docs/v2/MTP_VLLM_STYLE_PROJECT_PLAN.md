@@ -189,6 +189,13 @@ Done:
   `Qwen36MoECUDASingleDevicePrefixMTPPathGuards.Depth1RejectedCorrectionDefersToConditionToken`
   cover this split; fresh CUDA/ROCm GPU matrices show `correction_ms=0` and
   zero rollback, but MoE remains speed-negative because verifier time dominates.
+- All-position publication no longer captures the old post-sidecar prefix
+  checkpoint, because that verifier path publishes from the just-run target
+  graph and never restores the sidecar checkpoint. The decode-equivalent path
+  keeps its checkpoint until CPU/host verifier publication is replaced.
+  `V2_Unit_PrefillDecodeTransition` covers the skip counter and absence of the
+  old checkpoint timer; the fresh bounded matrix confirms GPU all-position lanes
+  emit `post_sidecar_checkpoint_skipped_all_position_publication` instead.
 - CUDA MoE graph-captured no-MTP baseline decode crash is fixed. Root cause was
   a split-K down-partials workspace contract mismatch plus missing expert-id
   upper-bound guards in CUDA MoE grouped k-part kernels. The focused regression

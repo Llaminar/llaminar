@@ -139,6 +139,42 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
             "0.0\t0.0\t0.0\t0\t0\t0.0\t0\t0\t0\t0\t0",
         )
 
+    def test_multiple_paths_emit_table_for_matrix_comparison(self) -> None:
+        paths: list[Path] = []
+        for total in (11.0, 22.0):
+            payload = {
+                "schema": "llaminar.perf_stats.v1",
+                "records": [
+                    {
+                        "domain": "mtp",
+                        "name": "verifier_forward",
+                        "phase": "decode",
+                        "count": 1,
+                        "total_ms": total,
+                    },
+                ],
+            }
+            handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+            with handle:
+                json.dump(payload, handle)
+                paths.append(Path(handle.name))
+
+        try:
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), *(str(path) for path in paths)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        finally:
+            for path in paths:
+                path.unlink(missing_ok=True)
+
+        lines = result.stdout.strip().splitlines()
+        self.assertEqual(lines[0].split("\t")[0], "path")
+        self.assertIn("\t11.0\t", lines[1])
+        self.assertIn("\t22.0\t", lines[2])
+
 
 if __name__ == "__main__":
     unittest.main()

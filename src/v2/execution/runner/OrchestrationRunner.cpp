@@ -1866,6 +1866,10 @@ namespace llaminar2
             draft_sampler.record_token(first_token);
         }
 
+        const bool use_all_position_state_publication_verifier =
+            verifier_policy.path ==
+            MTPVerifierExecutionPath::AllPositionStatePublication;
+
         std::vector<PrefixStateSnapshot> sidecar_checkpoints;
         sidecar_checkpoints.reserve(1);
         std::vector<std::vector<SamplingDistributionEntry>> host_mtp_draft_distributions(
@@ -2042,11 +2046,22 @@ namespace llaminar2
 
             if (draft_idx == 0)
             {
-                PerfStatsCollector::ScopedTimer timer("mtp", "capture_post_sidecar_prefix_state", "decode");
-                sidecar_checkpoints.push_back(runner_->captureLivePrefixCheckpoint());
-                if (!sidecar_checkpoints.back().valid)
+                if (use_all_position_state_publication_verifier)
                 {
-                    return fail_after_checkpoint("MTP decode could not capture post-sidecar shifted state");
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "post_sidecar_checkpoint_skipped_all_position_publication",
+                        1.0,
+                        "decode");
+                }
+                else
+                {
+                    PerfStatsCollector::ScopedTimer timer("mtp", "capture_post_sidecar_prefix_state", "decode");
+                    sidecar_checkpoints.push_back(runner_->captureLivePrefixCheckpoint());
+                    if (!sidecar_checkpoints.back().valid)
+                    {
+                        return fail_after_checkpoint("MTP decode could not capture post-sidecar shifted state");
+                    }
                 }
             }
             else
@@ -2458,28 +2473,13 @@ namespace llaminar2
             return std::nullopt;
         };
 
-        const bool use_all_position_state_publication_greedy_verifier =
-            verifier_policy.path ==
-            MTPVerifierExecutionPath::AllPositionStatePublication;
-        if (use_all_position_state_publication_greedy_verifier)
+        if (use_all_position_state_publication_verifier)
         {
-            if (sidecar_checkpoints.empty())
-            {
-                return fail_after_checkpoint(
-                    "All-position MTP verifier requires a post-sidecar checkpoint");
-            }
-
-            const PrefixStateSnapshot &sidecar_checkpoint =
-                sidecar_checkpoints.front();
-            if (!sidecar_checkpoint.valid)
-            {
-                return fail_after_checkpoint(
-                    "All-position MTP verifier received an invalid post-sidecar checkpoint");
-            }
-
             const bool sidecar_preserves_main_state =
                 runner_->supportsMTPSidecarPreservesMainState();
             bool restored_verifier_base = sidecar_preserves_main_state;
+            const bool captured_post_sidecar_checkpoint =
+                !sidecar_checkpoints.empty() && sidecar_checkpoints.front().valid;
             if (sidecar_preserves_main_state)
             {
                 PerfStatsCollector::addCounter(
@@ -2490,7 +2490,8 @@ namespace llaminar2
                     {},
                     {{"draft_tokens", std::to_string(draft_tokens.size())},
                      {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)},
-                     {"discarded_sidecar_checkpoint", sidecar_checkpoint.valid ? "true" : "false"}});
+                     {"discarded_sidecar_checkpoint",
+                      captured_post_sidecar_checkpoint ? "true" : "false"}});
             }
             else
             {
@@ -2510,7 +2511,8 @@ namespace llaminar2
                         {},
                         {{"draft_tokens", std::to_string(draft_tokens.size())},
                          {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)},
-                         {"discarded_sidecar_checkpoint", sidecar_checkpoint.valid ? "true" : "false"}});
+                         {"discarded_sidecar_checkpoint",
+                          captured_post_sidecar_checkpoint ? "true" : "false"}});
                 }
             }
             if (!restored_verifier_base)

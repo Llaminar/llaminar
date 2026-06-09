@@ -10,42 +10,32 @@ partial, or not fully measured. Red = fails or lacks required correctness.
 
 | Backend | Model | Sampling | RAG | Latest speed evidence | Main blocker |
 |---|---|---|---|---|---|
-| CUDA | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 53.09/55.24/75.48/52.96 vs 44.66 | dynamic conservative |
-| CUDA | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 44.58/42.42/37.04/44.74 vs 44.67 | deeper drafts reject |
-| ROCm | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 38.27/33.08/41.40/40.81 vs 31.34 | dynamic stays d1 |
-| ROCm | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 29.30/27.09/25.24/28.92 vs 31.23 | speed-negative |
-| CPU | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 5.02/5.40/8.51/5.16 vs 4.55 | dynamic conservative |
-| CPU | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 3.52/3.62/3.62/3.56 vs 4.62 | rollback path slow |
-| CUDA | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 61.42/67.31/69.58/62.83 vs 110.30 | verifier dominates |
-| CUDA | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 71.62/53.14/60.62/71.61 vs 110.61 | verifier dominates |
-| ROCm | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 38.58/37.36/40.24/38.61 vs 64.65 | verifier dominates |
-| ROCm | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 34.20/30.02/29.40/32.75 vs 64.71 | verifier dominates |
-| CPU | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 10.81/11.57/12.85/10.85 vs 17.55 | CPU publication/catch-up |
-| CPU | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 12.30/12.25/12.19/12.28 vs 18.14 | host verifier overhead |
+| CUDA | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 51.80/55.15/59.50/60.85 vs 44.63 | dynamic now OK in this lane |
+| CUDA | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 39.03/34.81/29.58/38.95 vs 44.63 | low acceptance |
+| ROCm | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 45.61/33.03/41.91/39.17 vs 31.19 | d2 acceptance dip |
+| ROCm | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 24.85/20.58/24.27/24.81 vs 31.30 | speed-negative |
+| CPU | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 5.49/5.69/8.89/5.50 vs 4.59 | dynamic conservative |
+| CPU | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 3.45/3.56/3.58/3.50 vs 4.58 | rollback path slow |
+| CUDA | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 64.23/66.72/69.42/61.26 vs 110.49 | verifier dominates |
+| CUDA | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 50.28/47.31/41.69/49.12 vs 111.24 | near-zero acceptance |
+| ROCm | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 38.64/37.46/43.57/38.64 vs 64.81 | verifier dominates |
+| ROCm | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 31.82/24.64/24.20/29.73 vs 65.08 | verifier dominates |
+| CPU | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 11.97/11.50/12.69/11.37 vs 17.48 | CPU verifier cost |
+| CPU | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 11.91/12.08/12.68/12.22 vs 17.53 | host verifier overhead |
 
 ## Latest Evidence
 
-- Fresh GPU dense matrix:
-  `benchmark_results/mtp_vllm_style/20260609T014847Z-bounded-device-matrix-deferred-correction/`.
-  CUDA/ROCm dense baseline, fixed d1/d2/d3, and dynamic completed for
-  greedy/stochastic. CPU baseline finished at 4.57 tok/s but fixed CPU lanes
-  were split out after the combined run spent about five minutes on CPU.
-- Fresh CUDA MoE matrix:
-  `benchmark_results/mtp_vllm_style/20260609T014540Z-cuda-moe-deferred-correction-fix/`.
-  Rejected corrections now show `correction_ms=0`, `correction_count=0`, and
-  nonzero `deferred_corrections`; MoE remains speed-negative.
-- Fresh ROCm MoE matrix:
-  `benchmark_results/mtp_vllm_style/20260609T020327Z-rocm-moe-deferred-correction-fix/`.
-  Same fixed/dynamic variant shape completed for greedy/stochastic with zero
-  rollback and zero correction-forward time; MoE remains speed-negative.
-- Last complete CPU matrices:
-  dense `20260608T231927Z-bounded-dense-device-matrix/`, MoE
-  `20260609T003744Z-bounded-cpu-moe-matrix-after-cuda-fix/`.
+- Fresh full bounded matrix:
+  `benchmark_results/mtp_vllm_style/20260609T022015Z-bounded-matrix-skip-allpos-sidecar-checkpoint/`.
+  It covers CUDA/ROCm/CPU, dense/MoE, greedy/stochastic, baseline plus fixed
+  d1/d2/d3/dynamic at 16 decode tokens. All rows completed. GPU all-position
+  lanes now skip the unused post-sidecar checkpoint (`capture_post_sidecar` is
+  absent; `post_sidecar_checkpoint_skipped_all_position_publication` is present).
 - Regression:
   `Qwen36MoECUDASingleDevicePrefixMTPPathGuards.Depth1RejectedCorrectionDefersToConditionToken`
   proves rejected-token publication commits shifted MTP state but defers the
   expensive correction main forward.
-- Matrix runner now supports bounded sweeps:
+- Matrix runner supports bounded sweeps:
   `scripts/run_mtp_iteration_benchmark_matrix.sh --decode-tokens 16 --perfstats`.
   `summary.tsv` now includes verifier/correction timing, main-verifier
   warmup/capture/replay counts, and replay reset/preserve counts. CPU lanes are
