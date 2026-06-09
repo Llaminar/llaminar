@@ -4826,6 +4826,39 @@ namespace llaminar2
         }
     }
 
+    void DeviceGraphOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled)
+    {
+        defer_all_position_verifier_sync_ = enabled;
+        if (!enabled)
+        {
+            pending_all_position_logits_stream_ = nullptr;
+        }
+    }
+
+    bool DeviceGraphOrchestrator::shouldDeferAllPositionVerifierFinalSync() const
+    {
+        return defer_all_position_verifier_sync_ &&
+               compute_all_position_logits_ &&
+               state_.device_id.is_gpu() &&
+               debugEnv().execution.gpu_graphs &&
+               !debugEnv().gpu_stage_timing &&
+               !debugEnv().gpu_stage_timing_detail;
+    }
+
+    void DeviceGraphOrchestrator::setPendingAllPositionVerifierStream(void *stream)
+    {
+        pending_all_position_logits_stream_ = stream;
+        if (stream)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "all_position_verifier_deferred_stream_handoffs",
+                1.0,
+                "decode",
+                state_.device_id.toString());
+        }
+    }
+
     bool DeviceGraphOrchestrator::supportsMTPSpecStatePublication() const
     {
         return graph_builder_ && graph_builder_->config().mtp.enabled &&
@@ -5409,7 +5442,10 @@ namespace llaminar2
             auto device_opt = state_.all_position_logits->current_device();
             if (device_opt.has_value() && device_opt->is_gpu())
             {
-                stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsOnDevice");
+                stream = pending_all_position_logits_stream_;
+                pending_all_position_logits_stream_ = nullptr;
+                if (!stream)
+                    stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsOnDevice");
                 if (!stream)
                 {
                     return -1;
@@ -5434,7 +5470,10 @@ namespace llaminar2
             auto device_opt = state_.all_position_logits_local->current_device();
             if (device_opt.has_value() && device_opt->is_gpu())
             {
-                stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsLocalOnDevice");
+                stream = pending_all_position_logits_stream_;
+                pending_all_position_logits_stream_ = nullptr;
+                if (!stream)
+                    stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsLocalOnDevice");
                 if (!stream)
                 {
                     return -1;
@@ -5489,6 +5528,12 @@ namespace llaminar2
         constexpr int kMaxStackVerifierRows = 16;
         if (row_count > kMaxStackVerifierRows)
         {
+            if (pending_all_position_logits_stream_)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Deferred all-position verifier sampling exceeds stack row capacity");
+                pending_all_position_logits_stream_ = nullptr;
+                return false;
+            }
             return IInferenceRunner::sampleGreedyFromAllPositionLogitsOnDeviceRows(
                 start_row, row_count, out_tokens);
         }
@@ -5514,7 +5559,11 @@ namespace llaminar2
             if (!backend || !gpu_ptr)
                 return false;
 
-            void *stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsOnDeviceRows");
+            void *stream = pending_all_position_logits_stream_;
+            const bool consumed_deferred_stream = stream != nullptr;
+            pending_all_position_logits_stream_ = nullptr;
+            if (!stream)
+                stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsOnDeviceRows");
             if (!stream)
             {
                 return false;
@@ -5538,6 +5587,11 @@ namespace llaminar2
                 argmax_partial_capacity_);
             if (!ok)
             {
+                if (consumed_deferred_stream)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Batched verifier argmax failed after deferred verifier replay");
+                    return false;
+                }
                 if (backend->backendDeviceType() == DeviceType::ROCm)
                 {
                     LOG_ERROR("[DeviceGraphOrchestrator] ROCm batched verifier argmax failed");

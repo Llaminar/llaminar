@@ -1365,6 +1365,7 @@ namespace llaminar2
         // remains outside this path because prompt shapes vary and capture setup
         // is not amortized.
         bool used_segmented_capture = false;
+        bool requested_deferred_all_position_sync = false;
 
         auto exec_t0 = std::chrono::high_resolution_clock::now();
         if (profiling_setup)
@@ -1402,14 +1403,26 @@ namespace llaminar2
                 LOG_DEBUG("[ForwardExecutionEngine] Experimental collective segmented GPU-graph replay enabled");
             }
 
+            const bool all_position_verifier =
+                host.computeAllPositionLogitsEnabled();
+            if (all_position_verifier &&
+                capture_policy.allow_segmented_capture &&
+                host.shouldDeferAllPositionVerifierFinalSync())
+            {
+                capture_policy.defer_final_sync = true;
+            }
+            requested_deferred_all_position_sync =
+                all_position_verifier && capture_policy.defer_final_sync;
+
             PerfStatsCollector::addCounter(
                 "forward_graph",
                 "decode_capture_policy",
                 1.0,
                 "decode",
                 input.device.toString(),
-                {{"context", host.computeAllPositionLogitsEnabled() ? "main_verifier" : "main_decode"},
+                {{"context", all_position_verifier ? "main_verifier" : "main_decode"},
                  {"allow_segmented", boolTag(capture_policy.allow_segmented_capture)},
+                 {"defer_final_sync", boolTag(capture_policy.defer_final_sync)},
                  {"has_collectives", boolTag(has_collective_nodes)},
                  {"collective_segmented", boolTag(capture_policy.collective_segmented_enabled)},
                  {"collectives_graph_capturable", boolTag(capture_policy.collectives_graph_capturable)}});
@@ -1447,7 +1460,7 @@ namespace llaminar2
             }
 
             forward_cache.segment_cache.perf_context =
-                host.computeAllPositionLogitsEnabled() ? "main_verifier" : "main_decode";
+                all_position_verifier ? "main_verifier" : "main_decode";
             success = executor_.executeDecodeWithCapturePolicy(
                 *forward_cache.graph,
                 ctx,
@@ -1477,20 +1490,39 @@ namespace llaminar2
             forward_cache.phase3_active = false;
         }
 
+        const bool all_position_verifier_sync_deferred =
+            success &&
+            forward_cache.phase3_active &&
+            requested_deferred_all_position_sync &&
+            forward_cache.segment_cache.capture_stream != nullptr;
+        if (all_position_verifier_sync_deferred)
+        {
+            host.setPendingAllPositionVerifierStream(
+                forward_cache.segment_cache.capture_stream);
+        }
+        else if (requested_deferred_all_position_sync)
+        {
+            host.setPendingAllPositionVerifierStream(nullptr);
+        }
+
         // Sync the stream at the forward pass boundary so logits are
         // immediately available to the caller without per-access event waits.
         if (success)
         {
             if (forward_cache.phase3_active)
             {
-                // Phase 3 replay already synchronized both capture_stream
-                // and defaultStream at the end of executeReplayPhase().
-                // Skip the redundant device-wide hipDeviceSynchronize and
-                // just mark the mapped logits as host-visible.
-                TensorBase *logits = host.logitsTensor();
-                if (logits && logits->isMapped())
+                // Phase 3 replay normally synchronizes both capture_stream
+                // and defaultStream at the end of executeReplayPhase(). When
+                // an all-position verifier explicitly defers that sync, the
+                // next device-side sampler owns the ordering and host-visible
+                // mapped logits must not be marked fresh here.
+                if (!all_position_verifier_sync_deferred)
                 {
-                    logits->markMappedSynced();
+                    TensorBase *logits = host.logitsTensor();
+                    if (logits && logits->isMapped())
+                    {
+                        logits->markMappedSynced();
+                    }
                 }
             }
             else

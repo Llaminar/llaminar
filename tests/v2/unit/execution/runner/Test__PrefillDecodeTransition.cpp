@@ -417,6 +417,16 @@ namespace
             return true;
         }
 
+        void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override
+        {
+            ++all_position_verifier_sync_deferral_set_count_;
+            all_position_verifier_sync_deferral_enabled_ = enabled;
+            if (enabled)
+                ++all_position_verifier_sync_deferral_enable_count_;
+            else
+                ++all_position_verifier_sync_deferral_disable_count_;
+        }
+
         int sampleGreedyFromMTPLogitsOnDevice() override
         {
             ++sample_mtp_logits_count_;
@@ -714,6 +724,10 @@ namespace
         int deviceDistributionSampleCount() const { return device_distribution_sample_count_; }
         int deviceDistributionVerifyCount() const { return device_distribution_verify_count_; }
         int deviceDistributionVerifyBatchCount() const { return device_distribution_verify_batch_count_; }
+        int allPositionVerifierSyncDeferralSetCount() const { return all_position_verifier_sync_deferral_set_count_; }
+        int allPositionVerifierSyncDeferralEnableCount() const { return all_position_verifier_sync_deferral_enable_count_; }
+        int allPositionVerifierSyncDeferralDisableCount() const { return all_position_verifier_sync_deferral_disable_count_; }
+        bool allPositionVerifierSyncDeferralEnabled() const { return all_position_verifier_sync_deferral_enabled_; }
         int lastSampleAllPositionStartRow() const { return last_sample_all_position_start_row_; }
         int lastSampleAllPositionRowCount() const { return last_sample_all_position_row_count_; }
         const PrefixStateSnapshot &lastRestoredSnapshot() const { return last_restored_snapshot_; }
@@ -1126,6 +1140,9 @@ namespace
         int device_distribution_sample_count_{0};
         int device_distribution_verify_count_{0};
         int device_distribution_verify_batch_count_{0};
+        int all_position_verifier_sync_deferral_set_count_{0};
+        int all_position_verifier_sync_deferral_enable_count_{0};
+        int all_position_verifier_sync_deferral_disable_count_{0};
         int last_sample_all_position_start_row_{-1};
         int last_sample_all_position_row_count_{0};
         int last_mtp_condition_token_{-1};
@@ -1143,6 +1160,7 @@ namespace
         bool supports_mtp_spec_state_publication_{false};
         bool publish_mtp_spec_state_ok_{true};
         bool supports_stochastic_device_sampling_{false};
+        bool all_position_verifier_sync_deferral_enabled_{false};
         bool requires_mtp_decode_equivalent_replay_{false};
         bool hide_local_logits_{false};
         bool use_captured_snapshot_{false};
@@ -2385,6 +2403,36 @@ namespace
         PerfStatsCollector::reset();
     }
 
+    TEST_F(Test__PrefillDecodeTransition, GreedyGPUAllPositionSpecPublicationScopesVerifierSyncDeferral)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0),
+            /*mtp_draft_tokens=*/2,
+            /*chained_mtp_support=*/true);
+        mock->enableMTPSidecarPreservesMainState();
+        mock->requireMTPDecodeEquivalentReplay();
+        mock->enableMTPSpecStatePublication();
+        mock->setVerifierAcceptedPrefixScript({2});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+
+        EXPECT_EQ(mock->setAllPositionCount(), 2);
+        EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
+        EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+        EXPECT_EQ(mock->allPositionVerifierSyncDeferralEnableCount(), 1);
+        EXPECT_EQ(mock->allPositionVerifierSyncDeferralDisableCount(), 1);
+        EXPECT_EQ(mock->allPositionVerifierSyncDeferralSetCount(), 2);
+        EXPECT_FALSE(mock->allPositionVerifierSyncDeferralEnabled());
+    }
+
     TEST_F(Test__PrefillDecodeTransition, AllPositionSpecPublicationReplaysOnlyRejectedCorrection)
     {
         const std::filesystem::path export_path =
@@ -2579,6 +2627,7 @@ namespace
 
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
+            EXPECT_EQ(mock->allPositionVerifierSyncDeferralSetCount(), 0);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1)
                 << "the first shifted MTP row is committed before the stochastic all-position verifier";
@@ -2674,6 +2723,7 @@ namespace
 
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->allPositionVerifierSyncDeferralSetCount(), 0);
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_THAT(mock->lastCommitMTPTokens(),

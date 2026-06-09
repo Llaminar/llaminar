@@ -135,6 +135,35 @@ namespace llaminar2
                 threshold);
         }
 
+        class ScopedMTPAllPositionVerifierSyncDeferral
+        {
+        public:
+            ScopedMTPAllPositionVerifierSyncDeferral(
+                IInferenceRunner *runner,
+                bool enabled)
+                : runner_(runner),
+                  enabled_(enabled && runner != nullptr)
+            {
+                if (enabled_)
+                    runner_->setMTPAllPositionVerifierSyncDeferralEnabled(true);
+            }
+
+            ~ScopedMTPAllPositionVerifierSyncDeferral()
+            {
+                if (enabled_)
+                    runner_->setMTPAllPositionVerifierSyncDeferralEnabled(false);
+            }
+
+            ScopedMTPAllPositionVerifierSyncDeferral(
+                const ScopedMTPAllPositionVerifierSyncDeferral &) = delete;
+            ScopedMTPAllPositionVerifierSyncDeferral &operator=(
+                const ScopedMTPAllPositionVerifierSyncDeferral &) = delete;
+
+        private:
+            IInferenceRunner *runner_ = nullptr;
+            bool enabled_ = false;
+        };
+
         void synchronizeRunnerPrimaryDeviceBeforeRelease(const IInferenceRunner *runner)
         {
             if (!runner)
@@ -2575,6 +2604,11 @@ namespace llaminar2
             }
 
             std::vector<int32_t> sampled_verifier_rows(draft_tokens.size(), -1);
+            const bool defer_all_position_verifier_sync =
+                !stochastic_verify && runner_->primaryDeviceId().is_gpu();
+            ScopedMTPAllPositionVerifierSyncDeferral verifier_sync_deferral(
+                runner_.get(),
+                defer_all_position_verifier_sync);
             {
                 PerfStatsCollector::ScopedTimer verifier_timer(
                     "mtp",

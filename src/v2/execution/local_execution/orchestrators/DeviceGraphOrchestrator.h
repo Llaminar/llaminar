@@ -1509,6 +1509,7 @@ namespace llaminar2
             int position_id,
             int32_t *out_token) override;
         bool flushPendingMTPWork() override;
+        void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;
         bool supportsMTPSpecStatePublication() const override;
         bool publishAcceptedMTPSpecState(
             const MTPSpecStepPlan &plan,
@@ -2252,6 +2253,12 @@ namespace llaminar2
         /** Monotonic live-state epoch used by versioned decode replay. */
         uint64_t liveReplayStateEpoch() const override { return live_replay_state_epoch_; }
 
+        /** Whether the current all-position verifier may hand its stream to the sampler. */
+        bool shouldDeferAllPositionVerifierFinalSync() const override;
+
+        /** Store the verifier replay stream for the next all-position logits consumer. */
+        void setPendingAllPositionVerifierStream(void *stream) override;
+
         /** Report host-side safety state for chunk-boundary maintenance. */
         PrefillChunkMaintenanceState prefillChunkMaintenanceState(
             const PrefillChunkPlan &chunk) const override;
@@ -2435,6 +2442,8 @@ namespace llaminar2
         MTPSidecarGraphCache mtp_sidecar_depth0_kv_only_cache_;
         std::array<MTPSidecarGraphCache, 5> mtp_sidecar_depth0_kv_only_batch_caches_;
         void *pending_mtp_logits_stream_ = nullptr;
+        bool defer_all_position_verifier_sync_ = false;
+        void *pending_all_position_logits_stream_ = nullptr;
 
         struct MTPTerminalHiddenRowSelectGraphCache
         {

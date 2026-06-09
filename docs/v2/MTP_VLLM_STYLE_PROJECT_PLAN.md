@@ -209,6 +209,19 @@ Done:
   `Qwen36MoECUDASingleDevicePrefixMTPPathGuards.Depth1RejectedCorrectionDefersToConditionToken`
   cover this split; fresh CUDA/ROCm GPU matrices show `correction_ms=0` and
   zero rollback, but MoE remains speed-negative because verifier time dominates.
+- Greedy GPU all-position verifier replay can now defer the verifier graph's
+  final stream sync and hand the capture stream directly to device-side row
+  sampling. The handoff is scoped by `OrchestrationRunner`, hard-fails if a
+  backend cannot sample on the handed-off stream, and is deliberately disabled
+  for stochastic verification until its multi-kernel distribution path has the
+  same stream contract. `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_ForwardExecutionEngine`, `V2_Unit_MTPGraphConstruction`, and focused
+  CUDA/ROCm Qwen3.6 MoE d3+stochastic parity passed. Release check
+  `benchmark_results/mtp_vllm_style/20260609T085703Z-gpu-moe-d3-verifier-stream-handoff/`
+  shows the counters firing with zero rollback/correction replay, but still no
+  MoE speed-positive result: CUDA d3 70.3 vs 109.8 tok/s and ROCm d3 42.4 vs
+  64.7 tok/s. The CPU Qwen3.6 MoE d3+stochastic parity cells also passed as
+  the non-GPU replay-state guard.
 - All-position publication no longer captures the old post-sidecar prefix
   checkpoint, because that verifier path publishes from the just-run target
   graph and never restores the sidecar checkpoint. The decode-equivalent path

@@ -22,9 +22,9 @@ partial, or not fully measured. Red = fails or lacks required correctness.
 | ROCm | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 24.8/20.3/22.9/23.9 vs 31.2 | speed-negative |
 | CPU | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 5.5/5.7/9.1/5.6 vs 4.6 | dynamic too shallow |
 | CPU | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 3.6/3.5/3.6/3.5 vs 4.7 | rollback path slow |
-| CUDA | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 62.6/66.6/69.5/56.5 vs 109.8 | verifier dominates |
+| CUDA | MoE 35B | greedy | Amber | 16tok d3 70.3 vs 109.8; handoff ok | verifier dominates |
 | CUDA | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 48.9/45.0/44.0/53.4 vs 109.7 | zero acceptance |
-| ROCm | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 38.1/37.3/41.4/38.6 vs 64.7 | verifier dominates |
+| ROCm | MoE 35B | greedy | Amber | 16tok d3 42.4 vs 64.7; handoff ok | verifier dominates |
 | ROCm | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 30.4/25.7/23.3/30.6 vs 64.2 | verifier dominates |
 | CPU | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 11.3/11.5/12.7/11.8 vs 17.9 | CPU verifier cost |
 | CPU | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 11.9/12.3/12.5/12.3 vs 17.5 | host verifier overhead |
@@ -54,12 +54,11 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   matrix remains the acceptance capture.
 - Runner guard: dynamic evidence now requires same-run baseline plus fixed
   d1/d2/d3 unless `--allow-partial-variants` is used for diagnostics.
-- Versioned replay guard: ordinary decode captures are live-epoch stamped and
-  recaptured after speculative publication; verifier captures keep their
-  accepted-state contract. Focused units plus CPU/CUDA/ROCm MoE stochastic and
-  d3 greedy parity passed. Release d3 check
-  `20260609T082255Z-gpu-moe-d3-versioned-replay`: CUDA 69.7 tok/s at 72.7%
-  acceptance, ROCm 40.4 tok/s at 60%; verifier/condition still dominates.
+- Versioned replay plus verifier-stream handoff guards passed focused units and
+  CUDA/ROCm MoE d3+stochastic parity. Release d3 check
+  `20260609T085703Z-gpu-moe-d3-verifier-stream-handoff`: CUDA 70.3 tok/s,
+  ROCm 42.4 tok/s, both 72.7% acceptance, zero rollback/correction replay.
+  Handoff counters fired, but verifier/condition time still dominates.
 
 ## Target Anchors
 

@@ -154,6 +154,28 @@ namespace llaminar2
          */
         virtual uint64_t liveReplayStateEpoch() const { return 0; }
 
+        /**
+         * @brief Whether the next all-position verifier replay may defer its final sync.
+         *
+         * The host is responsible for allowing this only when the immediate
+         * caller will consume all-position logits through a device operation on
+         * the same replay stream. The default keeps the normal synchronized
+         * forward boundary.
+         */
+        virtual bool shouldDeferAllPositionVerifierFinalSync() const { return false; }
+
+        /**
+         * @brief Receive the stream whose all-position verifier logits are pending.
+         *
+         * Called after a successful deferred replay. The host should enqueue the
+         * next logits-consuming operation on this stream, or clear the pending
+         * stream by passing nullptr when deferral is not active.
+         */
+        virtual void setPendingAllPositionVerifierStream(void *stream)
+        {
+            (void)stream;
+        }
+
         /** Domain placement epoch for MoE-sensitive prefill graph-cache keys. */
         virtual uint64_t moePlacementEpoch() const { return 0; }
 

@@ -322,6 +322,22 @@ namespace llaminar2
         virtual bool flushPendingMTPWork() { return true; }
 
         /**
+         * @brief Opt in to deferring the next all-position verifier graph sync.
+         *
+         * GPU runners may use this for greedy all-position MTP verification:
+         * the verifier graph replays on its capture stream, then the greedy row
+         * sampler is enqueued on that same stream and performs the required
+         * synchronization through its device-to-host token copy. This is a
+         * narrow vLLM-style stream handoff; stochastic verification keeps the
+         * default synchronized boundary until its distribution path has the
+         * same persistent stream contract.
+         */
+        virtual void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled)
+        {
+            (void)enabled;
+        }
+
+        /**
          * @brief Commit shifted MTP KV rows from the most recent main forward.
          *
          * MTP decode calls forwardMTP() before verifier/replay; that sidecar
