@@ -10,6 +10,8 @@
 
 #include "../../../tensors/TensorKernels.h"
 
+#include <vector>
+
 namespace llaminar2
 {
 
@@ -18,6 +20,7 @@ namespace llaminar2
     public:
         bool supportsPaddedPrefillRealLength() const override { return true; }
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override;
+        void bindSpeculativeStateWorkspace(float *workspace, int state_size) override;
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override;
 
         bool forward(
@@ -58,9 +61,14 @@ namespace llaminar2
             int channels, int kernel_size,
             bool apply_silu);
 
+        float *prepareSpeculativeState(float *live_state, int state_floats);
+
         float *verifier_state_capture_ = nullptr;
         int verifier_state_capture_rows_ = 0;
         int verifier_state_capture_size_ = 0;
+        float *speculative_state_work_ = nullptr;
+        int speculative_state_work_size_ = 0;
+        std::vector<float> owned_speculative_state_work_;
     };
 
 } // namespace llaminar2

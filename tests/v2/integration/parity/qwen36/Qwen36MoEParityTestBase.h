@@ -1169,33 +1169,20 @@ namespace llaminar2::test::parity::qwen36
                            record.name == name;
                 });
         };
-        const bool gpu_case =
-            test_case.required_cuda_devices > 0 ||
-            test_case.required_rocm_devices > 0;
         const bool used_decode_equivalent_stochastic_verifier =
             has_mtp_counter("decode_equivalent_stochastic_verifier_runs");
         const bool used_all_position_publication =
             has_mtp_counter("all_position_state_publication_verifier_runs") &&
             has_mtp_counter("spec_state_publications");
-        if (gpu_case)
-        {
-            EXPECT_TRUE(used_all_position_publication)
-                << "GPU Qwen3.6 MoE stochastic MTP must exercise vLLM-style "
-                   "all-position state publication\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
-                << "GPU Qwen3.6 MoE stochastic MTP must not fall back to the "
-                   "decode-equivalent stochastic verifier once publication is "
-                   "available\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-        }
-        else
-        {
-            EXPECT_TRUE(used_decode_equivalent_stochastic_verifier)
-                << "CPU Qwen3.6 MoE stochastic MTP still uses the host "
-                   "decode-equivalent verifier until CPU state publication lands\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-        }
+        EXPECT_TRUE(used_all_position_publication)
+            << "Qwen3.6 MoE stochastic MTP must exercise vLLM-style "
+               "all-position state publication on CPU, CUDA, and ROCm\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
+            << "Qwen3.6 MoE stochastic MTP must not fall back to the "
+               "decode-equivalent stochastic verifier once publication is "
+               "available\n"
+            << PerfStatsCollector::summaryString({"mtp"});
 
         const bool used_retired_phase138_stochastic_candidate =
             has_mtp_counter("phase138_stochastic_spec_decode_runs");
@@ -2030,6 +2017,339 @@ namespace llaminar2::test::parity::qwen36
                 << describeMoEDiagnosticRow(*first_sidecar);
         }
         return oss.str();
+    }
+
+    inline std::map<std::string, std::vector<float>> captureMoERunnerSnapshots(
+        IInferenceRunner &runner)
+    {
+        std::map<std::string, std::vector<float>> snapshots;
+        for (const auto &key : runner.getSnapshotKeys())
+        {
+            size_t size = 0;
+            const float *data = runner.getSnapshot(key, size);
+            if (!data || size == 0)
+            {
+                continue;
+            }
+            snapshots.emplace(key, std::vector<float>(data, data + size));
+        }
+        return snapshots;
+    }
+
+    inline std::vector<float> selectMoEVerifierSnapshotRow(
+        const std::vector<float> &all_position_snapshot,
+        size_t serial_snapshot_size,
+        int row)
+    {
+        if (serial_snapshot_size == 0 ||
+            all_position_snapshot.size() <= serial_snapshot_size ||
+            all_position_snapshot.size() % serial_snapshot_size != 0)
+        {
+            return all_position_snapshot;
+        }
+
+        const size_t rows = all_position_snapshot.size() / serial_snapshot_size;
+        if (row < 0 || static_cast<size_t>(row) >= rows)
+        {
+            return all_position_snapshot;
+        }
+
+        const auto begin =
+            all_position_snapshot.begin() +
+            static_cast<std::ptrdiff_t>(static_cast<size_t>(row) * serial_snapshot_size);
+        return std::vector<float>(
+            begin,
+            begin + static_cast<std::ptrdiff_t>(serial_snapshot_size));
+    }
+
+    inline void appendMoEAllPositionVerifierRows(
+        const std::map<std::string, std::vector<float>> &all_position_snapshots,
+        const std::map<std::string, std::vector<float>> &serial_snapshots,
+        int row,
+        int output_tokens,
+        std::ofstream &csv,
+        std::vector<MoESnapshotCompareRow> *rows)
+    {
+        std::vector<std::string> keys;
+        keys.reserve(all_position_snapshots.size() + serial_snapshots.size());
+        for (const auto &entry : all_position_snapshots)
+        {
+            keys.push_back(entry.first);
+        }
+        for (const auto &entry : serial_snapshots)
+        {
+            keys.push_back(entry.first);
+        }
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+
+        const std::string comparison =
+            "all_position_row" + std::to_string(row) +
+            "_vs_serial_prefix" + std::to_string(output_tokens);
+        for (const auto &key : keys)
+        {
+            const auto all_it = all_position_snapshots.find(key);
+            const auto serial_it = serial_snapshots.find(key);
+            if (all_it == all_position_snapshots.end() ||
+                serial_it == serial_snapshots.end())
+            {
+                MoESnapshotCompareRow missing;
+                missing.comparison = comparison;
+                missing.sync_idx = row;
+                missing.output_tokens = output_tokens;
+                missing.key = key;
+                missing.reference_key = key;
+                missing.left_label = "all_position";
+                missing.right_label = "serial";
+                missing.present_in_baseline =
+                    all_it != all_position_snapshots.end() &&
+                    !all_it->second.empty();
+                missing.present_in_mtp =
+                    serial_it != serial_snapshots.end() &&
+                    !serial_it->second.empty();
+                missing.elements = std::max(
+                    all_it == all_position_snapshots.end() ? size_t{0} : all_it->second.size(),
+                    serial_it == serial_snapshots.end() ? size_t{0} : serial_it->second.size());
+                rows->push_back(missing);
+                writeMoESnapshotCsvRow(csv, missing);
+                continue;
+            }
+
+            const auto selected = selectMoEVerifierSnapshotRow(
+                all_it->second,
+                serial_it->second.size(),
+                row);
+            auto compare = compareMoESnapshotVectors(
+                selected,
+                serial_it->second.data(),
+                serial_it->second.size(),
+                row,
+                output_tokens,
+                key,
+                key,
+                comparison,
+                "all_position",
+                "serial");
+            rows->push_back(compare);
+            writeMoESnapshotCsvRow(csv, compare);
+        }
+    }
+
+    inline void runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        ScopedMoEParityDeterministicMode deterministic_mode(
+            shouldUseMoEParityDeterministicMode(test_case));
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
+        ASSERT_GE(expected_tokens.size(), 4u)
+            << "all-position verifier row regression needs four reference tokens";
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cpu()
+                                    : test_case.devices.front().toLocalDeviceId();
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 1;
+        config.moe_expert_parallel_plan = test_case.moe_expert_parallel_plan;
+
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+        auto runner = createInferenceRunner(model_ctx, nullptr, device, config);
+        ASSERT_NE(runner, nullptr);
+        ASSERT_GT(runner->vocab_size(), 0);
+
+        auto sample_current = [&](const char *label) -> int32_t
+        {
+            int32_t sampled = runner->sampleGreedyOnDevice();
+            if (sampled >= 0)
+            {
+                return sampled;
+            }
+            const float *logits = runner->logits();
+            ADD_FAILURE() << "sampleGreedyOnDevice failed after " << label
+                          << "; falling back to host-visible logits";
+            return argmaxToken(logits, runner->vocab_size());
+        };
+
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+        runner->enableSnapshotCapture();
+
+        ASSERT_TRUE(runner->forward(
+            prompt_tokens.data(),
+            static_cast<int>(prompt_tokens.size())))
+            << "prefill forward failed";
+        EXPECT_EQ(sample_current("prefill"), expected_tokens[0]);
+
+        for (int i = 0; i < 2; ++i)
+        {
+            const int32_t token = expected_tokens[static_cast<size_t>(i)];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "serial setup forward failed at token index " << i;
+            EXPECT_EQ(sample_current("serial setup"), expected_tokens[static_cast<size_t>(i + 1)])
+                << "unexpected setup token at index " << i;
+        }
+
+        const int production_sidecar_position = runner->get_position();
+        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+            expected_tokens[0],
+            /*already_appended_tokens=*/0,
+            /*allow_speculative_discard=*/true,
+            production_sidecar_position - 2))
+            << "failed to advance shifted MTP cache for first setup token";
+        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+            expected_tokens[1],
+            /*already_appended_tokens=*/0,
+            /*allow_speculative_discard=*/true,
+            production_sidecar_position - 1))
+            << "failed to advance shifted MTP cache for second setup token";
+
+        const PrefixStateSnapshot verifier_base = runner->captureLivePrefixState();
+        ASSERT_TRUE(verifier_base.valid);
+
+        const std::array<int32_t, 2> verifier_tokens = {
+            expected_tokens[2],
+            expected_tokens[3],
+        };
+
+        runner->clearSnapshots();
+        const int base_sidecar_position = runner->get_position();
+        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+            verifier_tokens[0],
+            /*already_appended_tokens=*/0,
+            /*allow_speculative_discard=*/true,
+            base_sidecar_position))
+            << "shifted MTP row commit from terminal hidden must not perturb "
+               "main all-position verifier state";
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_tokens.data(), 2))
+            << "all-position verifier forward failed";
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        std::array<int32_t, 2> all_position_rows = {-1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            static_cast<int>(all_position_rows.size()),
+            all_position_rows.data()));
+        const float *all_position_logits = runner->getAllPositionLogits();
+        ASSERT_NE(all_position_logits, nullptr);
+        const int vocab = runner->vocab_size();
+        std::vector<float> all_position_logits_copy(
+            all_position_logits,
+            all_position_logits + static_cast<size_t>(all_position_rows.size()) *
+                                      static_cast<size_t>(vocab));
+        const auto all_position_snapshots = captureMoERunnerSnapshots(*runner);
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base));
+        const int32_t first_verifier = verifier_tokens[0];
+        runner->clearSnapshots();
+        ASSERT_TRUE(runner->forward(&first_verifier, 1))
+            << "serial row0 verifier forward failed";
+        const int32_t serial_row0 = sample_current("serial verifier row0");
+        const auto serial_row0_snapshots = captureMoERunnerSnapshots(*runner);
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base));
+        runner->clearSnapshots();
+        ASSERT_TRUE(runner->forward(&first_verifier, 1))
+            << "serial row1 first verifier forward failed";
+        const int32_t second_verifier = verifier_tokens[1];
+        ASSERT_TRUE(runner->forward(&second_verifier, 1))
+            << "serial row1 second verifier forward failed";
+        const int32_t serial_row1 = sample_current("serial verifier row1");
+        const auto serial_row1_snapshots = captureMoERunnerSnapshots(*runner);
+
+        const auto result_dir = moeDiagnosticResultsDir();
+        const auto csv_path = result_dir / "main_verifier_all_position_vs_serial.csv";
+        std::ofstream csv(csv_path);
+        ASSERT_TRUE(csv.is_open()) << "failed to open " << csv_path;
+        writeMoESnapshotCsvHeader(csv);
+        std::vector<MoESnapshotCompareRow> rows;
+        appendMoEAllPositionVerifierRows(
+            all_position_snapshots,
+            serial_row0_snapshots,
+            0,
+            1,
+            csv,
+            &rows);
+        appendMoEAllPositionVerifierRows(
+            all_position_snapshots,
+            serial_row1_snapshots,
+            1,
+            2,
+            csv,
+            &rows);
+
+        auto first_bad_row = [&](const std::string &comparison)
+            -> const MoESnapshotCompareRow *
+        {
+            return firstMoEDiagnosticDivergence(
+                rows,
+                comparison,
+                0.9999,
+                /*include_sidecar_keys=*/true);
+        };
+
+        const std::string row0_top5 = topKSummary(
+            all_position_logits_copy.data(),
+            vocab,
+            5);
+        const std::string row1_top5 = topKSummary(
+            all_position_logits_copy.data() + static_cast<size_t>(vocab),
+            vocab,
+            5);
+        const std::string serial_row1_top5 =
+            topKSummary(runner->logits(), vocab, 5);
+
+        EXPECT_EQ(all_position_rows[0], serial_row0)
+            << "all-position row0 must match one serial verifier decode"
+            << "\nall_position_rows=" << all_position_rows[0] << ","
+            << all_position_rows[1]
+            << "\nserial_row0=" << serial_row0
+            << "\nrow0 top5=[" << row0_top5 << "]"
+            << "\ndiagnostic CSV: " << csv_path;
+        EXPECT_EQ(all_position_rows[1], serial_row1)
+            << "all-position bonus row must match two serial verifier decodes"
+            << "\ncondition_prefix_tokens="
+            << joinTokensMoEDiagnostic({expected_tokens[0], expected_tokens[1]})
+            << "\nverifier_tokens="
+            << joinTokensMoEDiagnostic({verifier_tokens[0], verifier_tokens[1]})
+            << "\nall_position_rows=" << all_position_rows[0] << ","
+            << all_position_rows[1]
+            << "\nserial_row1=" << serial_row1
+            << "\nrow1 all-position top5=[" << row1_top5 << "]"
+            << "\nrow1 serial top5=[" << serial_row1_top5 << "]"
+            << "\nfirst row0 divergence="
+            << (first_bad_row("all_position_row0_vs_serial_prefix1")
+                    ? describeMoEDiagnosticRow(
+                          *first_bad_row("all_position_row0_vs_serial_prefix1"))
+                    : std::string("none"))
+            << "\nfirst row1 divergence="
+            << (first_bad_row("all_position_row1_vs_serial_prefix2")
+                    ? describeMoEDiagnosticRow(
+                          *first_bad_row("all_position_row1_vs_serial_prefix2"))
+                    : std::string("none"))
+            << "\ndiagnostic CSV: " << csv_path;
+
+        runner->disableSnapshotCapture();
     }
 
     inline void runMoEMTPSidecarStageBreakdownDiagnostic(

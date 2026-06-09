@@ -21,11 +21,68 @@
 
 #include "utils/Sampler.h"
 #include "kernels/common/SamplingMath.h"
+#include "kernels/cpu/sampling/CPUSamplerPrimitives.h"
 
 using namespace llaminar2;
 
 namespace
 {
+    std::vector<float> make_unique_logits(size_t vocab_size)
+    {
+        std::vector<float> logits(vocab_size);
+        for (size_t i = 0; i < vocab_size; ++i)
+        {
+            const float wave = std::sin(static_cast<float>(i) * 0.01731f) * 7.0f;
+            const float saw = static_cast<float>((i * 37u) % 997u) * 0.00037f;
+            const float trend = static_cast<float>(i % 19u) * 0.0031f;
+            logits[i] = wave + saw - trend;
+        }
+        return logits;
+    }
+
+    void expect_topk_variants_equal(const std::vector<float> &logits, int top_k)
+    {
+        std::vector<float> scalar_logits(static_cast<size_t>(top_k), 0.0f);
+        std::vector<float> avx2_logits(static_cast<size_t>(top_k), 0.0f);
+        std::vector<float> avx512_logits(static_cast<size_t>(top_k), 0.0f);
+        std::vector<int> scalar_ids(static_cast<size_t>(top_k), -1);
+        std::vector<int> avx2_ids(static_cast<size_t>(top_k), -1);
+        std::vector<int> avx512_ids(static_cast<size_t>(top_k), -1);
+
+        const int scalar_count = cpu_sampling::select_topk_scalar(
+            logits.data(),
+            static_cast<int>(logits.size()),
+            top_k,
+            scalar_logits.data(),
+            scalar_ids.data());
+        const int avx2_count = cpu_sampling::select_topk_avx2(
+            logits.data(),
+            static_cast<int>(logits.size()),
+            top_k,
+            avx2_logits.data(),
+            avx2_ids.data());
+        const int avx512_count = cpu_sampling::select_topk_avx512(
+            logits.data(),
+            static_cast<int>(logits.size()),
+            top_k,
+            avx512_logits.data(),
+            avx512_ids.data());
+
+        ASSERT_EQ(avx2_count, scalar_count);
+        ASSERT_EQ(avx512_count, scalar_count);
+        ASSERT_EQ(scalar_count, std::min<int>(top_k, static_cast<int>(logits.size())));
+        for (int i = 0; i < scalar_count; ++i)
+        {
+            EXPECT_EQ(avx2_ids[static_cast<size_t>(i)], scalar_ids[static_cast<size_t>(i)])
+                << "AVX2 top-k id mismatch at rank " << i;
+            EXPECT_EQ(avx512_ids[static_cast<size_t>(i)], scalar_ids[static_cast<size_t>(i)])
+                << "AVX512 top-k id mismatch at rank " << i;
+            EXPECT_FLOAT_EQ(avx2_logits[static_cast<size_t>(i)], scalar_logits[static_cast<size_t>(i)])
+                << "AVX2 top-k logit mismatch at rank " << i;
+            EXPECT_FLOAT_EQ(avx512_logits[static_cast<size_t>(i)], scalar_logits[static_cast<size_t>(i)])
+                << "AVX512 top-k logit mismatch at rank " << i;
+        }
+    }
 
     /**
      * @brief Test fixture for Sampler tests
@@ -453,6 +510,86 @@ namespace
             }
         }
         EXPECT_EQ(actual_ids.size(), expected_active);
+    }
+
+    TEST_F(SamplerTest, CPUSelectTopKVariantsMatchScalar)
+    {
+        const auto logits = make_unique_logits(4099);
+        for (int top_k : {1, 4, 20, 40, sampling_math::kMaxTopK})
+        {
+            expect_topk_variants_equal(logits, top_k);
+        }
+    }
+
+    TEST_F(SamplerTest, CPUSelectTopKHandlesNonVectorTail)
+    {
+        const auto logits = make_unique_logits(257);
+        expect_topk_variants_equal(logits, 31);
+    }
+
+    TEST_F(SamplerTest, ComputeDistributionTopKFastPathMatchesPartialSortBaseline)
+    {
+        const auto logits = make_unique_logits(8193);
+
+        SamplingParams params;
+        params.temperature = 0.72f;
+        params.top_k = 40;
+        params.top_p = 0.93f;
+
+        std::vector<std::pair<float, int>> sorted;
+        sorted.reserve(logits.size());
+        for (size_t i = 0; i < logits.size(); ++i)
+        {
+            sorted.emplace_back(logits[i], static_cast<int>(i));
+        }
+        std::partial_sort(
+            sorted.begin(),
+            sorted.begin() + params.top_k,
+            sorted.end(),
+            [](const auto &a, const auto &b)
+            {
+                return a.first > b.first;
+            });
+
+        std::vector<float> sorted_logits(static_cast<size_t>(params.top_k));
+        std::vector<int> sorted_ids(static_cast<size_t>(params.top_k));
+        for (int i = 0; i < params.top_k; ++i)
+        {
+            sorted_logits[static_cast<size_t>(i)] = sorted[static_cast<size_t>(i)].first;
+            sorted_ids[static_cast<size_t>(i)] = sorted[static_cast<size_t>(i)].second;
+        }
+
+        std::vector<float> scratch(static_cast<size_t>(params.top_k), 0.0f);
+        std::vector<int> expected_ids(static_cast<size_t>(params.top_k), -1);
+        std::vector<float> expected_probs(static_cast<size_t>(params.top_k), 0.0f);
+        sampling_math::build_topk_topp_distribution_from_sorted(
+            sorted_logits.data(),
+            sorted_ids.data(),
+            params.top_k,
+            params.top_p,
+            params.temperature,
+            expected_ids.data(),
+            expected_probs.data(),
+            scratch.data());
+
+        const auto distribution =
+            sampler_->compute_distribution(logits.data(), logits.size(), params);
+
+        size_t expected_active = 0;
+        for (int i = 0; i < params.top_k; ++i)
+        {
+            if (expected_ids[static_cast<size_t>(i)] < 0)
+            {
+                continue;
+            }
+            ASSERT_LT(expected_active, distribution.size());
+            EXPECT_EQ(distribution[expected_active].token_id, expected_ids[static_cast<size_t>(i)]);
+            EXPECT_NEAR(distribution[expected_active].probability,
+                        expected_probs[static_cast<size_t>(i)],
+                        1e-6f);
+            ++expected_active;
+        }
+        EXPECT_EQ(distribution.size(), expected_active);
     }
 
     TEST_F(SamplerTest, SharedSamplingMathSpeculativeVerifyMatchesSamplerHelpers)

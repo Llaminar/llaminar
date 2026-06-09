@@ -37,6 +37,12 @@ namespace llaminar2
         verifier_state_capture_size_ = state_size;
     }
 
+    void CPUShortConvolution::bindSpeculativeStateWorkspace(float *workspace, int state_size)
+    {
+        speculative_state_work_ = workspace;
+        speculative_state_work_size_ = state_size;
+    }
+
     bool CPUShortConvolution::restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream)
     {
         if (row < 0 || row >= verifier_state_capture_rows_)
@@ -50,6 +56,26 @@ namespace llaminar2
             stream);
     }
 
+    float *CPUShortConvolution::prepareSpeculativeState(float *live_state, int state_floats)
+    {
+        if (!live_state || state_floats <= 0)
+            return nullptr;
+
+        float *work = nullptr;
+        if (speculative_state_work_ && speculative_state_work_size_ >= state_floats)
+        {
+            work = speculative_state_work_;
+        }
+        else
+        {
+            owned_speculative_state_work_.resize(static_cast<size_t>(state_floats));
+            work = owned_speculative_state_work_.data();
+            speculative_state_work_size_ = std::max(speculative_state_work_size_, state_floats);
+        }
+
+        std::memcpy(work, live_state, static_cast<size_t>(state_floats) * sizeof(float));
+        return work;
+    }
 
     bool CPUShortConvolution::forward(
         const float *input, const float *weight, const float *bias,
@@ -57,6 +83,27 @@ namespace llaminar2
         int seq_len, int channels, int kernel_size,
         bool apply_silu)
     {
+        const int state_len = kernel_size - 1;
+        const int state_floats = channels * std::max(0, state_len);
+        const bool verifier_capture_active =
+            verifier_state_capture_ &&
+            verifier_state_capture_rows_ > 0 &&
+            verifier_state_capture_size_ >= state_floats &&
+            state_floats > 0;
+        if (verifier_capture_active)
+        {
+            float *speculative_state = prepareSpeculativeState(conv_state, state_floats);
+            if (!speculative_state)
+                return false;
+            return forwardWithStateSnapshots(
+                input, weight, bias, output, speculative_state,
+                seq_len, channels, kernel_size,
+                verifier_state_capture_,
+                verifier_state_capture_size_,
+                verifier_state_capture_rows_,
+                apply_silu);
+        }
+
         if (seq_len == 1)
         {
             return executeDecode(input, weight, bias, output, conv_state,

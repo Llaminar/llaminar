@@ -878,6 +878,125 @@ namespace
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
+    TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_AllFormatsMatchSerialDecodeRows)
+    {
+        const int K = 1024;
+        const int N = 4096;
+        const std::array<int, 3> verifier_rows = {2, 3, 4};
+
+        for (const auto &fmt : ALL_FORMATS)
+        {
+            auto weights = createWeightsForFormat(fmt.name, N, K);
+            ASSERT_NE(weights, nullptr) << "Failed to create " << fmt.name << " weights";
+
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid()) << fmt.name << " failed to pack";
+
+            for (int M : verifier_rows)
+            {
+                SCOPED_TRACE(fmt.name + std::string(" M=") + std::to_string(M));
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f,
+                    static_cast<uint32_t>(1700 + M + fmt.name.size()));
+                ASSERT_NE(input, nullptr);
+
+                FP32Tensor batched({static_cast<size_t>(M), static_cast<size_t>(N)});
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), &batched, M, N, K))
+                    << fmt.name << " batched verifier GEMM failed at M=" << M;
+
+                std::vector<float> serial(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+                for (int row = 0; row < M; ++row)
+                {
+                    ASSERT_TRUE(multiplyViaTensor(
+                        kernel,
+                        input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        serial.data() + static_cast<size_t>(row) * static_cast<size_t>(N),
+                        1,
+                        N,
+                        K))
+                        << fmt.name << " serial decode GEMV failed at M=" << M
+                        << " row=" << row;
+                }
+
+                const size_t count = static_cast<size_t>(M) * static_cast<size_t>(N);
+                const float cos = cosineSimilarity(batched.data(), serial.data(), count);
+                const float max_err = maxAbsError(batched.data(), serial.data(), count);
+                EXPECT_GE(cos, 0.999999f)
+                    << fmt.name << " M=" << M
+                    << " batched small-M verifier differs from serial decode rows";
+                EXPECT_LE(max_err, 1e-5f)
+                    << fmt.name << " M=" << M
+                    << " batched small-M verifier max error differs from serial decode rows";
+            }
+        }
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_Qwen36ShapesMatchSerialDecodeRows)
+    {
+        struct Shape
+        {
+            const char *name;
+            const char *format;
+            int N;
+            int K;
+            int M;
+        };
+
+        static const std::array<Shape, 6> shapes = {{
+            {"DenseGDNInner_Q4_K", "Q4_K", 10240, 5120, 2},
+            {"DenseGDNZ_Q4_K", "Q4_K", 6144, 5120, 2},
+            {"DenseGDNOut_Q4_K", "Q4_K", 5120, 6144, 4},
+            {"MoEGateUp_IQ2_S", "IQ2_S", 512, 256, 2},
+            {"MoEDown_IQ4_XS", "IQ4_XS", 256, 512, 2},
+            {"MoEBlock_IQ3_S", "IQ3_S", 7168, 5120, 2},
+        }};
+
+        for (const auto &shape : shapes)
+        {
+            SCOPED_TRACE(shape.name);
+            auto weights = createWeightsForFormat(
+                shape.format,
+                static_cast<size_t>(shape.N),
+                static_cast<size_t>(shape.K));
+            ASSERT_NE(weights, nullptr) << "Failed to create " << shape.format
+                                        << " weights for " << shape.name;
+
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid()) << shape.name << " failed to pack";
+
+            auto input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(shape.M), static_cast<size_t>(shape.K)}, -1.0f, 1.0f,
+                static_cast<uint32_t>(2200 + shape.N + shape.K + shape.M));
+            ASSERT_NE(input, nullptr);
+
+            FP32Tensor batched({static_cast<size_t>(shape.M), static_cast<size_t>(shape.N)});
+            ASSERT_TRUE(kernel.multiply_tensor(input.get(), &batched, shape.M, shape.N, shape.K))
+                << shape.name << " batched verifier GEMM failed";
+
+            std::vector<float> serial(
+                static_cast<size_t>(shape.M) * static_cast<size_t>(shape.N), 0.0f);
+            for (int row = 0; row < shape.M; ++row)
+            {
+                ASSERT_TRUE(multiplyViaTensor(
+                    kernel,
+                    input->data() + static_cast<size_t>(row) * static_cast<size_t>(shape.K),
+                    serial.data() + static_cast<size_t>(row) * static_cast<size_t>(shape.N),
+                    1,
+                    shape.N,
+                    shape.K))
+                    << shape.name << " serial decode GEMV failed at row=" << row;
+            }
+
+            const size_t count = static_cast<size_t>(shape.M) * static_cast<size_t>(shape.N);
+            const float cos = cosineSimilarity(batched.data(), serial.data(), count);
+            const float max_err = maxAbsError(batched.data(), serial.data(), count);
+            EXPECT_GE(cos, 0.999999f)
+                << shape.name << " batched small-M verifier differs from serial decode rows";
+            EXPECT_LE(max_err, 1e-5f)
+                << shape.name << " batched small-M verifier max error differs from serial decode rows";
+        }
+    }
+
     // =========================================================================
     // Full shape sweep across ALL formats
     // =========================================================================

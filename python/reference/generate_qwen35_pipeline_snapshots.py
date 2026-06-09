@@ -148,6 +148,7 @@ def run_prefill_and_decode(
     save_snapshots: bool = True,
     save_prefill_snapshots: bool = True,
     save_decode_snapshots: bool = True,
+    snapshot_decode_steps: Optional[Set[int]] = None,
 ):
     """
     Run prefill + optional decode steps with snapshot capture.
@@ -202,6 +203,9 @@ def run_prefill_and_decode(
     for step in range(decode_steps):
         prefix = f"decode_step{step}"
         print(f"\n[Decode step {step}] token={next_token}")
+        capture_this_decode_step = (
+            snapshot_decode_steps is None or step in snapshot_decode_steps
+        )
 
         # Single-token forward using cache. Snapshots from this step have
         # shape [1, 1, H] (one new position), matching what Llaminar's
@@ -211,10 +215,12 @@ def run_prefill_and_decode(
             clear_snapshots=True,
             past_key_values=cache,
             use_cache=True,
-            capture_stages=None if save_snapshots and save_decode_snapshots else [],
+            capture_stages=None
+            if save_snapshots and save_decode_snapshots and capture_this_decode_step
+            else [],
         )
         cache = result.get("past_key_values")
-        if save_snapshots and save_decode_snapshots:
+        if save_snapshots and save_decode_snapshots and capture_this_decode_step:
             step_snaps = model.get_snapshots()
             n = save_snapshots_as_npy(step_snaps, output_dir, prefix=prefix, verbose=verbose)
             total += n
@@ -288,6 +294,16 @@ Examples:
         action="store_true",
         help="Save decode-step snapshots but skip prefill snapshots",
     )
+    parser.add_argument(
+        "--snapshot-decode-steps",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated decode step indices to save when decode snapshots "
+            "are enabled. Forward still runs through all decode steps so cache "
+            "state is correct, but only selected steps are written."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -301,6 +317,27 @@ Examples:
     print(f"  Decode steps: {args.decode_steps}")
     print(f"  Metadata only: {args.metadata_only}")
     print(f"  Decode snapshots only: {args.decode_snapshots_only}")
+    print(f"  Snapshot decode steps: {args.snapshot_decode_steps or '<all>'}")
+
+    snapshot_decode_steps: Optional[Set[int]] = None
+    if args.snapshot_decode_steps:
+        snapshot_decode_steps = set()
+        for raw_part in args.snapshot_decode_steps.split(","):
+            part = raw_part.strip()
+            if not part:
+                continue
+            try:
+                step = int(part)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid --snapshot-decode-steps entry: {part!r}"
+                ) from exc
+            if step < 0 or step >= args.decode_steps:
+                raise ValueError(
+                    f"Snapshot decode step {step} is outside decode range "
+                    f"[0, {args.decode_steps})"
+                )
+            snapshot_decode_steps.add(step)
 
     # Create and load model via registry
     print("\nLoading model...")
@@ -317,6 +354,7 @@ Examples:
         save_snapshots=not args.metadata_only,
         save_prefill_snapshots=not args.decode_snapshots_only,
         save_decode_snapshots=True,
+        snapshot_decode_steps=snapshot_decode_steps,
     )
 
     # Write metadata

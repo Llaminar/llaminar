@@ -660,6 +660,14 @@ namespace llaminar2
                    total_tokens <= 4 &&
                    (config_.compute_all_position_logits || mtp_sidecar_context);
         };
+        auto forceCPUDecodeEquivalentMoEVerifier = [&](DeviceId candidate)
+        {
+            return candidate.is_cpu() &&
+                   total_tokens > 1 &&
+                   total_tokens <= 4 &&
+                   config_.compute_all_position_logits &&
+                   !mtp_sidecar_context;
+        };
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
         auto overlay_runtime_plan = runtimePlanForGraph(config_);
@@ -823,6 +831,8 @@ namespace llaminar2
                 expert_params.moe_runtime_table = moe_runtime_table;
                 expert_params.force_grouped_verifier_prefill_for_decode =
                     forceCudaSmallMMoEPrefill(stage_device) && total_tokens == 1;
+                expert_params.force_decode_equivalent_verifier_prefill =
+                    forceCPUDecodeEquivalentMoEVerifier(stage_device);
 
                 if (config_.moe.expert_mode == MoEExpertMode::ExpertParallel &&
                     expert_params.expert_mask.empty())
@@ -1437,6 +1447,8 @@ namespace llaminar2
             shared_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
             shared_params.force_grouped_verifier_prefill_for_decode =
                 forceCudaSmallMMoEPrefill(shared_device);
+            shared_params.force_decode_equivalent_verifier_prefill =
+                forceCPUDecodeEquivalentMoEVerifier(shared_device);
             shared_params.prepared_ref_gate = preparedRefForGraphWeight(
                 layer_bindings.shared_expert_gate, shared_device);
             shared_params.prepared_ref_up = preparedRefForGraphWeight(

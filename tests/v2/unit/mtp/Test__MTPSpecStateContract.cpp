@@ -409,6 +409,30 @@ TEST(Test__MTPSpecStateContract, PublisherFailsAtomicallyWhenStageRestoreFails)
     EXPECT_THAT(failed.restored_rows, ElementsAre(0));
 }
 
+TEST(Test__MTPSpecStateContract, PublisherReportsFirstFailedStageOnCPUParallelRestore)
+{
+    FakeVerifierStateStage captured0(/*captures=*/true);
+    FakeVerifierStateStage failed1(/*captures=*/true, /*restore_ok=*/false);
+    FakeVerifierStateStage failed2(/*captures=*/true, /*restore_ok=*/false);
+    FakeVerifierStateStage skipped(/*captures=*/false);
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecState(
+            publishPlan(/*accepted_count=*/3),
+            {&captured0, &failed1, &skipped, &failed2},
+            DeviceId::cpu(),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("failed restoring verifier row 2"));
+    EXPECT_THAT(result.error, HasSubstr("index 1"));
+    EXPECT_THAT(captured0.restored_rows, ElementsAre(2));
+    EXPECT_THAT(failed1.restored_rows, ElementsAre(2));
+    EXPECT_TRUE(skipped.restored_rows.empty());
+    EXPECT_THAT(failed2.restored_rows, ElementsAre(2));
+}
+
 TEST(Test__MTPSpecStateContract, GraphPublisherRestoresCapturedStagesInExecutionOrder)
 {
     auto captured0 = std::make_unique<FakeVerifierStateStage>(/*captures=*/true);

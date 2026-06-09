@@ -25,6 +25,11 @@ namespace
 #define QWEN36_DENSE_PREFIX_MTP_CASE cpuSingleDeviceCase
 #include "Qwen36DenseSingleDevicePrefixMTPParityTests.inc"
 
+TEST(Qwen36CPUSingleDevicePrefixMTPParity, NoMTPBenchmarkPromptKnownWindowPyTorchTokenParity)
+{
+    runDenseBenchmarkPromptKnownWindowPyTorchTokenParity(cpuSingleDeviceCase());
+}
+
 int main(int argc, char **argv)
 {
     int provided;

@@ -19,9 +19,11 @@
 #include "../HybridKVCacheConfig.h"
 #include "../IHybridKVCache.h"
 #include "../../tensors/TensorKernels.h"
+#include "../../utils/OpenMPUtils.h"
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace llaminar2
 {
@@ -492,6 +494,47 @@ namespace llaminar2
         HybridLayerMap layer_map_;
         std::vector<HybridGDNLayerState> gdn_states_;
 
+        struct HostStateCopySpan
+        {
+            uint8_t *dst = nullptr;
+            const uint8_t *src = nullptr;
+            size_t bytes = 0;
+        };
+
+        static constexpr size_t kParallelHostStateCopyThresholdBytes = 1u << 20;
+
+        static bool copyHostStateSpans(const std::vector<HostStateCopySpan> &spans)
+        {
+            size_t total_bytes = 0;
+            for (const auto &span : spans)
+            {
+                if (span.bytes == 0)
+                    continue;
+                if (!span.dst || !span.src)
+                    return false;
+                total_bytes += span.bytes;
+            }
+
+            if (total_bytes == 0)
+                return true;
+
+            const bool parallel =
+                total_bytes >= kParallelHostStateCopyThresholdBytes &&
+                spans.size() > 1;
+            auto copy_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int i = 0; i < static_cast<int>(spans.size()); ++i)
+                {
+                    const auto &span = spans[static_cast<size_t>(i)];
+                    if (span.bytes > 0)
+                        std::memcpy(span.dst, span.src, span.bytes);
+                }
+            };
+            OMP_WORKSHARE_REGION_IF(copy_work, parallel);
+            return true;
+        }
+
         int normalizeLayerIndex(int layer) const
         {
             if (layer >= first_layer_index_ &&
@@ -535,6 +578,9 @@ namespace llaminar2
             bool include_host_state = true,
             bool include_device_state = true) const
         {
+            std::vector<HostStateCopySpan> host_spans;
+            uint8_t *host_base = host_cursor;
+            size_t host_offset = 0;
             for (int layer = 0; layer < total_layers_; ++layer)
             {
                 const auto *state = getGDNState(layer);
@@ -545,13 +591,25 @@ namespace llaminar2
                 const size_t conv_bytes = state->conv_state.size() * sizeof(float);
                 if (include_host_state && recurrence_bytes > 0)
                 {
-                    std::memcpy(host_cursor, state->recurrence_state.data(), recurrence_bytes);
-                    host_cursor += recurrence_bytes;
+                    if (!host_base)
+                        return false;
+                    host_spans.push_back(
+                        HostStateCopySpan{
+                            host_base + host_offset,
+                            reinterpret_cast<const uint8_t *>(state->recurrence_state.data()),
+                            recurrence_bytes});
+                    host_offset += recurrence_bytes;
                 }
                 if (include_host_state && conv_bytes > 0)
                 {
-                    std::memcpy(host_cursor, state->conv_state.data(), conv_bytes);
-                    host_cursor += conv_bytes;
+                    if (!host_base)
+                        return false;
+                    host_spans.push_back(
+                        HostStateCopySpan{
+                            host_base + host_offset,
+                            reinterpret_cast<const uint8_t *>(state->conv_state.data()),
+                            conv_bytes});
+                    host_offset += conv_bytes;
                 }
 
                 if (include_device_state && state->conv_kernel)
@@ -575,6 +633,12 @@ namespace llaminar2
                     }
                 }
             }
+            if (include_host_state)
+            {
+                if (!copyHostStateSpans(host_spans))
+                    return false;
+                host_cursor = host_base + host_offset;
+            }
             return true;
         }
 
@@ -585,6 +649,9 @@ namespace llaminar2
             bool include_host_state = true,
             bool include_device_state = true)
         {
+            std::vector<HostStateCopySpan> host_spans;
+            const uint8_t *host_base = host_cursor;
+            size_t host_offset = 0;
             for (int layer = 0; layer < total_layers_; ++layer)
             {
                 auto *state = getGDNState(layer);
@@ -595,13 +662,25 @@ namespace llaminar2
                 const size_t conv_bytes = state->conv_state.size() * sizeof(float);
                 if (include_host_state && recurrence_bytes > 0)
                 {
-                    std::memcpy(state->recurrence_state.data(), host_cursor, recurrence_bytes);
-                    host_cursor += recurrence_bytes;
+                    if (!host_base)
+                        return false;
+                    host_spans.push_back(
+                        HostStateCopySpan{
+                            reinterpret_cast<uint8_t *>(state->recurrence_state.data()),
+                            host_base + host_offset,
+                            recurrence_bytes});
+                    host_offset += recurrence_bytes;
                 }
                 if (include_host_state && conv_bytes > 0)
                 {
-                    std::memcpy(state->conv_state.data(), host_cursor, conv_bytes);
-                    host_cursor += conv_bytes;
+                    if (!host_base)
+                        return false;
+                    host_spans.push_back(
+                        HostStateCopySpan{
+                            reinterpret_cast<uint8_t *>(state->conv_state.data()),
+                            host_base + host_offset,
+                            conv_bytes});
+                    host_offset += conv_bytes;
                 }
 
                 if (include_device_state && state->conv_kernel)
@@ -624,6 +703,12 @@ namespace llaminar2
                         device_cursor += bytes;
                     }
                 }
+            }
+            if (include_host_state)
+            {
+                if (!copyHostStateSpans(host_spans))
+                    return false;
+                host_cursor = host_base + host_offset;
             }
             return true;
         }

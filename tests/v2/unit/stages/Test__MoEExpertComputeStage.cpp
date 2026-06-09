@@ -220,6 +220,40 @@ protected:
         return std::make_shared<Q5_KTensor>(shape, raw);
     }
 
+    /// Create a 3D IQ3_S expert tensor in GGUF layout [cols, rows, num_experts].
+    std::shared_ptr<IQ3_STensor> createExpertIQ3S(int num_experts, int rows, int cols, uint32_t seed = 42)
+    {
+        std::vector<size_t> shape = {static_cast<size_t>(cols),
+                                     static_cast<size_t>(rows),
+                                     static_cast<size_t>(num_experts)};
+        size_t blocks_per_row = (static_cast<size_t>(cols) + IQ3_SBlock::BLOCK_SIZE - 1) /
+                                IQ3_SBlock::BLOCK_SIZE;
+        size_t total_blocks = static_cast<size_t>(num_experts) *
+                              static_cast<size_t>(rows) *
+                              blocks_per_row;
+        std::vector<uint8_t> raw(total_blocks * sizeof(IQ3_SBlock));
+
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> dist(0.0f, 0.1f);
+
+        auto *blocks = reinterpret_cast<IQ3_SBlock *>(raw.data());
+        for (size_t i = 0; i < total_blocks; ++i)
+        {
+            float max_abs = 0.0f;
+            for (size_t j = 0; j < IQ3_SBlock::BLOCK_SIZE; ++j)
+                max_abs = std::max(max_abs, std::abs(dist(rng)));
+
+            blocks[i].d = fp32_to_fp16(std::max(max_abs / 3.5f, 1e-6f));
+            std::memset(blocks[i].qh, 0, sizeof(blocks[i].qh));
+            std::memset(blocks[i].signs, 0, sizeof(blocks[i].signs));
+            std::memset(blocks[i].scales, 0x44, sizeof(blocks[i].scales));
+            for (uint8_t &q : blocks[i].qs)
+                q = static_cast<uint8_t>(rng() & 0xFF);
+        }
+
+        return std::make_shared<IQ3_STensor>(shape, raw);
+    }
+
     /// Compute reference SwiGLU: silu(gate) * up, where silu(x) = x * sigmoid(x)
     static float silu(float x)
     {
@@ -239,6 +273,27 @@ protected:
         for (int i = 0; i < n; ++i)
             sum += a[i] * b[i];
         return sum;
+    }
+
+    static float maxAbsDiff(const float *a, const float *b, size_t n)
+    {
+        float max_diff = 0.0f;
+        for (size_t i = 0; i < n; ++i)
+            max_diff = std::max(max_diff, std::abs(a[i] - b[i]));
+        return max_diff;
+    }
+
+    static float relativeL2(const float *a, const float *b, size_t n)
+    {
+        double diff = 0.0;
+        double ref = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+            diff += d * d;
+            ref += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+        }
+        return ref > 0.0 ? static_cast<float>(std::sqrt(diff / ref)) : 0.0f;
     }
     /// Compute routing results and return as FP32 tensors for MoEExpertComputeStage input.
     /// Runs IMoEKernel::route() directly, converts indices to float.
@@ -787,6 +842,149 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_MultipleTokens)
         }
         EXPECT_TRUE(token_nonzero) << "Token " << t << " output is all zeros";
     }
+}
+
+TEST_F(MoEExpertComputeStageTest, SharedExpert_TwoRowVerifierMatchesSerialDecode)
+{
+    const int seq = 2;
+    const int d = 256;
+    const int inter = 256;
+
+    auto input = TestTensorFactory::createFP32Random({seq, d}, -0.5f, 0.5f, 700);
+    auto gate_w = TestTensorFactory::createIQ3_SRandom({static_cast<size_t>(inter), static_cast<size_t>(d)}, 701);
+    auto up_w = TestTensorFactory::createIQ3_SRandom({static_cast<size_t>(inter), static_cast<size_t>(d)}, 702);
+    auto down_w = TestTensorFactory::createIQ3_SRandom({static_cast<size_t>(d), static_cast<size_t>(inter)}, 703);
+    auto multi_output = TestTensorFactory::createFP32({seq, d});
+    auto serial_output = TestTensorFactory::createFP32({seq, d});
+
+    auto run_shared = [&](TensorBase *run_input, TensorBase *run_output, int run_seq, int layer)
+    {
+        auto prepared = makePreparedFFNFixture(
+            gate_w.get(), up_w.get(), down_w.get(), DeviceId::cpu(), layer, "ffn_shexp");
+
+        SharedExpertFFNStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.input = run_input;
+        params.gate_w = gate_w.get();
+        params.up_w = up_w.get();
+        params.down_w = down_w.get();
+        params.output = run_output;
+        params.seq_len = run_seq;
+        params.d_model = d;
+        params.intermediate = inter;
+        params.prepared_ref_gate = prepared.gate_ref;
+        params.prepared_ref_up = prepared.up_ref;
+        params.prepared_ref_down = prepared.down_ref;
+        params.prepared_store = prepared.store.get();
+        params.force_decode_equivalent_verifier_prefill = run_seq > 1;
+
+        SharedExpertFFNStage stage(params);
+        if (run_seq > 1)
+            EXPECT_TRUE(stage.usesCPUDecodeEquivalentVerifierPrefillForTesting());
+        return stage.execute(cpu_ctx_.get());
+    };
+
+    ASSERT_TRUE(run_shared(input.get(), multi_output.get(), seq, 10));
+
+    for (int row = 0; row < seq; ++row)
+    {
+        FP32Tensor row_input({1, static_cast<size_t>(d)});
+        FP32Tensor row_output({1, static_cast<size_t>(d)});
+        std::copy_n(input->data() + static_cast<size_t>(row) * d,
+                    d,
+                    row_input.mutable_data());
+        ASSERT_TRUE(run_shared(&row_input, &row_output, 1, 20 + row));
+        std::copy_n(row_output.data(),
+                    d,
+                    serial_output->mutable_data() + static_cast<size_t>(row) * d);
+    }
+
+    const size_t count = static_cast<size_t>(seq) * d;
+    EXPECT_LT(relativeL2(multi_output->data(), serial_output->data(), count), 1e-5f);
+    EXPECT_LT(maxAbsDiff(multi_output->data(), serial_output->data(), count), 1e-4f);
+}
+
+TEST_F(MoEExpertComputeStageTest, MoEFFN_TwoRowVerifierMatchesSerialDecode_IQ3S)
+{
+    const int d = 256;
+    const int inter = 256;
+    const int seq = 2;
+    const int experts = 4;
+    const int topk = 2;
+
+    auto input = TestTensorFactory::createFP32Random({seq, d}, -0.5f, 0.5f, 720);
+    auto gate_weights = TestTensorFactory::createFP32Random({experts, d}, -0.1f, 0.1f, 721);
+    auto multi_output = TestTensorFactory::createFP32({seq, d});
+    auto serial_output = TestTensorFactory::createFP32({seq, d});
+
+    auto gate_exps = createExpertIQ3S(experts, inter, d, 730);
+    auto up_exps = createExpertIQ3S(experts, inter, d, 731);
+    auto down_exps = createExpertIQ3S(experts, d, inter, 732);
+
+    auto routing = computeRouting(input.get(), gate_weights.get(), seq, d, experts, topk);
+
+    auto run_moe = [&](TensorBase *run_input,
+                       TensorBase *run_indices,
+                       TensorBase *run_weights,
+                       TensorBase *run_output,
+                       int run_seq)
+    {
+        MoEExpertComputeStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.input = run_input;
+        params.routing_indices = run_indices;
+        params.routing_weights = run_weights;
+        params.gate_exps = gate_exps.get();
+        params.up_exps = up_exps.get();
+        params.down_exps = down_exps.get();
+        params.output = run_output;
+        params.seq_len = run_seq;
+        params.d_model = d;
+        params.num_experts = experts;
+        params.top_k = topk;
+        params.expert_intermediate = inter;
+        params.force_decode_equivalent_verifier_prefill = run_seq > 1;
+
+        if (!MoEExpertComputeStage::extractExpertViews(params))
+            return false;
+        if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
+            return false;
+        MoEExpertComputeStage stage(params);
+        return stage.execute(cpu_ctx_.get());
+    };
+
+    ASSERT_TRUE(run_moe(input.get(),
+                        routing.indices.get(),
+                        routing.weights.get(),
+                        multi_output.get(),
+                        seq));
+
+    for (int row = 0; row < seq; ++row)
+    {
+        FP32Tensor row_input({1, static_cast<size_t>(d)});
+        FP32Tensor row_indices({static_cast<size_t>(topk), 1});
+        FP32Tensor row_weights({static_cast<size_t>(topk), 1});
+        FP32Tensor row_output({1, static_cast<size_t>(d)});
+
+        std::copy_n(input->data() + static_cast<size_t>(row) * d,
+                    d,
+                    row_input.mutable_data());
+        std::copy_n(routing.indices->data() + static_cast<size_t>(row) * topk,
+                    topk,
+                    row_indices.mutable_data());
+        std::copy_n(routing.weights->data() + static_cast<size_t>(row) * topk,
+                    topk,
+                    row_weights.mutable_data());
+
+        ASSERT_TRUE(run_moe(&row_input, &row_indices, &row_weights, &row_output, 1));
+        std::copy_n(row_output.data(),
+                    d,
+                    serial_output->mutable_data() + static_cast<size_t>(row) * d);
+    }
+
+    const size_t count = static_cast<size_t>(seq) * d;
+    EXPECT_LT(relativeL2(multi_output->data(), serial_output->data(), count), 1e-5f);
+    EXPECT_LT(maxAbsDiff(multi_output->data(), serial_output->data(), count), 1e-4f);
 }
 
 TEST_F(MoEExpertComputeStageTest, MoEFFN_NullWeightsReturnsError)

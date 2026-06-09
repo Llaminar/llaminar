@@ -6,6 +6,7 @@
  */
 
 #include "Sampler.h"
+#include "kernels/cpu/sampling/CPUSamplerPrimitives.h"
 #include "kernels/common/SamplingMath.h"
 #include <limits>
 #include <stdexcept>
@@ -218,15 +219,18 @@ namespace llaminar2
             throw std::invalid_argument("Cannot build distribution from empty logits");
         }
 
-        std::vector<float> logits_vec(logits, logits + vocab_size);
+        const float *effective_logits = logits;
+        std::vector<float> logits_vec;
         if (params.has_penalties())
         {
+            logits_vec.assign(logits, logits + vocab_size);
             apply_penalties(logits_vec, params);
+            effective_logits = logits_vec.data();
         }
 
         if (params.is_greedy())
         {
-            return {{sample_greedy(logits_vec), 1.0f}};
+            return {{sample_greedy(effective_logits, vocab_size), 1.0f}};
         }
 
         float temperature = params.temperature;
@@ -239,38 +243,27 @@ namespace llaminar2
             params.top_k <= sampling_math::kMaxTopK &&
             params.top_k <= static_cast<int>(vocab_size))
         {
-            std::vector<std::pair<float, int>> candidates;
-            candidates.reserve(vocab_size);
-            for (size_t i = 0; i < vocab_size; ++i)
-            {
-                candidates.emplace_back(logits_vec[i], static_cast<int>(i));
-            }
-
-            const int k = std::min<int>(params.top_k, static_cast<int>(candidates.size()));
-            std::partial_sort(
-                candidates.begin(),
-                candidates.begin() + k,
-                candidates.end(),
-                [](const auto &a, const auto &b)
-                {
-                    return a.first > b.first;
-                });
-
+            const int k = params.top_k;
             std::vector<float> sorted_logits(static_cast<size_t>(k));
             std::vector<int> sorted_ids(static_cast<size_t>(k));
-            for (int i = 0; i < k; ++i)
+            const int selected = cpu_sampling::select_topk(
+                effective_logits,
+                static_cast<int>(vocab_size),
+                k,
+                sorted_logits.data(),
+                sorted_ids.data());
+            if (selected <= 0)
             {
-                sorted_logits[static_cast<size_t>(i)] = candidates[static_cast<size_t>(i)].first;
-                sorted_ids[static_cast<size_t>(i)] = candidates[static_cast<size_t>(i)].second;
+                return {{sample_greedy(effective_logits, vocab_size), 1.0f}};
             }
 
-            std::vector<float> scratch(static_cast<size_t>(k), 0.0f);
-            std::vector<int> out_ids(static_cast<size_t>(k), -1);
-            std::vector<float> out_probs(static_cast<size_t>(k), 0.0f);
+            std::vector<float> scratch(static_cast<size_t>(selected), 0.0f);
+            std::vector<int> out_ids(static_cast<size_t>(selected), -1);
+            std::vector<float> out_probs(static_cast<size_t>(selected), 0.0f);
             sampling_math::build_topk_topp_distribution_from_sorted(
                 sorted_logits.data(),
                 sorted_ids.data(),
-                k,
+                selected,
                 params.top_p,
                 temperature,
                 out_ids.data(),
@@ -278,8 +271,8 @@ namespace llaminar2
                 scratch.data());
 
             std::vector<SamplingDistributionEntry> distribution;
-            distribution.reserve(static_cast<size_t>(k));
-            for (int i = 0; i < k; ++i)
+            distribution.reserve(static_cast<size_t>(selected));
+            for (int i = 0; i < selected; ++i)
             {
                 if (out_ids[static_cast<size_t>(i)] >= 0 &&
                     out_probs[static_cast<size_t>(i)] > 0.0f)
@@ -300,7 +293,7 @@ namespace llaminar2
         candidates.reserve(vocab_size);
         for (size_t i = 0; i < vocab_size; ++i)
         {
-            candidates.emplace_back(static_cast<int>(i), logits_vec[i] / temperature);
+            candidates.emplace_back(static_cast<int>(i), effective_logits[i] / temperature);
         }
 
         int candidate_count = static_cast<int>(candidates.size());

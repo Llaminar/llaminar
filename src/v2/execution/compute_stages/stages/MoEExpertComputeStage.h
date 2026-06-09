@@ -134,6 +134,7 @@ namespace llaminar2
             BufferId routing_indices_buffer_id = BufferId::MOE_EXPERT_INDICES;
             BufferId routing_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
             bool force_grouped_verifier_prefill_for_decode = false;
+            bool force_decode_equivalent_verifier_prefill = false;
 
             // Output
             TensorBase *output = nullptr; ///< Combined output [seq_len, d_model]
@@ -271,6 +272,10 @@ namespace llaminar2
 
         // Test accessor
         void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
+        bool usesCPUDecodeEquivalentVerifierPrefillForTesting() const
+        {
+            return params_.force_decode_equivalent_verifier_prefill;
+        }
 
     private:
         Params params_;
@@ -313,6 +318,7 @@ namespace llaminar2
         /// Fast path for decode (seq_len=1): avoids token grouping, gather/scatter,
         /// and per-expert heap allocations. Uses routing results directly.
         bool executeSingleToken(IDeviceContext *ctx);
+        bool executeCPUDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
 
         void ensureGemmEnginesCached();
         bool ensureGemmEnginesForExperts(const std::vector<int> &expert_ids);
@@ -378,6 +384,7 @@ namespace llaminar2
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
             bool force_grouped_verifier_prefill_for_decode = false;
+            bool force_decode_equivalent_verifier_prefill = false;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution
@@ -403,6 +410,7 @@ namespace llaminar2
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         bool usesGroupedVerifierPrefillRouteForTesting() const;
+        bool usesCPUDecodeEquivalentVerifierPrefillForTesting() const;
 
         // =====================================================================
         // IWorkspaceConsumer Implementation
@@ -435,14 +443,18 @@ namespace llaminar2
 
         mutable std::shared_ptr<FP32Tensor> scratch_gate_;
         mutable std::shared_ptr<FP32Tensor> scratch_up_;
+        mutable std::shared_ptr<FP32Tensor> scratch_input_row_;
+        mutable std::shared_ptr<FP32Tensor> scratch_output_row_;
         mutable int scratch_seq_len_ = 0;
 
         void ensureGemmEnginesCached() const;
         bool ensureSharedGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool ensureSharedGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool shouldUseGroupedVerifierPrefillRoute() const;
+        bool shouldUseCPUDecodeEquivalentVerifierPrefill() const;
         bool tryGroupedVerifierPrefill(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool tryGroupedDecode(IMoEKernel *kernel, int d_model, int intermediate) const;
+        bool executeCPUDecodeEquivalentVerifierPrefill(IMoEKernel *kernel, int d_model, int intermediate);
 
         mutable int shared_grouped_gateup_desc_table_id_ = -1;
         mutable int shared_grouped_gateup_desc_table_d_model_ = 0;

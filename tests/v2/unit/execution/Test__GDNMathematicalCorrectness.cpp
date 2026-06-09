@@ -1846,6 +1846,10 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
             d_v,
             /*use_qk_l2norm=*/true));
 
+        const float *chunk_row = chunk_output.data() + static_cast<size_t>(t) * n_heads * d_v;
+        std::vector<float> row_output(chunk_row, chunk_row + n_heads * d_v);
+        EXPECT_LT(maxAbsDiff(row_output, step_output), 2e-4f) << "output row " << t;
+
         const float *snapshot = snapshots.data() + static_cast<size_t>(t) * state_floats;
         std::vector<float> row_state(snapshot, snapshot + state_floats);
         EXPECT_LT(maxAbsDiff(row_state, recurrent_state), 2e-4f) << "snapshot row " << t;
@@ -1879,6 +1883,131 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
             /*use_qk_l2norm=*/true));
     }
     EXPECT_LT(maxAbsDiff(restored_state, accepted_replay_state), 2e-4f);
+}
+
+TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesLikeReplay)
+{
+    const int accepted_rows = 2;
+    const int continuation_rows = 3;
+    const int seq_len = accepted_rows + continuation_rows;
+    const int n_heads = 2;
+    const int d_k = 16;
+    const int d_v = 128;
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    const int state_floats = n_heads * d_k * d_v;
+
+    std::mt19937 rng(88889);
+    std::normal_distribution<float> activation_dist(0.0f, 0.08f);
+    std::normal_distribution<float> gate_dist(0.0f, 0.15f);
+    std::uniform_real_distribution<float> state_dist(-0.02f, 0.02f);
+
+    std::vector<float> q_data(seq_len * qk_stride);
+    std::vector<float> k_data(seq_len * qk_stride);
+    std::vector<float> v_data(seq_len * v_stride);
+    std::vector<float> alpha_data(seq_len * n_heads);
+    std::vector<float> beta_data(seq_len * n_heads);
+    std::vector<float> A_log(n_heads);
+    std::vector<float> dt_bias(n_heads);
+    std::vector<float> initial_state(state_floats);
+
+    for (auto &x : q_data)
+        x = activation_dist(rng);
+    for (auto &x : k_data)
+        x = activation_dist(rng);
+    for (auto &x : v_data)
+        x = activation_dist(rng);
+    for (auto &x : alpha_data)
+        x = gate_dist(rng);
+    for (auto &x : beta_data)
+        x = gate_dist(rng);
+    for (auto &x : initial_state)
+        x = state_dist(rng);
+    for (int h = 0; h < n_heads; ++h)
+    {
+        A_log[h] = -std::exp(gate_dist(rng));
+        dt_bias[h] = gate_dist(rng);
+    }
+
+    CPUGatedDeltaNet verifier_kernel;
+    std::vector<float> verifier_state = initial_state;
+    std::vector<float> verifier_output(seq_len * v_stride);
+    std::vector<float> snapshots(static_cast<size_t>(seq_len) * state_floats);
+    ASSERT_TRUE(verifier_kernel.chunkForwardWithStateSnapshots(
+        q_data.data(),
+        k_data.data(),
+        v_data.data(),
+        alpha_data.data(),
+        beta_data.data(),
+        A_log.data(),
+        dt_bias.data(),
+        verifier_output.data(),
+        verifier_state.data(),
+        seq_len,
+        n_heads,
+        d_k,
+        d_v,
+        /*chunk_size=*/64,
+        /*use_qk_l2norm=*/true,
+        snapshots.data(),
+        state_floats,
+        seq_len));
+
+    std::vector<float> restored_state(state_floats);
+    ASSERT_TRUE(verifier_kernel.restoreStateFromSnapshot(
+        restored_state.data(),
+        snapshots.data(),
+        accepted_rows - 1,
+        state_floats,
+        state_floats));
+
+    CPUGatedDeltaNet restored_kernel;
+    std::vector<float> restored_continuation(continuation_rows * v_stride);
+    for (int row = 0; row < continuation_rows; ++row)
+    {
+        const int source_row = accepted_rows + row;
+        ASSERT_TRUE(restored_kernel.recurrent_step(
+            q_data.data() + static_cast<size_t>(source_row) * qk_stride,
+            k_data.data() + static_cast<size_t>(source_row) * qk_stride,
+            v_data.data() + static_cast<size_t>(source_row) * v_stride,
+            alpha_data.data() + static_cast<size_t>(source_row) * n_heads,
+            beta_data.data() + static_cast<size_t>(source_row) * n_heads,
+            A_log.data(),
+            dt_bias.data(),
+            restored_continuation.data() + static_cast<size_t>(row) * v_stride,
+            restored_state.data(),
+            n_heads,
+            d_k,
+            d_v,
+            /*use_qk_l2norm=*/true));
+    }
+
+    CPUGatedDeltaNet replay_kernel;
+    std::vector<float> replay_state = initial_state;
+    std::vector<float> replay_output(seq_len * v_stride);
+    for (int row = 0; row < seq_len; ++row)
+    {
+        ASSERT_TRUE(replay_kernel.recurrent_step(
+            q_data.data() + static_cast<size_t>(row) * qk_stride,
+            k_data.data() + static_cast<size_t>(row) * qk_stride,
+            v_data.data() + static_cast<size_t>(row) * v_stride,
+            alpha_data.data() + static_cast<size_t>(row) * n_heads,
+            beta_data.data() + static_cast<size_t>(row) * n_heads,
+            A_log.data(),
+            dt_bias.data(),
+            replay_output.data() + static_cast<size_t>(row) * v_stride,
+            replay_state.data(),
+            n_heads,
+            d_k,
+            d_v,
+            /*use_qk_l2norm=*/true));
+    }
+
+    const std::vector<float> replay_continuation(
+        replay_output.begin() + static_cast<size_t>(accepted_rows) * v_stride,
+        replay_output.end());
+    EXPECT_LT(maxAbsDiff(restored_continuation, replay_continuation), 2e-4f);
+    EXPECT_LT(maxAbsDiff(restored_state, replay_state), 2e-4f);
 }
 
 TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotsRestoreAcceptedVerifierRows)
@@ -1942,6 +2071,11 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotsRestoreAcceptedVe
             channels,
             kernel_size,
             /*apply_silu=*/true));
+
+        const float *output_row = output.data() + static_cast<size_t>(t) * channels;
+        std::vector<float> row_output(output_row, output_row + channels);
+        EXPECT_LT(maxAbsDiff(row_output, decode_output), 1e-6f) << "output row " << t;
+
         const float *snapshot = snapshots.data() + static_cast<size_t>(t) * state_floats;
         std::vector<float> row_state(snapshot, snapshot + state_floats);
         EXPECT_EQ(maxAbsDiff(row_state, decode_state), 0.0f) << "snapshot row " << t;
@@ -1971,6 +2105,102 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotsRestoreAcceptedVe
             /*apply_silu=*/true));
     }
     EXPECT_EQ(maxAbsDiff(restored_state, accepted_replay_state), 0.0f);
+}
+
+TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotRestoreContinuesLikeReplay)
+{
+    const int accepted_rows = 2;
+    const int continuation_rows = 3;
+    const int seq_len = accepted_rows + continuation_rows;
+    const int channels = 19;
+    const int kernel_size = 4;
+    const int state_len = kernel_size - 1;
+    const int state_floats = channels * state_len;
+
+    std::mt19937 rng(100000);
+    std::normal_distribution<float> activation_dist(0.0f, 0.08f);
+    std::normal_distribution<float> weight_dist(0.0f, 0.03f);
+    std::uniform_real_distribution<float> state_dist(-0.05f, 0.05f);
+
+    std::vector<float> input(seq_len * channels);
+    std::vector<float> weight(channels * kernel_size);
+    std::vector<float> bias(channels);
+    std::vector<float> initial_state(state_floats);
+
+    for (auto &x : input)
+        x = activation_dist(rng);
+    for (auto &x : weight)
+        x = weight_dist(rng);
+    for (auto &x : bias)
+        x = weight_dist(rng);
+    for (auto &x : initial_state)
+        x = state_dist(rng);
+
+    CPUShortConvolution verifier_kernel;
+    std::vector<float> verifier_state = initial_state;
+    std::vector<float> verifier_output(seq_len * channels);
+    std::vector<float> snapshots(static_cast<size_t>(seq_len) * state_floats);
+    ASSERT_TRUE(verifier_kernel.forwardWithStateSnapshots(
+        input.data(),
+        weight.data(),
+        bias.data(),
+        verifier_output.data(),
+        verifier_state.data(),
+        seq_len,
+        channels,
+        kernel_size,
+        snapshots.data(),
+        state_floats,
+        seq_len,
+        /*apply_silu=*/true));
+
+    std::vector<float> restored_state(state_floats);
+    ASSERT_TRUE(verifier_kernel.restoreStateFromSnapshot(
+        restored_state.data(),
+        snapshots.data(),
+        accepted_rows - 1,
+        state_floats,
+        state_floats));
+
+    CPUShortConvolution restored_kernel;
+    std::vector<float> restored_continuation(continuation_rows * channels);
+    for (int row = 0; row < continuation_rows; ++row)
+    {
+        const int source_row = accepted_rows + row;
+        ASSERT_TRUE(restored_kernel.forward(
+            input.data() + static_cast<size_t>(source_row) * channels,
+            weight.data(),
+            bias.data(),
+            restored_continuation.data() + static_cast<size_t>(row) * channels,
+            restored_state.data(),
+            /*seq_len=*/1,
+            channels,
+            kernel_size,
+            /*apply_silu=*/true));
+    }
+
+    CPUShortConvolution replay_kernel;
+    std::vector<float> replay_state = initial_state;
+    std::vector<float> replay_output(seq_len * channels);
+    for (int row = 0; row < seq_len; ++row)
+    {
+        ASSERT_TRUE(replay_kernel.forward(
+            input.data() + static_cast<size_t>(row) * channels,
+            weight.data(),
+            bias.data(),
+            replay_output.data() + static_cast<size_t>(row) * channels,
+            replay_state.data(),
+            /*seq_len=*/1,
+            channels,
+            kernel_size,
+            /*apply_silu=*/true));
+    }
+
+    const std::vector<float> replay_continuation(
+        replay_output.begin() + static_cast<size_t>(accepted_rows) * channels,
+        replay_output.end());
+    EXPECT_EQ(maxAbsDiff(restored_continuation, replay_continuation), 0.0f);
+    EXPECT_EQ(maxAbsDiff(restored_state, replay_state), 0.0f);
 }
 
 TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotsUseRawInputForInPlacePrefill)
@@ -2033,6 +2263,11 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotsUseRawInputForInP
             channels,
             kernel_size,
             /*apply_silu=*/true));
+
+        const float *output_row = in_place_buffer.data() + static_cast<size_t>(t) * channels;
+        std::vector<float> row_output(output_row, output_row + channels);
+        EXPECT_LT(maxAbsDiff(row_output, decode_output), 1e-6f) << "output row " << t;
+
         const float *snapshot = snapshots.data() + static_cast<size_t>(t) * state_floats;
         std::vector<float> row_state(snapshot, snapshot + state_floats);
         EXPECT_EQ(maxAbsDiff(row_state, decode_state), 0.0f) << "snapshot row " << t;

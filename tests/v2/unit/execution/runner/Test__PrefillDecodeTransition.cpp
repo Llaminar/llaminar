@@ -2772,6 +2772,203 @@ namespace
         PerfStatsCollector::reset();
     }
 
+    TEST_F(Test__PrefillDecodeTransition, AllPositionSpecPublicationStochasticHostAcceptsOnCPU)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_all_position_stochastic_host_accept_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/false,
+                /*hide_local_logits=*/false,
+                DeviceId::cpu(),
+                /*mtp_draft_tokens=*/1,
+                /*chained_mtp_support=*/false,
+                /*sidecar_sample_fusion=*/false,
+                {},
+                MTPVerifyMode::SpeculativeSampling);
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPSpecStatePublication();
+            mock->setVerifierAcceptedPrefixScript({1});
+
+            SamplingParams sampling;
+            sampling.temperature = 0.8f;
+            sampling.top_k = 2;
+            sampling.top_p = 0.95f;
+            sampling.presence_penalty = 0.25f;
+            sampling.seed = 123;
+            runner->setSamplingParams(sampling);
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const int forward_count_after_prefill = mock->forwardCallCount();
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->setAllPositionCount(), 2);
+            EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "CPU host stochastic publication should run one all-position verifier forward.";
+            EXPECT_EQ(mock->restoreCount(), 0)
+                << "graph-native sidecar state lets CPU publish without restoring the verifier base.";
+            EXPECT_EQ(mock->deviceDistributionBuildCount(), 0);
+            EXPECT_EQ(mock->deviceDistributionSampleCount(), 0);
+            EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 0);
+            EXPECT_EQ(mock->applyMainPenaltiesCount(), 0);
+            EXPECT_EQ(mock->applyMTPPenaltiesCount(), 0);
+            EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 2);
+
+            const MTPSpecStepPlan &published = mock->lastPublishedMTPSpecStep();
+            EXPECT_EQ(published.accepted_count, 2);
+            EXPECT_EQ(published.target_cached_tokens, 7);
+            EXPECT_FALSE(published.requiresCorrectionReplay());
+            EXPECT_TRUE(published.hasBonusReadyToken());
+
+            const auto probe = runner->prefixStateProbe();
+            EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
+            EXPECT_EQ(probe.mtp_stochastic_accept_tests, 1u);
+            EXPECT_EQ(probe.mtp_stochastic_accepts, 1u);
+            EXPECT_EQ(probe.mtp_stochastic_terminal_samples, 1u);
+            EXPECT_EQ(probe.mtp_transaction_commits, 1u);
+            EXPECT_EQ(probe.mtp_transaction_rollbacks, 0u);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *host_target =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Timer,
+                               "all_position_stochastic_host_target_distribution");
+            ASSERT_NE(host_target, nullptr);
+            const PerfStatRecord *host_terminal =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "stochastic_terminal_host_samples");
+            ASSERT_NE(host_terminal, nullptr);
+            const PerfStatRecord *trace =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "acceptance_trace",
+                                       {{"draft_tokens", "7,9"},
+                                        {"verifier_tokens", "9"},
+                                        {"all_position_rows", "9,3"},
+                                        {"accepted_speculative_prefix", "1"},
+                                        {"all_speculative_accepted", "true"},
+                                        {"verifier_path", "all_position_state_publication"},
+                                        {"decode_equivalent_replay_required", "false"},
+                                        {"correction_replay_tokens", "0"}});
+            ASSERT_NE(trace, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, AllPositionSpecPublicationStochasticHostRejectsOnCPU)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_all_position_stochastic_host_reject_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/false,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/false,
+                /*hide_local_logits=*/false,
+                DeviceId::cpu(),
+                /*mtp_draft_tokens=*/1,
+                /*chained_mtp_support=*/false,
+                /*sidecar_sample_fusion=*/false,
+                {},
+                MTPVerifyMode::SpeculativeSampling);
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPSpecStatePublication();
+            mock->setVerifierAcceptedPrefixScript({0});
+
+            SamplingParams sampling;
+            sampling.temperature = 0.8f;
+            sampling.top_k = 2;
+            sampling.top_p = 0.95f;
+            sampling.presence_penalty = 0.25f;
+            sampling.seed = 456;
+            runner->setSamplingParams(sampling);
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const int forward_count_after_prefill = mock->forwardCallCount();
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+            EXPECT_EQ(mock->setAllPositionCount(), 2);
+            EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "CPU host stochastic rejection should avoid same-step correction forward.";
+            EXPECT_EQ(mock->restoreCount(), 0);
+            EXPECT_EQ(mock->deviceDistributionBuildCount(), 0);
+            EXPECT_EQ(mock->deviceDistributionSampleCount(), 0);
+            EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 0);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_THAT(mock->lastCommitMTPTokens(),
+                        ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+            const MTPSpecStepPlan &published = mock->lastPublishedMTPSpecStep();
+            EXPECT_EQ(published.accepted_count, 1);
+            EXPECT_TRUE(published.requiresCorrectionReplay());
+            EXPECT_EQ(published.correction_replay_count, 1);
+            EXPECT_FALSE(published.hasBonusReadyToken());
+
+            const auto probe = runner->prefixStateProbe();
+            EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
+            EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
+            EXPECT_EQ(probe.mtp_stochastic_accept_tests, 1u);
+            EXPECT_EQ(probe.mtp_stochastic_accepts, 0u);
+            EXPECT_EQ(probe.mtp_stochastic_residual_samples, 1u);
+            EXPECT_EQ(probe.mtp_transaction_commits, 1u);
+            EXPECT_EQ(probe.mtp_transaction_rollbacks, 0u);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *host_residual =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "stochastic_residual_host_samples");
+            ASSERT_NE(host_residual, nullptr);
+            const PerfStatRecord *trace =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "acceptance_trace",
+                                       {{"draft_tokens", "7,9"},
+                                        {"verifier_tokens", "4"},
+                                        {"all_position_rows", "4,-1"},
+                                        {"accepted_speculative_prefix", "0"},
+                                        {"all_speculative_accepted", "false"},
+                                        {"verifier_path", "all_position_state_publication"},
+                                        {"decode_equivalent_replay_required", "false"},
+                                        {"correction_replay_tokens", "0"},
+                                        {"deferred_correction_condition_tokens", "1"}});
+            ASSERT_NE(trace, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
     TEST_F(Test__PrefillDecodeTransition, StatefulMTPVerifierUsesSharedDecodeEquivalentCatchup)
     {
         const std::filesystem::path export_path =

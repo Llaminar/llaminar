@@ -31,6 +31,7 @@
 #include "backends/DeviceId.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/PreparedWeightTestHarness.h"
+#include "utils/TestTensorFactory.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -308,6 +309,27 @@ namespace
         for (size_t vocab_idx = 0; vocab_idx < reference.size(); ++vocab_idx)
         {
             EXPECT_NEAR(logit_data[vocab_idx], reference[vocab_idx], 1e-5f)
+                << "row=" << row << " vocab_idx=" << vocab_idx;
+        }
+    }
+
+    std::vector<float> logitsRow(const FP32Tensor &logits, int row, int vocab_size)
+    {
+        const float *begin = logits.data() + static_cast<size_t>(row) * vocab_size;
+        return std::vector<float>(begin, begin + vocab_size);
+    }
+
+    void expectLogitsRowNearVector(
+        const FP32Tensor &logits,
+        int row,
+        const std::vector<float> &reference,
+        int vocab_size,
+        float tolerance)
+    {
+        const float *logit_data = logits.data() + static_cast<size_t>(row) * vocab_size;
+        for (size_t vocab_idx = 0; vocab_idx < reference.size(); ++vocab_idx)
+        {
+            EXPECT_NEAR(logit_data[vocab_idx], reference[vocab_idx], tolerance)
                 << "row=" << row << " vocab_idx=" << vocab_idx;
         }
     }
@@ -915,6 +937,68 @@ namespace
                 vocab_size_,
                 d_model_);
             expectLogitsRowNearReference(*logits, row, reference, vocab_size_);
+        }
+    }
+
+    TEST_F(Test__PrefillGraphCaptureDynamicParams, LMHead_CPUVerifierAllPositionsMatchesSplitDecodeRows_IQ3S)
+    {
+        const int seq_len = 2;
+        const int d_model = 256;
+        const int vocab_size = 512;
+        auto hidden_states = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            -0.25f, 0.25f, 2101);
+        auto lm_head_weight = TestTensorFactory::createIQ3_SRandom(
+            {static_cast<size_t>(vocab_size), static_cast<size_t>(d_model)},
+            2102);
+        auto all_position_logits = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(vocab_size)},
+            DeviceId::cpu());
+        auto split_logits = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{1, static_cast<size_t>(vocab_size)},
+            DeviceId::cpu());
+        auto prepared_lm_head = makePreparedGemmFixture(
+            lm_head_weight.get(),
+            DeviceId::cpu(),
+            "output.weight");
+
+        LMHeadStage::Params all_params{};
+        all_params.device_id = DeviceId::cpu();
+        all_params.hidden_states = hidden_states.get();
+        all_params.lm_head_weight = lm_head_weight.get();
+        all_params.logits = all_position_logits.get();
+        all_params.seq_len = seq_len;
+        all_params.d_model = d_model;
+        all_params.vocab_size = vocab_size;
+        all_params.compute_all_positions = true;
+        all_params.prepared_ref = prepared_lm_head.ref;
+        all_params.prepared_store = prepared_lm_head.store.get();
+
+        LMHeadStage all_positions(all_params);
+        ASSERT_TRUE(all_positions.execute(nullptr));
+
+        for (int row = 0; row < seq_len; ++row)
+        {
+            std::fill(split_logits->mutable_data(),
+                      split_logits->mutable_data() + vocab_size,
+                      0.0f);
+
+            LMHeadStage::Params split_params = all_params;
+            split_params.logits = split_logits.get();
+            split_params.seq_len = seq_len;
+            split_params.compute_all_positions = false;
+            split_params.effective_last_row_idx = row;
+
+            LMHeadStage split_row(split_params);
+            ASSERT_TRUE(split_row.execute(nullptr));
+
+            const std::vector<float> reference = logitsRow(*split_logits, 0, vocab_size);
+            expectLogitsRowNearVector(
+                *all_position_logits,
+                row,
+                reference,
+                vocab_size,
+                1e-6f);
         }
     }
 

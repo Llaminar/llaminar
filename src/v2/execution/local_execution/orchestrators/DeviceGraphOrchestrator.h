@@ -110,7 +110,11 @@ namespace llaminar2
     {
         std::unique_ptr<ComputeGraph> attention_decode; ///< Cached attention graph for decode
         std::unique_ptr<ComputeGraph> ffn_decode;       ///< Cached FFN graph for decode
-        int cached_seq_len = 0;                         ///< Sequence length when cached
+        int cached_seq_len = 0;                         ///< Legacy/shared sequence length for compatibility.
+        int attention_cached_seq_len = 0;               ///< Sequence length for cached attention graph.
+        int ffn_cached_seq_len = 0;                     ///< Sequence length for cached FFN graph.
+        bool attention_cached_all_position_logits = false;
+        bool ffn_cached_all_position_logits = false;
         bool valid = false;                             ///< Whether cache entries are valid
 
         void invalidate()
@@ -118,6 +122,10 @@ namespace llaminar2
             attention_decode.reset();
             ffn_decode.reset();
             cached_seq_len = 0;
+            attention_cached_seq_len = 0;
+            ffn_cached_seq_len = 0;
+            attention_cached_all_position_logits = false;
+            ffn_cached_all_position_logits = false;
             valid = false;
         }
 
@@ -1501,7 +1509,7 @@ namespace llaminar2
         bool forwardMTP(int32_t draft_condition_token) override;
         bool supportsChainedMTPDrafts() const override { return true; }
         bool supportsMTPSidecarSampleFusion() const override;
-        bool supportsMTPSidecarPreservesMainState() const override { return true; }
+        bool supportsMTPSidecarPreservesMainState() const override;
         bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
         bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override;
         bool forwardMTPFromLastDraftAndSampleGreedy(

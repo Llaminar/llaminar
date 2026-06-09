@@ -605,6 +605,60 @@ namespace llaminar2::test
         EXPECT_FLOAT_EQ(layer4->conv_state[0], 43.0f);
     }
 
+    TEST_F(Test__CPUHybridKVCache, HybridPrefixStateParallelHostCopyPreservesAllGDNState)
+    {
+        auto cache = createCache();
+        auto restored = createCache();
+
+        std::vector<std::vector<float>> expected_recurrence;
+        std::vector<std::vector<float>> expected_conv;
+        for (int layer = 0; layer < N_LAYERS; ++layer)
+        {
+            auto *state = cache->getGDNState(layer);
+            if (!state)
+                continue;
+
+            for (size_t i = 0; i < state->recurrence_state.size(); ++i)
+            {
+                state->recurrence_state[i] =
+                    static_cast<float>(layer * 100000 + static_cast<int>(i % 997));
+            }
+            for (size_t i = 0; i < state->conv_state.size(); ++i)
+            {
+                state->conv_state[i] =
+                    static_cast<float>(layer * 200000 + static_cast<int>(i % 389));
+            }
+            expected_recurrence.push_back(state->recurrence_state);
+            expected_conv.push_back(state->conv_state);
+        }
+
+        const HybridPrefixStateMetadata metadata = cache->hybridPrefixStateMetadata();
+        ASSERT_GT(metadata.host_bytes, 1u << 20)
+            << "fixture should exercise the parallel host-state copy threshold";
+        std::vector<uint8_t> payload(metadata.host_bytes);
+        HybridPrefixStateDescriptor desc;
+        desc.seq_idx = 0;
+        desc.logical_token_count = 11;
+        ASSERT_TRUE(cache->exportHybridPrefixState(desc, payload.data(), nullptr));
+        ASSERT_TRUE(restored->importHybridPrefixState(desc, payload.data(), nullptr));
+
+        size_t gdn_index = 0;
+        for (int layer = 0; layer < N_LAYERS; ++layer)
+        {
+            auto *state = restored->getGDNState(layer);
+            if (!state)
+                continue;
+
+            ASSERT_LT(gdn_index, expected_recurrence.size());
+            EXPECT_EQ(state->recurrence_state, expected_recurrence[gdn_index])
+                << "recurrence state mismatch for layer " << layer;
+            EXPECT_EQ(state->conv_state, expected_conv[gdn_index])
+                << "conv state mismatch for layer " << layer;
+            ++gdn_index;
+        }
+        EXPECT_EQ(gdn_index, expected_recurrence.size());
+    }
+
     TEST_F(Test__CPUHybridKVCache, HybridPrefixStateRejectsMissingHostBuffers)
     {
         auto cache = createCache();

@@ -2413,7 +2413,10 @@ namespace llaminar2
             auto &cache = layer_graph_cache_[layer_idx];
 
             // Check if we have a valid cached graph
-            if (cache.attention_decode && cache.cached_seq_len == seq_len && cache.valid)
+            if (cache.attention_decode &&
+                cache.attention_cached_seq_len == seq_len &&
+                cache.attention_cached_all_position_logits == compute_all_position_logits_ &&
+                cache.valid)
             {
                 LOG_DEBUG("[DeviceGraphOrchestrator] Reusing cached attention graph for layer "
                           << layer_idx << " (pos_offset=" << pos_offset << ")");
@@ -2454,6 +2457,8 @@ namespace llaminar2
 
             cache.attention_decode = std::make_unique<ComputeGraph>(result.takeGraph());
             cache.cached_seq_len = seq_len;
+            cache.attention_cached_seq_len = seq_len;
+            cache.attention_cached_all_position_logits = compute_all_position_logits_;
             cache.valid = true;
             cache_stats_.attention_cache_misses++;
 
@@ -2547,7 +2552,10 @@ namespace llaminar2
             auto &cache = layer_graph_cache_[layer_idx];
 
             // Check if we have a valid cached FFN graph
-            if (cache.ffn_decode && cache.valid)
+            if (cache.ffn_decode &&
+                cache.ffn_cached_seq_len == seq_len &&
+                cache.ffn_cached_all_position_logits == compute_all_position_logits_ &&
+                cache.valid)
             {
                 LOG_DEBUG("[DeviceGraphOrchestrator] Reusing cached FFN graph for layer " << layer_idx);
 
@@ -2581,6 +2589,10 @@ namespace llaminar2
             }
 
             cache.ffn_decode = std::make_unique<ComputeGraph>(result.takeGraph());
+            cache.cached_seq_len = seq_len;
+            cache.ffn_cached_seq_len = seq_len;
+            cache.ffn_cached_all_position_logits = compute_all_position_logits_;
+            cache.valid = true;
             cache_stats_.ffn_cache_misses++;
 
             // Execute the newly built graph
@@ -5380,6 +5392,24 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::supportsMTPSidecarSampleFusion() const
     {
         return state_.device_id.is_gpu();
+    }
+
+    bool DeviceGraphOrchestrator::supportsMTPSidecarPreservesMainState() const
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        {
+            return false;
+        }
+
+        // CPU MoE sidecar graphs currently share mutable MoE/verifier scratch
+        // with the main graph. They must restore the verifier-base checkpoint
+        // before target verification rather than advertising sidecar isolation.
+        if (!state_.device_id.is_gpu() && isPrefixCacheMoEModel())
+        {
+            return false;
+        }
+
+        return true;
     }
 
     IGlobalTPContext *DeviceGraphOrchestrator::globalTPContextForMTPCoordination() const

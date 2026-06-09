@@ -104,6 +104,38 @@ public:
 
 namespace
 {
+    bool canReuseCachedFFNGraphForTest(
+        const LayerGraphCache &cache,
+        int seq_len,
+        bool all_position_logits)
+    {
+        return cache.ffn_decode &&
+               cache.valid &&
+               cache.ffn_cached_seq_len == seq_len &&
+               cache.ffn_cached_all_position_logits == all_position_logits;
+    }
+
+    TEST(Test__LayerGraphCache, FFNVariantKeyIsIndependentFromAttentionVariant)
+    {
+        LayerGraphCache cache;
+        cache.valid = true;
+        cache.ffn_decode = std::make_unique<ComputeGraph>();
+        cache.ffn_cached_seq_len = 1;
+        cache.ffn_cached_all_position_logits = false;
+
+        EXPECT_TRUE(canReuseCachedFFNGraphForTest(cache, 1, false));
+        EXPECT_FALSE(canReuseCachedFFNGraphForTest(cache, 2, false));
+        EXPECT_FALSE(canReuseCachedFFNGraphForTest(cache, 1, true));
+
+        cache.attention_decode = std::make_unique<ComputeGraph>();
+        cache.cached_seq_len = 2;
+        cache.attention_cached_seq_len = 2;
+        cache.attention_cached_all_position_logits = true;
+
+        EXPECT_FALSE(canReuseCachedFFNGraphForTest(cache, 2, true))
+            << "Updating the attention cache variant must not make a stale FFN graph reusable";
+    }
+
     class ScopedEnv
     {
     public:
@@ -278,6 +310,28 @@ TEST_F(Test__DeviceGraphOrchestrator, NullGraphBuilderThrows)
     EXPECT_THROW(
         DeviceGraphOrchestrator(std::shared_ptr<QwenStandardGraph>(nullptr), nullptr),
         std::invalid_argument);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, CPUMoESidecarDoesNotAdvertiseMainStatePreservation)
+{
+    auto moe_config = makeMaintenanceMoEGraphConfig();
+    moe_config.mtp.enabled = true;
+    DeviceGraphOrchestrator moe_orchestrator(
+        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
+        nullptr);
+
+    EXPECT_FALSE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
+        << "CPU MoE sidecar graphs share verifier scratch with the main graph; "
+           "the runner must restore the verifier-base checkpoint before target verification.";
+
+    auto dense_config = config_;
+    dense_config.mtp.enabled = true;
+    DeviceGraphOrchestrator dense_orchestrator(
+        std::make_shared<QwenStandardGraph>(dense_config, nullptr),
+        nullptr);
+    EXPECT_TRUE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
+        << "The CPU MoE capability correction must not disable the generic "
+           "sidecar-isolated path for non-MoE graphs.";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeLazyCallback)

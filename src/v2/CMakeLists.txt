@@ -1427,6 +1427,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/cpu/primitives/SwiGLUPrimitives.cpp
     kernels/cpu/primitives/VectorPrimitives.cpp
     kernels/cpu/primitives/Q16HeadNormalization.cpp
+    kernels/cpu/sampling/CPUSamplerPrimitives.cpp
     # CPU GEMM kernels and auto-tuning infrastructure
     # NOTE: Legacy GEMM implementations (v1/v2/v3) removed - only gemm (OneDNN) remains
     # All old GEMM kernels removed: GemmAutoTuner, SmartGemmSearch, QuantizedGemm,

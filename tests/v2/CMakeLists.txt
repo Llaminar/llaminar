@@ -8448,6 +8448,32 @@ add_v2_test(V2_Perf_Q8_1_QuantizeSIMD
     LABELS "V2;Performance;Quantization;Q8_1;SIMD;AVX2;AVX512"
 )
 
+# Performance Test: CPU sampler top-k distribution before/after fast path
+add_executable(v2_perf_cpu_sampler_topk performance/Perf__CPUSamplerTopK.cpp)
+target_link_libraries(v2_perf_cpu_sampler_topk
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_CPUSamplerTopK
+    COMMAND $<TARGET_FILE:v2_perf_cpu_sampler_topk>
+    LABELS "V2;Performance;Sampling;CPU;SIMD;AVX2;AVX512;TopK;MTP"
+    MPI_PROCS 1
+)
+
+# Performance Test: MTP dynamic depth controller overhead
+add_executable(v2_perf_mtp_depth_controller performance/Perf__MTPDepthController.cpp)
+target_link_libraries(v2_perf_mtp_depth_controller
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_MTPDepthController
+    COMMAND $<TARGET_FILE:v2_perf_mtp_depth_controller>
+    LABELS "V2;Performance;MTP;DepthController;CPU"
+    MPI_PROCS 1
+)
+
 # Test: IQ4_XS Tensor Views
 add_executable(v2_test_iq4xs_views unit/tensors/Test__IQ4_XSTensor_Views.cpp)
 target_link_libraries(v2_test_iq4xs_views 

@@ -1642,7 +1642,7 @@ namespace llaminar2
             active_sampling_params_.has_penalties() && !stochastic_verify;
         const bool supports_all_position_state_publication =
             runner_->supportsMTPSpecStatePublication() &&
-            (!stochastic_verify || stochastic_device_verify);
+            (!stochastic_verify || stochastic_device_verify || stochastic_host_verify);
         const MTPVerifierPolicyDecision verifier_policy =
             chooseMTPVerifierPolicy(
                 MTPVerifierPolicyInput{
@@ -1902,7 +1902,7 @@ namespace llaminar2
         std::optional<PrefixStateSnapshot> verifier_replay_base_checkpoint;
         if (verify_commit_replay_check)
         {
-            verifier_replay_base_checkpoint = checkpoint;
+            verifier_replay_base_checkpoint = verifier_base_checkpoint;
         }
 
         const int base_sidecar_position = runner_->get_position();
@@ -2230,7 +2230,8 @@ namespace llaminar2
         auto verify_committed_prefix_replay = [&](
                                                   const char *path,
                                                   const std::vector<int32_t> &tokens_to_replay,
-                                                  int32_t expected_next_token)
+                                                  int32_t expected_next_token,
+                                                  const std::string &debug_context = {})
             -> std::optional<std::string>
         {
             if (!verify_commit_replay_check)
@@ -2397,7 +2398,8 @@ namespace llaminar2
                        " accepted_tokens=" + join_tokens(tokens_to_replay) +
                        " committed_next=" + std::to_string(expected_next_token) +
                        " replay_next=" + std::to_string(replay_next_token) +
-                       " used_ready_logits=" + (use_ready_logits ? std::string("true") : std::string("false"));
+                       " used_ready_logits=" + (use_ready_logits ? std::string("true") : std::string("false")) +
+                       (debug_context.empty() ? std::string{} : " " + debug_context);
             }
 
             std::optional<std::vector<int32_t>> committed_continuation =
@@ -2650,10 +2652,10 @@ namespace llaminar2
             MTPDecodeCatchupGreedyResult catchup;
             if (stochastic_verify)
             {
-                if (!stochastic_device_verify)
+                if (!stochastic_device_verify && !stochastic_host_verify)
                 {
                     return fail_after_checkpoint(
-                        "All-position stochastic MTP verifier requires device-resident distribution verification");
+                        "All-position stochastic MTP verifier requires device-resident or host distribution verification");
                 }
 
                 catchup.ok = true;
@@ -2672,9 +2674,34 @@ namespace llaminar2
                     catchup.stopped_on_output = true;
                 }
 
+                std::vector<SamplingDistributionEntry> host_target_distribution;
                 auto build_all_position_target_distribution =
                     [&](int row, int slot) -> bool
                 {
+                    if (stochastic_host_verify)
+                    {
+                        const float *all_position_logits =
+                            runner_->getAllPositionLogits();
+                        if (!all_position_logits || row < 0)
+                            return false;
+
+                        const float *row_logits =
+                            all_position_logits +
+                            static_cast<size_t>(row) * static_cast<size_t>(vocab);
+                        PerfStatsCollector::ScopedTimer timer(
+                            "mtp",
+                            "all_position_stochastic_host_target_distribution",
+                            "decode",
+                            {},
+                            {{"implementation", "all_position_state_publication"}});
+                        host_target_distribution =
+                            all_position_stochastic_penalty_sampler.compute_distribution(
+                                row_logits,
+                                static_cast<size_t>(vocab),
+                                active_sampling_params_);
+                        return !host_target_distribution.empty();
+                    }
+
                     auto penalty_map =
                         all_position_stochastic_penalty_sampler
                             .compute_penalty_map(active_sampling_params_, vocab);
@@ -2711,17 +2738,53 @@ namespace llaminar2
                     const float accept_threshold = sampler_.random_uniform_01();
                     const float residual_threshold = sampler_.random_uniform_01();
                     DeviceSpeculativeVerifyResult verify_result;
-                    if (!runner_->verifyStochasticDistributionsBatchOnDevice(
-                            /*first_target_slot=*/row,
-                            /*first_draft_slot=*/row,
-                            &draft_token,
-                            &accept_threshold,
-                            &residual_threshold,
-                            /*row_count=*/1,
-                            &verify_result))
+                    if (stochastic_device_verify)
                     {
-                        return fail_after_checkpoint(
-                            "All-position stochastic MTP device verifier failed");
+                        if (!runner_->verifyStochasticDistributionsBatchOnDevice(
+                                /*first_target_slot=*/row,
+                                /*first_draft_slot=*/row,
+                                &draft_token,
+                                &accept_threshold,
+                                &residual_threshold,
+                                /*row_count=*/1,
+                                &verify_result))
+                        {
+                            return fail_after_checkpoint(
+                                "All-position stochastic MTP device verifier failed");
+                        }
+                    }
+                    else
+                    {
+                        if (row < 0 ||
+                            row >= static_cast<int>(host_mtp_draft_distributions.size()) ||
+                            host_mtp_draft_distributions[static_cast<size_t>(row)].empty() ||
+                            host_target_distribution.empty())
+                        {
+                            return fail_after_checkpoint(
+                                "All-position stochastic MTP host verifier missing distributions");
+                        }
+                        const auto &draft_distribution =
+                            host_mtp_draft_distributions[static_cast<size_t>(row)];
+                        const float p =
+                            Sampler::probability_of_token(host_target_distribution, draft_token);
+                        const float q =
+                            Sampler::probability_of_token(draft_distribution, draft_token);
+                        verify_result.accept_probability =
+                            Sampler::speculative_accept_probability(p, q);
+                        verify_result.accept_threshold = accept_threshold;
+                        verify_result.accepted =
+                            accept_threshold < verify_result.accept_probability;
+                        verify_result.token = verify_result.accepted
+                                                  ? draft_token
+                                                  : sampleResidualDistributionWithThreshold(
+                                                        host_target_distribution,
+                                                        draft_distribution,
+                                                        residual_threshold);
+                        if (verify_result.token < 0)
+                        {
+                            return fail_after_checkpoint(
+                                "All-position stochastic MTP host residual verifier failed");
+                        }
                     }
 
                     ++mtp_stats_.stochastic_accept_tests;
@@ -2735,7 +2798,7 @@ namespace llaminar2
                          {"draft_token", std::to_string(draft_token)},
                          {"accept_probability", std::to_string(verify_result.accept_probability)},
                          {"threshold", std::to_string(verify_result.accept_threshold)},
-                         {"device_resident", "true"},
+                         {"device_resident", stochastic_device_verify ? "true" : "false"},
                          {"verifier_path", "all_position_state_publication"}});
 
                     int32_t output_token = -1;
@@ -2771,7 +2834,9 @@ namespace llaminar2
                         ++mtp_stats_.stochastic_residual_samples;
                         PerfStatsCollector::addCounter(
                             "mtp",
-                            "stochastic_residual_device_samples",
+                            stochastic_device_verify
+                                ? "stochastic_residual_device_samples"
+                                : "stochastic_residual_host_samples",
                             1.0,
                             "decode",
                             {},
@@ -2812,10 +2877,14 @@ namespace llaminar2
                             "All-position stochastic MTP bonus distribution build failed");
                     }
                     catchup.ready_token =
-                        runner_->sampleStochasticDistributionOnDevice(
-                            DeviceDistributionBuffer::Target,
-                            bonus_row,
-                            sampler_.random_uniform_01());
+                        stochastic_device_verify
+                            ? runner_->sampleStochasticDistributionOnDevice(
+                                  DeviceDistributionBuffer::Target,
+                                  bonus_row,
+                                  sampler_.random_uniform_01())
+                            : sampleDistributionWithThreshold(
+                                  host_target_distribution,
+                                  sampler_.random_uniform_01());
                     if (catchup.ready_token < 0)
                     {
                         return fail_after_checkpoint(
@@ -2826,7 +2895,9 @@ namespace llaminar2
                     ++mtp_stats_.stochastic_terminal_samples;
                     PerfStatsCollector::addCounter(
                         "mtp",
-                        "stochastic_terminal_device_samples",
+                        stochastic_device_verify
+                            ? "stochastic_terminal_device_samples"
+                            : "stochastic_terminal_host_samples",
                         1.0,
                         "decode",
                         {},
@@ -3118,10 +3189,23 @@ namespace llaminar2
 
             if (!stopped_on_output && ready_token >= 0)
             {
+                std::ostringstream replay_context;
+                replay_context
+                    << "draft_tokens=" << join_tokens(draft_tokens)
+                    << " verifier_tokens=" << join_tokens(verifier_tokens)
+                    << " all_position_rows=" << join_tokens(sampled_verifier_rows)
+                    << " accepted_state_count=" << step.accepted_count
+                    << " target_cached_tokens=" << step.target_cached_tokens
+                    << " main_forward_token_count=" << main_forward_token_count
+                    << " all_speculative_accepted="
+                    << (all_speculative_accepted ? "true" : "false")
+                    << " accepted_speculative_prefix="
+                    << accepted_speculative_prefix;
                 if (auto mismatch = verify_committed_prefix_replay(
                         "all_position_state_publication_verifier",
                         accepted_tokens,
-                        ready_token))
+                        ready_token,
+                        replay_context.str()))
                 {
                     return fail_after_checkpoint(*mismatch);
                 }

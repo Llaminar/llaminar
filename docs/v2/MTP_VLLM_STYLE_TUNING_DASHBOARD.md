@@ -1,13 +1,12 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Scope: Qwen3.6 dense/MoE MTP on SingleDevice CUDA, ROCm, and CPU. Keep this
-file under 5KB and update it after every tuning iteration.
+Scope: SingleDevice Qwen3.6 dense/MoE MTP on CUDA/ROCm/CPU. Keep under 5KB;
+update every iteration.
 
-Iteration contract: refresh the same CUDA/ROCm/CPU matrix with no-MTP baseline,
-fixed d1, fixed d2, fixed d3, and dynamic depth. Do not report dynamic without
-the fixed-depth neighbors from the same run. Dynamic starts at d1, may demote to
-d0 per-step bypass, and may probe/promote back up to d3. Before commit, run the
-broad unit gate plus the relevant backend parity cells.
+Iteration contract: refresh CUDA/ROCm/CPU with no-MTP, fixed d1/d2/d3, and
+dynamic. Do not report dynamic without same-run fixed neighbors. Dynamic starts
+at d1, may demote to d0, and may probe/promote to d3. Before commit, run broad
+units plus relevant parity cells.
 
 RAG: Green = correct and speed-positive near target. Amber = correct but slow,
 partial, or not fully measured. Red = fails or lacks required correctness.
@@ -43,15 +42,20 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   d0 on an all-zero window, and perfect probes can promote early. This removed
   the bad greedy d0 cliff seen in the previous bounded matrix, but dynamic still
   often trails the best fixed depth on short runs.
-- Regression:
-  `V2_Unit_MTPDepthController` covers d0 probe/cooldown, perfect-probe
-  promotion, stepwise demotion, and d1-to-d0 all-zero demotion.
+- Regression/perf: `V2_Unit_MTPDepthController` covers d0 hysteresis.
+  `V2_Perf_MTPDepthController` shows policy bookkeeping is tiny: 11-25 ns/op.
 - Matrix runner supports bounded sweeps:
   `scripts/run_mtp_iteration_benchmark_matrix.sh --decode-tokens 16 --perfstats`.
-  `summary.tsv` now includes verifier/condition/correction timing,
-  main-verifier warmup/capture/replay counts, and replay reset/preserve counts.
-  CPU lanes are still minutes-long even when bounded; full default-length
-  matrix remains the acceptance capture.
+  Summary includes verifier/condition/correction timing and replay health.
+- CPU dense Prefix/MTP parity harness removed duplicate no-MTP baseline runner
+  passes; focused cells now land around 41-43s instead of prior 80-200s costs.
+- CPU dynamic dense greedy profile
+  `20260609T122350Z-cpu-dense-dynamic-verifier-profile`: 6.56 tok/s; verifier
+  4.20s, condition 1.48s, publication 56.8ms. Decode stage time is mostly
+  GEMM_FUSED_GATE_UP 30.7%, GEMM 27.2%, GDN_PROJECTION 13.9%, LM_HEAD 12.2%.
+  The controller is not the bottleneck.
+- CPU dense long-window token parity stops before the known step-114 near-tie:
+  `1473` beats PyTorch `48567` by 0.0315 logit; old sampler matches.
 - Runner guard: dynamic evidence now requires same-run baseline plus fixed
   d1/d2/d3 unless `--allow-partial-variants` is used for diagnostics.
 - Versioned replay plus verifier-stream handoff guards passed focused units and
@@ -59,6 +63,8 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   `20260609T085703Z-gpu-moe-d3-verifier-stream-handoff`: CUDA 70.3 tok/s,
   ROCm 42.4 tok/s, both 72.7% acceptance, zero rollback/correction replay.
   Handoff counters fired, but verifier/condition time still dominates.
+- CPU MoE replay false failure fixed: verifier-base restore and batched LM-head
+  all-position rows match serial decode (replay 37.0s, row 27.3s).
 
 ## Target Anchors
 
@@ -72,11 +78,9 @@ llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
 
 ## Next
 
-1. Run the bounded device matrix every iteration: CUDA/ROCm/CPU, dense/MoE,
-   greedy/stochastic, baseline plus fixed d1/d2/d3 and dynamic. Schedule CPU
-   separately only when runtime forces it; keep the same git/config, use
-   verifier/capture columns to explain speed deltas, and record crashes/timeouts
-   explicitly instead of leaving stale numbers.
+1. Run the bounded CUDA/ROCm/CPU matrix every iteration: dense/MoE,
+   greedy/stochastic, baseline plus fixed d1/d2/d3 and dynamic. Split CPU only
+   when needed; record crashes/timeouts explicitly.
 2. Use full default matrix for acceptance checkpoints after bounded lanes are
    stable.
 3. Attack MoE verifier/catch-up cost; CUDA, ROCm, and CPU MoE are functional

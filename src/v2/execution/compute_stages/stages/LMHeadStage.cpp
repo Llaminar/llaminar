@@ -140,7 +140,9 @@ namespace llaminar2
             return false;
         }
 
-        // Bias is passed directly to GEMM kernel for fused application
+        // Bias is passed directly to GEMM kernel for fused application.
+        // CPU NativeVNNI uses its batched M=2..4 path here for verifier rows;
+        // parity tests compare these rows against serial one-token decode.
         bool success = lm_gemm->multiply_tensor(
             hidden_states,
             logits,

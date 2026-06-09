@@ -226,6 +226,71 @@ TEST_F(MoERoutingStageTest, SingleToken)
     EXPECT_NEAR(sum, 1.0f, 0.01f);
 }
 
+TEST_F(MoERoutingStageTest, CPUVerifierTwoRowsMatchSplitDecodeRoutes)
+{
+    const int seq = 2;
+    const int d_model = 512;
+    const int num_experts = 16;
+    const int top_k = 4;
+    auto input = TestTensorFactory::createFP32Random({seq, d_model}, -0.5f, 0.5f, 1200);
+    auto gate_weights = TestTensorFactory::createFP32Random({num_experts, d_model}, -0.1f, 0.1f, 1201);
+    auto multi_indices = TestTensorFactory::createFP32({seq, top_k});
+    auto multi_weights = TestTensorFactory::createFP32({seq, top_k});
+    auto split_indices = TestTensorFactory::createFP32({seq, top_k});
+    auto split_weights = TestTensorFactory::createFP32({seq, top_k});
+
+    auto run_route = [&](TensorBase *run_input,
+                         TensorBase *run_indices,
+                         TensorBase *run_weights,
+                         int run_seq) -> bool
+    {
+        MoERoutingStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.input = run_input;
+        params.gate_weights = gate_weights.get();
+        params.output_indices = run_indices;
+        params.output_weights = run_weights;
+        params.seq_len = run_seq;
+        params.d_model = d_model;
+        params.num_experts = num_experts;
+        params.top_k = top_k;
+        params.norm_topk_prob = true;
+        params.layer_idx = 0;
+
+        MoERoutingStage stage(params);
+        return stage.execute(cpu_ctx_.get());
+    };
+
+    ASSERT_TRUE(run_route(input.get(), multi_indices.get(), multi_weights.get(), seq));
+
+    for (int row = 0; row < seq; ++row)
+    {
+        FP32Tensor row_input({1, static_cast<size_t>(d_model)});
+        FP32Tensor row_indices({1, static_cast<size_t>(top_k)});
+        FP32Tensor row_weights({1, static_cast<size_t>(top_k)});
+        std::copy_n(input->data() + static_cast<size_t>(row) * d_model,
+                    d_model,
+                    row_input.mutable_data());
+        ASSERT_TRUE(run_route(&row_input, &row_indices, &row_weights, 1));
+
+        std::copy_n(row_indices.data(),
+                    top_k,
+                    split_indices->mutable_data() + static_cast<size_t>(row) * top_k);
+        std::copy_n(row_weights.data(),
+                    top_k,
+                    split_weights->mutable_data() + static_cast<size_t>(row) * top_k);
+    }
+
+    for (int i = 0; i < seq * top_k; ++i)
+    {
+        EXPECT_EQ(static_cast<int>(multi_indices->data()[i]),
+                  static_cast<int>(split_indices->data()[i]))
+            << "slot " << i;
+        EXPECT_FLOAT_EQ(multi_weights->data()[i], split_weights->data()[i])
+            << "slot " << i;
+    }
+}
+
 TEST_F(MoERoutingStageTest, NullInputsReturnError)
 {
     auto output_indices = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});

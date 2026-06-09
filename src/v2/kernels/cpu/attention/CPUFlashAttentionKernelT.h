@@ -647,17 +647,25 @@ namespace llaminar2
                     float *O_ptr = O_base->mutable_data();
                     if (Q_ptr && O_ptr)
                     {
-                        const int position_offset = (kv_len > seq_len)
-                                                        ? (kv_len - seq_len)
-                                                        : 0;
-                        return compute_decode_fp16kv(
-                            Q_ptr,
-                            K_fp16->typed_data(),
-                            V_fp16->typed_data(),
-                            O_ptr,
-                            kv_len, n_heads, n_kv_heads, head_dim,
-                            causal, position_offset,
-                            head_start, gqa_n_rep);
+                        const int q_stride = n_heads * head_dim;
+                        const int base_position_offset = (kv_len > seq_len)
+                                                             ? (kv_len - seq_len)
+                                                             : 0;
+                        for (int row = 0; row < seq_len; ++row)
+                        {
+                            if (!compute_decode_fp16kv(
+                                    Q_ptr + static_cast<size_t>(row) * q_stride,
+                                    K_fp16->typed_data(),
+                                    V_fp16->typed_data(),
+                                    O_ptr + static_cast<size_t>(row) * q_stride,
+                                    kv_len, n_heads, n_kv_heads, head_dim,
+                                    causal, base_position_offset + row,
+                                    head_start, gqa_n_rep))
+                            {
+                                return false;
+                            }
+                        }
+                        return true;
                     }
                 }
             }
@@ -686,11 +694,21 @@ namespace llaminar2
                                                         : 0;
                         if (kv_len != seq_len)
                         {
-                            return compute_decode_q16kv(
-                                Q_ptr, K_q16, V_q16, O_ptr,
-                                kv_len, n_heads, n_kv_heads, head_dim,
-                                causal, position_offset,
-                                head_start, gqa_n_rep);
+                            const int q_stride = n_heads * head_dim;
+                            for (int row = 0; row < seq_len; ++row)
+                            {
+                                if (!compute_decode_q16kv(
+                                        Q_ptr + static_cast<size_t>(row) * q_stride,
+                                        K_q16, V_q16,
+                                        O_ptr + static_cast<size_t>(row) * q_stride,
+                                        kv_len, n_heads, n_kv_heads, head_dim,
+                                        causal, position_offset + row,
+                                        head_start, gqa_n_rep))
+                                {
+                                    return false;
+                                }
+                            }
+                            return true;
                         }
                         else
                         {
@@ -723,14 +741,24 @@ namespace llaminar2
                     float *O_ptr = O_base->mutable_data();
                     if (Q_ptr && O_ptr)
                     {
-                        const int position_offset = (kv_len > seq_len)
-                                                        ? (kv_len - seq_len)
-                                                        : 0;
-                        return compute_decode_tqkv(
-                            Q_ptr, K_tq8, V_tq4, O_ptr,
-                            kv_len, n_heads, n_kv_heads, head_dim,
-                            causal, position_offset,
-                            head_start, gqa_n_rep);
+                        const int q_stride = n_heads * head_dim;
+                        const int base_position_offset = (kv_len > seq_len)
+                                                             ? (kv_len - seq_len)
+                                                             : 0;
+                        for (int row = 0; row < seq_len; ++row)
+                        {
+                            if (!compute_decode_tqkv(
+                                    Q_ptr + static_cast<size_t>(row) * q_stride,
+                                    K_tq8, V_tq4,
+                                    O_ptr + static_cast<size_t>(row) * q_stride,
+                                    kv_len, n_heads, n_kv_heads, head_dim,
+                                    causal, base_position_offset + row,
+                                    head_start, gqa_n_rep))
+                            {
+                                return false;
+                            }
+                        }
+                        return true;
                     }
                 }
             }
@@ -759,11 +787,21 @@ namespace llaminar2
                                                         : 0;
                         if (kv_len != seq_len)
                         {
-                            return compute_decode_q8kv(
-                                Q_ptr, K_q8, V_q8, O_ptr,
-                                kv_len, n_heads, n_kv_heads, head_dim,
-                                causal, position_offset,
-                                head_start, gqa_n_rep);
+                            const int q_stride = n_heads * head_dim;
+                            for (int row = 0; row < seq_len; ++row)
+                            {
+                                if (!compute_decode_q8kv(
+                                        Q_ptr + static_cast<size_t>(row) * q_stride,
+                                        K_q8, V_q8,
+                                        O_ptr + static_cast<size_t>(row) * q_stride,
+                                        kv_len, n_heads, n_kv_heads, head_dim,
+                                        causal, position_offset + row,
+                                        head_start, gqa_n_rep))
+                                {
+                                    return false;
+                                }
+                            }
+                            return true;
                         }
                     }
                 }

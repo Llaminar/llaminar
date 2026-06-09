@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
@@ -303,6 +304,34 @@ TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputAllreducesUnderTP)
 
     EXPECT_TRUE(hasDependency(graph, "layer0_moe_expert_allreduce", "layer0_moe_expert_ffn"));
     EXPECT_TRUE(hasDependency(graph, "layer0_moe_combine", "layer0_moe_expert_allreduce"));
+}
+
+TEST(Test__Qwen35MoEGraph, CPUAllPositionMoEVerifierUsesDecodeEquivalentExpertPath)
+{
+    GraphConfig config = makeMoEConfig();
+    config.compute_all_position_logits = true;
+    Qwen35MoEGraph graph_builder(config, nullptr);
+
+    TensorArena arena;
+    auto layer = makeMoELayerWeights(arena);
+    auto buffers = makeActivationBuffers(arena, /*tokens=*/2, config.d_model,
+                                         config.moe.num_experts, config.moe.top_k);
+
+    ComputeGraph graph = graph_builder.buildFFNGraph(
+        layer, buffers, /*layer_idx=*/0, /*seq_len=*/2,
+        /*batch_size=*/1, DeviceId::cpu());
+
+    auto *node = graph.getNode("layer0_moe_expert_ffn");
+    ASSERT_NE(node, nullptr);
+    auto *stage = dynamic_cast<MoEExpertComputeStage *>(node->stage.get());
+    ASSERT_NE(stage, nullptr);
+    EXPECT_TRUE(stage->usesCPUDecodeEquivalentVerifierPrefillForTesting());
+
+    auto *shared_node = graph.getNode("layer0_shared_expert_ffn");
+    ASSERT_NE(shared_node, nullptr);
+    auto *shared_stage = dynamic_cast<SharedExpertFFNStage *>(shared_node->stage.get());
+    ASSERT_NE(shared_stage, nullptr);
+    EXPECT_TRUE(shared_stage->usesCPUDecodeEquivalentVerifierPrefillForTesting());
 }
 
 TEST(Test__Qwen35MoEGraph, SchemaDefaultsRoutedExpertWeightsToExpertParallel)

@@ -92,10 +92,17 @@ namespace
 
     // K=512 is divisible by both 32 (per-block) and 256 (superblock).
     // N=16,32 exercise the ldc<64 overflow protection path.
-    // M=1 (GEMV), M=9 (odd GEMM, GDN bug shape), M=64 (large GEMM).
+    // M=1 (GEMV), M=2..4 (MTP verifier small-M), M=9
+    // (odd GEMM, GDN bug shape), M=64 (large GEMM).
     static const std::vector<ShapeConfig> SHAPE_TABLE = {
         {1, 512, 512, "GEMV_N512"},
         {1, 32, 512, "GEMV_N32"},
+        {2, 512, 512, "GEMM_M2_N512"},
+        {2, 32, 512, "GEMM_M2_N32"},
+        {3, 512, 512, "GEMM_M3_N512"},
+        {3, 32, 512, "GEMM_M3_N32"},
+        {4, 512, 512, "GEMM_M4_N512"},
+        {4, 32, 512, "GEMM_M4_N32"},
         {9, 512, 512, "GEMM_M9_N512"},
         {9, 32, 512, "GEMM_M9_N32"},
         {9, 16, 512, "GEMM_M9_N16"},

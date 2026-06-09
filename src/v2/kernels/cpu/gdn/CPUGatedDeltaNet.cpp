@@ -134,6 +134,12 @@ namespace llaminar2
         verifier_state_capture_size_ = state_size;
     }
 
+    void CPUGatedDeltaNet::bindSpeculativeStateWorkspace(float *workspace, int state_size)
+    {
+        speculative_state_work_ = workspace;
+        speculative_state_work_size_ = state_size;
+    }
+
     bool CPUGatedDeltaNet::restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream)
     {
         if (row < 0 || row >= verifier_state_capture_rows_)
@@ -145,6 +151,27 @@ namespace llaminar2
             verifier_state_capture_size_,
             verifier_state_capture_size_,
             stream);
+    }
+
+    float *CPUGatedDeltaNet::prepareSpeculativeState(float *live_state, int state_floats)
+    {
+        if (!live_state || state_floats <= 0)
+            return nullptr;
+
+        float *work = nullptr;
+        if (speculative_state_work_ && speculative_state_work_size_ >= state_floats)
+        {
+            work = speculative_state_work_;
+        }
+        else
+        {
+            owned_speculative_state_work_.resize(static_cast<size_t>(state_floats));
+            work = owned_speculative_state_work_.data();
+            speculative_state_work_size_ = std::max(speculative_state_work_size_, state_floats);
+        }
+
+        std::memcpy(work, live_state, static_cast<size_t>(state_floats) * sizeof(float));
+        return work;
     }
 
     // =========================================================================
@@ -785,6 +812,20 @@ namespace llaminar2
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm)
     {
+        const int state_floats = n_heads * d_k * d_v;
+        const bool verifier_capture_active =
+            verifier_state_capture_ &&
+            verifier_state_capture_rows_ > 0 &&
+            verifier_state_capture_size_ >= state_floats &&
+            state_floats > 0;
+        float *state_for_compute = state;
+        if (verifier_capture_active)
+        {
+            state_for_compute = prepareSpeculativeState(state, state_floats);
+            if (!state_for_compute)
+                return false;
+        }
+
         const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
         constexpr float l2_eps = 1e-6f;
 
@@ -819,7 +860,7 @@ namespace llaminar2
                 const float beta_h = 1.0f / (1.0f + std::exp(-beta_raw[h]));
 
                 // ── Core recurrence ──
-                float *S = state + static_cast<size_t>(h) * d_k * d_v;
+                float *S = state_for_compute + static_cast<size_t>(h) * d_k * d_v;
                 const float *q_h = q_local;
                 const float *k_h = k_local;
                 const float *v_h = v + h * d_v;
@@ -829,6 +870,13 @@ namespace llaminar2
             }
         };
         OMP_WORKSHARE_REGION(do_work);
+
+        if (verifier_capture_active)
+        {
+            std::memcpy(verifier_state_capture_,
+                        state_for_compute,
+                        static_cast<size_t>(state_floats) * sizeof(float));
+        }
 
         return true;
     }
@@ -886,6 +934,9 @@ namespace llaminar2
             state_snapshots = verifier_state_capture_;
             snapshot_stride_floats = verifier_state_capture_size_;
             max_snapshot_rows = verifier_state_capture_rows_;
+            state = prepareSpeculativeState(state, state_floats);
+            if (!state)
+                return false;
         }
         return chunkForwardImpl(
             Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,

@@ -2,9 +2,11 @@
 
 #include "../compute_stages/IComputeStage.h"
 #include "../local_execution/graph/ComputeGraph.h"
+#include "../../utils/OpenMPUtils.h"
 
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace llaminar2
 {
@@ -63,6 +65,71 @@ namespace llaminar2
         }
 
         const int restore_row = plan.accepted_count - 1;
+        if (device.is_cpu() && state_stages.size() > 1)
+        {
+            std::vector<int> status(state_stages.size(), 0);
+            auto publish_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int i = 0; i < static_cast<int>(state_stages.size()); ++i)
+                {
+                    IComputeStage *stage = state_stages[static_cast<size_t>(i)];
+                    if (stage == nullptr)
+                    {
+                        status[static_cast<size_t>(i)] = -2;
+                        continue;
+                    }
+                    if (!stage->hasVerifierStateCapture())
+                    {
+                        status[static_cast<size_t>(i)] = 0;
+                        continue;
+                    }
+                    status[static_cast<size_t>(i)] =
+                        stage->restoreVerifierStateCaptureRow(restore_row, stream) ? 1 : -1;
+                }
+            };
+            OMP_WORKSHARE_REGION_IF(publish_work, state_stages.size() > 1);
+
+            for (size_t i = 0; i < state_stages.size(); ++i)
+            {
+                if (status[i] == 0)
+                {
+                    ++result.skipped_stage_count;
+                    continue;
+                }
+                if (status[i] == 1)
+                {
+                    ++result.restored_stage_count;
+                    continue;
+                }
+
+                std::ostringstream msg;
+                if (status[i] == -2)
+                {
+                    msg << "MTP spec-state publication received null stage at index "
+                        << i;
+                }
+                else
+                {
+                    IComputeStage *stage = state_stages[i];
+                    msg << "MTP spec-state publication failed restoring verifier row "
+                        << restore_row << " for stage "
+                        << (stage ? stage->name() : "<null>")
+                        << " at index " << i;
+                }
+                return publicationFailure(plan, msg.str());
+            }
+
+            if (require_captured_stage && result.restored_stage_count == 0)
+            {
+                return publicationFailure(
+                    plan,
+                    "MTP spec-state publication required a verifier-captured state stage but restored none");
+            }
+
+            return result;
+        }
+
         for (size_t i = 0; i < state_stages.size(); ++i)
         {
             IComputeStage *stage = state_stages[i];

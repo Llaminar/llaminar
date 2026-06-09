@@ -443,6 +443,13 @@ namespace llaminar2
         const int intermediate = params_.expert_intermediate;
         const bool is_gpu = params_.device_id.is_gpu();
 
+        if (!is_gpu &&
+            params_.force_decode_equivalent_verifier_prefill &&
+            seq_len > 1)
+        {
+            return executeCPUDecodeEquivalentVerifierPrefill(ctx);
+        }
+
         const bool has_prepared_expert_state =
             (!params_.prepared_gate_gemm.empty() &&
              params_.prepared_gate_gemm.size() == static_cast<size_t>(num_experts)) ||
@@ -1398,6 +1405,299 @@ namespace llaminar2
         LOG_TRACE("[MoEExpertComputeStage] Single-token decode (batched gate+up): " << num_active << " experts");
         if (is_gpu && !params_.output_registered_in_arena)
             markStandaloneGpuOutputWritten(params_.output, params_.device_id, gpuStream());
+        return true;
+    }
+
+    bool MoEExpertComputeStage::executeCPUDecodeEquivalentVerifierPrefill(IDeviceContext *ctx)
+    {
+        (void)ctx;
+
+        const int seq_len = params_.seq_len;
+        const int d_model = params_.d_model;
+        const int num_experts = params_.num_experts;
+        const int top_k = params_.top_k;
+        const int intermediate = params_.expert_intermediate;
+
+        if (params_.device_id.is_gpu() || seq_len <= 1)
+            return false;
+        if (!params_.input || !params_.output ||
+            !params_.routing_indices || !params_.routing_weights)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] CPU decode-equivalent verifier prefill missing tensors");
+            return false;
+        }
+
+        const bool has_prepared_expert_state =
+            !params_.prepared_gate_gemm.empty() &&
+            params_.prepared_gate_gemm.size() == static_cast<size_t>(num_experts);
+        if (params_.expert_gate_views.empty() && !has_prepared_expert_state)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] CPU decode-equivalent verifier prefill requires prepared expert engines");
+            return false;
+        }
+
+        IMoEKernel *kernel = ensureMoEKernel();
+        kernel->zeroBuffer(params_.output,
+                           static_cast<size_t>(seq_len) *
+                               static_cast<size_t>(d_model) *
+                               sizeof(float));
+
+        const int local_start = params_.local_expert_start;
+        const int local_count = (params_.local_expert_count < 0)
+                                    ? num_experts
+                                    : params_.local_expert_count;
+        const int local_end = local_start + local_count;
+
+        if (static_cast<int>(scratch_gate_batch_.size()) < top_k)
+        {
+            scratch_gate_batch_.resize(top_k);
+            scratch_up_batch_.resize(top_k);
+            for (int i = 0; i < top_k; ++i)
+            {
+                scratch_gate_batch_[i] = makeScratchFP32(1, intermediate, params_.device_id);
+                scratch_up_batch_[i] = makeScratchFP32(1, intermediate, params_.device_id);
+            }
+        }
+        if (!scratch_batch_ || scratch_capacity_ < 1)
+        {
+            scratch_batch_ = makeScratchFP32(1, d_model, params_.device_id);
+            scratch_capacity_ = 1;
+        }
+        if (!scratch_out_)
+            scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
+
+        const float *input_data = params_.input->data();
+        const float *routing_idx_data = params_.routing_indices->data();
+        const float *routing_wt_data = params_.routing_weights->data();
+        float *output_data = params_.output->mutable_data();
+
+        ensureGemmEnginesCached();
+
+        struct ActiveExpert
+        {
+            int expert_id;
+            float weight;
+            int batch_idx;
+        };
+
+        for (int row = 0; row < seq_len; ++row)
+        {
+            std::copy_n(input_data + static_cast<size_t>(row) * d_model,
+                        d_model,
+                        scratch_batch_->mutable_data());
+
+            ActiveExpert active_experts[16];
+            int routing_int_indices[16];
+            bool compute_here[16];
+            int num_active = 0;
+
+            if (top_k > 16)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] CPU decode-equivalent verifier prefill top_k="
+                          << top_k << " exceeds stack capacity");
+                return false;
+            }
+
+            const float *row_indices =
+                routing_idx_data + static_cast<size_t>(row) * top_k;
+            const float *row_weights =
+                routing_wt_data + static_cast<size_t>(row) * top_k;
+
+            for (int k = 0; k < top_k; ++k)
+            {
+                routing_int_indices[k] = static_cast<int>(row_indices[k]);
+                if (routing_int_indices[k] < 0 ||
+                    routing_int_indices[k] >= num_experts)
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Invalid routed expert id "
+                              << routing_int_indices[k]
+                              << " at verifier row " << row
+                              << " slot " << k
+                              << " for layer " << params_.layer_idx);
+                    return false;
+                }
+                if (!std::isfinite(row_weights[k]))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Non-finite route weight at verifier row "
+                              << row << " slot " << k
+                              << " for layer " << params_.layer_idx);
+                    return false;
+                }
+            }
+
+            if (params_.replica_set.num_replicated > 0)
+            {
+                params_.replica_set.assignForToken(
+                    routing_int_indices,
+                    row_weights,
+                    top_k,
+                    params_.my_socket_id,
+                    params_.expert_mask,
+                    compute_here);
+            }
+            else
+            {
+                for (int k = 0; k < top_k; ++k)
+                {
+                    const int expert_id = routing_int_indices[k];
+                    if (!params_.expert_mask.empty())
+                        compute_here[k] = params_.expert_mask[expert_id];
+                    else
+                        compute_here[k] =
+                            expert_id >= local_start && expert_id < local_end;
+                }
+            }
+
+            batch_projections_.clear();
+            batch_projections_.reserve(static_cast<size_t>(top_k) * 2);
+            for (int k = 0; k < top_k; ++k)
+            {
+                if (!compute_here[k])
+                    continue;
+
+                const int expert_id = routing_int_indices[k];
+                ITensorGemm *gate_gemm = cached_gate_gemm_[expert_id];
+                ITensorGemm *up_gemm = cached_up_gemm_[expert_id];
+                if (!gate_gemm || !up_gemm)
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Missing CPU verifier gate/up engine for expert "
+                              << expert_id << " layer " << params_.layer_idx);
+                    return false;
+                }
+
+                batch_projections_.push_back(
+                    {gate_gemm, scratch_gate_batch_[num_active].get(), intermediate, nullptr, "gate"});
+                batch_projections_.push_back(
+                    {up_gemm, scratch_up_batch_[num_active].get(), intermediate, nullptr, "up"});
+                active_experts[num_active] = {expert_id, row_weights[k], num_active};
+                ++num_active;
+            }
+
+            if (num_active > 0)
+            {
+                if (!batch_projections_[0].kernel->multiply_fused_tensor(
+                        scratch_batch_.get(),
+                        batch_projections_,
+                        /*m=*/1,
+                        d_model,
+                        nullptr,
+                        getWorkspace()))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] CPU verifier gate/up projection failed for layer "
+                              << params_.layer_idx << " row " << row);
+                    return false;
+                }
+            }
+
+            if (static_cast<int>(scratch_down_batch_.size()) < num_active)
+            {
+                scratch_down_batch_.resize(num_active);
+                for (int i = 0; i < num_active; ++i)
+                    if (!scratch_down_batch_[i])
+                        scratch_down_batch_[i] = makeScratchFP32(1, d_model, params_.device_id);
+            }
+
+            for (int i = 0; i < num_active; ++i)
+            {
+                if (!cached_down_gemm_[active_experts[i].expert_id])
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Missing CPU verifier down engine for expert "
+                              << active_experts[i].expert_id
+                              << " layer " << params_.layer_idx);
+                    return false;
+                }
+            }
+
+            swiglu_scratch_batch_.resize(std::max(
+                swiglu_scratch_batch_.size(),
+                static_cast<size_t>(num_active)));
+            for (int i = 0; i < num_active; ++i)
+            {
+                const auto &info = active_experts[i];
+                const float *gate_fp32 =
+                    scratch_gate_batch_[info.batch_idx]->data();
+                const float *up_fp32 =
+                    scratch_up_batch_[info.batch_idx]->data();
+                if (static_cast<int>(swiglu_scratch_batch_[i].size()) < intermediate)
+                    swiglu_scratch_batch_[i].resize(intermediate);
+
+                primitives::compute_swiglu_serial(
+                    gate_fp32,
+                    up_fp32,
+                    swiglu_scratch_batch_[i].data(),
+                    intermediate);
+            }
+
+            bool fused_ok = false;
+            if (num_active >= 2)
+            {
+                ITensorGemm::FusedExpertDownDesc down_descs[16];
+                for (int i = 0; i < num_active && i < 16; ++i)
+                {
+                    const auto &info = active_experts[i];
+                    down_descs[i].kernel = cached_down_gemm_[info.expert_id];
+                    down_descs[i].input = swiglu_scratch_batch_[i].data();
+                    down_descs[i].output = scratch_down_batch_[i]->mutable_data();
+                    down_descs[i].n = d_model;
+                }
+                fused_ok = cached_down_gemm_[active_experts[0].expert_id]
+                               ->multiply_fused_expert_down(
+                                   down_descs,
+                                   num_active,
+                                   1,
+                                   intermediate);
+            }
+
+            float *row_output =
+                output_data + static_cast<size_t>(row) * d_model;
+            if (fused_ok)
+            {
+                for (int i = 0; i < num_active; ++i)
+                {
+                    const auto &info = active_experts[i];
+                    primitives::vec_axpy(
+                        row_output,
+                        scratch_down_batch_[i]->data(),
+                        info.weight,
+                        d_model);
+                }
+            }
+            else
+            {
+                float *scratch_out_ptr = scratch_out_->mutable_data();
+                for (int i = 0; i < num_active; ++i)
+                {
+                    const auto &info = active_experts[i];
+                    ITensorGemm *down_gemm =
+                        cached_down_gemm_[info.expert_id];
+                    if (!fusedSwigluDown(
+                            scratch_gate_batch_[info.batch_idx].get(),
+                            scratch_up_batch_[info.batch_idx].get(),
+                            scratch_out_.get(),
+                            down_gemm,
+                            kernel,
+                            /*m=*/1,
+                            d_model,
+                            intermediate,
+                            params_.device_id,
+                            gpuStream(),
+                            getWorkspace()))
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage] CPU verifier down projection failed for expert "
+                                  << info.expert_id << " layer "
+                                  << params_.layer_idx << " row " << row);
+                        return false;
+                    }
+
+                    primitives::vec_axpy(
+                        row_output,
+                        scratch_out_ptr,
+                        info.weight,
+                        d_model);
+                }
+            }
+        }
+
         return true;
     }
 
@@ -2514,6 +2814,79 @@ namespace llaminar2
         return shouldUseGroupedVerifierPrefillRoute();
     }
 
+    bool SharedExpertFFNStage::shouldUseCPUDecodeEquivalentVerifierPrefill() const
+    {
+        return params_.device_id.is_cpu() &&
+               params_.force_decode_equivalent_verifier_prefill &&
+               params_.seq_len > 1 &&
+               params_.seq_len <= 4;
+    }
+
+    bool SharedExpertFFNStage::usesCPUDecodeEquivalentVerifierPrefillForTesting() const
+    {
+        return shouldUseCPUDecodeEquivalentVerifierPrefill();
+    }
+
+    bool SharedExpertFFNStage::executeCPUDecodeEquivalentVerifierPrefill(
+        IMoEKernel *kernel, int d_model, int intermediate)
+    {
+        if (!kernel || !params_.input || !params_.output ||
+            !cached_gate_gemm_ || !cached_up_gemm_ || !cached_down_gemm_)
+        {
+            return false;
+        }
+
+        if (!scratch_input_row_ ||
+            scratch_input_row_->shape() != std::vector<size_t>{1u, static_cast<size_t>(d_model)})
+        {
+            scratch_input_row_ = makeScratchFP32(1, d_model, params_.device_id);
+        }
+        if (!scratch_output_row_ ||
+            scratch_output_row_->shape() != std::vector<size_t>{1u, static_cast<size_t>(d_model)})
+        {
+            scratch_output_row_ = makeScratchFP32(1, d_model, params_.device_id);
+        }
+
+        const float *input = params_.input->data();
+        float *output = params_.output->mutable_data();
+        if (!input || !output)
+            return false;
+
+        for (int row = 0; row < params_.seq_len; ++row)
+        {
+            std::copy_n(input + static_cast<size_t>(row) * d_model,
+                        d_model,
+                        scratch_input_row_->mutable_data());
+
+            std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                {cached_gate_gemm_, scratch_gate_.get(), intermediate, nullptr, "shared_gate"},
+                {cached_up_gemm_, scratch_up_.get(), intermediate, nullptr, "shared_up"}};
+            if (!cached_gate_gemm_->multiply_fused_tensor(
+                    scratch_input_row_.get(), projections,
+                    1, d_model,
+                    nullptr, getWorkspace()))
+            {
+                LOG_ERROR("[SharedExpertFFNStage] CPU decode-equivalent shared gate/up projection failed at row " << row);
+                return false;
+            }
+
+            if (!fusedSwigluDown(
+                    scratch_gate_.get(), scratch_up_.get(), scratch_output_row_.get(),
+                    cached_down_gemm_, kernel, 1, d_model, intermediate,
+                    params_.device_id, gpuStream(), getWorkspace()))
+            {
+                LOG_ERROR("[SharedExpertFFNStage] CPU decode-equivalent shared SwiGLU/down projection failed at row " << row);
+                return false;
+            }
+
+            std::copy_n(scratch_output_row_->data(),
+                        d_model,
+                        output + static_cast<size_t>(row) * d_model);
+        }
+
+        return true;
+    }
+
     bool SharedExpertFFNStage::tryGroupedVerifierPrefill(
         IMoEKernel *kernel, int d_model, int intermediate) const
     {
@@ -2637,6 +3010,16 @@ namespace llaminar2
                 return false;
             }
             markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
+            return true;
+        }
+
+        if (shouldUseCPUDecodeEquivalentVerifierPrefill())
+        {
+            if (!executeCPUDecodeEquivalentVerifierPrefill(kernel, d_model, intermediate))
+            {
+                LOG_ERROR("[SharedExpertFFNStage] CPU decode-equivalent verifier shared expert path failed");
+                return false;
+            }
             return true;
         }
 

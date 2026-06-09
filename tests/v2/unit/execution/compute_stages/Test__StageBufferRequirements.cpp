@@ -434,7 +434,7 @@ TEST_F(Test__StageBufferRequirements, StageBufferRequirements_TotalInputBytes)
 
 TEST_F(Test__StageBufferRequirements, EmbeddingStage_DeclaresCorrectBuffers)
 {
-    static constexpr size_t VOCAB_SIZE = 151936;
+    static constexpr size_t VOCAB_SIZE = 1024;
     auto embed_table = createFP32Tensor(VOCAB_SIZE, D_MODEL);
     auto output = createFP32Tensor(SEQ_LEN, D_MODEL);
     std::vector<int> token_ids(SEQ_LEN, 0);
@@ -482,7 +482,7 @@ TEST_F(Test__StageBufferRequirements, EmbeddingStage_NullTensors_ReturnsEmpty)
 
 TEST_F(Test__StageBufferRequirements, LMHeadStage_DeclaresCorrectBuffers)
 {
-    static constexpr size_t VOCAB_SIZE = 151936;
+    static constexpr size_t VOCAB_SIZE = 1024;
     auto hidden_states = createFP32Tensor(SEQ_LEN, D_MODEL);
     auto lm_head_weight = createFP32Tensor(VOCAB_SIZE, D_MODEL);
     auto logits = createFP32Tensor(SEQ_LEN, VOCAB_SIZE);
@@ -522,7 +522,7 @@ TEST_F(Test__StageBufferRequirements, LMHeadStage_DeclaresCorrectBuffers)
 
 TEST_F(Test__StageBufferRequirements, LMHeadStage_WithBias_IncludesBiasBuffer)
 {
-    static constexpr size_t VOCAB_SIZE = 151936;
+    static constexpr size_t VOCAB_SIZE = 1024;
     auto hidden_states = createFP32Tensor(SEQ_LEN, D_MODEL);
     auto lm_head_weight = createFP32Tensor(VOCAB_SIZE, D_MODEL);
     auto logits = createFP32Tensor(SEQ_LEN, VOCAB_SIZE);

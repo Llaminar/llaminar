@@ -41,16 +41,31 @@ The important ideas are:
 - Publication is explicit: accepted speculative slots become live state; rejected
   suffix and bonus-ready rows do not mutate live recurrent/KV state.
 
-Llaminar is slow today because dense and current CUDA MoE MTP still rely on a
-decode-equivalent verifier replay path. For depth-1, that means two one-token
-main forwards around each speculative pair, so the sidecar is cheap but the
-verifier dominates runtime.
+Llaminar is slow today when it diverges from that shape: dense greedy still pays
+extra verifier work through batched all-position LM-head rows, stochastic evidence
+still includes stepwise/decode-equivalent cost on some lanes, and MoE verifier
+paths are functionally green but dominated by target-forward and condition
+forward time.
 
 ## Target Architecture
 
-Add a device-agnostic MTP execution contract:
+The target is a first-class speculative decode transaction, not a collection of
+runner fallbacks. The transaction owns all metadata, draft rows, verifier rows,
+sampling decisions, and accepted-state publication for one decode step.
 
 ```cpp
+struct MTPSpecPersistentMetadata
+{
+    DeviceBuffer<int32_t> draft_token_ids;        // [requests, max_draft]
+    DeviceBuffer<int32_t> target_logits_indices;  // flattened draft rows
+    DeviceBuffer<int32_t> bonus_logits_indices;   // one per request
+    DeviceBuffer<int32_t> num_draft_tokens;       // [requests]
+    DeviceBuffer<int32_t> num_accepted_tokens;    // [requests]
+    DeviceBuffer<int32_t> spec_state_indices;     // [requests, max_draft + 1]
+    DeviceBuffer<int32_t> non_spec_state_indices;
+    DeviceBuffer<int32_t> token_indices;
+};
+
 struct MTPSpecStepPlan
 {
     int draft_count;
@@ -65,24 +80,62 @@ public:
     virtual bool prepareSpecSlots(const MTPSpecStepPlan&) = 0;
     virtual bool runDraftGraph(const MTPSpecStepPlan&) = 0;
     virtual bool runTargetVerifierGraph(const MTPSpecStepPlan&) = 0;
+    virtual bool runRejectionSampler(const MTPSpecStepPlan&) = 0;
     virtual bool publishAcceptedState(const MTPSpecStepPlan&) = 0;
     virtual bool discardRejectedState(const MTPSpecStepPlan&) = 0;
 };
 ```
 
-Implementation principles:
+Subsystem boundaries:
+
+- `MTPSpecTransactionDriver`: one device-agnostic coordinator used by CPU, CUDA,
+  ROCm, dense, and MoE. It replaces decode-equivalent verifier branches.
+- `MTPSpecPersistentMetadata`: vLLM-style padded buffers for draft tokens,
+  target/bonus logit rows, accepted counts, state indices, sequence/query
+  starts, and masks. GPU buffers live in workspace/arena allocations; CPU uses
+  the same layout in host buffers.
+- Draft graph: graph-shaped prefill plus one-token draft steps using persistent
+  input ids, positions, hidden state, MTP KV, and optional draft probability
+  output. Draft sampling is fused when the backend supports it.
+- Target verifier graph: one `draft_count + 1` target forward. It produces only
+  the verifier rows needed by `target_logits_indices` and `bonus_logits_indices`;
+  computing a full all-position LM head is a compatibility path, not the target.
+- Rejection sampler: greedy is a deterministic specialization of the stochastic
+  contract. Stochastic verification consumes target logits/probs, draft
+  probabilities, uniform/residual randoms, and emits output tokens plus
+  `num_accepted_tokens`.
+- State publication: KV, shifted MTP KV, GDN recurrence, short-conv state,
+  terminal hidden/logits, sampler history, and positions are published from
+  accepted speculative slots. Rejected suffix and bonus-only rows never mutate
+  live state.
+- Backend layer: CPU/CUDA/ROCm implement buffer binding and kernels only. The
+  accepted-count planner, metadata semantics, stochastic math, and transaction
+  state machine are shared.
+- MoE graph layer: routed/shared expert execution is graph-native and uses the
+  same metadata. Expert routing scratch is transient; only continuation state is
+  publishable.
+
+Non-negotiable invariants:
 
 - Per-device graphs only; no nested multi-device sidecar graph.
 - Every GPU operation uses an explicit non-null stream.
 - Every GPU scratch allocation uses arena/workspace declarations and
   `IWorkspaceConsumer`; no ad-hoc kernel-owned caches.
-- CPU, CUDA, and ROCm share the row/state publication planner and sampler math.
-  Backend code only implements kernels and buffer binding.
 - TransferEngine handles host/device movement where graph-stage contracts do not
   already provide device-resident buffers.
-- Greedy and stochastic use the same state publication path.
-- MoE sidecar uses graph-native MoE stages and sparse/replicated expert domains,
-  not dense-only fallbacks.
+- Fallbacks are temporary migration scaffolding only. Once a path is replaced
+  and parity/perf accepted, the dead code and tests are removed.
+
+Current Llaminar shape versus target:
+
+| Area | Current shape | vLLM-shaped target |
+|------|---------------|--------------------|
+| Greedy dense | All-position verifier publication exists and is speed-positive | Row-indexed verifier logits and graph transaction |
+| Stochastic dense | Correct, but short-lane speed-negative and CPU evidence includes stepwise cost | Batched rejection sampler over target/draft probs |
+| CPU verifier | Full target forward plus batched all-position LM-head rows | Target/bonus row LM head and shared metadata buffers |
+| MoE | Functionally green, speed-negative | Graph-native sidecar plus batched verifier/rejection |
+| State publication | Captured-stage restore works | Spec state slots are the primary live-state mechanism |
+| Graph capture | Improving per backend | Draft, verify, sample, publish are captured where possible |
 
 ## Current Status
 
@@ -175,6 +228,11 @@ Done:
   completed all CUDA/ROCm/CPU dense/MoE greedy/stochastic lanes with fixed
   d1/d2/d3/dynamic. Dense greedy is still speed-positive; dynamic is less
   cliffy but remains short-run conservative versus the best fixed depth.
+- `V2_Perf_MTPDepthController` now characterizes dynamic policy overhead. The
+  controller is scalar counter bookkeeping, measuring about 11-25 ns per update
+  in Release, so CPU dynamic-depth tuning should target verifier, condition, and
+  accepted-state publication costs rather than threading or vectorizing the
+  controller itself.
 - CUDA MoE greedy has parity/style coverage.
 - CUDA MoE MTP sidecar M=1 now uses the same grouped-prefill contract as
   verifier M=2..4, avoiding the fragile runtime grouped-decode chain inside
@@ -213,6 +271,35 @@ Done:
   contract without marking CPU graph-cache identities stale, and the same deep
   CPU/CUDA/ROCm dense+MoE depth-3 greedy/stochastic verifier parity guard passed
   after the diagnostic hook landed.
+- CPU stochastic all-position publication now uses the same accepted-state
+  publication contract as CUDA/ROCm, with host-side target/draft distributions
+  built from the shared sampler probability and residual math. Focused runner
+  units cover host accept and reject/correction cases, and the backend-symmetric
+  dense+MoE CPU/CUDA/ROCm depth-3 greedy plus stochastic verifier parity gate
+  passed after the parity contract was tightened to reject the old
+  decode-equivalent fallback.
+- CPU hybrid state export/import now builds deterministic host-copy spans and
+  copies large recurrence/short-conv payloads through the existing OpenMP
+  workshare pattern. CPU accepted-state publication also restores independent
+  verifier-captured stages in parallel while keeping GPU publication ordered on
+  the explicit stream. `V2_Unit_HybridKVCache`, `V2_Unit_MTPSpecStateContract`,
+  and `V2_Unit_PrefillDecodeTransition` cover the parallel copy and publication
+  contracts.
+- CPU sampler top-k distribution building now uses an ISA-dispatched
+  scalar/AVX2/AVX512 top-k primitive in the Qwen chat/MTP compact top-k path,
+  avoiding the former full-vocab `pair` allocation plus `partial_sort`.
+  `V2_Unit_Sampler` proves scalar, AVX2, and AVX512 top-k equivalence and
+  distribution parity with the old partial-sort baseline. `V2_Perf_CPUSamplerTopK`
+  on a 151,936-token Qwen-style vocabulary measured old/new distribution build
+  times of 0.190846/0.020120 ms for top-k 20, 0.187209/0.028611 ms for top-k
+  40, and 0.262855/0.225518 ms for top-k 256.
+- CPU dense Qwen3.6 Prefix/MTP parity no longer spins up redundant no-MTP
+  baseline runners inside prefix restore, split-prefill, fixed/dynamic MTP, or
+  stochastic verifier helpers when the PyTorch decode token fixture already
+  provides the correctness oracle. Focused CTest reruns show the former slow
+  cells now cluster around 41-43s: split prefill 42.63s, fixed d3 MTP 41.81s,
+  stochastic verifier 43.15s, and dynamic MTP 42.55s. Dedicated no-MTP and
+  determinism tests remain intact.
 - Rejected-token all-position publication no longer runs an expensive same-step
   correction main forward. The runner now emits the correction token, commits
   its shifted MTP row from current terminal hidden so the sidecar cache remains
@@ -276,13 +363,30 @@ Open gaps:
   acceptance work. Bounded CPU dense and MoE have previous evidence, but fresh
   all-in-one iteration runs now split CPU out because a single `cpu:0` dense
   baseline can take about five minutes even at 16 decode tokens.
-- CPU stochastic accepted-count publication is not yet implemented; CPU
-  stochastic currently proves correctness through the decode-equivalent host
-  verifier path. Latest bounded evidence is speed-negative: best fixed d3 is
-  3.62 vs 4.62 tok/s and still rolls back.
+- CPU stochastic accepted-count publication is now implemented and
+  correctness-gated, but benchmark acceptance is still open. The parity stats
+  showed real CPU overhead in the publication path, including hybrid checkpoint
+  export, accepted-state publication, and host sampler work. The first
+  parallelization pass and top-k sampler fast path have landed, but latest
+  bounded benchmark evidence is still speed-negative until refreshed after
+  these changes.
+- CPU dynamic dense greedy is not controller-overhead bound. In the latest
+  bounded matrix, dynamic behaves like fixed d2 at 5.6 tok/s while fixed d3 hits
+  9.1 tok/s; the dynamic perfstats show about 4.26s verifier time, 1.51s
+  condition-forward time, and 0.51s accepted-state publication time over the
+  16-token lane.
+- A focused CPU dense dynamic profiler pass
+  `benchmark_results/mtp_vllm_style/20260609T122350Z-cpu-dense-dynamic-verifier-profile/`
+  confirms the verifier cost is model math, not controller or executor spin:
+  dynamic landed at 6.56 tok/s with 4.20s verifier, 1.48s condition-forward,
+  and 56.8ms publication. Host executor decode stage time was led by
+  `GEMM_FUSED_GATE_UP` 30.7%, `GEMM` 27.2%, `GDN_PROJECTION` 13.9%, and
+  `LM_HEAD` 12.2%. This is still less vLLM-shaped than desired because CPU
+  stochastic evidence is stepwise and CPU greedy still pays a full all-position
+  target forward plus batched all-position LM-head rows for verification.
 - GDN/short-conv speculative-slot publication is available through verifier row
-  capture hooks and is now used by the GPU all-position publication path; CPU
-  publication and broader benchmark evidence still need to catch up.
+  capture hooks and is now used by the CPU/CUDA/ROCm all-position publication
+  path; broader benchmark evidence still needs to catch up.
 - CUDA/ROCm/CPU MoE bounded matrices are functionally green for greedy and
   stochastic, but MTP is speed-negative everywhere. The common blocker is true
   verifier/catch-up cost. Latest fixed d3 MoE greedy spends about 379 ms total
@@ -295,7 +399,15 @@ Open gaps:
   too weak to catch it, but the release MoE benchmark acceptance collapsed.
   Keep the correction boundary recapture until a stronger backend state-refresh
   contract exists.
-- CPU vLLM-style state publication is not implemented or benchmarked.
+- CPU vLLM-style state publication is implemented for the current stochastic
+  SingleDevice contract but not yet benchmark-accepted.
+- CPU MoE commit-replay verification now restores the post-condition
+  verifier-base checkpoint. The focused CPU parity regression also proves the
+  main all-position verifier rows match serial decode rows, including shifted
+  cache preconditioning. The slow CPU serial LM-head verifier helper was removed
+  after the batched NativeVNNI all-position path matched serial decode rows, so
+  future failures should be treated as real state or publication drift rather
+  than a checker-base artifact.
 - CUDA MoE MTP is still speed-negative and must reduce verifier/catch-up cost
   before acceptance. Stochastic also needs acceptance-policy tuning or depth
   policy integration for the default prompt class.
@@ -307,52 +419,230 @@ Open gaps:
 
 ## Implementation Phases
 
-### Phase A: Spec-State Contract
+### Phase 1: Freeze The Spec Transaction Contract
 
-- Finalize `MTPSpecStepPlan` and the accepted-count publication planner.
-  Status: semantic plan builder plus vector/graph stage-state publisher units
-  landed. The runner hook now combines KV and verifier-captured recurrent
-  publication, and greedy/stochastic decode path integration is unit-gated for
-  accept-all and rejected-correction replay.
-- Add CPU reference publication for KV, GDN recurrence, short-conv state,
-  terminal logits/hidden, and sampler history.
-- Unit-test accept-all, reject-first, reject-after-prefix, bonus-ready, stop,
-  EOS, and prefix-restore cases.
+Goal: make one transaction object describe every speculative step.
 
-### Phase B: Dense SingleDevice Backend Publication
+Work:
 
-- CUDA: implement graph-capturable speculative state slots and accepted-state
-  publication kernels for KV, GDN, and short-conv.
-- ROCm: implement the same backend contract with HIP kernels and explicit stream
-  binding.
-- CPU: implement the same contract with deterministic reference code first, then
-  optimize.
-- Replace dense decode-equivalent replay with the publication path only after
-  parity passes.
+- Promote `MTPSpecStepPlan`, `MTPSpecDecodeMetadata`, accepted-count planning,
+  and publication provenance into the only legal interface between
+  `OrchestrationRunner` and backend publication.
+- Add `MTPSpecPersistentMetadata` and a CPU reference implementation with the
+  same shape as the GPU buffers.
+- Encode target rows, bonus rows, accepted counts, rejected/correction rows,
+  state-slot indices, and stop/EOS behavior in metadata rather than side
+  channels.
+- Move dynamic-depth observations to consume transaction outputs only.
 
-### Phase C: Greedy And Stochastic Sampler Unification
+Exit gate:
 
-- Centralize sampler math so CPU/CUDA/ROCm use the same probability rules.
-- Keep greedy as a deterministic specialization of the same metadata path.
-- Add MoE stochastic parity lanes before enabling stochastic MoE benchmark cells.
+- Unit tests cover accept-all, reject-first, reject-after-prefix, bonus-ready,
+  stop/EOS, prefix restore, stochastic residual, and budget-limited d0/d1 cases
+  without invoking a model runner.
+- Runner tests fail if a path commits tokens or state without a transaction.
 
-### Phase D: MoE SingleDevice
+### Phase 2: Persistent Metadata Buffers And Spec Slots
 
-- Fix ROCm grouped-prefill workspace sizing/binding.
-- Bring dense publication into Qwen3.6 MoE MTP blocks.
-- Ensure shared/routed expert paths, routing metadata, and expert workspaces are
-  graph-native and workspace-declared.
-- Investigate CUDA MoE acceptance regression against old 90%+ captures.
-- Remove the remaining MoE decode-equivalent verifier/catch-up replay cost from
-  CUDA and ROCm before marking MoE MTP speed accepted.
+Goal: match vLLM's padded persistent metadata/state-buffer shape.
 
-### Phase E: Benchmark Acceptance
+Work:
+
+- Add per-backend persistent buffers for draft tokens, positions, query starts,
+  target/bonus logit indices, draft probabilities, random uniforms, accepted
+  counts, and GDN/short-conv/KV state-slot indices.
+- GPU buffers must be declared through workspace/arena consumers and updated on
+  explicit streams. CPU buffers use the same layout and can be parallel-filled.
+- Replace request-local vectors in hot verifier paths with views into these
+  buffers.
+- Add diagnostics showing whether a lane used persistent metadata or a
+  compatibility vector path.
+
+Exit gate:
+
+- CPU/CUDA/ROCm unit tests prove identical metadata layout for fixed d1/d2/d3,
+  dynamic d0 probes, and stochastic rows.
+- Perfstats show zero hot-path ad-hoc GPU allocations and no implicit-stream
+  operations.
+
+### Phase 3: Row-Indexed Target Verifier Graph
+
+Goal: keep the target verifier as one `draft_count + 1` forward but avoid
+unnecessary all-position work.
+
+Work:
+
+- Build verifier graph inputs from persistent metadata, not temporary vectors.
+- Add row-indexed LM-head/logits production for target rows and bonus rows.
+  Full all-position LM head remains only as a guarded compatibility mode until
+  row-indexed parity is proven.
+- Preserve verifier graph capture/replay across accept-all steps and recapture
+  only when a true state-boundary invalidation occurs.
+- Add CPU stage attribution for verifier rows so regressions can identify
+  GEMM/GDN/LM-head cost by phase.
+
+Exit gate:
+
+- Dense CPU/CUDA/ROCm greedy parity passes with row-indexed verifier logits.
+- Bounded dense greedy benchmarks show verifier time drops versus the current
+  all-position LM-head path without lowering acceptance.
+- Compatibility all-position verifier mode can be disabled in CI for dense
+  SingleDevice.
+
+### Phase 4: Batched Greedy/Stochastic Rejection Sampler
+
+Goal: replace stepwise stochastic verification with a vLLM-shaped batched
+sampler.
+
+Work:
+
+- Implement a shared rejection-sampling interface over flattened target logits,
+  draft probabilities, draft tokens, and random thresholds.
+- GPU kernels produce output tokens plus `num_accepted_tokens` without CPU
+  participation. CPU uses scalar/AVX2/AVX512 dispatch plus OpenMP where useful.
+- Greedy uses the same buffers and output contract, with argmax equality as the
+  deterministic accept test.
+- Remove decode-equivalent stochastic verifier fallbacks after parity and
+  benchmark acceptance.
+
+Exit gate:
+
+- CPU/CUDA/ROCm sampler parity passes on synthetic and saved Qwen3.6 real-logit
+  fixtures for greedy, top-k/top-p, temperature, residual sampling, and seeded
+  RNG.
+- Dense stochastic MTP no longer emits `decode_equivalent_stochastic_forward_one`
+  in accepted lanes.
+- Bounded stochastic dense benchmarks are speed-positive or have a documented
+  acceptance-limit reason.
+
+### Phase 5: Publish From Spec Slots, Not Checkpoints
+
+Goal: make accepted-state publication cheap, atomic, and backend-neutral.
+
+Work:
+
+- Publish KV, shifted MTP KV, GDN recurrence, short-conv state, terminal hidden,
+  terminal logits, sampler history, positions, and sequence lengths from
+  accepted speculative slots.
+- Keep checkpoint export/import only for prefix-cache restore and debug
+  verification, not the steady MTP verifier path.
+- Add state-version diagnostics that distinguish accepted publication,
+  rejected correction, prefix restore, and session reset.
+- Ensure CPU publication uses the same slot contract as CUDA/ROCm rather than a
+  host-only checkpoint path.
+
+Exit gate:
+
+- Perfstats show publication cost is small and stable across d1/d2/d3 on CPU,
+  CUDA, and ROCm.
+- Forced reject parity proves the live state equals full replay after the next
+  ordinary decode step.
+- Dead checkpoint-dependent MTP publication code and tests are removed.
+
+### Phase 6: Graph-Captured Draft/Verify/Sample/Publish
+
+Goal: make the whole SingleDevice MTP step graph-shaped where the backend can
+support it.
+
+Work:
+
+- Capture draft prefill, one-token draft decode, target verifier, greedy
+  sampling, stochastic distribution/rejection, and publication helpers with
+  persistent buffers.
+- GPU stochastic graph capture must include Qwen chat defaults: temperature,
+  top-k, top-p, penalties where supported, and seeded RNG metadata.
+- CPU keeps the same transaction boundaries and uses optimized kernels rather
+  than graph capture.
+
+Exit gate:
+
+- CUDA and ROCm dense greedy/stochastic graph stress tests pass at long context.
+- No GPU lane needs final verifier sync before sampling unless explicitly
+  documented.
+- Perfstats expose capture/replay, stream handoff, sampler, and publication
+  counters for every MTP step.
+
+### Phase 7: Dense Performance Acceptance
+
+Goal: make dense SingleDevice performant before MoE-specific tuning.
+
+Work:
+
+- Run the bounded matrix every iteration and full default matrix at acceptance
+  checkpoints.
+- Tune M=1..4 GEMV/GEMM, GDN/short-conv publication, row-indexed LM-head, and
+  dynamic-depth hysteresis using the same evidence across CPU/CUDA/ROCm.
+- Keep CUDA, ROCm, and CPU correctness surfaces symmetric.
+
+Exit gate:
+
+- Dense greedy and stochastic are correct on CPU/CUDA/ROCm.
+- CUDA and ROCm post comparable speedup classes versus their no-MTP baselines;
+  if one backend lags, it gets a tuning pass before acceptance.
+- Dynamic approaches the best fixed depth for the prompt class after warmup.
+
+### Phase 8: MoE SingleDevice Parity With Dense Contract
+
+Goal: run Qwen3.6 MoE through the same transaction, metadata, sampler, and
+publication contract as dense.
+
+Work:
+
+- Reuse the dense transaction driver for MoE.
+- Make routed/shared expert sidecar and verifier stages graph-native with
+  workspace-declared scratch.
+- Persist only continuation state; expert routing payloads, histograms, and
+  sparse scratch remain transient.
+- Ensure CUDA and ROCm use the same MoE strategy before backend-specific tuning.
+
+Exit gate:
+
+- MoE CPU/CUDA/ROCm greedy and stochastic parity passes with the same tests as
+  dense plus MoE layer-by-layer math analysis.
+- MoE bounded matrix is speed-positive for greedy and stochastic or has a
+  measured route/acceptance bottleneck.
+- No MoE path uses dense-only fallbacks.
+
+### Phase 9: Multi-Device Promotion
+
+Goal: extend the accepted SingleDevice contract to TP/PP/ExpertParallel without
+changing its semantics.
+
+Work:
+
+- LocalTP/GlobalTP participants share the same draft tokens, target rows,
+  accepted counts, and rollback/publication decision.
+- PP stages publish only their local layer state but agree on global accepted
+  token counts.
+- ExpertParallel participants execute sparse no-op/dispatch/return stages in a
+  symmetric sequence, with placement fingerprints included in prefix/MTP state.
+
+Exit gate:
+
+- LocalTP, NodeLocalTP, LocalPP, and ExpertParallel parity suites pass for dense
+  and MoE where hardware exists.
+- Multi-device MTP never lets one participant publish a longer prefix than the
+  common accepted count.
+
+### Phase 10: Default-Enablement Evidence
+
+Goal: decide rollout from measured correctness and speed, not optimism.
+
+Work:
 
 - Refresh the dashboard after every iteration.
-- Green requires correctness plus speed-positive MTP against same-run no-MTP
-  baseline, with CUDA and ROCm posting comparable sized wins.
 - Compare CUDA against llama.cpp anchors and keep ROCm within the same class of
   speedup before considering backend acceptance.
+- Capture CPU separately with realistic expectations but the same correctness
+  gates.
+
+Exit gate:
+
+- Green requires correctness plus speed-positive MTP against same-run no-MTP
+  baseline.
+- Dense and MoE have separate acceptance records for greedy and stochastic.
+- Any default enablement proposal names the exact backend/model/sampling lanes
+  that passed parity and benchmark gates.
 
 ## Iteration Gates
 
@@ -394,8 +684,9 @@ ctest --test-dir build_v2_integration \
 This must cover, as applicable:
 
 - Dense CPU/CUDA/ROCm greedy MTP and prefix restore.
-- Dense CPU/CUDA/ROCm stochastic MTP. The CPU lane may use the host verifier;
-  CUDA/ROCm must use device-resident stochastic verification.
+- Dense CPU/CUDA/ROCm stochastic MTP. CPU may use host kernels, but it must use
+  the same batched verifier/rejection contract; CUDA/ROCm must use
+  device-resident stochastic verification.
 - Seeded stochastic sampler parity for saved real-model logits must be symmetric
   across CPU/CUDA/ROCm so backend drift cannot hide behind aggregate counters.
 - Dense CUDA/ROCm GPU graph smokes.
@@ -426,6 +717,14 @@ policy.
 
 Use `cpu:0` for the SingleDevice CPU lane. Bare `cpu` auto-selects two-socket
 CPU TP and belongs to a later multi-device/TP matrix, not this gate.
+
+For CPU dynamic-depth work, also run the focused policy-overhead perf test so
+controller cost stays separated from model verifier/publication cost:
+
+```bash
+ctest --test-dir build_v2_release -R "^V2_Perf_MTPDepthController$" \
+  --output-on-failure --parallel
+```
 
 ```bash
 cmake --build build_v2_release --parallel

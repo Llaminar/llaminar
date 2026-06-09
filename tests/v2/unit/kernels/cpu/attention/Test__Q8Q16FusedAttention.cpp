@@ -42,6 +42,14 @@ static double cosine_similarity(const float *a, const float *b, size_t n)
     return dot / std::sqrt(na * nb);
 }
 
+static float max_abs_diff(const float *a, const float *b, size_t n)
+{
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < n; ++i)
+        max_diff = std::max(max_diff, std::abs(a[i] - b[i]));
+    return max_diff;
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Test fixture
 // ─────────────────────────────────────────────────────────────────────
@@ -144,6 +152,33 @@ protected:
         return result;
     }
 
+    std::vector<float> runFusedQ8PathRows(
+        FP32Tensor *Q,
+        const Q8_1Tensor *K_q8, const Q8_1Tensor *V_q8,
+        int seq_len, int kv_len, bool causal)
+    {
+        auto output = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(q_dim_)});
+
+        auto kernel = Q->createAttention();
+        EXPECT_NE(kernel, nullptr);
+
+        auto ws = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(n_heads_ * kv_len)});
+
+        bool ok = kernel->compute_tensor(
+            Q, K_q8, V_q8, output.get(),
+            /*batch_size=*/1, seq_len, kv_len,
+            n_heads_, n_kv_heads_, head_dim_,
+            causal, /*window_size=*/-1,
+            ws.get(), nullptr, nullptr, -1);
+        EXPECT_TRUE(ok);
+
+        std::vector<float> result(static_cast<size_t>(seq_len) * q_dim_);
+        std::memcpy(result.data(), output->data(), result.size() * sizeof(float));
+        return result;
+    }
+
     /**
      * Run attention with raw Q16_1 tensors (fused path).
      * The kernel should detect Q16_1 native_type and dispatch to compute_decode_q16kv.
@@ -172,6 +207,33 @@ protected:
 
         std::vector<float> result(q_dim_);
         std::memcpy(result.data(), output->data(), q_dim_ * sizeof(float));
+        return result;
+    }
+
+    std::vector<float> runFusedQ16PathRows(
+        FP32Tensor *Q,
+        const Q16_1Tensor *K_q16, const Q16_1Tensor *V_q16,
+        int seq_len, int kv_len, bool causal)
+    {
+        auto output = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(q_dim_)});
+
+        auto kernel = Q->createAttention();
+        EXPECT_NE(kernel, nullptr);
+
+        auto ws = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(n_heads_ * kv_len)});
+
+        bool ok = kernel->compute_tensor(
+            Q, K_q16, V_q16, output.get(),
+            /*batch_size=*/1, seq_len, kv_len,
+            n_heads_, n_kv_heads_, head_dim_,
+            causal, /*window_size=*/-1,
+            ws.get(), nullptr, nullptr, -1);
+        EXPECT_TRUE(ok);
+
+        std::vector<float> result(static_cast<size_t>(seq_len) * q_dim_);
+        std::memcpy(result.data(), output->data(), result.size() * sizeof(float));
         return result;
     }
 };
@@ -390,4 +452,80 @@ TEST_F(Test__Q8Q16FusedAttention, Q16_1_FusedVsDequant_CausalMask)
     double cos = cosine_similarity(dequant_result.data(), fused_result.data(), q_dim_);
     std::cout << "Q16_1 Fused vs Dequant (causal, h128, kv=30): cosine=" << cos << std::endl;
     EXPECT_GT(cos, 0.999) << "Q16_1 fused with causal mask should match";
+}
+
+TEST_F(Test__Q8Q16FusedAttention, Q8_1_MultiRowDecodeMatchesSerialPrefixDecode_M2ToM4)
+{
+    SetUpDims(/*head_dim=*/64, /*n_heads=*/8, /*n_kv_heads=*/4);
+    constexpr int BASE_KV = 19;
+    constexpr int MAX_M = 4;
+    constexpr int FULL_KV = BASE_KV + MAX_M;
+
+    auto Q_all = makeRandomFP32(MAX_M, q_dim_, 9000);
+    auto K_fp32 = makeRandomFP32(FULL_KV, kv_dim_, 9001);
+    auto V_fp32 = makeRandomFP32(FULL_KV, kv_dim_, 9002);
+    auto K_q8 = Q8_1Tensor::quantize_from_fp32(K_fp32->data(), K_fp32->shape());
+    auto V_q8 = Q8_1Tensor::quantize_from_fp32(V_fp32->data(), V_fp32->shape());
+
+    for (int m = 2; m <= MAX_M; ++m)
+    {
+        FP32Tensor Q_multi({static_cast<size_t>(m), static_cast<size_t>(q_dim_)});
+        std::copy_n(Q_all->data(), static_cast<size_t>(m) * q_dim_, Q_multi.mutable_data());
+        const int kv_len = BASE_KV + m;
+        const std::vector<float> multi =
+            runFusedQ8PathRows(&Q_multi, K_q8.get(), V_q8.get(), m, kv_len, /*causal=*/true);
+
+        for (int row = 0; row < m; ++row)
+        {
+            FP32Tensor Q_row({1, static_cast<size_t>(q_dim_)});
+            std::copy_n(Q_all->data() + static_cast<size_t>(row) * q_dim_,
+                        q_dim_,
+                        Q_row.mutable_data());
+            const std::vector<float> serial =
+                runFusedQ8Path(&Q_row, K_q8.get(), V_q8.get(), BASE_KV + row + 1, /*causal=*/true);
+            const float *multi_row = multi.data() + static_cast<size_t>(row) * q_dim_;
+            const double cos = cosine_similarity(multi_row, serial.data(), q_dim_);
+            const float max_diff = max_abs_diff(multi_row, serial.data(), q_dim_);
+            EXPECT_GT(cos, 0.999f) << "M=" << m << " row=" << row;
+            EXPECT_LT(max_diff, 2e-3f) << "M=" << m << " row=" << row;
+        }
+    }
+}
+
+TEST_F(Test__Q8Q16FusedAttention, Q16_1_MultiRowDecodeMatchesSerialPrefixDecode_M2ToM4)
+{
+    SetUpDims(/*head_dim=*/64, /*n_heads=*/8, /*n_kv_heads=*/4);
+    constexpr int BASE_KV = 19;
+    constexpr int MAX_M = 4;
+    constexpr int FULL_KV = BASE_KV + MAX_M;
+
+    auto Q_all = makeRandomFP32(MAX_M, q_dim_, 9100);
+    auto K_fp32 = makeRandomFP32(FULL_KV, kv_dim_, 9101);
+    auto V_fp32 = makeRandomFP32(FULL_KV, kv_dim_, 9102);
+    auto K_q16 = Q16_1Tensor::quantize_from_fp32(K_fp32->data(), K_fp32->shape());
+    auto V_q16 = Q16_1Tensor::quantize_from_fp32(V_fp32->data(), V_fp32->shape());
+
+    for (int m = 2; m <= MAX_M; ++m)
+    {
+        FP32Tensor Q_multi({static_cast<size_t>(m), static_cast<size_t>(q_dim_)});
+        std::copy_n(Q_all->data(), static_cast<size_t>(m) * q_dim_, Q_multi.mutable_data());
+        const int kv_len = BASE_KV + m;
+        const std::vector<float> multi =
+            runFusedQ16PathRows(&Q_multi, K_q16.get(), V_q16.get(), m, kv_len, /*causal=*/true);
+
+        for (int row = 0; row < m; ++row)
+        {
+            FP32Tensor Q_row({1, static_cast<size_t>(q_dim_)});
+            std::copy_n(Q_all->data() + static_cast<size_t>(row) * q_dim_,
+                        q_dim_,
+                        Q_row.mutable_data());
+            const std::vector<float> serial =
+                runFusedQ16Path(&Q_row, K_q16.get(), V_q16.get(), BASE_KV + row + 1, /*causal=*/true);
+            const float *multi_row = multi.data() + static_cast<size_t>(row) * q_dim_;
+            const double cos = cosine_similarity(multi_row, serial.data(), q_dim_);
+            const float max_diff = max_abs_diff(multi_row, serial.data(), q_dim_);
+            EXPECT_GT(cos, 0.999f) << "M=" << m << " row=" << row;
+            EXPECT_LT(max_diff, 2e-3f) << "M=" << m << " row=" << row;
+        }
+    }
 }
