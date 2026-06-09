@@ -1261,6 +1261,7 @@ namespace llaminar2
                                             const char *path,
                                             const PrefixStateSnapshot &base,
                                             int emitted_tokens,
+                                            int state_advanced_tokens,
                                             PrefixStateProvenance verifier_source,
                                             bool has_terminal_logits,
                                             bool has_ready_token)
@@ -1268,9 +1269,16 @@ namespace llaminar2
         {
             if (!base.valid)
                 return std::string("MTP transaction base snapshot is invalid");
+            if (state_advanced_tokens < 0 ||
+                state_advanced_tokens > emitted_tokens)
+            {
+                return std::string("MTP transaction advanced-state token count is outside emitted output count");
+            }
 
             MTPCommitValidationOptions options;
             options.require_decode_equivalent_source = true;
+            options.require_base_shifted_mtp_kv = false;
+            options.require_committed_shifted_mtp_kv = true;
             options.require_terminal_hidden = true;
             options.require_terminal_logits = has_terminal_logits;
             options.require_ready_token = has_ready_token;
@@ -1284,7 +1292,8 @@ namespace llaminar2
 
             MTPDecodeStateStamp committed_stamp;
             committed_stamp.valid = base.valid;
-            committed_stamp.logical_tokens = base.cached_tokens + emitted_tokens;
+            committed_stamp.logical_tokens =
+                base.cached_tokens + state_advanced_tokens;
             committed_stamp.main_kv_tokens = committed_stamp.logical_tokens;
             committed_stamp.shifted_mtp_kv_tokens =
                 expectedShiftedMTPTokens(committed_stamp.logical_tokens);
@@ -1298,7 +1307,7 @@ namespace llaminar2
             MTPStateValidationResult validation = validateAtomicMTPCommit(
                 base_stamp,
                 committed_stamp,
-                emitted_tokens,
+                state_advanced_tokens,
                 verifier_source,
                 options);
             if (!validation)
@@ -1339,6 +1348,7 @@ namespace llaminar2
                 {},
                 {{"path", path},
                  {"emitted_tokens", std::to_string(emitted_tokens)},
+                 {"state_advanced_tokens", std::to_string(state_advanced_tokens)},
                  {"source", toString(verifier_source)}});
             return std::nullopt;
         };
@@ -1351,7 +1361,8 @@ namespace llaminar2
                                                   bool terminal_logits_ready,
                                                   bool is_complete,
                                                   PrefixStateProvenance verifier_source,
-                                                  bool state_advanced)
+                                                  bool state_advanced,
+                                                  int state_advanced_token_count = -1)
             -> std::optional<std::string>
         {
             if (tokens.empty())
@@ -1359,10 +1370,15 @@ namespace llaminar2
 
             if (state_advanced)
             {
+                const int advanced_tokens =
+                    state_advanced_token_count >= 0
+                        ? state_advanced_token_count
+                        : static_cast<int>(tokens.size());
                 if (auto validation_error = validate_mtp_transaction(
                         path,
                         base,
                         static_cast<int>(tokens.size()),
+                        advanced_tokens,
                         verifier_source,
                         terminal_logits_ready && !is_complete,
                         ready_token.has_value() && !is_complete))
@@ -1404,6 +1420,12 @@ namespace llaminar2
                                      ? std::to_string(*ready_token)
                                      : std::string("none")},
                  {"state_advanced", state_advanced ? "true" : "false"},
+                 {"state_advanced_tokens",
+                  std::to_string(state_advanced
+                                     ? (state_advanced_token_count >= 0
+                                            ? state_advanced_token_count
+                                            : static_cast<int>(tokens.size()))
+                                     : 0)},
                  {"complete", is_complete ? "true" : "false"},
                  {"source", toString(verifier_source)}});
             return std::nullopt;
@@ -2861,6 +2883,7 @@ namespace llaminar2
             }
 
             int correction_forward_count = 0;
+            int deferred_correction_condition_count = 0;
             if (step.requiresCorrectionReplay())
             {
                 const int replay_start = step.correction_replay_start_index;
@@ -2870,8 +2893,10 @@ namespace llaminar2
                         static_cast<int>(catchup.accepted_tokens.size()))
                 {
                     return fail_after_checkpoint(
-                        "All-position MTP verifier correction replay plan is outside committed outputs");
+                        "All-position MTP verifier deferred correction plan is outside committed outputs");
                 }
+                correction_forward_count = 0;
+                deferred_correction_condition_count = replay_count;
                 for (int i = 0; i < replay_count; ++i)
                 {
                     const int token_index = replay_start + i;
@@ -2881,7 +2906,7 @@ namespace llaminar2
                     {
                         PerfStatsCollector::ScopedTimer timer(
                             "mtp",
-                            "all_position_correction_shifted_commit",
+                            "all_position_deferred_correction_shifted_commit",
                             "decode");
                         shifted_commit_ok =
                             runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
@@ -2893,97 +2918,17 @@ namespace llaminar2
                     if (!shifted_commit_ok)
                     {
                         return fail_after_checkpoint(
-                            "All-position MTP verifier correction shifted-cache commit failed");
+                            "All-position MTP verifier deferred correction shifted-cache commit failed");
                     }
-
-                    int forward_token = static_cast<int>(replay_token);
-                    bool forward_ok = false;
-                    {
-                        PerfStatsCollector::ScopedTimer timer(
-                            "mtp",
-                            "all_position_correction_forward",
-                            "decode");
-                        forward_ok = runner_->forward(&forward_token, 1);
-                    }
-                    if (!forward_ok)
-                    {
-                        return fail_after_checkpoint(
-                            "All-position MTP verifier correction replay forward failed");
-                    }
-                    ++correction_forward_count;
                 }
-
-                if (!catchup.stopped_on_output)
-                {
-                    int32_t ready = -1;
-                    if (stochastic_verify)
-                    {
-                        auto penalty_map =
-                            all_position_stochastic_penalty_sampler
-                                .compute_penalty_map(
-                                    active_sampling_params_,
-                                    vocab);
-                        if (!runner_->applyPenaltiesOnDevice(
-                                penalty_map,
-                                vocab))
-                        {
-                            return fail_after_checkpoint(
-                                "All-position stochastic MTP correction ready-token penalty application failed");
-                        }
-                        if (!runner_->buildStochasticDistributionOnDevice(
-                                DeviceLogitsSource::Main,
-                                0,
-                                DeviceDistributionBuffer::Target,
-                                0,
-                                active_sampling_params_,
-                                vocab))
-                        {
-                            return fail_after_checkpoint(
-                                "All-position stochastic MTP correction ready-token distribution build failed");
-                        }
-                        ready = runner_->sampleStochasticDistributionOnDevice(
-                            DeviceDistributionBuffer::Target,
-                            0,
-                            sampler_.random_uniform_01());
-                        if (ready >= 0)
-                        {
-                            PerfStatsCollector::addCounter(
-                                "mtp",
-                                "phase138_stochastic_correction_ready_samples",
-                                1.0,
-                                "decode",
-                                {},
-                                {{"verifier_path", "all_position_state_publication"}});
-                        }
-                    }
-                    else
-                    {
-                        ready = runner_->sampleGreedyOnDevice();
-                        if (ready < 0)
-                        {
-                            const float *main_logits = runner_->logits();
-                            if (!main_logits)
-                            {
-                                return fail_after_checkpoint(
-                                    "All-position MTP verifier correction replay produced no ready logits");
-                            }
-                            PerfStatsCollector::ScopedTimer timer(
-                                "mtp",
-                                "all_position_correction_ready_sample_host",
-                                "decode");
-                            ready = sampler_.sample(
-                                main_logits,
-                                static_cast<size_t>(vocab),
-                                active_sampling_params_);
-                        }
-                    }
-                    if (ready < 0)
-                    {
-                        return fail_after_checkpoint(
-                            "All-position MTP verifier correction ready-token sampling failed");
-                    }
-                    catchup.ready_token = ready;
-                }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "all_position_deferred_correction_condition_tokens",
+                    static_cast<double>(deferred_correction_condition_count),
+                    "decode",
+                    {},
+                    {{"verifier_path", "all_position_state_publication"},
+                     {"start_index", std::to_string(replay_start)}});
             }
 
             std::vector<int32_t> accepted_tokens =
@@ -3006,8 +2951,14 @@ namespace llaminar2
                 !stopped_on_output &&
                 ready_token < 0)
             {
-                return fail_after_checkpoint(
-                    "All-position MTP verifier rejected without replaying correction state or producing a ready token");
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "all_position_rejection_without_ready_token",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"deferred_condition_tokens",
+                      std::to_string(deferred_correction_condition_count)}});
             }
 
             if (auto tx_error = validate_spec_decode_transaction(
@@ -3101,6 +3052,8 @@ namespace llaminar2
                  {"catchup_implementation", "all_position_state_publication"},
                  {"decode_equivalent_replay_required", "false"},
                  {"correction_replay_tokens", std::to_string(correction_forward_count)},
+                 {"deferred_correction_condition_tokens",
+                  std::to_string(deferred_correction_condition_count)},
                  {"output_tokens", std::to_string(accepted_tokens.size())},
                  {"ready_token", std::to_string(ready_token)},
                  {"used_ready_logits", use_ready_logits ? "true" : "false"}});
@@ -3126,7 +3079,8 @@ namespace llaminar2
                     /*terminal_logits_ready=*/!stopped_on_output && ready_token >= 0,
                     /*is_complete=*/stopped_on_output,
                     PrefixStateProvenance::VerifierPrefillRowsDecodeEquivalent,
-                    /*state_advanced=*/true))
+                    /*state_advanced=*/true,
+                    /*state_advanced_token_count=*/accepted_state_count))
             {
                 return fail_after_checkpoint(*commit_error);
             }

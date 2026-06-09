@@ -246,7 +246,7 @@ TEST(Test__MTPDecodeCatchup, AllPositionVerifierAcceptsAllAndMatchesStepwiseOrac
     EXPECT_TRUE(eq.ok) << eq.error;
 }
 
-TEST(Test__MTPDecodeCatchup, AllPositionVerifierRejectsAndMarksCorrectionReplayBoundary)
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierRejectsAndDefersCorrectionCondition)
 {
     MTPDecodeCatchupGreedyRequest request;
     request.draft_tokens = {7, 9, 9};
@@ -266,7 +266,9 @@ TEST(Test__MTPDecodeCatchup, AllPositionVerifierRejectsAndMarksCorrectionReplayB
         << "the correction token has not been forwarded yet";
     EXPECT_EQ(candidate.target_verifier_state_commit_count, 2)
         << "only the accepted verifier-input prefix is publishable";
-    EXPECT_EQ(candidate.shifted_commit_count, 3);
+    EXPECT_EQ(candidate.shifted_commit_count, 3)
+        << "the rejected correction token is emitted and shifted-committed, "
+           "but its main-model condition forward is deferred";
 }
 
 TEST(Test__MTPDecodeCatchup, AllPositionVerifierWithCorrectionReplayMatchesStepwiseOracle)

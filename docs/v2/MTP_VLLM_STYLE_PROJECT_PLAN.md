@@ -180,6 +180,15 @@ Done:
   Bounded CUDA MoE diagnostics show verifier replay is now exercised for fixed
   d1/d2/d3/dynamic lanes, but MoE remains speed-negative because verifier plus
   correction time still dominates.
+- Rejected-token all-position publication no longer runs an expensive same-step
+  correction main forward. The runner now emits the correction token, commits
+  its shifted MTP row from current terminal hidden so the sidecar cache remains
+  aligned, records `deferred_correction_condition_tokens`, and defers the
+  correction token's main-model condition forward to the next ordinary decode
+  step. Focused units and
+  `Qwen36MoECUDASingleDevicePrefixMTPPathGuards.Depth1RejectedCorrectionDefersToConditionToken`
+  cover this split; fresh CUDA/ROCm GPU matrices show `correction_ms=0` and
+  zero rollback, but MoE remains speed-negative because verifier time dominates.
 - CUDA MoE graph-captured no-MTP baseline decode crash is fixed. Root cause was
   a split-K down-partials workspace contract mismatch plus missing expert-id
   upper-bound guards in CUDA MoE grouped k-part kernels. The focused regression
@@ -202,8 +211,9 @@ Done:
 Open gaps:
 
 - Full default-length CPU dense and CPU MoE matrix refreshes remain slow
-  acceptance work. Bounded CPU dense and MoE now have evidence, but the CPU
-  lanes still take minutes even at 16 decode tokens.
+  acceptance work. Bounded CPU dense and MoE have previous evidence, but fresh
+  all-in-one iteration runs now split CPU out because a single `cpu:0` dense
+  baseline can take about five minutes even at 16 decode tokens.
 - CPU stochastic accepted-count publication is not yet implemented; CPU
   stochastic currently proves correctness through the decode-equivalent host
   verifier path. Latest bounded evidence is speed-negative: best fixed d3 is

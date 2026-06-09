@@ -43,6 +43,13 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "all_position_deferred_correction_condition_tokens",
+                    "phase": "decode",
+                    "count": 3,
+                    "total_ms": 0,
+                },
+                {
+                    "domain": "mtp",
                     "name": "all_position_publish_accepted_state",
                     "phase": "decode",
                     "count": 3,
@@ -112,6 +119,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["verifier_ms"], 18.25)
         self.assertEqual(summary["correction_ms"], 7.5)
         self.assertEqual(summary["correction_count"], 2)
+        self.assertEqual(summary["deferred_corrections"], 3)
         self.assertEqual(summary["publish_ms"], 1.25)
         self.assertEqual(summary["main_verifier_warmup"], 4)
         self.assertEqual(summary["main_verifier_capture"], 1)
@@ -128,7 +136,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         )
         self.assertEqual(
             result.stdout.strip(),
-            "0.0\t0.0\t0.0\t0\t0.0\t0\t0\t0\t0\t0",
+            "0.0\t0.0\t0.0\t0\t0\t0.0\t0\t0\t0\t0\t0",
         )
 
 

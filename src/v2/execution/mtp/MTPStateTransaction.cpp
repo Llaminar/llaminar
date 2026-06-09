@@ -43,7 +43,8 @@ namespace llaminar2
         {
             return MTPStateValidationResult::failure("decode position does not match logical token count");
         }
-        if (state.shifted_mtp_kv_tokens != expectedShiftedMTPTokens(state.logical_tokens))
+        if (options.require_shifted_mtp_kv &&
+            state.shifted_mtp_kv_tokens != expectedShiftedMTPTokens(state.logical_tokens))
         {
             return MTPStateValidationResult::failure("shifted MTP KV token count does not match logical token count");
         }
@@ -71,10 +72,19 @@ namespace llaminar2
     {
         if (emitted_tokens <= 0)
             return MTPStateValidationResult::failure("atomic MTP commit emitted no tokens");
-        auto base_result = validateCommittedMTPDecodeState(base, options);
+        MTPCommitValidationOptions base_options = options;
+        base_options.require_shifted_mtp_kv =
+            options.require_base_shifted_mtp_kv;
+        MTPCommitValidationOptions committed_options = options;
+        committed_options.require_shifted_mtp_kv =
+            options.require_committed_shifted_mtp_kv;
+
+        auto base_result = validateCommittedMTPDecodeState(base, base_options);
         if (!base_result)
             return MTPStateValidationResult::failure("base state failed validation: " + base_result.reason);
-        auto committed_result = validateCommittedMTPDecodeState(committed, options);
+        auto committed_result = validateCommittedMTPDecodeState(
+            committed,
+            committed_options);
         if (!committed_result)
             return MTPStateValidationResult::failure("committed state failed validation: " + committed_result.reason);
         if (options.require_decode_equivalent_source && !isDecodeEquivalent(verifier_source))

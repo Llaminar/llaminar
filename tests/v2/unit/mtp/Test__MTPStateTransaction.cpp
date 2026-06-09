@@ -134,6 +134,35 @@ TEST(Test__MTPStateTransaction, AtomicCommitRequiresBasePlusEmittedTokens)
     EXPECT_NE(result.reason.find("base plus emitted"), std::string::npos);
 }
 
+TEST(Test__MTPStateTransaction, AtomicCommitCanAllowOnlyBaseShiftedKVLag)
+{
+    MTPDecodeStateStamp base = makeState(5);
+    base.shifted_mtp_kv_tokens = 0;
+    MTPDecodeStateStamp committed = makeState(6);
+
+    MTPCommitValidationOptions options;
+    options.require_base_shifted_mtp_kv = false;
+    options.require_committed_shifted_mtp_kv = true;
+
+    auto result = validateAtomicMTPCommit(
+        base,
+        committed,
+        /*emitted_tokens=*/1,
+        PrefixStateProvenance::DecodeEquivalent,
+        options);
+    EXPECT_TRUE(result) << result.reason;
+
+    committed.shifted_mtp_kv_tokens = 0;
+    result = validateAtomicMTPCommit(
+        base,
+        committed,
+        /*emitted_tokens=*/1,
+        PrefixStateProvenance::DecodeEquivalent,
+        options);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("shifted MTP KV"), std::string::npos);
+}
+
 TEST(Test__MTPStateTransaction, AtomicCommitRequiresTerminalReadyState)
 {
     MTPDecodeStateStamp base = makeState(5);

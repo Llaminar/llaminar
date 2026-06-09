@@ -58,11 +58,12 @@ namespace llaminar2
          *
          * Stepwise catch-up forwards every committed output token, so the
          * default (-1) means "same as accepted_tokens.size()". A vLLM-style
-         * verifier graph is different after a rejection: the correction token
-         * is sampled from the rejecting row, but that correction token has not
-         * itself been forwarded. Such candidates set this to the accepted
-         * verifier-input prefix and replay the correction suffix before
-         * claiming decode equivalence.
+     * verifier graph is different after a rejection: the correction token
+     * is sampled from the rejecting row, but that correction token has not
+     * itself been forwarded. Such candidates set this to the accepted
+     * verifier-input prefix. Runners may either replay the correction suffix
+     * immediately to produce a ready token or defer it as the next ordinary
+     * condition token, matching the vLLM speculative-state publication shape.
          */
         int target_verifier_state_commit_count = -1;
     };

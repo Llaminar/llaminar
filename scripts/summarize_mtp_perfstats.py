@@ -14,6 +14,7 @@ FIELDS = (
     "verifier_ms",
     "correction_ms",
     "correction_count",
+    "deferred_corrections",
     "publish_ms",
     "main_verifier_warmup",
     "main_verifier_capture",
@@ -93,6 +94,12 @@ def summarize(path: Path | None) -> dict[str, float | int]:
         "verifier_ms": _sum_total_ms(records, "mtp", "verifier_forward"),
         "correction_ms": _sum_total_ms(records, "mtp", "all_position_correction_forward"),
         "correction_count": _sum_count(records, "mtp", "all_position_correction_forward"),
+        "deferred_corrections": _sum_count(
+            records,
+            "mtp",
+            "all_position_deferred_correction_condition_tokens",
+            phase="decode",
+        ),
         "publish_ms": _sum_total_ms(records, "mtp", "all_position_publish_accepted_state"),
         "main_verifier_warmup": _sum_count(
             records,

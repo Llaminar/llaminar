@@ -2343,12 +2343,14 @@ namespace
             EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2)
-                << "the first shifted row is committed before the verifier, then only the rejected correction suffix is replayed";
+                << "the first shifted row is committed before the verifier; "
+                   "the rejected correction gets a shifted row while its "
+                   "main-model condition forward is deferred";
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
                         ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
-            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 2)
-                << "all-position verifier plus one correction replay";
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "only the all-position verifier forward runs in this step";
 
             const MTPSpecStepPlan &published = mock->lastPublishedMTPSpecStep();
             EXPECT_EQ(published.accepted_count, 1);
@@ -2370,8 +2372,9 @@ namespace
                                         {"all_speculative_accepted", "false"},
                                         {"verifier_path", "all_position_state_publication"},
                                         {"decode_equivalent_replay_required", "false"},
-                                        {"correction_replay_tokens", "1"},
-                                        {"ready_token", "3"}});
+                                        {"correction_replay_tokens", "0"},
+                                        {"deferred_correction_condition_tokens", "1"},
+                                        {"ready_token", "-1"}});
             ASSERT_NE(trace, nullptr);
 
             const PerfStatRecord *publication_runs =
@@ -2379,7 +2382,7 @@ namespace
                                        PerfStatRecord::Kind::Counter,
                                        "all_position_state_publication_verifier_runs",
                                        {{"verifier_rows", "3"},
-                                        {"correction_replay_tokens", "1"},
+                                        {"correction_replay_tokens", "0"},
                                         {"accepted_state_count", "1"},
                                         {"target_cached_tokens", "6"}});
             ASSERT_NE(publication_runs, nullptr);
@@ -2427,23 +2430,23 @@ namespace
                 << "depth-2 all-position verification includes a bonus-ready row";
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2)
-                << "first shifted row plus rejected correction replay are sequential";
+                << "first condition row plus deferred correction shifted row";
             EXPECT_EQ(mock->commitMTPShiftedCount(), 3)
                 << "accepted verifier prefix must be committed from verifier hidden rows";
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 2)
-                << "the final shifted commit is the rejected correction replay";
+                << "the final shifted commit is the deferred correction row";
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 0);
-            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 2)
-                << "all-position verifier plus one correction replay";
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "only the all-position verifier forward runs in this step";
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *publication_runs =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,
                                        "all_position_state_publication_verifier_runs",
-                                       {{"forward_tokens", "4"},
+                                       {{"forward_tokens", "3"},
                                         {"verifier_rows", "3"},
-                                        {"correction_replay_tokens", "1"},
+                                        {"correction_replay_tokens", "0"},
                                         {"accepted_state_count", "2"},
                                         {"target_cached_tokens", "7"}});
             ASSERT_NE(publication_runs, nullptr);
@@ -2595,13 +2598,15 @@ namespace
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
-            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 2)
-                << "all-position verifier plus one residual correction replay";
-            EXPECT_EQ(mock->deviceDistributionBuildCount(), 4)
-                << "first token, draft, all-position verifier row, and correction ready distribution";
-            EXPECT_EQ(mock->deviceDistributionSampleCount(), 3);
+            EXPECT_THAT(mock->lastCommitMTPTokens(),
+                        ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "only the all-position verifier forward runs in this step";
+            EXPECT_EQ(mock->deviceDistributionBuildCount(), 3)
+                << "first token, draft, and all-position verifier row distributions";
+            EXPECT_EQ(mock->deviceDistributionSampleCount(), 2);
             EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
-            EXPECT_EQ(mock->applyMainPenaltiesCount(), 2);
+            EXPECT_EQ(mock->applyMainPenaltiesCount(), 1);
             EXPECT_EQ(mock->applyMTPPenaltiesCount(), 1);
             EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 1);
 
@@ -2631,7 +2636,8 @@ namespace
                                         {"all_speculative_accepted", "false"},
                                         {"verifier_path", "all_position_state_publication"},
                                         {"decode_equivalent_replay_required", "false"},
-                                        {"correction_replay_tokens", "1"}});
+                                        {"correction_replay_tokens", "0"},
+                                        {"deferred_correction_condition_tokens", "1"}});
             ASSERT_NE(trace, nullptr);
         }
         std::filesystem::remove(export_path);

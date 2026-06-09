@@ -30,6 +30,9 @@ namespace llaminar2
     struct MTPCommitValidationOptions
     {
         bool require_decode_equivalent_source = true;
+        bool require_shifted_mtp_kv = true;
+        bool require_base_shifted_mtp_kv = true;
+        bool require_committed_shifted_mtp_kv = true;
         bool require_terminal_hidden = true;
         bool require_terminal_logits = true;
         bool require_ready_token = true;
