@@ -301,6 +301,8 @@ namespace llaminar2
             ITensor *routing_indices, ITensor *routing_weights,
             int seq_len, int num_experts, int top_k) override;
 
+        bool prepareSharedExpertPrefillGroup(int seq_len) override;
+
         bool executeGroupedPrefillPipeline(
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,

@@ -2502,7 +2502,7 @@ namespace llaminar2
 
     bool SharedExpertFFNStage::shouldUseGroupedVerifierPrefillRoute() const
     {
-        return params_.device_id.is_cuda() &&
+        return params_.device_id.is_gpu() &&
                params_.force_grouped_verifier_prefill_for_decode &&
                params_.seq_len >= 1 &&
                params_.seq_len <= 4 &&
@@ -2633,7 +2633,7 @@ namespace llaminar2
         {
             if (!tryGroupedVerifierPrefill(kernel, d_model, intermediate))
             {
-                LOG_ERROR("[SharedExpertFFNStage] CUDA verifier grouped shared expert path failed");
+                LOG_ERROR("[SharedExpertFFNStage] Verifier grouped shared expert path failed");
                 return false;
             }
             markGpuTensorWritten(params_.output, params_.device_id, gpuStream());

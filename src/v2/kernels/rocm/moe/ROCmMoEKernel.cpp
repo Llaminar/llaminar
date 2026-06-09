@@ -388,6 +388,16 @@ extern "C"
         int max_active_experts,
         int device_idx, void *stream);
 
+    bool hipMoE_prepare_shared_expert_group(
+        int *expert_offsets,
+        int *expert_counts,
+        int *grouped_token_indices,
+        float *grouped_weights,
+        int *active_expert_ids,
+        int seq_len,
+        int device_idx,
+        void *stream);
+
     // Phase 4: Tensor-aware utility bridges
     bool hipMoE_int_to_float(
         const int *d_input, float *d_output, int count,
@@ -4315,6 +4325,96 @@ namespace llaminar2
         // for consumption by executeGroupedPrefillPipeline()
 
         prepared_num_experts_ = num_experts;
+        return true;
+    }
+
+    bool ROCmMoEKernel::prepareSharedExpertPrefillGroup(int seq_len)
+    {
+        if (seq_len <= 0)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "prepareSharedExpertPrefillGroup"))
+            return false;
+
+        if (seq_len > group_slots_cap_)
+        {
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_int_indices_),
+                                     MoEWorkspaceBuffers::GROUP_INT_INDICES,
+                                     static_cast<size_t>(seq_len) * sizeof(int),
+                                     "prepareSharedExpertPrefillGroup(group_int_indices)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_token_indices_),
+                                     MoEWorkspaceBuffers::GROUP_TOKEN_INDICES,
+                                     static_cast<size_t>(seq_len) * sizeof(int),
+                                     "prepareSharedExpertPrefillGroup(group_token_indices)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_weights_),
+                                     MoEWorkspaceBuffers::GROUP_WEIGHTS,
+                                     static_cast<size_t>(seq_len) * sizeof(float),
+                                     "prepareSharedExpertPrefillGroup(group_weights)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
+                                     MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
+                                     sizeof(int),
+                                     "prepareSharedExpertPrefillGroup(group_active_expert_ids)"))
+            {
+                d_group_int_indices_ = nullptr;
+                d_group_token_indices_ = nullptr;
+                d_group_weights_ = nullptr;
+                d_group_active_expert_ids_ = nullptr;
+                group_slots_cap_ = 0;
+                return false;
+            }
+            group_slots_cap_ = seq_len;
+        }
+        if (group_experts_cap_ < 1)
+        {
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_offsets_),
+                                     MoEWorkspaceBuffers::GROUP_OFFSETS,
+                                     sizeof(int),
+                                     "prepareSharedExpertPrefillGroup(group_offsets)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_counts_),
+                                     MoEWorkspaceBuffers::GROUP_COUNTS,
+                                     sizeof(int),
+                                     "prepareSharedExpertPrefillGroup(group_counts)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_max_tokens_),
+                                     MoEWorkspaceBuffers::ROCM_GROUP_MAX_TOKENS,
+                                     sizeof(int),
+                                     "prepareSharedExpertPrefillGroup(group_max_tokens)"))
+            {
+                d_group_offsets_ = nullptr;
+                d_group_counts_ = nullptr;
+                d_group_max_tokens_ = nullptr;
+                group_experts_cap_ = 0;
+                return false;
+            }
+            group_experts_cap_ = 1;
+        }
+
+        if (!hipMoE_prepare_shared_expert_group(
+                d_group_offsets_,
+                d_group_counts_,
+                d_group_token_indices_,
+                d_group_weights_,
+                d_group_active_expert_ids_,
+                seq_len,
+                device_ordinal_,
+                getStream()))
+        {
+            return false;
+        }
+
+        prepared_num_experts_ = 1;
+        group_active_expert_slots_ = 1;
+        if (PerfStatsCollector::isEnabled())
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "rocm_moe_shared_expert_prefill_group_calls",
+                1.0,
+                "moe",
+                DeviceId::rocm(device_ordinal_).to_string(),
+                PerfStatsCollector::Tags{
+                    {"seq_len", std::to_string(seq_len)},
+                    {"top_k", "1"},
+                    {"active_expert_slots", "1"}});
+        }
         return true;
     }
 

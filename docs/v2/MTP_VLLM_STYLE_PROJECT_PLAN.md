@@ -158,12 +158,12 @@ Done:
   evidence shows matched CUDA/ROCm acceptance at 52 accepted and 12 rejected:
   CUDA d1 is 51.29 tok/s and ROCm d1 is 31.31 tok/s. ROCm stochastic is only
   barely speed-positive and remains below the CUDA-class win target.
-- Bounded dense iteration matrix now covers CUDA/ROCm/CPU, greedy/stochastic,
-  baseline, fixed d1/d2/d3, and dynamic at 16 decode tokens. Greedy is
-  speed-positive on all three backends, with best lanes CUDA d3 89.13 vs 44.60
-  tok/s, ROCm d1/dynamic about 45.4 vs 31.3 tok/s, and CPU d3 8.51 vs 4.55
-  tok/s. Stochastic is speed-negative on all three backends on this short
-  seeded lane.
+- Bounded dense iteration matrix covers CUDA/ROCm/CPU, greedy/stochastic,
+  baseline, fixed d1/d2/d3, and dynamic at 16 decode tokens. Latest full matrix
+  is `benchmark_results/mtp_vllm_style/20260609T061226Z-iteration-matrix-6753b5e7/`.
+  Greedy is speed-positive on all three backends, with best lanes CUDA d3 66.7
+  vs 44.6 tok/s, ROCm d1 43.9 vs 31.4 tok/s, and CPU d3 9.1 vs 4.6 tok/s.
+  Stochastic is speed-negative on all three backends on this short seeded lane.
 - Dynamic depth now has a production-shaped depth-zero policy: dynamic matrix
   runs start at d1 with `min_depth=0`, d0 normal decode maintains shifted MTP KV
   so later probes can resume safely, demotion is stepwise, d1 only demotes to d0
@@ -213,20 +213,26 @@ Done:
   `RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpertTable` now captures
   route selection plus fused grouped expert decode against a Qwen3.6-scale
   expert table.
+- ROCm MoE shared-expert grouped prefill preparation is now graph-native enough
+  for verifier/shared-expert grouped routes. It declares workspace buffers,
+  prepares implicit shared-expert group metadata on the explicit HIP stream, and
+  has focused `V2_Unit_PrefillGraphCapturability` plus
+  `ROCmMoEKernel.SharedExpertGroupedPrefillMatchesSequentialPath` coverage.
 - `scripts/run_mtp_iteration_benchmark_matrix.sh` now has `--decode-tokens N`
   for bounded all-device iteration sweeps. The default remains the full
   benchmark decode length.
 - The matrix runner now hard-fails dynamic-depth evidence without same-run
   `baseline,fixed_d1,fixed_d2,fixed_d3` neighbors unless
   `--allow-partial-variants` is explicitly set for local diagnostics.
-- Bounded MoE iteration matrix now covers CUDA/ROCm/CPU, greedy/stochastic,
-  baseline, fixed d1/d2/d3, and dynamic at 16 decode tokens. All lanes are
-  functionally green, including CUDA and ROCm stochastic. Every MoE MTP lane is
-  still speed-negative against its same-run baseline. Best bounded greedy lanes
-  are CUDA d3 72.41 vs 110.71 tok/s, ROCm d3 38.21 vs 64.29 tok/s, and CPU d3
-  12.85 vs 17.55 tok/s. Best bounded stochastic lanes are CUDA d1 68.72 vs
-  111.26 tok/s, ROCm d1 32.69 vs 64.26 tok/s, and CPU d1/dynamic about 12.3 vs
-  18.14 tok/s.
+- Bounded MoE iteration matrix covers CUDA/ROCm/CPU, greedy/stochastic,
+  baseline, fixed d1/d2/d3, and dynamic at 16 decode tokens. Latest full matrix
+  is `benchmark_results/mtp_vllm_style/20260609T061226Z-iteration-matrix-6753b5e7/`.
+  All lanes are functionally green, including CUDA and ROCm stochastic. Every
+  MoE MTP lane is still speed-negative against its same-run baseline. Best
+  bounded greedy lanes are CUDA d3 69.5 vs 109.8 tok/s, ROCm d3 41.4 vs 64.7
+  tok/s, and CPU d3 12.7 vs 17.9 tok/s. Best bounded stochastic lanes are CUDA
+  dynamic 53.4 vs 109.7 tok/s, ROCm dynamic 30.6 vs 64.2 tok/s, and CPU d3 12.5
+  vs 17.5 tok/s.
 - The dead verifier-row publication hooks and tests were removed.
 
 Open gaps:

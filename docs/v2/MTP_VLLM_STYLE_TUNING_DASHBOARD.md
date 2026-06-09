@@ -15,25 +15,28 @@ partial, or not fully measured. Red = fails or lacks required correctness.
 
 | Backend | Model | Sampling | RAG | Latest speed evidence | Main blocker |
 |---|---|---|---|---|---|
-| CUDA | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 61.1/53.8/59.5/49.4 vs 44.6 | dynamic not best depth |
-| CUDA | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 38.3/33.1/29.6/36.8 vs 44.6 | low acceptance |
-| ROCm | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 38.6/33.2/41.7/34.4 vs 31.4 | dynamic conservative |
-| ROCm | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 24.9/20.5/24.4/23.5 vs 31.3 | speed-negative |
-| CPU | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 5.7/5.7/9.1/5.6 vs 4.5 | dynamic too shallow |
-| CPU | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 3.4/3.6/3.6/3.6 vs 4.4 | rollback path slow |
-| CUDA | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 61.8/67.1/70.2/57.0 vs 109.7 | verifier dominates |
-| CUDA | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 50.7/47.1/43.0/57.6 vs 110.2 | near-zero acceptance |
-| ROCm | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 38.8/34.8/41.7/33.3 vs 64.4 | verifier dominates |
-| ROCm | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 30.0/25.9/24.1/28.7 vs 64.8 | verifier dominates |
-| CPU | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 11.5/11.4/12.9/11.4 vs 18.2 | CPU verifier cost |
-| CPU | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 12.4/12.7/12.2/12.6 vs 18.1 | host verifier overhead |
+| CUDA | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 53.8/53.7/66.7/50.8 vs 44.6 | dynamic too shallow |
+| CUDA | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 41.9/33.3/29.6/35.5 vs 44.7 | low acceptance |
+| ROCm | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 43.9/33.3/41.8/34.3 vs 31.4 | dynamic conservative |
+| ROCm | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 24.8/20.3/22.9/23.9 vs 31.2 | speed-negative |
+| CPU | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 5.5/5.7/9.1/5.6 vs 4.6 | dynamic too shallow |
+| CPU | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 3.6/3.5/3.6/3.5 vs 4.7 | rollback path slow |
+| CUDA | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 62.6/66.6/69.5/56.5 vs 109.8 | verifier dominates |
+| CUDA | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 48.9/45.0/44.0/53.4 vs 109.7 | zero acceptance |
+| ROCm | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 38.1/37.3/41.4/38.6 vs 64.7 | verifier dominates |
+| ROCm | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 30.4/25.7/23.3/30.6 vs 64.2 | verifier dominates |
+| CPU | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 11.3/11.5/12.7/11.8 vs 17.9 | CPU verifier cost |
+| CPU | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 11.9/12.3/12.5/12.3 vs 17.5 | host verifier overhead |
 
 ## Latest Evidence
 
 - Fresh full bounded matrix:
-  `benchmark_results/mtp_vllm_style/20260609T-post-hysteresis-tune-matrix/`.
+  `benchmark_results/mtp_vllm_style/20260609T061226Z-iteration-matrix-6753b5e7/`.
   It covers CUDA/ROCm/CPU, dense/MoE, greedy/stochastic, baseline plus fixed
   d1/d2/d3/dynamic at 16 decode tokens. All rows completed.
+- ROCm shared-expert grouped prefill preparation is implemented and regression
+  covered. It makes the path graph-native but does not yet make MoE MTP
+  speed-positive.
 - Dynamic controller tuning: d0 bypass is supported, shifted MTP state is
   maintained during d0 normal decode, demotion is stepwise, d1 only demotes to
   d0 on an all-zero window, and perfect probes can promote early. This removed
@@ -50,8 +53,8 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   matrix remains the acceptance capture.
 - Runner guard: dynamic evidence now requires same-run baseline plus fixed
   d1/d2/d3 unless `--allow-partial-variants` is used for diagnostics.
-- MoE verifier finding: fixed d3 greedy spends 379/214 ms verifier/condition
-  time on CUDA and 684/312 ms on ROCm; correction replay is 0 ms, so the next
+- MoE verifier finding: fixed d3 greedy spends 378/220 ms verifier/condition
+  time on CUDA and 711/313 ms on ROCm; correction replay is 0 ms, so the next
   target is the 524-stage all-position verifier graph and condition-forward
   frequency.
 

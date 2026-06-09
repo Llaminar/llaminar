@@ -866,7 +866,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, DecodeAlwaysCapturableOnRocmWithoutSc
 #endif
 }
 
-TEST_F(SharedExpertFFNPrefillGraphCapture, CudaForcedVerifierSmallMUsesGroupedPrefillRoute)
+TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedVerifierSmallMUsesGroupedPrefillRoute)
 {
     ScopedRocmMoEFlags flags(true, true, true);
 
@@ -874,11 +874,82 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, CudaForcedVerifierSmallMUsesGroupedPr
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
 
-    for (int seq_len : {2, 3, 4})
+    auto expect_backend = [&](DeviceId device, bool supported, const char *backend_name)
+    {
+        for (int seq_len : {2, 3, 4})
+        {
+            SharedExpertFFNStage::Params params;
+            params.device_id = device;
+            params.seq_len = seq_len;
+            params.d_model = D_MODEL;
+            params.intermediate = INTERMEDIATE;
+            params.input = input_.get();
+            params.gate_w = gate_w.get();
+            params.up_w = up_w.get();
+            params.down_w = down_w.get();
+            params.output = output_.get();
+            params.force_grouped_verifier_prefill_for_decode = true;
+
+            SharedExpertFFNStage stage(params);
+            EXPECT_EQ(stage.usesGroupedVerifierPrefillRouteForTesting(), supported)
+                << backend_name << " all-position verifier shared expert M=" << seq_len
+                << " grouped prefill route support mismatch";
+        }
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true, "CUDA");
+#else
+    expect_backend(DeviceId::cuda(0), false, "CUDA");
+#endif
+
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true, "ROCm");
+#else
+    expect_backend(DeviceId::rocm(0), false, "ROCm");
+#endif
+}
+
+TEST_F(SharedExpertFFNPrefillGraphCapture, GpuNormalSmallMPrefillDoesNotForceGroupedVerifierRoute)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto expect_backend = [&](DeviceId device, const char *backend_name)
+    {
+        for (int seq_len : {2, 3, 4})
+        {
+            SharedExpertFFNStage::Params params;
+            params.device_id = device;
+            params.seq_len = seq_len;
+            params.d_model = D_MODEL;
+            params.intermediate = INTERMEDIATE;
+            params.input = input_.get();
+            params.output = output_.get();
+
+            SharedExpertFFNStage stage(params);
+            EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting())
+                << "Normal " << backend_name << " shared-expert prefill M=" << seq_len
+                << " should not enter the verifier-only grouped route without the explicit verifier flag";
+        }
+    };
+
+    expect_backend(DeviceId::cuda(0), "CUDA");
+    expect_backend(DeviceId::rocm(0), "ROCm");
+}
+
+TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayKeepsGroupedPrefillRoute)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    auto expect_backend = [&](DeviceId device, bool supported, const char *backend_name)
     {
         SharedExpertFFNStage::Params params;
-        params.device_id = DeviceId::cuda(0);
-        params.seq_len = seq_len;
+        params.device_id = device;
+        params.seq_len = 1;
         params.d_model = D_MODEL;
         params.intermediate = INTERMEDIATE;
         params.input = input_.get();
@@ -889,67 +960,24 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, CudaForcedVerifierSmallMUsesGroupedPr
         params.force_grouped_verifier_prefill_for_decode = true;
 
         SharedExpertFFNStage stage(params);
+        EXPECT_EQ(stage.usesGroupedVerifierPrefillRouteForTesting(), supported)
+            << backend_name << " forced single-row verifier replay should stay on grouped prefill when supported";
+    };
+
 #if defined(HAVE_CUDA)
-        EXPECT_TRUE(stage.usesGroupedVerifierPrefillRouteForTesting())
-            << "CUDA all-position verifier shared expert M=" << seq_len
-            << " should use the grouped prefill pipeline so it matches routed expert verifier rows";
+    expect_backend(DeviceId::cuda(0), true, "CUDA");
 #else
-        EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting());
+    expect_backend(DeviceId::cuda(0), false, "CUDA");
 #endif
-    }
-}
 
-TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalSmallMPrefillDoesNotForceGroupedVerifierRoute)
-{
-    ScopedRocmMoEFlags flags(true, true, true);
-
-    for (int seq_len : {2, 3, 4})
-    {
-        SharedExpertFFNStage::Params params;
-        params.device_id = DeviceId::cuda(0);
-        params.seq_len = seq_len;
-        params.d_model = D_MODEL;
-        params.intermediate = INTERMEDIATE;
-        params.input = input_.get();
-        params.output = output_.get();
-
-        SharedExpertFFNStage stage(params);
-        EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting())
-            << "Normal CUDA shared-expert prefill M=" << seq_len
-            << " should not enter the verifier-only grouped route without the explicit verifier flag";
-    }
-}
-
-TEST_F(SharedExpertFFNPrefillGraphCapture, CudaForcedDecodeReplayKeepsGroupedPrefillRoute)
-{
-    ScopedRocmMoEFlags flags(true, true, true);
-
-    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
-    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
-    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
-
-    SharedExpertFFNStage::Params params;
-    params.device_id = DeviceId::cuda(0);
-    params.seq_len = 1;
-    params.d_model = D_MODEL;
-    params.intermediate = INTERMEDIATE;
-    params.input = input_.get();
-    params.gate_w = gate_w.get();
-    params.up_w = up_w.get();
-    params.down_w = down_w.get();
-    params.output = output_.get();
-    params.force_grouped_verifier_prefill_for_decode = true;
-
-    SharedExpertFFNStage stage(params);
-#if defined(HAVE_CUDA)
-    EXPECT_TRUE(stage.usesGroupedVerifierPrefillRouteForTesting())
-        << "Forced single-row verifier replay should stay on the grouped prefill route";
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true, "ROCm");
 #else
-    EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting());
+    expect_backend(DeviceId::rocm(0), false, "ROCm");
 #endif
 }
 
-TEST_F(SharedExpertFFNPrefillGraphCapture, CudaForcedDecodeReplayRequiresGroupedPrefillEnabled)
+TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayRequiresGroupedPrefillEnabled)
 {
     ScopedRocmMoEFlags flags(true, true, false);
 
@@ -957,21 +985,28 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, CudaForcedDecodeReplayRequiresGrouped
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
 
-    SharedExpertFFNStage::Params params;
-    params.device_id = DeviceId::cuda(0);
-    params.seq_len = 1;
-    params.d_model = D_MODEL;
-    params.intermediate = INTERMEDIATE;
-    params.input = input_.get();
-    params.gate_w = gate_w.get();
-    params.up_w = up_w.get();
-    params.down_w = down_w.get();
-    params.output = output_.get();
-    params.force_grouped_verifier_prefill_for_decode = true;
+    auto expect_backend = [&](DeviceId device, const char *backend_name)
+    {
+        SharedExpertFFNStage::Params params;
+        params.device_id = device;
+        params.seq_len = 1;
+        params.d_model = D_MODEL;
+        params.intermediate = INTERMEDIATE;
+        params.input = input_.get();
+        params.gate_w = gate_w.get();
+        params.up_w = up_w.get();
+        params.down_w = down_w.get();
+        params.output = output_.get();
+        params.force_grouped_verifier_prefill_for_decode = true;
 
-    SharedExpertFFNStage stage(params);
-    EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting())
-        << "No verifier replay should silently enter grouped prefill when grouped prefill is disabled";
+        SharedExpertFFNStage stage(params);
+        EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting())
+            << "No " << backend_name
+            << " verifier replay should silently enter grouped prefill when grouped prefill is disabled";
+    };
+
+    expect_backend(DeviceId::cuda(0), "CUDA");
+    expect_backend(DeviceId::rocm(0), "ROCm");
 }
 
 // =========================================================================

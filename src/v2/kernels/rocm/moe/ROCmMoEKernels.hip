@@ -2623,6 +2623,28 @@ __global__ void rocm_moe_group_tokens_small_float_kernel(
     }
 }
 
+__global__ void rocm_moe_prepare_shared_expert_group_kernel(
+    int *__restrict__ expert_offsets,
+    int *__restrict__ expert_counts,
+    int *__restrict__ grouped_token_indices,
+    float *__restrict__ grouped_weights,
+    int *__restrict__ active_expert_ids,
+    int seq_len)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx == 0)
+    {
+        expert_offsets[0] = 0;
+        expert_counts[0] = seq_len;
+        active_expert_ids[0] = 0;
+    }
+    if (idx < seq_len)
+    {
+        grouped_token_indices[idx] = idx;
+        grouped_weights[idx] = 1.0f;
+    }
+}
+
 __global__ void rocm_moe_prefill_group_clear_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     int max_slots, int num_experts)
@@ -2912,6 +2934,45 @@ bool hipMoE_group_tokens_small_float(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE small float grouping kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_prepare_shared_expert_group(
+    int *expert_offsets,
+    int *expert_counts,
+    int *grouped_token_indices,
+    float *grouped_weights,
+    int *active_expert_ids,
+    int seq_len,
+    int device_idx,
+    void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!stream || !expert_offsets || !expert_counts ||
+        !grouped_token_indices || !grouped_weights || !active_expert_ids ||
+        seq_len <= 0)
+    {
+        fprintf(stderr, "HIP MoE shared expert grouping invalid arguments\n");
+        return false;
+    }
+
+    const int threads = 256;
+    const int blocks = (seq_len + threads - 1) / threads;
+    hipLaunchKernelGGL(rocm_moe_prepare_shared_expert_group_kernel,
+        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        expert_offsets, expert_counts,
+        grouped_token_indices, grouped_weights,
+        active_expert_ids, seq_len);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE shared expert grouping kernel launch failed: %s\n",
+                hipGetErrorString(err));
         return false;
     }
     return true;

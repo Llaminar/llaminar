@@ -4855,6 +4855,126 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
     EXPECT_LT(rel_l2, 1.0e-3) << "cosine=" << cosine;
 }
 
+TEST(Test__ROCmMoEKernel, SharedExpertGroupedPrefillMatchesSequentialPath)
+{
+    SKIP_IF_NO_ROCM();
+
+    const DeviceId device = DeviceId::rocm(0);
+    constexpr int seq_len = 4;
+    constexpr int d_model = 64;
+    constexpr int intermediate = 32;
+    constexpr int num_experts = 1;
+    constexpr int top_k = 1;
+
+    ScopedEnvOverride perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto gate_weights = TestTensorFactory::createQ4_0Random(
+        {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 6101);
+    auto up_weights = TestTensorFactory::createQ4_0Random(
+        {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 6102);
+    auto down_weights = TestTensorFactory::createQ4_0Random(
+        {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)}, 6103);
+
+    auto gate_packed = std::make_unique<rocm::ROCmPackedWeights>();
+    auto up_packed = std::make_unique<rocm::ROCmPackedWeights>();
+    auto down_packed = std::make_unique<rocm::ROCmPackedWeights>();
+    ASSERT_TRUE(rocm::packWeightsToROCm(gate_weights.get(), *gate_packed));
+    ASSERT_TRUE(rocm::packWeightsToROCm(up_weights.get(), *up_packed));
+    ASSERT_TRUE(rocm::packWeightsToROCm(down_weights.get(), *down_packed));
+
+    rocm::ROCmQuantisedGemmKernel gate_kernel(gate_packed.get(), 0);
+    rocm::ROCmQuantisedGemmKernel up_kernel(up_packed.get(), 0);
+    rocm::ROCmQuantisedGemmKernel down_kernel(down_packed.get(), 0);
+
+    WorkspaceRequirements gemm_reqs;
+    gemm_reqs.merge(gate_kernel.getWorkspaceRequirements(seq_len, intermediate, d_model));
+    gemm_reqs.merge(up_kernel.getWorkspaceRequirements(seq_len, intermediate, d_model));
+    gemm_reqs.merge(down_kernel.getWorkspaceRequirements(seq_len, d_model, intermediate));
+    auto gemm_workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024 * 1024);
+    ASSERT_TRUE(gemm_workspace->allocate(gemm_reqs));
+    gate_kernel.bindWorkspace(gemm_workspace.get());
+    up_kernel.bindWorkspace(gemm_workspace.get());
+    down_kernel.bindWorkspace(gemm_workspace.get());
+    gate_kernel.prepareWeights();
+    up_kernel.prepareWeights();
+    down_kernel.prepareWeights();
+
+    auto input = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)}, -0.5f, 0.5f, 6104);
+    ASSERT_TRUE(input->ensureOnDevice(device));
+
+    auto reference_gate = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(intermediate)});
+    auto reference_up = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(intermediate)});
+    auto reference_output = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    ASSERT_TRUE(reference_gate->ensureOnDevice(device));
+    ASSERT_TRUE(reference_up->ensureOnDevice(device));
+    ASSERT_TRUE(reference_output->ensureOnDevice(device));
+
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&gate_kernel, reference_gate.get(), intermediate, nullptr, "shared_gate"},
+        {&up_kernel, reference_up.get(), intermediate, nullptr, "shared_up"}};
+    ASSERT_TRUE(gate_kernel.multiply_fused_tensor(
+        input.get(), projections, seq_len, d_model));
+    reference_gate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    reference_up->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu(
+        reference_gate.get(), reference_up.get(), reference_output.get(),
+        seq_len, d_model, intermediate));
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    DeviceNativeVNNIMatrixDesc gate_desc;
+    DeviceNativeVNNIMatrixDesc up_desc;
+    DeviceNativeVNNIMatrixDesc down_desc;
+    ASSERT_TRUE(gate_kernel.exportNativeVNNIMatrixDesc(gate_desc));
+    ASSERT_TRUE(up_kernel.exportNativeVNNIMatrixDesc(up_desc));
+    ASSERT_TRUE(down_kernel.exportNativeVNNIMatrixDesc(down_desc));
+
+    ROCmMoEKernel moe_kernel(0);
+    auto moe_workspace = bindDefaultMoEWorkspace(
+        moe_kernel, seq_len, d_model, intermediate, num_experts, top_k);
+    ASSERT_TRUE(moe_kernel.prepareSharedExpertPrefillGroup(seq_len));
+    const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
+        &gate_desc, &up_desc, num_experts, d_model, intermediate);
+    ASSERT_GE(gateup_table, 0);
+    const int down_table = moe_kernel.uploadGroupedExpertDownDescriptorTable(
+        &down_desc, num_experts, d_model, intermediate);
+    ASSERT_GE(down_table, 0);
+
+    auto grouped_output = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    ASSERT_TRUE(grouped_output->ensureOnDevice(device));
+    ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
+        input.get(), grouped_output.get(), gateup_table, down_table,
+        seq_len, d_model, intermediate, num_experts, top_k));
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    {
+        const auto records = PerfStatsCollector::snapshot(
+            {"kernel.rocm_moe_shared_expert_prefill_group_calls"});
+        double calls = 0.0;
+        for (const auto &record : records)
+            calls += record.value;
+        EXPECT_GT(calls, 0.0)
+            << "shared expert verifier prefill must use the ROCm grouped preparation kernel";
+    }
+
+    reference_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    const size_t output_count = static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+    const float *reference = reference_output->data();
+    const float *grouped = grouped_output->data();
+    ASSERT_FALSE(hasNaNOrInf(grouped, output_count));
+
+    const double cosine = cosineSimilarity(grouped, reference, output_count);
+    const double rel_l2 = relativeL2Error(grouped, reference, output_count);
+    EXPECT_GE(cosine, 0.999) << "relative L2=" << rel_l2;
+    EXPECT_LE(rel_l2, 0.02) << "cosine=" << cosine;
+}
+
 // ============================================================================
 // Test: groupTokensByExpertDevice() — prefill scale
 // ============================================================================
