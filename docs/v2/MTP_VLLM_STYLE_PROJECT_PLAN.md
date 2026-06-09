@@ -191,6 +191,15 @@ Done:
   Bounded CUDA MoE diagnostics show verifier replay is now exercised for fixed
   d1/d2/d3/dynamic lanes, but MoE remains speed-negative because verifier plus
   correction time still dominates.
+- Ordinary decode segmented captures now carry a live replay-state epoch.
+  `DeviceGraphOrchestrator` advances that epoch after live-prefix/speculative
+  state publication, and `ForwardExecutionEngine` recaptures stale ordinary
+  decode graphs before replay while leaving all-position verifier graphs under
+  their accepted-state publication contract. Focused cache/engine units plus
+  CPU/CUDA/ROCm MoE stochastic verifier and depth-3 greedy parity passed; the
+  release fixed-d3 sanity check
+  `benchmark_results/mtp_vllm_style/20260609T082255Z-gpu-moe-d3-versioned-replay/`
+  preserved acceptance instead of reproducing the stale-capture collapse.
 - Rejected-token all-position publication no longer runs an expensive same-step
   correction main forward. The runner now emits the correction token, commits
   its shifted MTP row from current terminal hidden so the sidecar cache remains
@@ -251,8 +260,8 @@ Open gaps:
 - CUDA/ROCm/CPU MoE bounded matrices are functionally green for greedy and
   stochastic, but MTP is speed-negative everywhere. The common blocker is true
   verifier/catch-up cost. Latest fixed d3 MoE greedy spends about 379 ms total
-  verifier time plus 214 ms condition-forward time on CUDA, and 684 ms verifier
-  plus 312 ms condition-forward time on ROCm, while correction replay remains
+  verifier time plus 220 ms condition-forward time on CUDA, and 659 ms verifier
+  plus 346 ms condition-forward time on ROCm, while correction replay remains
   0 ms. Dynamic depth is now stable across d0/d1/d2 transitions but still needs
   better short-run promotion and stochastic depth selection.
 - CPU vLLM-style state publication is not implemented or benchmarked.

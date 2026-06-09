@@ -302,6 +302,25 @@ namespace llaminar2
         // allowing us to skip the 339-node graph.reset() since flags are already clear.
         bool phase3_active = false;
 
+        /// Live replay-state epoch that the current segmented capture is safe for.
+        /// Ordinary main-decode graphs are invalidated when speculative state
+        /// publication advances the live state to a newer epoch. All-position
+        /// verifier captures keep their own publication contract and do not use
+        /// this stamp for preservation.
+        uint64_t segmented_capture_live_state_epoch = 0;
+
+        bool requiresLiveStateEpochRecapture(bool ordinary_decode_context,
+                                             bool segmented_capture_allowed,
+                                             uint64_t live_state_epoch) const
+        {
+            return ordinary_decode_context &&
+                   segmented_capture_allowed &&
+                   segment_cache.initialized &&
+                   !segment_cache.needs_capture &&
+                   segmented_capture_live_state_epoch != 0 &&
+                   segmented_capture_live_state_epoch != live_state_epoch;
+        }
+
         /// GPU graph capture/replay for eliminating per-kernel launch overhead
         std::unique_ptr<IGPUGraphCapture> gpu_graph;
 
@@ -361,6 +380,7 @@ namespace llaminar2
             segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
             gpu_graph_update_failures = 0;
             phase3_active = false;
+            segmented_capture_live_state_epoch = 0;
         }
 
         /**
@@ -424,6 +444,7 @@ namespace llaminar2
             applied_stream = nullptr;
             gpu_stream = nullptr;
             gpu_ctx = nullptr;
+            segmented_capture_live_state_epoch = 0;
         }
 
         void invalidate()
@@ -452,6 +473,7 @@ namespace llaminar2
             gpu_stream = nullptr;
             gpu_ctx = nullptr;
             phase3_active = false;
+            segmented_capture_live_state_epoch = 0;
             pp_external_hidden_state = nullptr;
             pp_working_buffer = nullptr;
             pp_copy_bytes = 0;

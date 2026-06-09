@@ -1426,6 +1426,26 @@ namespace llaminar2
                 }
             }
 
+            const bool main_decode_replay =
+                !host.computeAllPositionLogitsEnabled();
+            const uint64_t live_state_epoch = host.liveReplayStateEpoch();
+            if (forward_cache.requiresLiveStateEpochRecapture(
+                    main_decode_replay,
+                    capture_policy.allow_segmented_capture,
+                    live_state_epoch))
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "decode_segmented_state_epoch_recapture",
+                    1.0,
+                    "decode",
+                    input.device.toString(),
+                    {{"context", "main_decode"},
+                     {"old_epoch", std::to_string(forward_cache.segmented_capture_live_state_epoch)},
+                     {"new_epoch", std::to_string(live_state_epoch)}});
+                forward_cache.resetReplayState();
+            }
+
             forward_cache.segment_cache.perf_context =
                 host.computeAllPositionLogitsEnabled() ? "main_verifier" : "main_decode";
             success = executor_.executeDecodeWithCapturePolicy(
@@ -1448,6 +1468,9 @@ namespace llaminar2
             // Phase 3 replay doesn't call markCompleted(), so we can
             // skip graph.reset() on subsequent steps.
             forward_cache.phase3_active = true;
+            if (is_decode && !host.computeAllPositionLogitsEnabled())
+                forward_cache.segmented_capture_live_state_epoch =
+                    host.liveReplayStateEpoch();
         }
         else
         {

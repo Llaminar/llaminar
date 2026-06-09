@@ -906,6 +906,59 @@ namespace
         return nullptr;
     }
 
+    bool recordTagsContain(const PerfStatRecord &record,
+                           const PerfStatsCollector::Tags &tags)
+    {
+        for (const auto &[key, value] : tags)
+        {
+            const auto it = record.tags.find(key);
+            if (it == record.tags.end() || it->second != value)
+                return false;
+        }
+        return true;
+    }
+
+    const PerfStatRecord *findMTPRecordContaining(
+        const std::vector<PerfStatRecord> &records,
+        PerfStatRecord::Kind kind,
+        const std::string &name,
+        const PerfStatsCollector::Tags &tags)
+    {
+        for (const auto &record : records)
+        {
+            if (record.kind == kind &&
+                record.domain == "mtp" &&
+                record.name == name &&
+                recordTagsContain(record, tags))
+            {
+                return &record;
+            }
+        }
+        return nullptr;
+    }
+
+    double sumMTPRecordValuesContaining(
+        const std::vector<PerfStatRecord> &records,
+        PerfStatRecord::Kind kind,
+        const std::string &name,
+        const PerfStatsCollector::Tags &tags)
+    {
+        double total = 0.0;
+        for (const auto &record : records)
+        {
+            if (record.kind == kind &&
+                record.domain == "mtp" &&
+                record.name == name &&
+                recordTagsContain(record, tags))
+            {
+                EXPECT_NE(record.tags.find("previous_live_state_epoch"), record.tags.end());
+                EXPECT_NE(record.tags.find("live_state_epoch"), record.tags.end());
+                total += record.value;
+            }
+        }
+        return total;
+    }
+
     void prepareDenseForwardWeights(
         const DeviceGraphOrchestrator &orchestrator,
         QwenStandardGraph &graph_builder,
@@ -2873,14 +2926,20 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
-    const PerfStatRecord *restore_preserved =
-        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", restore_tags);
-    ASSERT_NE(restore_preserved, nullptr);
-    EXPECT_DOUBLE_EQ(restore_preserved->value, 2.0);
-    const PerfStatRecord *truncate_preserved =
-        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", truncate_tags);
-    ASSERT_NE(truncate_preserved, nullptr);
-    EXPECT_DOUBLE_EQ(truncate_preserved->value, 1.0);
+    EXPECT_DOUBLE_EQ(
+        sumMTPRecordValuesContaining(
+            records,
+            PerfStatRecord::Kind::Counter,
+            "live_prefix_replay_state_after_mutation",
+            restore_tags),
+        2.0);
+    EXPECT_DOUBLE_EQ(
+        sumMTPRecordValuesContaining(
+            records,
+            PerfStatRecord::Kind::Counter,
+            "live_prefix_replay_state_after_mutation",
+            truncate_tags),
+        1.0);
     const auto legacy_reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_payload_checkpoint"},
         {"reason", "moe_live_state_mutation_guard"}};
@@ -2891,7 +2950,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "reset"},
         {"sidecar_replay_state", "reset"}};
-    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
+    EXPECT_EQ(findMTPRecordContaining(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
               nullptr);
     PerfStatsCollector::reset();
 }
@@ -2950,10 +3009,13 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
-    const PerfStatRecord *restore_preserved =
-        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", restore_tags);
-    ASSERT_NE(restore_preserved, nullptr);
-    EXPECT_DOUBLE_EQ(restore_preserved->value, 1.0);
+    EXPECT_DOUBLE_EQ(
+        sumMTPRecordValuesContaining(
+            records,
+            PerfStatRecord::Kind::Counter,
+            "live_prefix_replay_state_after_mutation",
+            restore_tags),
+        1.0);
     const auto legacy_reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_logical_checkpoint"},
         {"reason", "moe_live_state_mutation_guard"}};
@@ -2964,7 +3026,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "reset"},
         {"sidecar_replay_state", "reset"}};
-    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
+    EXPECT_EQ(findMTPRecordContaining(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
               nullptr);
     PerfStatsCollector::reset();
 }
@@ -3001,10 +3063,13 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEReplayState
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
-    const PerfStatRecord *preserved =
-        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", preserve_tags);
-    ASSERT_NE(preserved, nullptr);
-    EXPECT_DOUBLE_EQ(preserved->value, 1.0);
+    EXPECT_DOUBLE_EQ(
+        sumMTPRecordValuesContaining(
+            records,
+            PerfStatRecord::Kind::Counter,
+            "live_prefix_replay_state_after_mutation",
+            preserve_tags),
+        1.0);
     const auto legacy_reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_logical_checkpoint"},
         {"reason", "moe_live_state_mutation_guard"}};
@@ -3017,7 +3082,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEReplayState
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "reset"},
         {"sidecar_replay_state", "reset"}};
-    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
+    EXPECT_EQ(findMTPRecordContaining(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
               nullptr);
     PerfStatsCollector::reset();
 }

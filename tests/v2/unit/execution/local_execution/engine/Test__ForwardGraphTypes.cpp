@@ -705,6 +705,7 @@ TEST(Test__ForwardGraphCache, ReplayResetPreservesSegmentCaptureStream)
     cache.segment_cache.initialized = true;
     cache.gpu_graph_update_failures = 3;
     cache.phase3_active = true;
+    cache.segmented_capture_live_state_epoch = 42;
 
     cache.resetReplayState();
 
@@ -712,6 +713,7 @@ TEST(Test__ForwardGraphCache, ReplayResetPreservesSegmentCaptureStream)
     EXPECT_FALSE(cache.segment_cache.initialized);
     EXPECT_EQ(cache.gpu_graph_update_failures, 0);
     EXPECT_FALSE(cache.phase3_active);
+    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
 }
 
 TEST(Test__ForwardGraphCache, MarkGPUStreamBindingsDirtyPreservesReplayState)
@@ -725,6 +727,7 @@ TEST(Test__ForwardGraphCache, MarkGPUStreamBindingsDirtyPreservesReplayState)
     cache.gpu_stream_applied = true;
     cache.applied_stream = stream;
     cache.phase3_active = true;
+    cache.segmented_capture_live_state_epoch = 42;
 
     cache.markGPUStreamBindingsDirty();
 
@@ -734,6 +737,77 @@ TEST(Test__ForwardGraphCache, MarkGPUStreamBindingsDirtyPreservesReplayState)
     EXPECT_FALSE(cache.gpu_stream_applied);
     EXPECT_EQ(cache.applied_stream, nullptr);
     EXPECT_TRUE(cache.phase3_active);
+    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 42u);
+}
+
+TEST(Test__ForwardGraphCache, ReplayStateEpochClearsOnStateInvalidatingResets)
+{
+    ForwardGraphCache cache;
+    cache.segmented_capture_live_state_epoch = 17;
+    cache.phase3_active = true;
+
+    cache.resetReplayStateAfterWorkspaceRebind();
+    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+    EXPECT_FALSE(cache.phase3_active);
+
+    cache.segmented_capture_live_state_epoch = 23;
+    cache.valid = true;
+    cache.resetSessionState();
+    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+
+    cache.segmented_capture_live_state_epoch = 29;
+    cache.valid = true;
+    cache.invalidate();
+    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+    EXPECT_FALSE(cache.valid);
+}
+
+TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureOnlyAppliesToReadyOrdinaryDecode)
+{
+    ForwardGraphCache cache;
+    cache.segment_cache.initialized = true;
+    cache.segment_cache.needs_capture = false;
+    cache.segmented_capture_live_state_epoch = 7;
+
+    EXPECT_TRUE(cache.requiresLiveStateEpochRecapture(
+        /*ordinary_decode_context=*/true,
+        /*segmented_capture_allowed=*/true,
+        /*live_state_epoch=*/8));
+    EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
+        /*ordinary_decode_context=*/true,
+        /*segmented_capture_allowed=*/true,
+        /*live_state_epoch=*/7));
+    EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
+        /*ordinary_decode_context=*/false,
+        /*segmented_capture_allowed=*/true,
+        /*live_state_epoch=*/8))
+        << "All-position verifier captures use the verifier publication contract.";
+    EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
+        /*ordinary_decode_context=*/true,
+        /*segmented_capture_allowed=*/false,
+        /*live_state_epoch=*/8));
+
+    cache.segment_cache.needs_capture = true;
+    EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
+        /*ordinary_decode_context=*/true,
+        /*segmented_capture_allowed=*/true,
+        /*live_state_epoch=*/8))
+        << "A graph queued for capture does not need an extra recapture reset.";
+
+    cache.segment_cache.needs_capture = false;
+    cache.segment_cache.initialized = false;
+    EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
+        /*ordinary_decode_context=*/true,
+        /*segmented_capture_allowed=*/true,
+        /*live_state_epoch=*/8));
+
+    cache.segment_cache.initialized = true;
+    cache.segmented_capture_live_state_epoch = 0;
+    EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
+        /*ordinary_decode_context=*/true,
+        /*segmented_capture_allowed=*/true,
+        /*live_state_epoch=*/8))
+        << "Unstamped captures are handled by existing reset paths.";
 }
 
 TEST(Test__ForwardGraphCache, InvalidateDestroysSegmentCaptureStream)

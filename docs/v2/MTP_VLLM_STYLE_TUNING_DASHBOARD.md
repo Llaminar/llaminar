@@ -6,7 +6,8 @@ file under 5KB and update it after every tuning iteration.
 Iteration contract: refresh the same CUDA/ROCm/CPU matrix with no-MTP baseline,
 fixed d1, fixed d2, fixed d3, and dynamic depth. Do not report dynamic without
 the fixed-depth neighbors from the same run. Dynamic starts at d1, may demote to
-d0 per-step bypass, and may probe/promote back up to d3.
+d0 per-step bypass, and may probe/promote back up to d3. Before commit, run the
+broad unit gate plus the relevant backend parity cells.
 
 RAG: Green = correct and speed-positive near target. Amber = correct but slow,
 partial, or not fully measured. Red = fails or lacks required correctness.
@@ -53,10 +54,12 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   matrix remains the acceptance capture.
 - Runner guard: dynamic evidence now requires same-run baseline plus fixed
   d1/d2/d3 unless `--allow-partial-variants` is used for diagnostics.
-- MoE verifier finding: fixed d3 greedy spends 378/220 ms verifier/condition
-  time on CUDA and 711/313 ms on ROCm; correction replay is 0 ms, so the next
-  target is the 524-stage all-position verifier graph and condition-forward
-  frequency.
+- Versioned replay guard: ordinary decode captures are live-epoch stamped and
+  recaptured after speculative publication; verifier captures keep their
+  accepted-state contract. Focused units plus CPU/CUDA/ROCm MoE stochastic and
+  d3 greedy parity passed. Release d3 check
+  `20260609T082255Z-gpu-moe-d3-versioned-replay`: CUDA 69.7 tok/s at 72.7%
+  acceptance, ROCm 40.4 tok/s at 60%; verifier/condition still dominates.
 
 ## Target Anchors
 

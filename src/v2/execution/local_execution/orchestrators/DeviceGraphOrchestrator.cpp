@@ -5774,6 +5774,10 @@ namespace llaminar2
         bool preserve_gpu_replay_state)
     {
         PerfStatsCollector::Tags tags{{"operation", operation ? operation : "unknown"}};
+        const uint64_t previous_epoch = live_replay_state_epoch_;
+        ++live_replay_state_epoch_;
+        tags["previous_live_state_epoch"] = std::to_string(previous_epoch);
+        tags["live_state_epoch"] = std::to_string(live_replay_state_epoch_);
         if (isPrefixCacheMoEModel())
         {
             tags["model"] = "moe";

@@ -144,6 +144,16 @@ namespace llaminar2
         /** Whether the current forward graph must materialize logits for every input row. */
         virtual bool computeAllPositionLogitsEnabled() const { return false; }
 
+        /**
+         * @brief Monotonic live-state epoch for decode graph replay safety.
+         *
+         * Speculative publication can jump KV/GDN/short-conv state by multiple
+         * tokens. Ordinary one-token decode captures are only safe to replay
+         * when they were captured after the current live-state epoch was
+         * established, unless a future state-sync hook explicitly stamps them.
+         */
+        virtual uint64_t liveReplayStateEpoch() const { return 0; }
+
         /** Domain placement epoch for MoE-sensitive prefill graph-cache keys. */
         virtual uint64_t moePlacementEpoch() const { return 0; }
 

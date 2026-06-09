@@ -2249,6 +2249,9 @@ namespace llaminar2
         /** Whether forward graph construction should emit all-position logits. */
         bool computeAllPositionLogitsEnabled() const override { return compute_all_position_logits_; }
 
+        /** Monotonic live-state epoch used by versioned decode replay. */
+        uint64_t liveReplayStateEpoch() const override { return live_replay_state_epoch_; }
+
         /** Report host-side safety state for chunk-boundary maintenance. */
         PrefillChunkMaintenanceState prefillChunkMaintenanceState(
             const PrefillChunkPlan &chunk) const override;
@@ -2681,6 +2684,7 @@ namespace llaminar2
         /// Session epoch counter — incremented on each clear_cache() call
         /// Used to detect stale kernel state across inference sessions
         uint64_t session_epoch_ = 0;
+        uint64_t live_replay_state_epoch_ = 1;
         uint64_t device_sampling_counter_ = 0;
 
         bool compute_all_position_logits_ = false;
