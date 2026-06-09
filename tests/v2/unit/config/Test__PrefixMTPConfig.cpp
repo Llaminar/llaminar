@@ -82,6 +82,7 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
         "--mtp-depth-policy", "dynamic",
         "--mtp-min-draft-tokens", "1",
         "--mtp-max-draft-tokens", "3",
+        "--mtp-initial-draft-tokens", "2",
         "--mtp-depth-window", "8",
         "--mtp-depth-min-samples", "4",
         "--mtp-depth-cooldown", "2",
@@ -110,6 +111,7 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
     EXPECT_EQ(config.mtp.depth_policy.max_depth, 3);
+    EXPECT_EQ(config.mtp.depth_policy.initial_depth, 2);
     EXPECT_EQ(config.mtp.depth_policy.window_size, 8);
     EXPECT_EQ(config.mtp.depth_policy.min_samples, 4);
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 2);
@@ -151,6 +153,33 @@ TEST(Test__PrefixMTPConfig, ParserRejectsInvalidPrefixAndMTPEnums)
         auto parser = createOrchestrationConfigParser();
         EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
     }
+    {
+        ArgvHelper args({"llaminar2", "--mtp-initial-draft-tokens", "-1"});
+        auto parser = createOrchestrationConfigParser();
+        EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+}
+
+TEST(Test__PrefixMTPConfig, ParserAcceptsDynamicDepthZeroBypassPolicy)
+{
+    ArgvHelper args({
+        "llaminar2",
+        "--mtp",
+        "--mtp-draft-tokens", "3",
+        "--mtp-depth-policy", "dynamic",
+        "--mtp-min-draft-tokens", "0",
+        "--mtp-initial-draft-tokens", "1",
+        "--mtp-max-draft-tokens", "3",
+    });
+
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.mtp.enabled);
+    EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
+    EXPECT_EQ(config.mtp.depth_policy.min_depth, 0);
+    EXPECT_EQ(config.mtp.depth_policy.initial_depth, 1);
+    EXPECT_EQ(config.mtp.depth_policy.max_depth, 3);
 }
 
 TEST(Test__PrefixMTPConfig, YamlSectionsParsePrefixCacheAndMTP)

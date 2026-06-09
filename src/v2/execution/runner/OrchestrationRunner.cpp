@@ -1098,7 +1098,29 @@ namespace llaminar2
         {
             return std::max(1, mtp.draft_tokens);
         }
-        return std::max(1, mtp_depth_controller_->currentDepth());
+        return mtp_depth_controller_->requestedDepthForStep();
+    }
+
+    void OrchestrationRunner::recordMTPDepthZeroBypass()
+    {
+        if (!mtp_depth_controller_)
+        {
+            return;
+        }
+        const MTPDepthDecision decision = mtp_depth_controller_->recordBypassStep();
+        mtp_stats_.current_depth = mtp_depth_controller_->currentDepth();
+        mtp_stats_.min_depth = mtp_depth_controller_->minDepth();
+        mtp_stats_.max_depth = mtp_depth_controller_->maxDepth();
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "depth_policy_zero_depth_bypasses",
+            1.0,
+            "decode",
+            {},
+            {{"current_depth", std::to_string(decision.new_depth)},
+             {"next_requested_depth", std::to_string(mtp_depth_controller_->requestedDepthForStep())},
+             {"reason", toString(decision.reason)}});
     }
 
     void OrchestrationRunner::recordMTPDepthObservation(
@@ -3775,6 +3797,7 @@ namespace llaminar2
             broadcastCommand(MPICommand::DECODE_STEP);
 
         const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        bool adaptive_depth_zero_step = false;
         if (mtp.enabled)
         {
             const std::string mtp_hard_failure = mtpDecodeHardFailureReason();
@@ -3787,9 +3810,24 @@ namespace llaminar2
             const std::string mtp_bypass_reason = mtpDecodeBypassReason();
             if (mtp_bypass_reason.empty())
             {
-                return decodeStepMTP();
+                if (!ensureMTPDepthController(mtp))
+                {
+                    result.error = last_error_.empty()
+                                       ? "Invalid MTP depth policy"
+                                       : last_error_;
+                    return result;
+                }
+                if (currentMTPDraftDepth(mtp) > 0)
+                {
+                    return decodeStepMTP();
+                }
+                recordMTPDepthZeroBypass();
+                adaptive_depth_zero_step = true;
             }
-            recordMTPBypass(mtp_bypass_reason);
+            else
+            {
+                recordMTPBypass(mtp_bypass_reason);
+            }
         }
 
         std::optional<int32_t> ready_token_for_decode;
@@ -3910,6 +3948,37 @@ namespace llaminar2
             token = sampler_.sample(logits, static_cast<size_t>(vocab), active_sampling_params_);
         }
 
+        const bool token_is_stop =
+            std::find(stop_tokens_.begin(), stop_tokens_.end(), token) != stop_tokens_.end();
+        if (adaptive_depth_zero_step && !token_is_stop)
+        {
+            const int base_sidecar_position = runner_->get_position();
+            bool shifted_commit_ok = false;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "depth_zero_bypass_shifted_commit",
+                    "decode");
+                shifted_commit_ok =
+                    runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
+                        token,
+                        /*already_appended_tokens=*/0,
+                        /*allow_speculative_discard=*/true,
+                        base_sidecar_position);
+            }
+            if (!shifted_commit_ok)
+            {
+                result.error =
+                    "MTP dynamic depth-zero shifted-cache maintenance failed";
+                return result;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "depth_zero_bypass_shifted_commits",
+                1.0,
+                "decode");
+        }
+
         // Record token for presence/frequency penalty tracking
         sampler_.record_token(token);
 
@@ -3919,14 +3988,7 @@ namespace llaminar2
         last_token_ = token; // Store for next decode step
 
         // Check stop tokens
-        for (int32_t stop : stop_tokens_)
-        {
-            if (token == stop)
-            {
-                result.is_complete = true;
-                break;
-            }
-        }
+        result.is_complete = token_is_stop;
 
         return result;
     }

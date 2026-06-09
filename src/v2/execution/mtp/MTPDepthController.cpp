@@ -26,6 +26,8 @@ namespace llaminar2
             return "demote_zero_accept_rate";
         case MTPDepthDecisionReason::DemoteLowAcceptanceRate:
             return "demote_low_acceptance_rate";
+        case MTPDepthDecisionReason::DepthZeroBypass:
+            return "depth_zero_bypass";
         case MTPDepthDecisionReason::Hold:
             return "hold";
         default:
@@ -64,8 +66,10 @@ namespace llaminar2
                     ? config.min_depth
                     : config.max_depth;
         }
-        if (config.min_depth < 1)
-            throw std::invalid_argument("MTP depth policy min_depth must be > 0");
+        if (config.min_depth < 0)
+            throw std::invalid_argument("MTP depth policy min_depth must be >= 0");
+        if (config.mode == MTPDepthPolicyMode::Fixed && config.min_depth < 1)
+            throw std::invalid_argument("MTP fixed depth policy min_depth must be > 0");
         if (config.max_depth < config.min_depth)
             throw std::invalid_argument("MTP depth policy max_depth must be >= min_depth");
         if (config.initial_depth < config.min_depth ||
@@ -107,6 +111,20 @@ namespace llaminar2
         stats_ = {};
     }
 
+    bool MTPDepthController::depthZeroProbeReady() const
+    {
+        return config_.mode != MTPDepthPolicyMode::Fixed &&
+               current_depth_ == 0 &&
+               steps_since_change_ >= config_.cooldown_steps;
+    }
+
+    int MTPDepthController::requestedDepthForStep() const
+    {
+        if (current_depth_ > 0)
+            return current_depth_;
+        return depthZeroProbeReady() ? std::min(1, config_.max_depth) : 0;
+    }
+
     void MTPDepthController::reset()
     {
         current_depth_ = config_.initial_depth;
@@ -128,7 +146,6 @@ namespace llaminar2
             return true;
 
         if (config_.mode == MTPDepthPolicyMode::Fixed ||
-            current_depth_ <= config_.min_depth ||
             steps_since_change_ < config_.cooldown_steps ||
             window_.verifier_runs < static_cast<uint64_t>(config_.min_samples) ||
             window_.attempted_draft_tokens == 0)
@@ -142,6 +159,16 @@ namespace llaminar2
         const double zero_accept_rate =
             static_cast<double>(window_.zero_accepts) /
             static_cast<double>(window_.verifier_runs);
+
+        const bool perfect_probe =
+            current_depth_ < config_.max_depth &&
+            window_.full_accepts == window_.verifier_runs &&
+            window_.zero_accepts == 0;
+        if (perfect_probe)
+            return true;
+
+        if (current_depth_ <= config_.min_depth)
+            return false;
 
         return zero_accept_rate >= config_.demote_zero_accept_rate ||
                acceptance_rate < config_.demote_acceptance_rate;
@@ -184,23 +211,34 @@ namespace llaminar2
         }
 
         int proposed_depth = current_depth_;
+        const bool demoting_d1_to_zero =
+            config_.min_depth == 0 && current_depth_ == 1;
+        const double zero_accept_demote_threshold =
+            demoting_d1_to_zero ? 1.0 : config_.demote_zero_accept_rate;
+        const bool perfect_accept_window =
+            window_.verifier_runs > 0 &&
+            window_.full_accepts == window_.verifier_runs &&
+            window_.zero_accepts == 0;
+
         if (current_depth_ > config_.min_depth &&
-            decision.zero_accept_rate >= config_.demote_zero_accept_rate)
+            decision.zero_accept_rate >= zero_accept_demote_threshold)
         {
             proposed_depth = current_depth_ - 1;
             decision.reason = MTPDepthDecisionReason::DemoteZeroAcceptRate;
         }
         else if (current_depth_ > config_.min_depth &&
+                 !demoting_d1_to_zero &&
                  decision.acceptance_rate < config_.demote_acceptance_rate)
         {
-            proposed_depth = config_.min_depth;
+            proposed_depth = current_depth_ - 1;
             decision.reason = MTPDepthDecisionReason::DemoteLowAcceptanceRate;
         }
         else if (current_depth_ < config_.max_depth &&
                  decision.full_accept_rate >= config_.promote_full_accept_rate &&
-                 decision.zero_accept_rate < config_.demote_zero_accept_rate)
+                 window_.zero_accepts == 0)
         {
-            if (promotion_streak_ + 1 >= config_.promote_consecutive_windows)
+            if (perfect_accept_window ||
+                promotion_streak_ + 1 >= config_.promote_consecutive_windows)
             {
                 proposed_depth = current_depth_ + 1;
                 decision.reason = MTPDepthDecisionReason::PromoteFullAcceptRate;
@@ -307,7 +345,38 @@ namespace llaminar2
             current_depth_ = decision.new_depth;
             steps_since_change_ = 0;
         }
+        else if (current_depth_ == 0 && decision.evaluated)
+        {
+            steps_since_change_ = 0;
+        }
         window_ = {};
+        last_decision_ = decision;
+        return decision;
+    }
+
+    MTPDepthDecision MTPDepthController::recordBypassStep()
+    {
+        MTPDepthDecision decision;
+        decision.old_depth = current_depth_;
+        decision.new_depth = current_depth_;
+        decision.recommended_depth = current_depth_;
+
+        if (config_.mode == MTPDepthPolicyMode::Fixed)
+        {
+            decision.reason = MTPDepthDecisionReason::FixedMode;
+            last_decision_ = decision;
+            return decision;
+        }
+
+        if (current_depth_ != 0)
+        {
+            decision.reason = MTPDepthDecisionReason::Hold;
+            last_decision_ = decision;
+            return decision;
+        }
+
+        ++steps_since_change_;
+        decision.reason = MTPDepthDecisionReason::DepthZeroBypass;
         last_decision_ = decision;
         return decision;
     }

@@ -164,6 +164,17 @@ Done:
   tok/s, ROCm d1/dynamic about 45.4 vs 31.3 tok/s, and CPU d3 8.51 vs 4.55
   tok/s. Stochastic is speed-negative on all three backends on this short
   seeded lane.
+- Dynamic depth now has a production-shaped depth-zero policy: dynamic matrix
+  runs start at d1 with `min_depth=0`, d0 normal decode maintains shifted MTP KV
+  so later probes can resume safely, demotion is stepwise, d1 only demotes to d0
+  after an all-zero window, and perfect probes can promote early without waiting
+  for the long default promotion hysteresis. Focused controller and runner
+  regressions cover d0 cooldown/probe, shifted-cache maintenance, stepwise
+  demotion, and perfect-probe promotion. The post-tune bounded matrix
+  `benchmark_results/mtp_vllm_style/20260609T-post-hysteresis-tune-matrix/`
+  completed all CUDA/ROCm/CPU dense/MoE greedy/stochastic lanes with fixed
+  d1/d2/d3/dynamic. Dense greedy is still speed-positive; dynamic is less
+  cliffy but remains short-run conservative versus the best fixed depth.
 - CUDA MoE greedy has parity/style coverage.
 - CUDA MoE MTP sidecar M=1 now uses the same grouped-prefill contract as
   verifier M=2..4, avoiding the fragile runtime grouped-decode chain inside
@@ -230,8 +241,8 @@ Open gaps:
   publication and broader benchmark evidence still need to catch up.
 - CUDA/ROCm/CPU MoE bounded matrices are functionally green for greedy and
   stochastic, but MTP is speed-negative everywhere. The common blocker is true
-  verifier/catch-up cost. Dynamic depth also needs enough evidence or hysteresis
-  tuning to promote during short default runs.
+  verifier/catch-up cost. Dynamic depth is now stable across d0/d1/d2 transitions
+  but still needs better short-run promotion and stochastic depth selection.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE MTP is still speed-negative and must reduce verifier/catch-up cost
   before acceptance. Stochastic also needs acceptance-policy tuning or depth
@@ -350,7 +361,11 @@ no-MTP baseline, fixed d1, fixed d2, fixed d3, and dynamic depth. This matrix is
 the normal tuning instrument, not an occasional acceptance run. Greedy rows use
 production runtime settings with `--temperature 0`, not `--deterministic`;
 stochastic rows use a pinned seed, default `123`, so acceptance and throughput
-can be compared across iterations. The generated `summary.tsv` includes
+can be compared across iterations. Dynamic depth must always be reported beside
+the fixed d1/d2/d3 rows from the same git hash and runtime configuration; do not
+tune or accept dynamic in isolation. The matrix dynamic lane starts at d1, allows
+per-step d0 adaptive bypass through `--mtp-min-draft-tokens 0`, and probes back
+toward d3 after cooldown. The generated `summary.tsv` includes
 `speedup_vs_baseline` for every MTP row plus perfstats-derived verifier health:
 `verifier_ms`, `correction_ms`, `main_verifier_warmup/capture/replay`, and
 replay reset/preserve counts. Use those fields to explain a speed regression

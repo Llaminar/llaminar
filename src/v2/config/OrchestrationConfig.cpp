@@ -896,9 +896,9 @@ namespace llaminar2
         {
             errors.push_back("MTP draft tokens must be > 0");
         }
-        if (mtp.depth_policy.min_depth <= 0)
+        if (mtp.depth_policy.min_depth < 0)
         {
-            errors.push_back("MTP depth policy min depth must be > 0");
+            errors.push_back("MTP depth policy min depth must be >= 0");
         }
         if (mtp.depth_policy.max_depth < 0)
         {
@@ -911,7 +911,11 @@ namespace llaminar2
         const int effective_max_depth =
             mtp.depth_policy.max_depth > 0 ? mtp.depth_policy.max_depth : mtp.draft_tokens;
         const int effective_initial_depth =
-            mtp.depth_policy.initial_depth > 0 ? mtp.depth_policy.initial_depth : effective_max_depth;
+            mtp.depth_policy.initial_depth > 0
+                ? mtp.depth_policy.initial_depth
+                : (mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic
+                       ? mtp.depth_policy.min_depth
+                       : effective_max_depth);
         if (effective_max_depth < mtp.depth_policy.min_depth)
         {
             errors.push_back("MTP depth policy max depth must be >= min depth");

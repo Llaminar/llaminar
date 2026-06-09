@@ -15,6 +15,9 @@ Default matrix:
   modes:    greedy,stochastic
   variants: baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
 
+The dynamic variant starts at depth 1, allows adaptive depth-0 bypass, and may
+probe/promote back up to the configured max depth 3.
+
 Options:
   --binary PATH          llaminar2 binary (default: build_v2_release/llaminar2)
   --dense-model PATH     Dense Qwen3.6 GGUF
@@ -210,7 +213,13 @@ describe_variant() {
       variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy fixed)
       ;;
     dynamic)
-      variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic)
+      variant_args=(
+        --mtp
+        --mtp-draft-tokens 3
+        --mtp-depth-policy dynamic
+        --mtp-min-draft-tokens 0
+        --mtp-initial-draft-tokens 1
+      )
       ;;
     *)
       echo "error: unknown variant '${variant}'" >&2

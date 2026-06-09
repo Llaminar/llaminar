@@ -18,6 +18,7 @@ namespace llaminar2
         PromoteFullAcceptRate,
         DemoteZeroAcceptRate,
         DemoteLowAcceptanceRate,
+        DepthZeroBypass,
         Hold,
     };
 
@@ -78,6 +79,7 @@ namespace llaminar2
         void reset();
 
         int currentDepth() const { return current_depth_; }
+        int requestedDepthForStep() const;
         int minDepth() const { return config_.min_depth; }
         int maxDepth() const { return config_.max_depth; }
         MTPDepthPolicyMode mode() const { return config_.mode; }
@@ -85,10 +87,12 @@ namespace llaminar2
         const MTPDepthDecision &lastDecision() const { return last_decision_; }
 
         MTPDepthDecision recordStep(const MTPDepthObservation &observation);
+        MTPDepthDecision recordBypassStep();
 
     private:
         MTPDepthDecision evaluateWindow() const;
         bool windowReady() const;
+        bool depthZeroProbeReady() const;
 
         MTPDepthPolicyConfig config_;
         int current_depth_ = 1;

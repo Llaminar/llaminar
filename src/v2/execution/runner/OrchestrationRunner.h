@@ -443,6 +443,7 @@ namespace llaminar2
         bool ensureMTPDepthController(const MTPRuntimeConfig &mtp);
         int effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const;
         int currentMTPDraftDepth(const MTPRuntimeConfig &mtp);
+        void recordMTPDepthZeroBypass();
         void recordMTPDepthObservation(
             int requested_depth,
             int effective_depth,

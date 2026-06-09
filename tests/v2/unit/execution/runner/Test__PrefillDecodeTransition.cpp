@@ -1850,6 +1850,69 @@ namespace
         EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "demote_zero_accept_rate");
     }
 
+    TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthZeroBypassesDraftVerifierWithoutDisablingMTP)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        depth_policy.min_depth = 0;
+        depth_policy.max_depth = 3;
+        depth_policy.initial_depth = 1;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 2;
+        depth_policy.demote_zero_accept_rate = 0.30;
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true,
+            /*sidecar_sample_fusion=*/false,
+            depth_policy);
+        mock->setDecodeArgmaxScript({
+            MockInferenceRunner::VERIFY_REJECT_TOKEN,
+            MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+            MockInferenceRunner::DECODE_ARGMAX_TOKEN});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 0);
+        auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_current_depth, 0);
+        EXPECT_EQ(probe.mtp_min_depth, 0);
+        EXPECT_EQ(probe.mtp_depth_policy_demotions, 1u);
+        EXPECT_EQ(probe.mtp_depth_policy_updates, 1u);
+        EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "demote_zero_accept_rate");
+
+        const int forward_mtp_count_after_demote = mock->forwardMTPCount();
+        const int chained_mtp_count_after_demote = mock->forwardMTPFromLastDraftCount();
+        const int shifted_commit_count_after_demote = mock->commitMTPShiftedCount();
+        GenerationResult step2 = runner->decodeStep();
+        ASSERT_TRUE(step2.success()) << step2.error;
+
+        EXPECT_EQ(mock->forwardMTPCount(), forward_mtp_count_after_demote)
+            << "depth-zero adaptive bypass must not run MTP draft sidecars";
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), chained_mtp_count_after_demote)
+            << "depth-zero adaptive bypass must not run chained MTP draft sidecars";
+        EXPECT_EQ(mock->commitMTPShiftedCount(), shifted_commit_count_after_demote + 1)
+            << "depth-zero adaptive bypass must still maintain shifted MTP cache for later probes";
+        probe = runner->prefixStateProbe();
+        EXPECT_TRUE(probe.mtp_request.enabled);
+        EXPECT_FALSE(probe.mtp_request.bypassed)
+            << "adaptive depth-zero is a per-step policy action, not an unsupported-feature bypass";
+        EXPECT_EQ(probe.mtp_bypasses, 0u);
+        EXPECT_EQ(probe.mtp_current_depth, 0);
+        EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "depth_zero_bypass");
+    }
+
     TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthPersistsAcrossClearCachePrefillCycles)
     {
         MTPDepthPolicyConfig depth_policy;

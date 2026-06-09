@@ -349,8 +349,8 @@ namespace llaminar2
             else if (key == "min_draft_tokens")
             {
                 config.mtp.depth_policy.min_depth = std::stoi(value);
-                if (config.mtp.depth_policy.min_depth <= 0)
-                    throw std::invalid_argument("mtp min_draft_tokens must be > 0");
+                if (config.mtp.depth_policy.min_depth < 0)
+                    throw std::invalid_argument("mtp min_draft_tokens must be >= 0");
             }
             else if (key == "max_draft_tokens")
             {
@@ -361,8 +361,8 @@ namespace llaminar2
             else if (key == "initial_draft_tokens")
             {
                 config.mtp.depth_policy.initial_depth = std::stoi(value);
-                if (config.mtp.depth_policy.initial_depth <= 0)
-                    throw std::invalid_argument("mtp initial_draft_tokens must be > 0");
+                if (config.mtp.depth_policy.initial_depth < 0)
+                    throw std::invalid_argument("mtp initial_draft_tokens must be >= 0");
             }
             else if (key == "depth_window")
             {
@@ -1755,14 +1755,29 @@ namespace llaminar2
             .long_name = "--mtp-min-draft-tokens",
             .category = "MTP",
             .value_label = "<n>",
-            .description = "Minimum MTP draft depth for observe/dynamic depth policy",
+            .description = "Minimum MTP draft depth for observe/dynamic depth policy; 0 allows adaptive bypass",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
                     c.mtp.depth_policy.min_depth = std::stoi(v);
-                    if (c.mtp.depth_policy.min_depth <= 0)
+                    if (c.mtp.depth_policy.min_depth < 0)
                     {
-                        throw std::invalid_argument("--mtp-min-draft-tokens must be > 0");
+                        throw std::invalid_argument("--mtp-min-draft-tokens must be >= 0");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-initial-draft-tokens",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Initial MTP draft depth for observe/dynamic depth policy; 0 derives from policy defaults",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.initial_depth = std::stoi(v);
+                    if (c.mtp.depth_policy.initial_depth < 0)
+                    {
+                        throw std::invalid_argument("--mtp-initial-draft-tokens must be >= 0");
                     }
                 }),
         });
