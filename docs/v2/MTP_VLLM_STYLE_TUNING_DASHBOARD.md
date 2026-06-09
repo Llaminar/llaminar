@@ -48,6 +48,11 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   warmup/capture/replay counts, and replay reset/preserve counts. CPU lanes are
   still minutes-long even when bounded; full default-length matrix remains the
   acceptance capture.
+- Runner guard: dynamic evidence now requires same-run baseline plus fixed
+  d1/d2/d3 unless `--allow-partial-variants` is used for diagnostics.
+- MoE verifier finding: fixed d3 greedy spends 379 ms total verifier time on
+  CUDA and 684 ms on ROCm; correction replay is 0 ms, so the next target is the
+  524-stage all-position verifier graph.
 
 ## Target Anchors
 

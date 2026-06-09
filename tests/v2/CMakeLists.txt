@@ -1617,6 +1617,15 @@ set_tests_properties(V2_Unit_MTPPerfStatsSummary PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_MTPIterationBenchmarkMatrix
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_mtp_iteration_benchmark_matrix.py
+)
+set_tests_properties(V2_Unit_MTPIterationBenchmarkMatrix PROPERTIES
+    LABELS "V2;Unit;MTP;Benchmark;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_CUDAGemvDispatchGeneratorAliases
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_gemv_dispatch_generator.py

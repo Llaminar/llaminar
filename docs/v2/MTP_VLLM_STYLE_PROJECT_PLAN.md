@@ -216,6 +216,9 @@ Done:
 - `scripts/run_mtp_iteration_benchmark_matrix.sh` now has `--decode-tokens N`
   for bounded all-device iteration sweeps. The default remains the full
   benchmark decode length.
+- The matrix runner now hard-fails dynamic-depth evidence without same-run
+  `baseline,fixed_d1,fixed_d2,fixed_d3` neighbors unless
+  `--allow-partial-variants` is explicitly set for local diagnostics.
 - Bounded MoE iteration matrix now covers CUDA/ROCm/CPU, greedy/stochastic,
   baseline, fixed d1/d2/d3, and dynamic at 16 decode tokens. All lanes are
   functionally green, including CUDA and ROCm stochastic. Every MoE MTP lane is
@@ -241,8 +244,10 @@ Open gaps:
   publication and broader benchmark evidence still need to catch up.
 - CUDA/ROCm/CPU MoE bounded matrices are functionally green for greedy and
   stochastic, but MTP is speed-negative everywhere. The common blocker is true
-  verifier/catch-up cost. Dynamic depth is now stable across d0/d1/d2 transitions
-  but still needs better short-run promotion and stochastic depth selection.
+  verifier/catch-up cost. Latest fixed d3 MoE greedy spends about 379 ms total
+  verifier time on CUDA and 684 ms on ROCm, while correction replay remains
+  0 ms. Dynamic depth is now stable across d0/d1/d2 transitions but still needs
+  better short-run promotion and stochastic depth selection.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE MTP is still speed-negative and must reduce verifier/catch-up cost
   before acceptance. Stochastic also needs acceptance-policy tuning or depth

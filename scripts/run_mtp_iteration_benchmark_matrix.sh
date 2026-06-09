@@ -26,6 +26,9 @@ Options:
   --models LIST          Comma list: dense,moe
   --modes LIST           Comma list: greedy,stochastic
   --variants LIST        Comma list: baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
+  --allow-partial-variants
+                         Permit diagnostic variant subsets. Without this,
+                         dynamic requires baseline plus fixed d1/d2/d3.
   --seed N               Seed for stochastic rows (default: 123)
   --decode-tokens N      Override benchmark decode tokens via --n-predict N
   --output-dir DIR       Output directory
@@ -44,6 +47,7 @@ Environment aliases:
   LLAMINAR_MTP_MATRIX_SEED
   LLAMINAR_MTP_MATRIX_DECODE_TOKENS
   LLAMINAR_MTP_MATRIX_RESULTS_DIR
+  LLAMINAR_MTP_MATRIX_ALLOW_PARTIAL_VARIANTS
 
 Do not use --no-mpi-bootstrap for this benchmark matrix.
 USAGE
@@ -62,6 +66,7 @@ variants="${LLAMINAR_MTP_MATRIX_VARIANTS:-baseline,fixed_d1,fixed_d2,fixed_d3,dy
 seed="${LLAMINAR_MTP_MATRIX_SEED:-123}"
 decode_tokens="${LLAMINAR_MTP_MATRIX_DECODE_TOKENS:-}"
 output_dir="${LLAMINAR_MTP_MATRIX_RESULTS_DIR:-}"
+allow_partial_variants="${LLAMINAR_MTP_MATRIX_ALLOW_PARTIAL_VARIANTS:-0}"
 perfstats=0
 dry_run=0
 extra_args=()
@@ -116,6 +121,10 @@ while [[ $# -gt 0 ]]; do
       perfstats=1
       shift
       ;;
+    --allow-partial-variants)
+      allow_partial_variants=1
+      shift
+      ;;
     --dry-run)
       dry_run=1
       shift
@@ -153,6 +162,27 @@ done
 if [[ -n "${decode_tokens}" && ! "${decode_tokens}" =~ ^[1-9][0-9]*$ ]]; then
   echo "error: --decode-tokens must be a positive integer, got: ${decode_tokens}" >&2
   exit 2
+fi
+
+variant_list=" $(echo "${variants}" | tr ',' ' ') "
+has_variant() {
+  [[ "${variant_list}" == *" $1 "* ]]
+}
+
+if [[ "${allow_partial_variants}" != "1" ]]; then
+  if has_variant dynamic; then
+    missing=()
+    for required in baseline fixed_d1 fixed_d2 fixed_d3; do
+      if ! has_variant "${required}"; then
+        missing+=("${required}")
+      fi
+    done
+    if (( ${#missing[@]} > 0 )); then
+      echo "error: dynamic matrix rows require same-run baseline,fixed_d1,fixed_d2,fixed_d3; missing: ${missing[*]}" >&2
+      echo "hint: use --allow-partial-variants only for local diagnostics, not iteration evidence" >&2
+      exit 2
+    fi
+  fi
 fi
 
 split_csv() {
@@ -266,6 +296,7 @@ metadata_path="${output_dir}/metadata.txt"
   echo "seed=${seed}"
   echo "decode_tokens=${decode_tokens:-default}"
   echo "perfstats=${perfstats}"
+  echo "allow_partial_variants=${allow_partial_variants}"
   echo "extra_args=${extra_args[*]:-}"
   echo
   git -C "${repo_root}" status --short || true
