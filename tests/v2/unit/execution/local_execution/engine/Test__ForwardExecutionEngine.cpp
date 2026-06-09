@@ -1466,6 +1466,7 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
         {"all_position_logits", "true"},
         {"context", "main_verifier"},
         {"decode_has_history", "true"},
+        {"all_position_logit_rows", "0"},
         {"moe_placement_epoch", "0"},
         {"result", "miss"},
         {"seq_len", "2"}};
@@ -1473,6 +1474,7 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
         {"all_position_logits", "true"},
         {"context", "main_verifier"},
         {"decode_has_history", "true"},
+        {"all_position_logit_rows", "0"},
         {"moe_placement_epoch", "0"},
         {"result", "hit"},
         {"seq_len", "2"}};

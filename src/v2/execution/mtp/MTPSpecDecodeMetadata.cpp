@@ -35,6 +35,17 @@ namespace llaminar2
             return batch;
         }
 
+        MTPSpecDecodeVerifierInputPlan verifierInputPlanFailure(
+            const MTPSpecDecodeMetadataShape &shape,
+            std::string reason)
+        {
+            MTPSpecDecodeVerifierInputPlan plan;
+            plan.shape = shape;
+            plan.ok = false;
+            plan.error = std::move(reason);
+            return plan;
+        }
+
         MTPSpecDecodeStateCommitPlan statePlanFailure(
             const MTPSpecDecodeMetadataShape &shape,
             int request_count,
@@ -106,6 +117,7 @@ namespace llaminar2
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::BONUS_READY_STATE_SLOT_INDICES, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::DRAFT_TOKENS, draft_slots));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::SAMPLED_TOKENS, target_slots));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS, target_slots));
         return reqs;
     }
 
@@ -457,6 +469,57 @@ namespace llaminar2
         return plan;
     }
 
+    MTPSpecDecodeVerifierInputPlan buildMTPSpecDecodeVerifierInputPlan(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<MTPSpecDecodeVerifierDraftRequest> &requests)
+    {
+        if (!shape.valid())
+            return verifierInputPlanFailure(shape, "invalid MTP verifier input metadata shape");
+        if (requests.empty())
+            return verifierInputPlanFailure(shape, "MTP verifier input plan has no requests");
+        if (static_cast<int>(requests.size()) > shape.max_requests)
+            return verifierInputPlanFailure(shape, "MTP verifier input plan exceeds max_requests");
+
+        MTPSpecDecodeVerifierInputPlan plan;
+        plan.ok = true;
+        plan.shape = shape;
+        plan.request_count = static_cast<int>(requests.size());
+        fillZero(plan.query_start_locs, shape.max_requests + 1);
+        fillInvalid(plan.bonus_logit_rows, shape.max_requests);
+
+        int query_cursor = 0;
+        for (size_t request_index = 0; request_index < requests.size(); ++request_index)
+        {
+            const MTPSpecDecodeVerifierDraftRequest &request = requests[request_index];
+            const int draft_count = static_cast<int>(request.draft_tokens.size());
+            if (draft_count <= 0)
+                return verifierInputPlanFailure(shape, "MTP verifier input request has no draft tokens");
+            if (draft_count > shape.max_draft_tokens)
+                return verifierInputPlanFailure(shape, "MTP verifier input request exceeds max_draft_tokens");
+
+            plan.query_start_locs[request_index] = query_cursor;
+
+            // Current Llaminar verifier rows are compact and contiguous for a
+            // request: row 0 verifies the first sidecar draft, and the final
+            // row becomes the bonus-ready distribution if every draft accepts.
+            for (int row = 0; row < draft_count; ++row)
+            {
+                plan.verifier_input_tokens.push_back(
+                    request.draft_tokens[static_cast<size_t>(row)]);
+                plan.verifier_logit_rows.push_back(query_cursor + row);
+            }
+            plan.bonus_logit_rows[request_index] =
+                query_cursor + draft_count - 1;
+            query_cursor += draft_count;
+        }
+
+        plan.query_start_locs[requests.size()] = query_cursor;
+        plan.total_verifier_input_tokens = query_cursor;
+        plan.compact_logit_row_count =
+            static_cast<int>(plan.verifier_logit_rows.size());
+        return plan;
+    }
+
     MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatch(
         const MTPSpecDecodeMetadataShape &shape,
         const std::vector<MTPSpecDecodeRequest> &requests,
@@ -784,7 +847,8 @@ namespace llaminar2
                bonus_ready_token_indices &&
                bonus_ready_state_slot_indices &&
                draft_tokens &&
-               sampled_tokens;
+               sampled_tokens &&
+               verifier_logit_rows;
     }
 
     MTPSpecDecodeMetadataWorkspaceBinding::MTPSpecDecodeMetadataWorkspaceBinding(
@@ -976,7 +1040,10 @@ namespace llaminar2
                 &device_pointers_.draft_tokens) ||
             !bind_int32(
                 MTPSpecDecodeWorkspaceBuffers::SAMPLED_TOKENS,
-                &device_pointers_.sampled_tokens))
+                &device_pointers_.sampled_tokens) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS,
+                &device_pointers_.verifier_logit_rows))
         {
             binding_error_ = error.str();
             device_pointers_ = {};
@@ -1115,6 +1182,94 @@ namespace llaminar2
         }
 
         result.ok = true;
+        return result;
+    }
+
+    MTPSpecDecodeMetadataUploadResult uploadMTPSpecDecodeVerifierInputPlan(
+        const MTPSpecDecodeVerifierInputPlan &plan,
+        const MTPSpecDecodeMetadataWorkspaceBinding &binding,
+        DeviceId device,
+        IBackend *backend,
+        void *stream)
+    {
+        MTPSpecDecodeMetadataUploadResult result;
+        if (!plan.ok)
+        {
+            result.error = std::string("cannot upload invalid MTP verifier input plan: ") +
+                           plan.error;
+            return result;
+        }
+        if (!binding.hasWorkspace())
+        {
+            result.error = std::string("MTP verifier metadata workspace is not completely bound: ") +
+                           binding.bindingError();
+            return result;
+        }
+        if (plan.compact_logit_row_count < 0 ||
+            plan.compact_logit_row_count >
+                plan.shape.max_requests * plan.shape.maxTargetQueryLen() ||
+            static_cast<int>(plan.verifier_logit_rows.size()) <
+                plan.compact_logit_row_count)
+        {
+            result.error = "MTP verifier row plan is outside metadata shape";
+            return result;
+        }
+        if (device.is_gpu())
+        {
+            if (!stream)
+            {
+                result.error =
+                    "MTP verifier row metadata GPU upload requires an explicit non-null stream";
+                return result;
+            }
+            if (!backend)
+            {
+                result.error = "MTP verifier row metadata GPU upload requires a backend";
+                return result;
+            }
+        }
+
+        const auto &ptrs = binding.devicePointers();
+        if (!ptrs.verifier_logit_rows)
+        {
+            result.error = "MTP verifier row metadata workspace has no verifier row buffer";
+            return result;
+        }
+
+        const size_t bytes =
+            static_cast<size_t>(plan.compact_logit_row_count) * sizeof(int32_t);
+        if (bytes == 0)
+        {
+            result.ok = true;
+            return result;
+        }
+
+        bool ok = true;
+        if (device.is_gpu())
+        {
+            ok = backend->hostToDeviceOnStream(
+                ptrs.verifier_logit_rows,
+                plan.verifier_logit_rows.data(),
+                bytes,
+                device.ordinal,
+                stream);
+        }
+        else
+        {
+            std::memcpy(
+                ptrs.verifier_logit_rows,
+                plan.verifier_logit_rows.data(),
+                bytes);
+        }
+
+        if (!ok)
+        {
+            result.error = "MTP verifier row metadata upload failed";
+            return result;
+        }
+
+        result.ok = true;
+        result.bytes_uploaded = bytes;
         return result;
     }
 

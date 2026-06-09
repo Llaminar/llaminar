@@ -2340,6 +2340,21 @@ namespace llaminar2
                 });
             }
         }
+        if (state_.device_id.is_gpu() &&
+            (compute_row_indexed_all_position_logits_ ||
+             pending_mtp_spec_verifier_input_plan_.has_value()))
+        {
+            // This is runner metadata, not stage scratch.  The row-select
+            // stage reads these stable device pointers during graph replay, and
+            // OrchestrationRunner uploads new values for each verifier step.
+            extras.push_back(WorkspaceConsumerRequest{
+                &mtp_spec_decode_metadata_binding_,
+                state_.device_id,
+                /*m=*/1,
+                /*n=*/3,
+                /*k=*/0,
+            });
+        }
 
         WorkspaceBudgetConfig workspace_budget;
         return workspace_allocator_->allocateForGraph(graph, hints, extras, workspace_budget);
@@ -3381,6 +3396,25 @@ namespace llaminar2
         if (compute_all_position_logits_)
         {
             const auto &config = graph_builder_->config();
+            size_t rows = static_cast<size_t>(total_tokens);
+            if (compute_row_indexed_all_position_logits_)
+            {
+                if (batch_size != 1)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Row-indexed all-position logits require batch_size=1");
+                    return nullptr;
+                }
+                if (row_indexed_all_position_logits_row_count_ <= 0 ||
+                    row_indexed_all_position_logits_row_count_ > total_tokens)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Invalid row-indexed all-position logit row count: rows="
+                              << row_indexed_all_position_logits_row_count_
+                              << " total_tokens=" << total_tokens);
+                    return nullptr;
+                }
+                rows = static_cast<size_t>(row_indexed_all_position_logits_row_count_);
+            }
+            const int rows_key = static_cast<int>(rows);
             if (config.lm_head_column_parallel)
             {
                 if (!state_.logits_local)
@@ -3395,7 +3429,6 @@ namespace llaminar2
                 }
 
                 const auto &local_shape = state_.logits_local->shape();
-                const size_t rows = static_cast<size_t>(total_tokens);
                 const size_t local_vocab =
                     local_shape.size() >= 2 ? local_shape[1] : static_cast<size_t>(std::max(0, config.vocab_local));
                 if (local_vocab == 0)
@@ -3404,7 +3437,6 @@ namespace llaminar2
                     return nullptr;
                 }
 
-                const int rows_key = static_cast<int>(rows);
                 auto &local_logits_owner = state_.all_position_logits_local_by_rows[rows_key];
                 bool needs_allocate = !local_logits_owner;
                 if (local_logits_owner)
@@ -3458,9 +3490,7 @@ namespace llaminar2
                     return nullptr;
                 }
 
-                const size_t rows = static_cast<size_t>(total_tokens);
                 const size_t vocab = static_cast<size_t>(state_.vocab_size);
-                const int rows_key = static_cast<int>(rows);
                 auto &logits_owner = state_.all_position_logits_by_rows[rows_key];
                 bool needs_allocate = !logits_owner;
                 if (logits_owner)
@@ -5365,7 +5395,154 @@ namespace llaminar2
         {
             return false;
         }
+        if (!enabled &&
+            !graph_builder_->setComputeRowIndexedAllPositionLogits(false, 0))
+        {
+            return false;
+        }
         compute_all_position_logits_ = enabled;
+        if (!enabled)
+        {
+            // Row-indexed logits are meaningful only while the verifier asks
+            // for all-position logits. Clearing both knobs together prevents a
+            // stale compact row count from shaping the next verifier graph.
+            compute_row_indexed_all_position_logits_ = false;
+            row_indexed_all_position_logits_row_count_ = 0;
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::setComputeRowIndexedAllPositionLogits(bool enabled, int row_count)
+    {
+        if (!graph_builder_)
+        {
+            return false;
+        }
+        if (!graph_builder_->setComputeRowIndexedAllPositionLogits(enabled, row_count))
+        {
+            return false;
+        }
+        compute_row_indexed_all_position_logits_ = enabled;
+        row_indexed_all_position_logits_row_count_ = enabled ? row_count : 0;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::setMTPSpecVerifierInputPlan(
+        const MTPSpecDecodeVerifierInputPlan &plan)
+    {
+        if (!plan.ok)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Refusing invalid MTP verifier input plan: "
+                      << plan.error);
+            return false;
+        }
+        if (plan.compact_logit_row_count <= 0 ||
+            plan.compact_logit_row_count > plan.shape.maxTargetQueryLen() ||
+            plan.compact_logit_row_count >
+                static_cast<int>(plan.verifier_logit_rows.size()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Refusing malformed MTP verifier row plan: rows="
+                      << plan.compact_logit_row_count
+                      << " row_values=" << plan.verifier_logit_rows.size());
+            return false;
+        }
+
+        mtp_spec_decode_metadata_binding_.setShape(plan.shape);
+        pending_mtp_spec_verifier_input_plan_ = plan;
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::clearMTPSpecVerifierInputPlan()
+    {
+        pending_mtp_spec_verifier_input_plan_.reset();
+    }
+
+    bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(
+        const ForwardInput &input,
+        void *execution_stream,
+        DeviceId execution_device)
+    {
+        (void)input;
+        if (!compute_all_position_logits_ ||
+            !compute_row_indexed_all_position_logits_)
+        {
+            return true;
+        }
+
+        // CPU row selection still uses the stage-owned host vector.  The
+        // metadata workspace is needed only once the graph reads row indices
+        // from a persistent device buffer.
+        if (!state_.device_id.is_gpu())
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "verifier_row_metadata_path",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"path", "cpu_stage_owned"},
+                 {"rows", std::to_string(row_indexed_all_position_logits_row_count_)}});
+            return true;
+        }
+
+        if (!pending_mtp_spec_verifier_input_plan_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Row-indexed GPU verifier graph has no pending MTP row plan");
+            return false;
+        }
+        if (!execution_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Row-indexed GPU verifier metadata upload requires an explicit stream");
+            return false;
+        }
+
+        const DeviceId metadata_device =
+            execution_device.is_gpu() ? execution_device : state_.device_id;
+        IBackend *backend = getBackendFor(metadata_device);
+        if (!backend)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] No backend for verifier metadata upload on "
+                      << metadata_device.toString());
+            return false;
+        }
+
+        const int expected_rows = row_indexed_all_position_logits_row_count_;
+        const auto &plan = *pending_mtp_spec_verifier_input_plan_;
+        if (plan.compact_logit_row_count != expected_rows)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Verifier row plan count "
+                      << plan.compact_logit_row_count
+                      << " does not match graph row count " << expected_rows);
+            return false;
+        }
+
+        const auto upload = uploadMTPSpecDecodeVerifierInputPlan(
+            plan,
+            mtp_spec_decode_metadata_binding_,
+            metadata_device,
+            backend,
+            execution_stream);
+        if (!upload.ok)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload verifier row metadata: "
+                      << upload.error);
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "verifier_row_metadata_upload_bytes",
+            static_cast<double>(upload.bytes_uploaded),
+            "decode",
+            metadata_device.toString());
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "verifier_row_metadata_path",
+            1.0,
+            "decode",
+            metadata_device.toString(),
+            {{"path", "persistent_workspace"},
+             {"rows", std::to_string(expected_rows)}});
         return true;
     }
 

@@ -168,6 +168,15 @@ namespace llaminar2
             return true;
         }
 
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override
+        {
+            if (enabled && (row_count <= 0 || row_count > 4))
+                return false;
+            config_.compute_row_indexed_logits = enabled;
+            config_.row_indexed_logits_row_count = enabled ? row_count : 0;
+            return true;
+        }
+
         void setModelContext(std::shared_ptr<IModelContext> model_ctx) override;
 
         BufferArena *arena() const { return arena_; }

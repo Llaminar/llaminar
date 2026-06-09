@@ -272,6 +272,14 @@ namespace llaminar2
             return false;
         }
 
+        /// Enable compact row-indexed all-position verifier logits.
+        virtual bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count)
+        {
+            (void)enabled;
+            (void)row_count;
+            return false;
+        }
+
         /// Set model context for registry-created builders in tests/dependency injection.
         virtual void setModelContext(std::shared_ptr<IModelContext> model_ctx) { (void)model_ctx; }
 

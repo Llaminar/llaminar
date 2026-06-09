@@ -21,6 +21,12 @@ namespace llaminar2::rocm
         int device_ordinal,
         int **host_selected_row);
 
+    /** @brief Allocate pinned host storage for several selected rows. */
+    bool allocateRowSelectHostParams(
+        int device_ordinal,
+        int **host_selected_rows,
+        int row_count);
+
     /** @brief Free pinned host scalar storage allocated by allocateRowSelectHostParam(). */
     void freeRowSelectHostParam(
         int device_ordinal,
@@ -44,6 +50,13 @@ namespace llaminar2::rocm
         const int *host_selected_row,
         void *stream);
 
+    /** @brief Upload selected-row indices to their stable device address. */
+    bool uploadRowSelectParams(
+        int *device_selected_rows,
+        const int *host_selected_rows,
+        int row_count,
+        void *stream);
+
     /** @brief Launch FP32 row-select copy: output[0, :] = input[selected_row, :]. */
     bool launchRowSelectFP32(
         const float *input,
@@ -51,6 +64,16 @@ namespace llaminar2::rocm
         const int *device_selected_row,
         int seq_len,
         int d_model,
+        void *stream);
+
+    /** @brief Launch FP32 multi-row select: output[row, :] = input[selected_rows[row], :]. */
+    bool launchRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int *device_selected_rows,
+        int seq_len,
+        int d_model,
+        int selected_row_count,
         void *stream);
 
     /** @brief Launch FP32 MTP concat: output[row] = [embedding[row], hidden[row]]. */

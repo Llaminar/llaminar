@@ -39,6 +39,7 @@ namespace llaminar2
         constexpr const char *BONUS_READY_STATE_SLOT_INDICES = "mtp_spec_decode_bonus_ready_state_slot_indices";
         constexpr const char *DRAFT_TOKENS = "mtp_spec_decode_draft_tokens";
         constexpr const char *SAMPLED_TOKENS = "mtp_spec_decode_sampled_tokens";
+        constexpr const char *VERIFIER_LOGIT_ROWS = "mtp_spec_decode_verifier_logit_rows";
     } // namespace MTPSpecDecodeWorkspaceBuffers
 
     struct MTPSpecDecodeMetadataShape
@@ -85,6 +86,45 @@ namespace llaminar2
         std::vector<int32_t> draft_tokens;
         std::vector<int32_t> sampled_tokens;
         std::vector<MTPSpecDecodeTransaction> transactions;
+    };
+
+    /**
+     * @brief Draft-token request used before target verifier logits exist.
+     *
+     * This is the pre-verification side of the vLLM-style metadata contract.
+     * The normal `MTPSpecDecodeRequest` also contains sampled verifier tokens,
+     * which are not available until after the target verifier graph runs.
+     */
+    struct MTPSpecDecodeVerifierDraftRequest
+    {
+        int request_id = 0;
+        std::vector<int32_t> draft_tokens;
+    };
+
+    /**
+     * @brief Flattened target-verifier input and row-selection plan.
+     *
+     * Llaminar's current SingleDevice verifier contract feeds the already
+     * accepted main token followed by sidecar draft tokens into one target
+     * forward. The logits rows produced by that forward verify the later draft
+     * tokens and provide the bonus-ready row when every draft is accepted. This
+     * plan makes that row mapping explicit so the graph builder, sampler, and
+     * state publication path share the same compact-row semantics.
+     */
+    struct MTPSpecDecodeVerifierInputPlan
+    {
+        bool ok = false;
+        std::string error;
+
+        MTPSpecDecodeMetadataShape shape;
+        int request_count = 0;
+        int total_verifier_input_tokens = 0;
+        int compact_logit_row_count = 0;
+
+        std::vector<int32_t> verifier_input_tokens;
+        std::vector<int32_t> query_start_locs;
+        std::vector<int32_t> verifier_logit_rows;
+        std::vector<int32_t> bonus_logit_rows;
     };
 
     struct MTPSpecDecodeStateCommitPlan
@@ -134,6 +174,18 @@ namespace llaminar2
         const std::vector<int32_t> &committed_output_counts,
         const std::vector<int32_t> &stopped_flags);
 
+    /**
+     * @brief Build pre-verifier row metadata from draft tokens.
+     *
+     * The result remains host-readable for CPU tests and diagnostics. GPU
+     * runners upload the compact row-index subset through
+     * `uploadMTPSpecDecodeVerifierInputPlan()` so graph-captured row-select
+     * stages read stable workspace metadata instead of stage-local vectors.
+     */
+    MTPSpecDecodeVerifierInputPlan buildMTPSpecDecodeVerifierInputPlan(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<MTPSpecDecodeVerifierDraftRequest> &requests);
+
     MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
         const MTPSpecDecodeMetadataShape &shape,
         const std::vector<MTPSpecDecodeRequest> &requests,
@@ -179,6 +231,7 @@ namespace llaminar2
         int32_t *bonus_ready_state_slot_indices = nullptr;
         int32_t *draft_tokens = nullptr;
         int32_t *sampled_tokens = nullptr;
+        int32_t *verifier_logit_rows = nullptr;
 
         bool complete() const;
     };
@@ -232,6 +285,21 @@ namespace llaminar2
 
     MTPSpecDecodeMetadataUploadResult uploadMTPSpecDecodeMetadataBatch(
         const MTPSpecDecodeMetadataBatch &batch,
+        const MTPSpecDecodeMetadataWorkspaceBinding &binding,
+        DeviceId device,
+        IBackend *backend,
+        void *stream);
+
+    /**
+     * @brief Upload the compact target-verifier row plan for graph replay.
+     *
+     * The all-position verifier graph reads `VERIFIER_LOGIT_ROWS` from the same
+     * runner-owned metadata workspace as the stochastic/spec-state kernels. GPU
+     * callers must pass the exact explicit stream that will execute or replay
+     * the graph so the row-select stage observes the freshly uploaded indices.
+     */
+    MTPSpecDecodeMetadataUploadResult uploadMTPSpecDecodeVerifierInputPlan(
+        const MTPSpecDecodeVerifierInputPlan &plan,
         const MTPSpecDecodeMetadataWorkspaceBinding &binding,
         DeviceId device,
         IBackend *backend,

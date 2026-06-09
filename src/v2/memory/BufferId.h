@@ -50,6 +50,7 @@ namespace llaminar2
         ATTN_CONTEXT_WORKSPACE, ///< Attention context scratch
         GEMM_WORKSPACE,         ///< GEMM temporary storage
         LM_HEAD_INPUT_ROW,      ///< Stable [1, d_model] scratch row feeding LM head in bucketed prefill
+        LM_HEAD_INPUT_ROWS,     ///< Stable [M<=4, d_model] compact verifier rows feeding LM head
 
         // ── Collective staging buffers ──────────────────────────────────────
         ALLREDUCE_STAGING, ///< Staging buffer for allreduce
@@ -183,6 +184,8 @@ namespace llaminar2
             return "GEMM_WORKSPACE";
         case BufferId::LM_HEAD_INPUT_ROW:
             return "LM_HEAD_INPUT_ROW";
+        case BufferId::LM_HEAD_INPUT_ROWS:
+            return "LM_HEAD_INPUT_ROWS";
         case BufferId::ALLREDUCE_STAGING:
             return "ALLREDUCE_STAGING";
         case BufferId::ALLGATHER_STAGING:

@@ -42,6 +42,34 @@ namespace llaminar2::cuda
             }
         }
 
+        /// @brief Copy several selected FP32 rows using a grid-stride loop over the compact output.
+        __global__ void rowsSelectFP32Kernel(
+            const float *__restrict__ input,
+            float *__restrict__ output,
+            const int *__restrict__ selected_rows,
+            int seq_len,
+            int d_model,
+            int selected_row_count)
+        {
+            const int total = selected_row_count * d_model;
+            const int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+            const int stride = blockDim.x * gridDim.x;
+            const int upper_bound_row = seq_len - 1;
+            for (int idx = thread_index; idx < total; idx += stride)
+            {
+                const int output_row = idx / d_model;
+                const int column = idx - output_row * d_model;
+                const int raw_selected_row = selected_rows ? selected_rows[output_row] : 0;
+                const int selected_row = raw_selected_row < 0
+                                             ? 0
+                                             : (raw_selected_row > upper_bound_row ? upper_bound_row : raw_selected_row);
+                const size_t source_offset =
+                    static_cast<size_t>(selected_row) * static_cast<size_t>(d_model) +
+                    static_cast<size_t>(column);
+                output[static_cast<size_t>(idx)] = input[source_offset];
+            }
+        }
+
         /// @brief Concatenate two [rows, hidden_dim] matrices row-wise as [embedding, hidden].
         __global__ void mtpConcatFP32Kernel(
             const float *__restrict__ hidden,
@@ -87,6 +115,24 @@ namespace llaminar2::cuda
         if (!ok(cudaSetDevice(device_ordinal)))
             return false;
         return ok(cudaHostAlloc(reinterpret_cast<void **>(host_selected_row), sizeof(int), cudaHostAllocDefault));
+    }
+
+    bool allocateRowSelectHostParams(
+        int device_ordinal,
+        int **host_selected_rows,
+        int row_count)
+    {
+        if (!host_selected_rows || row_count <= 0)
+            return false;
+
+        *host_selected_rows = nullptr;
+
+        if (!ok(cudaSetDevice(device_ordinal)))
+            return false;
+        return ok(cudaHostAlloc(
+            reinterpret_cast<void **>(host_selected_rows),
+            static_cast<size_t>(row_count) * sizeof(int),
+            cudaHostAllocDefault));
     }
 
     void freeRowSelectHostParam(
@@ -147,6 +193,23 @@ namespace llaminar2::cuda
             cuda_stream));
     }
 
+    bool uploadRowSelectParams(
+        int *device_selected_rows,
+        const int *host_selected_rows,
+        int row_count,
+        void *stream)
+    {
+        if (!device_selected_rows || !host_selected_rows || row_count <= 0 || !stream)
+            return false;
+        auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+        return ok(cudaMemcpyAsync(
+            device_selected_rows,
+            host_selected_rows,
+            static_cast<size_t>(row_count) * sizeof(int),
+            cudaMemcpyHostToDevice,
+            cuda_stream));
+    }
+
     bool launchRowSelectFP32(
         const float *input,
         float *output,
@@ -167,6 +230,33 @@ namespace llaminar2::cuda
             device_selected_row,
             seq_len,
             d_model);
+        return ok(cudaGetLastError());
+    }
+
+    bool launchRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int *device_selected_rows,
+        int seq_len,
+        int d_model,
+        int selected_row_count,
+        void *stream)
+    {
+        if (!input || !output || !device_selected_rows || seq_len <= 0 || d_model <= 0 ||
+            selected_row_count <= 0 || !stream)
+            return false;
+
+        constexpr int threads_per_block = 256;
+        const int total = selected_row_count * d_model;
+        const int blocks = std::max(1, std::min(1024, (total + threads_per_block - 1) / threads_per_block));
+        auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+        rowsSelectFP32Kernel<<<blocks, threads_per_block, 0, cuda_stream>>>(
+            input,
+            output,
+            device_selected_rows,
+            seq_len,
+            d_model,
+            selected_row_count);
         return ok(cudaGetLastError());
     }
 

@@ -29,6 +29,7 @@
 #include "../../execution/compute_stages/stages/LocalPPTransferStage.h"
 #include "../../execution/compute_stages/stages/FusedResidualNormStage.h"
 #include "../../execution/compute_stages/stages/QKNormStage.h"
+#include "../../execution/mtp/MTPSpecDecodeMetadata.h"
 #include "../../config/PipelineConfig.h"
 #include "../../memory/BufferId.h" // Phase 2: contract BufferIds
 #include <algorithm>
@@ -77,6 +78,72 @@ namespace llaminar2
         BufferId gatheredLogitsBufferId(bool all_positions)
         {
             return all_positions ? BufferId::ALL_POSITION_LOGITS : BufferId::LOGITS;
+        }
+
+        /**
+         * @brief Describes the LM-head input shape and buffer contract.
+         *
+         * Normal decode/prefill passes the whole normalized activation tensor to
+         * LMHeadStage and lets that stage read only the final row. Full
+         * all-position verification projects every normalized row. The vLLM-style
+         * compact verifier path is the middle ground: row-select first packs the
+         * verifier rows into LM_HEAD_INPUT_ROWS, then LMHeadStage projects every
+         * row of that compact scratch tensor.
+         */
+        struct LMHeadInputLayout
+        {
+            int seq_len = 1;
+            BufferId input_buffer_id = BufferId::NORMALIZED;
+            bool compute_all_positions = false;
+            bool use_prefill_replay_row_offset = true;
+        };
+
+        /**
+         * @brief Resolve LMHeadStage shape/contract fields from the selected input tensor.
+         *
+         * Keeping this logic in one helper prevents the single-device, PP, and
+         * schema-built graph paths from drifting as we add verifier modes.
+         */
+        LMHeadInputLayout describeLMHeadInputLayout(
+            const GraphConfig &config,
+            const ActivationBuffers &buffers,
+            TensorBase *lm_head_input,
+            int total_tokens)
+        {
+            const TensorBase *normalized = buffers.normalized;
+            const TensorBase *compact_rows = buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
+            const bool input_is_normalized = lm_head_input == normalized;
+            const bool input_is_compact_rows =
+                config.compute_all_position_logits &&
+                config.compute_row_indexed_logits &&
+                lm_head_input == compact_rows;
+
+            LMHeadInputLayout layout;
+            if (input_is_compact_rows)
+            {
+                layout.seq_len = config.row_indexed_logits_row_count;
+                layout.input_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+                layout.compute_all_positions = true;
+                // Compact rows already start at row 0, so replay row offsets
+                // would be wrong and are intentionally disabled here.
+                layout.use_prefill_replay_row_offset = false;
+                return layout;
+            }
+
+            if (input_is_normalized)
+            {
+                layout.seq_len = total_tokens;
+                layout.input_buffer_id = BufferId::NORMALIZED;
+                layout.compute_all_positions = config.compute_all_position_logits;
+                layout.use_prefill_replay_row_offset = true;
+                return layout;
+            }
+
+            layout.seq_len = 1;
+            layout.input_buffer_id = BufferId::LM_HEAD_INPUT_ROW;
+            layout.compute_all_positions = false;
+            layout.use_prefill_replay_row_offset = false;
+            return layout;
         }
     }
 
@@ -299,6 +366,10 @@ namespace llaminar2
 
         // Ensure current_hidden alias in layer_buffers (expected by some stages)
         lb.current_hidden = buffers_.current_hidden;
+        if (auto *scratch_row = toBase(arena_->getTensor(BufferId::LM_HEAD_INPUT_ROW)))
+            lb.extensions[BufferId::LM_HEAD_INPUT_ROW] = scratch_row;
+        if (auto *scratch_rows = toBase(arena_->getTensor(BufferId::LM_HEAD_INPUT_ROWS)))
+            lb.extensions[BufferId::LM_HEAD_INPUT_ROWS] = scratch_rows;
 
         LOG_DEBUG("[QwenGraphBase] Arena bound: "
                   << "residual=" << lb.residual
@@ -327,7 +398,58 @@ namespace llaminar2
         dependency_out = dependency_node;
 
         if (config_.compute_all_position_logits)
-            return final_norm_output;
+        {
+            if (!config_.compute_row_indexed_logits)
+                return final_norm_output;
+
+            const int row_count = config_.row_indexed_logits_row_count;
+            if (row_count <= 0 || row_count > total_tokens || row_count > 4)
+            {
+                LOG_ERROR("[QwenGraphBase] Row-indexed all-position logits require 1..min(4,total_tokens) rows, got "
+                          << row_count << " for total_tokens=" << total_tokens);
+                throw std::runtime_error("invalid row-indexed all-position logits row count");
+            }
+
+            TensorBase *scratch_rows = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
+            if (!scratch_rows)
+            {
+                LOG_ERROR("[QwenGraphBase] Row-indexed all-position logits require lm_head_input_rows scratch buffer");
+                throw std::runtime_error("row-indexed all-position logits scratch buffer missing");
+            }
+
+            // The verifier sequence starts at the current live position. Row i
+            // contains the main-model logits after consuming verifier token i,
+            // exactly the rows consumed by the greedy/stochastic verifier logic.
+            std::vector<int> selected_rows;
+            selected_rows.reserve(static_cast<size_t>(row_count));
+            for (int i = 0; i < row_count; ++i)
+                selected_rows.push_back(i);
+
+            HiddenStateRowsSelectStage::Params row_params;
+            row_params.input = final_norm_output;
+            row_params.output = scratch_rows;
+            row_params.seq_len = total_tokens;
+            row_params.d_model = config_.d_model;
+            row_params.selected_row_count = row_count;
+            row_params.selected_row_indices = std::move(selected_rows);
+            row_params.device_id = device;
+            row_params.input_buffer_id = input_buffer_id;
+            row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+            if (device.is_gpu())
+            {
+                row_params.workspace_buffer_name =
+                    MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
+                row_params.declare_selected_rows_workspace = false;
+                row_params.upload_selected_rows_to_workspace = false;
+            }
+
+            graph.addNode("lm_head_rows_select",
+                          ComputeStageFactory::createHiddenStateRowsSelect(row_params),
+                          device);
+            graph.addDependency("lm_head_rows_select", dependency_node);
+            dependency_out = "lm_head_rows_select";
+            return scratch_rows;
+        }
 
         // Only bucketed prefill needs a dynamic row-select. Normal exact-shape
         // prefill and decode preserve the existing LMHeadStage offset behavior.
@@ -644,29 +766,29 @@ namespace llaminar2
         LOG_DEBUG("[QwenGraphBase] LM head in buildFullForwardGraph: use_column_parallel="
                   << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
+        const LMHeadInputLayout lm_layout =
+            describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+
         LMHeadStage::Params lm_params;
-        // Feed LM head from either final RMSNorm or the bucket-safe selected row.
+        // Feed LM head from final RMSNorm, bucket one-row scratch, or compact
+        // verifier rows. The layout helper keeps the row count and BufferId
+        // contract synchronized.
         lm_params.hidden_states = lm_head_input;
         lm_params.lm_head_weight = modelLMHead();
         lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
         lm_params.logits = lm_head_output;
-        lm_params.seq_len = (lm_head_input == buffers_.layer_buffers.normalized) ? total_tokens : 1;
+        lm_params.seq_len = lm_layout.seq_len;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias_tensor = nullptr; // Qwen2 has no LM head bias
         lm_params.device_id = config_.default_device;
         lm_params.prepared_store = prepared_weight_store_;
-        lm_params.input_buffer_id = (lm_head_input == buffers_.layer_buffers.normalized)
-                                        ? BufferId::NORMALIZED
-                                        : BufferId::LM_HEAD_INPUT_ROW;
+        lm_params.input_buffer_id = lm_layout.input_buffer_id;
         lm_params.output_buffer_id = logitsBufferId(
             use_column_parallel,
-            config_.compute_all_position_logits &&
-                lm_head_input == buffers_.layer_buffers.normalized);
-        lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
-        lm_params.compute_all_positions =
-            config_.compute_all_position_logits &&
-            lm_head_input == buffers_.layer_buffers.normalized;
+            lm_layout.compute_all_positions);
+        lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+        lm_params.compute_all_positions = lm_layout.compute_all_positions;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
@@ -684,17 +806,15 @@ namespace llaminar2
             allgather_params.local_input = buffers_.logits_local;
             allgather_params.full_output = buffers_.logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
-            // LM head always computes only the last token's logits (lm_m=1),
-            // so the AllGather always transfers 1 row regardless of total_tokens
-            allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
+            allgather_params.actual_seq_len = lm_layout.compute_all_positions ? lm_layout.seq_len : 1;
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             // Multi-domain TP typically doesn't route LM head to a specific domain
             allgather_params.domain = nullptr;
             allgather_params.input_buffer_id = logitsBufferId(
                 /*column_parallel=*/true,
-                config_.compute_all_position_logits);
+                lm_layout.compute_all_positions);
             allgather_params.output_buffer_id = gatheredLogitsBufferId(
-                config_.compute_all_position_logits);
+                lm_layout.compute_all_positions);
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -994,28 +1114,26 @@ namespace llaminar2
             LOG_DEBUG("[QwenGraphBase] LM head in buildPartialForwardGraph: use_column_parallel="
                       << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
+            const LMHeadInputLayout lm_layout =
+                describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+
             LMHeadStage::Params lm_params;
             lm_params.hidden_states = lm_head_input;
             lm_params.lm_head_weight = modelLMHead();
             lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
             lm_params.logits = lm_head_output;
-            lm_params.seq_len = (lm_head_input == buffers_.layer_buffers.normalized) ? total_tokens : 1;
+            lm_params.seq_len = lm_layout.seq_len;
             lm_params.d_model = config_.d_model;
             lm_params.vocab_size = lm_head_vocab_size;
             lm_params.bias_tensor = nullptr;
             lm_params.device_id = config_.default_device;
             lm_params.prepared_store = prepared_weight_store_;
-            lm_params.input_buffer_id = (lm_head_input == buffers_.layer_buffers.normalized)
-                                            ? BufferId::NORMALIZED
-                                            : BufferId::LM_HEAD_INPUT_ROW;
+            lm_params.input_buffer_id = lm_layout.input_buffer_id;
             lm_params.output_buffer_id = logitsBufferId(
                 use_column_parallel,
-                config_.compute_all_position_logits &&
-                    lm_head_input == buffers_.layer_buffers.normalized);
-            lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
-            lm_params.compute_all_positions =
-                config_.compute_all_position_logits &&
-                lm_head_input == buffers_.layer_buffers.normalized;
+                lm_layout.compute_all_positions);
+            lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+            lm_params.compute_all_positions = lm_layout.compute_all_positions;
 
             graph.addNode("lm_head",
                           ComputeStageFactory::createLMHead(lm_params),
@@ -1033,14 +1151,13 @@ namespace llaminar2
                 allgather_params.local_input = buffers_.logits_local;
                 allgather_params.full_output = buffers_.logits;
                 allgather_params.mpi_ctx = mpi_ctx_.get();
-                // LM head always computes only the last token's logits (lm_m=1)
-                allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
+                allgather_params.actual_seq_len = lm_layout.compute_all_positions ? lm_layout.seq_len : 1;
                 allgather_params.domain = nullptr;
                 allgather_params.input_buffer_id = logitsBufferId(
                     /*column_parallel=*/true,
-                    config_.compute_all_position_logits);
+                    lm_layout.compute_all_positions);
                 allgather_params.output_buffer_id = gatheredLogitsBufferId(
-                    config_.compute_all_position_logits);
+                    lm_layout.compute_all_positions);
 
                 graph.addNode("lm_head_allgather",
                               ComputeStageFactory::createAllGather(allgather_params),
@@ -1359,28 +1476,26 @@ namespace llaminar2
                 LOG_DEBUG("[QwenGraphBase] LM head in unified PP: use_column_parallel="
                           << use_column_parallel << " vocab_size=" << lm_head_vocab_size);
 
+                const LMHeadInputLayout lm_layout =
+                    describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+
                 LMHeadStage::Params lm_params;
                 lm_params.hidden_states = lm_head_input;
                 lm_params.lm_head_weight = modelLMHead();
                 lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), stage_device);
                 lm_params.logits = lm_head_output;
-                lm_params.seq_len = (lm_head_input == buffers_.layer_buffers.normalized) ? total_tokens : 1;
+                lm_params.seq_len = lm_layout.seq_len;
                 lm_params.d_model = config_.d_model;
                 lm_params.vocab_size = lm_head_vocab_size;
                 lm_params.bias_tensor = nullptr;
                 lm_params.device_id = stage_device;
                 lm_params.prepared_store = prepared_weight_store_;
-                lm_params.input_buffer_id = (lm_head_input == buffers_.layer_buffers.normalized)
-                                                ? BufferId::NORMALIZED
-                                                : BufferId::LM_HEAD_INPUT_ROW;
+                lm_params.input_buffer_id = lm_layout.input_buffer_id;
                 lm_params.output_buffer_id = logitsBufferId(
                     use_column_parallel,
-                    config_.compute_all_position_logits &&
-                        lm_head_input == buffers_.layer_buffers.normalized);
-                lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
-                lm_params.compute_all_positions =
-                    config_.compute_all_position_logits &&
-                    lm_head_input == buffers_.layer_buffers.normalized;
+                    lm_layout.compute_all_positions);
+                lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+                lm_params.compute_all_positions = lm_layout.compute_all_positions;
 
                 graph.addNode("lm_head",
                               ComputeStageFactory::createLMHead(lm_params),
@@ -1398,14 +1513,13 @@ namespace llaminar2
                     allgather_params.local_input = buffers_.logits_local;
                     allgather_params.full_output = buffers_.logits;
                     allgather_params.mpi_ctx = mpi_ctx_.get();
-                    // LM head always computes only the last token's logits (lm_m=1)
-                    allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
+                    allgather_params.actual_seq_len = lm_layout.compute_all_positions ? lm_layout.seq_len : 1;
                     allgather_params.domain = nullptr;
                     allgather_params.input_buffer_id = logitsBufferId(
                         /*column_parallel=*/true,
-                        config_.compute_all_position_logits);
+                        lm_layout.compute_all_positions);
                     allgather_params.output_buffer_id = gatheredLogitsBufferId(
-                        config_.compute_all_position_logits);
+                        lm_layout.compute_all_positions);
 
                     graph.addNode("lm_head_allgather",
                                   ComputeStageFactory::createAllGather(allgather_params),
@@ -1609,28 +1723,91 @@ namespace llaminar2
                                                                   << " lm_head_vocab_size=" << lm_head_vocab_size
                                                                   << " lm_head_output=" << lm_head_output);
 
+        TensorBase *lm_head_input = hidden_states;
+        std::string lm_head_dependency = "final_norm";
+        int lm_head_seq_len = total_tokens;
+        BufferId lm_head_input_buffer_id = BufferId::HIDDEN_STATE;
+        bool lm_head_compute_all_positions = config_.compute_all_position_logits;
+        bool lm_head_use_prefill_row_offset = true;
+
+        if (config_.compute_all_position_logits && config_.compute_row_indexed_logits)
+        {
+            const int row_count = config_.row_indexed_logits_row_count;
+            if (row_count <= 0 || row_count > total_tokens || row_count > 4)
+            {
+                LOG_ERROR("[QwenGraphBase] Standalone LM-head graph row-indexed verifier requires 1..min(4,total_tokens) rows, got "
+                          << row_count << " for total_tokens=" << total_tokens);
+                throw std::runtime_error("invalid standalone row-indexed all-position logits row count");
+            }
+
+            TensorBase *scratch_rows = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
+            if (!scratch_rows)
+            {
+                LOG_ERROR("[QwenGraphBase] Standalone row-indexed verifier requires lm_head_input_rows scratch buffer");
+                throw std::runtime_error("standalone row-indexed verifier scratch buffer missing");
+            }
+
+            std::vector<int> selected_rows;
+            selected_rows.reserve(static_cast<size_t>(row_count));
+            for (int i = 0; i < row_count; ++i)
+                selected_rows.push_back(i);
+
+            HiddenStateRowsSelectStage::Params row_params;
+            row_params.input = hidden_states;
+            row_params.output = scratch_rows;
+            row_params.seq_len = total_tokens;
+            row_params.d_model = config_.d_model;
+            row_params.selected_row_count = row_count;
+            row_params.selected_row_indices = std::move(selected_rows);
+            row_params.device_id = device;
+            row_params.input_buffer_id = BufferId::HIDDEN_STATE;
+            row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+            if (device.is_gpu())
+            {
+                row_params.workspace_buffer_name =
+                    MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
+                row_params.declare_selected_rows_workspace = false;
+                row_params.upload_selected_rows_to_workspace = false;
+            }
+
+            graph.addNode("lm_head_rows_select",
+                          ComputeStageFactory::createHiddenStateRowsSelect(row_params),
+                          device);
+            graph.addDependency("lm_head_rows_select", lm_head_dependency);
+
+            // Compact verifier rows are a new dense matrix. The LM head should
+            // project every compact row starting at row zero.
+            lm_head_input = scratch_rows;
+            lm_head_dependency = "lm_head_rows_select";
+            lm_head_seq_len = row_count;
+            lm_head_input_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+            lm_head_compute_all_positions = true;
+            lm_head_use_prefill_row_offset = false;
+        }
+
         // LM Head projection
         LMHeadStage::Params lm_params;
-        lm_params.hidden_states = hidden_states;
+        lm_params.hidden_states = lm_head_input;
         lm_params.lm_head_weight = modelLMHead();
         lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
         lm_params.logits = lm_head_output;
-        lm_params.seq_len = total_tokens;
+        lm_params.seq_len = lm_head_seq_len;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias_tensor = nullptr;
         lm_params.device_id = device;
         lm_params.prepared_store = prepared_weight_store_;
-        lm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+        lm_params.input_buffer_id = lm_head_input_buffer_id;
         lm_params.output_buffer_id = logitsBufferId(
             use_column_parallel,
-            config_.compute_all_position_logits);
-        lm_params.compute_all_positions = config_.compute_all_position_logits;
+            lm_head_compute_all_positions);
+        lm_params.compute_all_positions = lm_head_compute_all_positions;
+        lm_params.use_prefill_replay_row_offset = lm_head_use_prefill_row_offset;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
                       device);
-        graph.addDependency("lm_head", "final_norm");
+        graph.addDependency("lm_head", lm_head_dependency);
 
         // =================================================================
         // AllGather stage for column-parallel LM head
@@ -1644,15 +1821,14 @@ namespace llaminar2
             allgather_params.local_input = logits_local;
             allgather_params.full_output = output_logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
-            // LM head always computes only the last token's logits (lm_m=1)
-            allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
+            allgather_params.actual_seq_len = lm_head_compute_all_positions ? lm_head_seq_len : 1;
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             allgather_params.domain = nullptr;
             allgather_params.input_buffer_id = logitsBufferId(
                 /*column_parallel=*/true,
-                config_.compute_all_position_logits);
+                lm_head_compute_all_positions);
             allgather_params.output_buffer_id = gatheredLogitsBufferId(
-                config_.compute_all_position_logits);
+                lm_head_compute_all_positions);
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),

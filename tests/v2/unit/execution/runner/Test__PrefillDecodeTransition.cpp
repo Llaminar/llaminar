@@ -26,6 +26,7 @@
 #include "execution/global_pp/GlobalPPTopology.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
+#include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "config/OrchestrationConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
@@ -309,6 +310,44 @@ namespace
             return true;
         }
 
+        /**
+         * @brief Mock the production compact verifier-logits capability.
+         *
+         * Production graph builders treat row_count as a fixed graph shape. The
+         * mock follows the same 1..4 contract so runner tests fail if
+         * OrchestrationRunner forgets to enable row-indexed verifier logits
+         * around the all-position verifier forward.
+         */
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override
+        {
+            if (!mtp_enabled_)
+                return false;
+            if (enabled && (row_count <= 0 || row_count > 4))
+                return false;
+            row_indexed_all_position_logits_enabled_ = enabled;
+            row_indexed_all_position_logits_row_count_ = enabled ? row_count : 0;
+            ++set_row_indexed_all_position_count_;
+            return true;
+        }
+
+        bool setMTPSpecVerifierInputPlan(
+            const MTPSpecDecodeVerifierInputPlan &plan) override
+        {
+            if (!mtp_enabled_ || !plan.ok)
+                return false;
+            ++set_mtp_spec_verifier_plan_count_;
+            last_mtp_spec_verifier_rows_ = plan.verifier_logit_rows;
+            last_mtp_spec_verifier_tokens_ = plan.verifier_input_tokens;
+            mtp_spec_verifier_plan_installed_ = true;
+            return true;
+        }
+
+        void clearMTPSpecVerifierInputPlan() override
+        {
+            ++clear_mtp_spec_verifier_plan_count_;
+            mtp_spec_verifier_plan_installed_ = false;
+        }
+
         const float *getAllPositionLogits() const override
         {
             if (hide_local_logits_)
@@ -383,6 +422,8 @@ namespace
             }
             position_ = plan.target_cached_tokens;
             all_position_logits_enabled_ = false;
+            row_indexed_all_position_logits_enabled_ = false;
+            row_indexed_all_position_logits_row_count_ = 0;
             return true;
         }
 
@@ -485,6 +526,8 @@ namespace
             is_first_forward_in_cycle_ = true; // Reset cycle
             setupPrefillLogits();              // Reset logits state
             position_ = 0;
+            row_indexed_all_position_logits_enabled_ = false;
+            row_indexed_all_position_logits_row_count_ = 0;
         }
 
         int get_position() const override { return position_; }
@@ -702,6 +745,12 @@ namespace
         int restoreCount() const { return restore_count_; }
         int captureCheckpointCount() const { return capture_checkpoint_count_; }
         int setAllPositionCount() const { return set_all_position_count_; }
+        int setRowIndexedAllPositionCount() const { return set_row_indexed_all_position_count_; }
+        int setMTPSpecVerifierPlanCount() const { return set_mtp_spec_verifier_plan_count_; }
+        int clearMTPSpecVerifierPlanCount() const { return clear_mtp_spec_verifier_plan_count_; }
+        bool mtpSpecVerifierPlanInstalled() const { return mtp_spec_verifier_plan_installed_; }
+        const std::vector<int32_t> &lastMTPSpecVerifierRows() const { return last_mtp_spec_verifier_rows_; }
+        const std::vector<int32_t> &lastMTPSpecVerifierTokens() const { return last_mtp_spec_verifier_tokens_; }
         int lastMTPConditionToken() const { return last_mtp_condition_token_; }
         int lastChainedMTPConditionToken() const { return last_chained_mtp_condition_token_; }
         int lastChainedMTPPositionId() const { return last_chained_mtp_position_id_; }
@@ -858,6 +907,8 @@ namespace
             last_restored_snapshot_ = snapshot;
             position_ = snapshot.cached_tokens;
             all_position_logits_enabled_ = false;
+            row_indexed_all_position_logits_enabled_ = false;
+            row_indexed_all_position_logits_row_count_ = 0;
             return true;
         }
 
@@ -1036,7 +1087,10 @@ namespace
 
         void setupAllPositionLogits(int seq_len)
         {
-            all_position_logits_.assign(static_cast<size_t>(seq_len) * VOCAB_SIZE, -10.0f);
+            const int logits_rows = row_indexed_all_position_logits_enabled_
+                                        ? row_indexed_all_position_logits_row_count_
+                                        : seq_len;
+            all_position_logits_.assign(static_cast<size_t>(logits_rows) * VOCAB_SIZE, -10.0f);
             int accepted_prefix = accept_mtp_token_ ? 1 : 0;
             if (verifier_accepted_prefix_script_index_ < verifier_accepted_prefix_script_.size())
             {
@@ -1046,7 +1100,7 @@ namespace
             const int speculative_depth = std::max(0, seq_len - 1);
             accepted_prefix = std::clamp(accepted_prefix, 0, speculative_depth);
 
-            for (int row = 0; row < seq_len; ++row)
+            for (int row = 0; row < logits_rows; ++row)
             {
                 int token = DECODE_ARGMAX_TOKEN;
                 if (row < speculative_depth)
@@ -1061,8 +1115,8 @@ namespace
             }
             if (column_parallel_logits_)
             {
-                resetLocalTensor(all_position_logits_local_, seq_len);
-                for (int row = 0; row < seq_len; ++row)
+                resetLocalTensor(all_position_logits_local_, logits_rows);
+                for (int row = 0; row < logits_rows; ++row)
                 {
                     int token = DECODE_ARGMAX_TOKEN;
                     if (row < speculative_depth)
@@ -1123,6 +1177,9 @@ namespace
         int restore_count_{0};
         mutable int capture_checkpoint_count_{0};
         int set_all_position_count_{0};
+        int set_row_indexed_all_position_count_{0};
+        int set_mtp_spec_verifier_plan_count_{0};
+        int clear_mtp_spec_verifier_plan_count_{0};
         int commit_mtp_shifted_count_{0};
         int sequential_commit_mtp_shifted_count_{0};
         int last_commit_mtp_already_appended_{0};
@@ -1152,6 +1209,8 @@ namespace
         bool mtp_enabled_{false};
         bool accept_mtp_token_{true};
         bool all_position_logits_enabled_{false};
+        bool row_indexed_all_position_logits_enabled_{false};
+        bool mtp_spec_verifier_plan_installed_{false};
         bool column_parallel_logits_{false};
         bool supports_mtp_token_coordination_{false};
         bool supports_chained_mtp_drafts_{false};
@@ -1168,6 +1227,7 @@ namespace
         DeviceId primary_device_{DeviceId::cpu()};
         int vocab_start_{0};
         int vocab_local_{VOCAB_SIZE};
+        int row_indexed_all_position_logits_row_count_{0};
         std::string mtp_unsupported_reason_;
         PrefixStateSnapshot captured_snapshot_;
         PrefixStateSnapshot last_restored_snapshot_;
@@ -1175,6 +1235,8 @@ namespace
         std::vector<int> last_forward_tokens_;
         std::vector<std::vector<int>> forward_history_;
         std::vector<int> last_commit_mtp_tokens_;
+        std::vector<int32_t> last_mtp_spec_verifier_rows_;
+        std::vector<int32_t> last_mtp_spec_verifier_tokens_;
         std::vector<int> verifier_accepted_prefix_script_;
         std::vector<int> decode_argmax_script_;
         mutable std::vector<PrefixStateSnapshot> captured_checkpoint_script_;
@@ -2332,6 +2394,19 @@ namespace
                                     MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             EXPECT_EQ(mock->setAllPositionCount(), 2);
+            EXPECT_EQ(mock->setRowIndexedAllPositionCount(), 2)
+                << "row-indexed verifier logits should be enabled and disabled around the verifier forward";
+            EXPECT_EQ(mock->setMTPSpecVerifierPlanCount(), 1)
+                << "the verifier row plan must be installed before the row-indexed forward";
+            EXPECT_EQ(mock->clearMTPSpecVerifierPlanCount(), 1)
+                << "the scoped verifier row plan must be cleared after the forward";
+            EXPECT_FALSE(mock->mtpSpecVerifierPlanInstalled())
+                << "stale verifier metadata must not survive a decode step";
+            EXPECT_THAT(mock->lastMTPSpecVerifierRows(), ElementsAre(0, 1, 2));
+            EXPECT_THAT(mock->lastMTPSpecVerifierTokens(),
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
             EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
             EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
             EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 3);

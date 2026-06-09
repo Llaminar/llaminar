@@ -135,6 +135,52 @@ namespace llaminar2
                 threshold);
         }
 
+        /**
+         * @brief Build the current single-request target-verifier row plan.
+         *
+         * The transaction pipeline still runs one request per runner today.
+         * Centralizing this conversion keeps the compact verifier row contract
+         * next to the metadata model instead of leaving it implicit in the
+         * runner's draft-token vector handling.
+         */
+        MTPSpecDecodeVerifierInputPlan buildSingleRequestVerifierInputPlan(
+            const std::vector<int32_t> &draft_tokens)
+        {
+            MTPSpecDecodeMetadataShape shape;
+            shape.max_requests = 1;
+            shape.max_draft_tokens = static_cast<int>(draft_tokens.size());
+
+            MTPSpecDecodeVerifierDraftRequest request;
+            request.request_id = 0;
+            request.draft_tokens = draft_tokens;
+            return buildMTPSpecDecodeVerifierInputPlan(shape, {request});
+        }
+
+        /**
+         * @brief Whether the Qwen row-select graph can consume this plan today.
+         *
+         * `HiddenStateRowsSelectStage` currently packs leading rows
+         * `0..row_count-1` for cached verifier graphs. Persistent arbitrary row
+         * buffers are a later migration step; this guard makes any accidental
+         * mismatch fail loudly instead of sampling the wrong verifier row.
+         */
+        bool verifierInputPlanUsesLeadingCompactRows(
+            const MTPSpecDecodeVerifierInputPlan &plan)
+        {
+            if (!plan.ok ||
+                plan.compact_logit_row_count !=
+                    static_cast<int>(plan.verifier_logit_rows.size()))
+            {
+                return false;
+            }
+            for (int row = 0; row < plan.compact_logit_row_count; ++row)
+            {
+                if (plan.verifier_logit_rows[static_cast<size_t>(row)] != row)
+                    return false;
+            }
+            return true;
+        }
+
         class ScopedMTPAllPositionVerifierSyncDeferral
         {
         public:
@@ -162,6 +208,44 @@ namespace llaminar2
         private:
             IInferenceRunner *runner_ = nullptr;
             bool enabled_ = false;
+        };
+
+        /**
+         * @brief Installs a verifier row plan for one scoped forward call.
+         *
+         * Device runners upload this plan into their graph metadata workspace
+         * immediately before the row-indexed all-position verifier executes.
+         * The destructor clears the plan so a cached verifier graph can never
+         * accidentally replay with row metadata from an older speculative step.
+         */
+        class ScopedMTPSpecVerifierInputPlan
+        {
+        public:
+            ScopedMTPSpecVerifierInputPlan(
+                IInferenceRunner *runner,
+                const MTPSpecDecodeVerifierInputPlan &plan)
+                : runner_(runner),
+                  installed_(runner != nullptr &&
+                             runner->setMTPSpecVerifierInputPlan(plan))
+            {
+            }
+
+            ~ScopedMTPSpecVerifierInputPlan()
+            {
+                if (runner_)
+                    runner_->clearMTPSpecVerifierInputPlan();
+            }
+
+            bool installed() const { return installed_; }
+
+            ScopedMTPSpecVerifierInputPlan(
+                const ScopedMTPSpecVerifierInputPlan &) = delete;
+            ScopedMTPSpecVerifierInputPlan &operator=(
+                const ScopedMTPSpecVerifierInputPlan &) = delete;
+
+        private:
+            IInferenceRunner *runner_ = nullptr;
+            bool installed_ = false;
         };
 
         void synchronizeRunnerPrimaryDeviceBeforeRelease(const IInferenceRunner *runner)
@@ -1274,6 +1358,7 @@ namespace llaminar2
             {
                 PerfStatsCollector::ScopedTimer timer("mtp", "disable_all_position_logits_after_failure", "decode");
                 runner_->setComputeAllPositionLogits(false);
+                runner_->setComputeRowIndexedAllPositionLogits(false, 0);
             }
             bool restored = false;
             {
@@ -2174,16 +2259,42 @@ namespace llaminar2
             auto verifier_rows_from_current_state = [&]()
                 -> std::optional<std::vector<int32_t>>
             {
-                if (!runner_->setComputeAllPositionLogits(true))
+                const MTPSpecDecodeVerifierInputPlan verifier_input_plan =
+                    buildSingleRequestVerifierInputPlan(draft_tokens);
+                if (!verifierInputPlanUsesLeadingCompactRows(verifier_input_plan))
                     return std::nullopt;
-                if (!runner_->forward(draft_tokens.data(), static_cast<int>(draft_tokens.size())))
+                const int verifier_row_count =
+                    verifier_input_plan.compact_logit_row_count;
+                ScopedMTPSpecVerifierInputPlan verifier_plan_scope(
+                    runner_.get(),
+                    verifier_input_plan);
+                if (!verifier_plan_scope.installed())
+                    return std::nullopt;
+                if (!runner_->setComputeRowIndexedAllPositionLogits(true, verifier_row_count))
+                    return std::nullopt;
+                if (!runner_->setComputeAllPositionLogits(true))
+                {
+                    runner_->setComputeRowIndexedAllPositionLogits(false, 0);
+                    return std::nullopt;
+                }
+                if (!runner_->forward(
+                        verifier_input_plan.verifier_input_tokens.data(),
+                        verifier_input_plan.total_verifier_input_tokens))
                 {
                     runner_->setComputeAllPositionLogits(false);
+                    runner_->setComputeRowIndexedAllPositionLogits(false, 0);
                     return std::nullopt;
                 }
                 if (!runner_->setComputeAllPositionLogits(false))
+                {
+                    runner_->setComputeRowIndexedAllPositionLogits(false, 0);
                     return std::nullopt;
-                std::vector<int32_t> rows(draft_tokens.size(), -1);
+                }
+                if (!runner_->setComputeRowIndexedAllPositionLogits(false, 0))
+                    return std::nullopt;
+                std::vector<int32_t> rows(
+                    static_cast<size_t>(verifier_row_count),
+                    -1);
                 if (!runner_->sampleGreedyFromAllPositionLogitsOnDeviceRows(
                         0,
                         static_cast<int>(rows.size()),
@@ -2605,7 +2716,23 @@ namespace llaminar2
                     "decode");
             }
 
-            std::vector<int32_t> sampled_verifier_rows(draft_tokens.size(), -1);
+            const MTPSpecDecodeVerifierInputPlan verifier_input_plan =
+                buildSingleRequestVerifierInputPlan(draft_tokens);
+            if (!verifier_input_plan.ok)
+            {
+                return fail_after_checkpoint(
+                    std::string("All-position MTP verifier input metadata failed: ") +
+                    verifier_input_plan.error);
+            }
+            if (!verifierInputPlanUsesLeadingCompactRows(verifier_input_plan))
+            {
+                return fail_after_checkpoint(
+                    "All-position MTP verifier row metadata is not representable by the current compact row-select graph");
+            }
+
+            std::vector<int32_t> sampled_verifier_rows(
+                static_cast<size_t>(verifier_input_plan.compact_logit_row_count),
+                -1);
             const bool defer_all_position_verifier_sync =
                 !stochastic_verify && runner_->primaryDeviceId().is_gpu();
             ScopedMTPAllPositionVerifierSyncDeferral verifier_sync_deferral(
@@ -2619,23 +2746,51 @@ namespace llaminar2
                     {},
                     {{"implementation", "all_position_state_publication"},
                      {"verifier_path", "all_position_state_publication"}});
+                const int verifier_row_count =
+                    verifier_input_plan.compact_logit_row_count;
+                // The verifier forward still consumes every draft token so KV,
+                // GDN, and MoE state publication can see the full sequence.
+                // Row-indexed logits only shrink the LM-head projection rows.
+                ScopedMTPSpecVerifierInputPlan verifier_plan_scope(
+                    runner_.get(),
+                    verifier_input_plan);
+                if (!verifier_plan_scope.installed())
+                {
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier could not install row metadata plan");
+                }
+                if (!runner_->setComputeRowIndexedAllPositionLogits(
+                        true,
+                        verifier_row_count))
+                {
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier could not enable row-indexed logits");
+                }
                 if (!runner_->setComputeAllPositionLogits(true))
                 {
+                    runner_->setComputeRowIndexedAllPositionLogits(false, 0);
                     return fail_after_checkpoint(
                         "All-position MTP verifier could not enable all-position logits");
                 }
                 if (!runner_->forward(
-                        draft_tokens.data(),
-                        static_cast<int>(draft_tokens.size())))
+                        verifier_input_plan.verifier_input_tokens.data(),
+                        verifier_input_plan.total_verifier_input_tokens))
                 {
                     runner_->setComputeAllPositionLogits(false);
+                    runner_->setComputeRowIndexedAllPositionLogits(false, 0);
                     return fail_after_checkpoint(
                         "All-position MTP verifier forward failed");
                 }
                 if (!runner_->setComputeAllPositionLogits(false))
                 {
+                    runner_->setComputeRowIndexedAllPositionLogits(false, 0);
                     return fail_after_checkpoint(
                         "All-position MTP verifier could not disable all-position logits");
+                }
+                if (!runner_->setComputeRowIndexedAllPositionLogits(false, 0))
+                {
+                    return fail_after_checkpoint(
+                        "All-position MTP verifier could not disable row-indexed logits");
                 }
             }
 

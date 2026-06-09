@@ -445,6 +445,10 @@ namespace llaminar2
         bool flushPendingMTPWork() override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override;
+        bool setMTPSpecVerifierInputPlan(
+            const MTPSpecDecodeVerifierInputPlan &plan) override;
+        void clearMTPSpecVerifierInputPlan() override;
         const float *getAllPositionLogits() const override;
         std::string mtpDecodeUnsupportedReason() const override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
@@ -887,6 +891,10 @@ namespace llaminar2
 
         /// Padded sequence length for current batch
         int current_padded_seq_len_ = 0;
+
+        /// Compact all-position verifier rows requested by the current MTP path.
+        /// A value of zero means gather every row from current_padded_seq_len_.
+        int current_all_position_logit_rows_ = 0;
 
         /// Sequence lengths for current batch
         std::vector<int> current_sequence_lengths_;

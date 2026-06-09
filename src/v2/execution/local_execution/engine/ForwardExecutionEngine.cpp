@@ -293,6 +293,7 @@ namespace llaminar2
                 {"seq_len", std::to_string(signature.seq_len)},
                 {"decode_has_history", boolTag(signature.decode_has_history)},
                 {"all_position_logits", boolTag(signature.all_position_logits)},
+                {"all_position_logit_rows", std::to_string(signature.all_position_logit_rows)},
                 {"moe_placement_epoch", std::to_string(signature.moe_placement_epoch)}};
         }
 
@@ -329,6 +330,8 @@ namespace llaminar2
                 return lhs.seq_len < rhs.seq_len;
             if (lhs.all_position_logits != rhs.all_position_logits)
                 return lhs.all_position_logits < rhs.all_position_logits;
+            if (lhs.all_position_logit_rows != rhs.all_position_logit_rows)
+                return lhs.all_position_logit_rows < rhs.all_position_logit_rows;
             return lhs.batch_size < rhs.batch_size;
         }
     }
@@ -883,6 +886,7 @@ namespace llaminar2
                 is_decode,
                 decode_has_history,
                 all_position_logits,
+                all_position_logits ? std::max(0, host.allPositionLogitRows()) : 0,
                 is_standard_path,
                 config_.pp_stage_config.has_value(),
                 pp_first_layer,
@@ -1309,6 +1313,19 @@ namespace llaminar2
         {
             setup_stream_t1 = Clock::now();
             setup_dynamic_params_t0 = setup_stream_t1;
+        }
+
+        if (host.computeAllPositionLogitsEnabled() &&
+            host.allPositionLogitRows() > 0)
+        {
+            if (!host.prepareAllPositionVerifierGraphMetadata(
+                    input,
+                    dynamic_param_stream,
+                    stream_device))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Failed to prepare cached all-position verifier graph metadata");
+                return false;
+            }
         }
 
         // Update position-dependent params using cached stage pointers.
@@ -2191,6 +2208,36 @@ namespace llaminar2
                 return false;
             }
             LOG_DEBUG("[ForwardExecutionEngine] Got device context, starting execution...");
+
+            if (host.computeAllPositionLogitsEnabled() &&
+                host.allPositionLogitRows() > 0)
+            {
+                void *metadata_stream = nullptr;
+                if (ctx->deviceId().is_gpu())
+                {
+                    try
+                    {
+                        metadata_stream = GPUDeviceContextPool::instance()
+                                              .getContext(ctx->deviceId())
+                                              .defaultStream();
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOG_ERROR("[ForwardExecutionEngine] Could not resolve verifier metadata stream for "
+                                  << ctx->deviceId().toString() << ": " << e.what());
+                        return false;
+                    }
+                }
+
+                if (!host.prepareAllPositionVerifierGraphMetadata(
+                        effective_input,
+                        metadata_stream,
+                        ctx->deviceId()))
+                {
+                    LOG_ERROR("[ForwardExecutionEngine] Failed to prepare all-position verifier graph metadata");
+                    return false;
+                }
+            }
 
             success = executor_.execute(graph, ctx);
         }

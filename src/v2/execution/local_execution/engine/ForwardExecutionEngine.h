@@ -144,6 +144,30 @@ namespace llaminar2
         /** Whether the current forward graph must materialize logits for every input row. */
         virtual bool computeAllPositionLogitsEnabled() const { return false; }
 
+        /** Compact verifier row count when all-position logits are row-indexed; 0 means full input rows. */
+        virtual int allPositionLogitRows() const { return 0; }
+
+        /**
+         * @brief Prepare per-step metadata consumed by an all-position verifier graph.
+         *
+         * The forward engine calls this after workspace binding and after it has
+         * chosen the stream that the graph will use for eager execution, warmup,
+         * capture, or replay. Hosts can upload small graph-facing metadata here
+         * without the engine knowing feature-specific details such as MTP row
+         * selection. GPU hosts must treat `execution_stream` as mandatory when
+         * `execution_device` is a GPU.
+         */
+        virtual bool prepareAllPositionVerifierGraphMetadata(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device)
+        {
+            (void)input;
+            (void)execution_stream;
+            (void)execution_device;
+            return true;
+        }
+
         /**
          * @brief Monotonic live-state epoch for decode graph replay safety.
          *

@@ -1242,6 +1242,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/AttentionComputeStage.cpp
     execution/compute_stages/stages/EmbeddingStage.cpp
     execution/compute_stages/stages/HiddenStateRowSelectStage.cpp
+    execution/compute_stages/stages/HiddenStateRowsSelectStage.cpp
     execution/compute_stages/stages/LMHeadStage.cpp
     execution/local_execution/graph/DeviceGraphCaptureController.cpp
     execution/local_execution/graph/ComputeGraph.cpp

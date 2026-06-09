@@ -146,6 +146,13 @@ namespace llaminar2
         /// input row instead of the selected final row.
         bool compute_all_position_logits = false;
 
+        /// Runtime-only verifier optimization: pack selected hidden rows into a
+        /// compact scratch before LM head instead of projecting every row in
+        /// the verifier activation tensor. Valid only when
+        /// compute_all_position_logits is enabled.
+        bool compute_row_indexed_logits = false;
+        int row_indexed_logits_row_count = 0;
+
         /// TurboQuant context for TQ4 KV cache quantization.
         /// Holds rotation matrix. Not owned by GraphConfig.
         const TurboQuantContext *turboquant_ctx = nullptr;

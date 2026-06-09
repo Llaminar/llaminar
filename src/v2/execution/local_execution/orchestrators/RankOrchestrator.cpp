@@ -2830,7 +2830,64 @@ namespace llaminar2
                 all_success = false;
             }
         }
+        if (all_success && !enabled)
+        {
+            // Child runners clear their row-indexed graph-builder state when
+            // all-position logits are disabled. Mirror that aggregate state so
+            // TP logits gathering uses the full-row shape on the next request.
+            current_all_position_logit_rows_ = 0;
+        }
         return all_success;
+    }
+
+    bool RankOrchestrator::setComputeRowIndexedAllPositionLogits(bool enabled, int row_count)
+    {
+        if (device_runners_.empty())
+        {
+            return false;
+        }
+
+        bool all_success = true;
+        for (auto &runner : device_runners_)
+        {
+            if (!runner || !runner->setComputeRowIndexedAllPositionLogits(enabled, row_count))
+            {
+                all_success = false;
+            }
+        }
+        if (all_success)
+        {
+            current_all_position_logit_rows_ = enabled ? row_count : 0;
+        }
+        return all_success;
+    }
+
+    bool RankOrchestrator::setMTPSpecVerifierInputPlan(
+        const MTPSpecDecodeVerifierInputPlan &plan)
+    {
+        if (device_runners_.empty())
+        {
+            return false;
+        }
+
+        bool all_success = true;
+        for (auto &runner : device_runners_)
+        {
+            if (!runner || !runner->setMTPSpecVerifierInputPlan(plan))
+            {
+                all_success = false;
+            }
+        }
+        return all_success;
+    }
+
+    void RankOrchestrator::clearMTPSpecVerifierInputPlan()
+    {
+        for (auto &runner : device_runners_)
+        {
+            if (runner)
+                runner->clearMTPSpecVerifierInputPlan();
+        }
     }
 
     const float *RankOrchestrator::getAllPositionLogits() const
@@ -2840,7 +2897,12 @@ namespace llaminar2
             return nullptr;
         }
 
-        const size_t rows = std::max<size_t>(1, static_cast<size_t>(std::max(0, current_padded_seq_len_)));
+        const size_t rows = std::max<size_t>(
+            1,
+            static_cast<size_t>(
+                current_all_position_logit_rows_ > 0
+                    ? current_all_position_logit_rows_
+                    : std::max(0, current_padded_seq_len_)));
 
         bool has_local_all_position_logits = false;
         for (const auto &runner : device_runners_)

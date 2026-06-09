@@ -245,6 +245,8 @@ namespace llaminar2
             return BufferId::GEMM_WORKSPACE; // reuse for mask
         if (name == "lm_head_input_row")
             return BufferId::LM_HEAD_INPUT_ROW;
+        if (name == "lm_head_input_rows")
+            return BufferId::LM_HEAD_INPUT_ROWS;
         if (name == "gate")
             return BufferId::GATE_PROJ;
         if (name == "up")

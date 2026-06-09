@@ -50,8 +50,9 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_ExactShapes)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    // Qwen3 has 9 layer buffers, including the stable LM-head input row.
-    EXPECT_EQ(reqs.buffers.size(), 9u) << "Expected 9 layer buffers";
+    // Qwen3 has 10 layer buffers, including one-row prefill scratch and
+    // four-row compact verifier scratch for row-indexed MTP target logits.
+    EXPECT_EQ(reqs.buffers.size(), 10u) << "Expected 10 layer buffers";
 
     // normalized: [512, 2048]
     auto *normalized = findBuf(reqs, "normalized");
@@ -115,6 +116,13 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_ExactShapes)
     ASSERT_EQ(lm_head_input_row->shape.size(), 2u);
     EXPECT_EQ(lm_head_input_row->shape[0], 1u);
     EXPECT_EQ(lm_head_input_row->shape[1], 2048u);
+
+    // lm_head_input_rows: [4, d_model] compact verifier rows for MTP target logits.
+    auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
+    ASSERT_NE(lm_head_input_rows, nullptr);
+    ASSERT_EQ(lm_head_input_rows->shape.size(), 2u);
+    EXPECT_EQ(lm_head_input_rows->shape[0], 4u);
+    EXPECT_EQ(lm_head_input_rows->shape[1], 2048u);
 }
 
 // ============================================================================
@@ -207,6 +215,8 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_TP2)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
+    EXPECT_EQ(reqs.buffers.size(), 10u);
+
     // Q: [512, 8*128=1024]
     auto *Q = findBuf(reqs, "Q");
     ASSERT_NE(Q, nullptr);
@@ -221,4 +231,9 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_TP2)
     auto *gate = findBuf(reqs, "gate");
     ASSERT_NE(gate, nullptr);
     EXPECT_EQ(gate->shape[1], 4480u);
+
+    auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
+    ASSERT_NE(lm_head_input_rows, nullptr);
+    EXPECT_EQ(lm_head_input_rows->shape[0], 4u);
+    EXPECT_EQ(lm_head_input_rows->shape[1], 2048u);
 }

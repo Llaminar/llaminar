@@ -66,6 +66,7 @@ namespace
         // ----- Configurable Behavior -----
         bool build_should_fail = false;
         bool all_position_logits = false;
+        int all_position_logit_rows = 0;
         int graph_node_count = 3; // Stages in built graph (0 = empty)
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
@@ -168,6 +169,11 @@ namespace
         bool computeAllPositionLogitsEnabled() const override
         {
             return all_position_logits;
+        }
+
+        int allPositionLogitRows() const override
+        {
+            return all_position_logit_rows;
         }
 
     private:
@@ -536,6 +542,37 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, AllPositionVerifierLogitsUseSeparat
     engine.execute(all_positions2.input, output, host);
     EXPECT_EQ(host.build_calls, 2)
         << "The all-position verifier graph should then hit its own cache entry";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, RowIndexedVerifierRowCountUsesSeparateDecodeCacheKey)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+    host.all_position_logits = true;
+
+    ForwardOutput output{};
+
+    // A row-indexed verifier graph has the same input sequence shape as the
+    // full verifier, but the LM-head input/output rows are compacted to the
+    // active MTP depth. Cache keys must include that row count so a depth-2
+    // graph can never be replayed for a depth-3 verifier.
+    host.all_position_logit_rows = 2;
+    TestInput depth2_a(3, 1, DeviceId::cpu(), /*position_offset=*/128);
+    ASSERT_TRUE(engine.execute(depth2_a.input, output, host));
+    EXPECT_EQ(host.build_calls, 1);
+
+    host.all_position_logit_rows = 3;
+    TestInput depth3(3, 1, DeviceId::cpu(), /*position_offset=*/131);
+    ASSERT_TRUE(engine.execute(depth3.input, output, host));
+    EXPECT_EQ(host.build_calls, 2)
+        << "Changing compact verifier row count must build a separate graph";
+
+    host.all_position_logit_rows = 2;
+    TestInput depth2_b(3, 1, DeviceId::cpu(), /*position_offset=*/134);
+    ASSERT_TRUE(engine.execute(depth2_b.input, output, host));
+    EXPECT_EQ(host.build_calls, 2)
+        << "Returning to the depth-2 row-indexed shape should hit its cache entry";
 }
 
 TEST_F(Test__ForwardExecutionEngineAdvanced, ResetSessionReplayState_PreservesCachedGraphAndResetsStages)

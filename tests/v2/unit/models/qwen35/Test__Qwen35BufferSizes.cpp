@@ -67,8 +67,9 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    // Qwen3.5 has 20 main layer buffers plus 17 MTP verifier sidecar buffers.
-    EXPECT_EQ(reqs.buffers.size(), 37u) << "Expected 37 layer buffers";
+    // Qwen3.5 has 20 main layer buffers, 17 MTP verifier sidecar buffers,
+    // and the compact LM-head verifier row scratch used by row-indexed MTP.
+    EXPECT_EQ(reqs.buffers.size(), 38u) << "Expected 38 layer buffers";
 
     // ── Shared buffers ──
 
@@ -220,6 +221,13 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     EXPECT_EQ(lm_head_input_row->shape[0], 1u);
     EXPECT_EQ(lm_head_input_row->shape[1], 2560u);
 
+    // lm_head_input_rows: [4, d_model] compact verifier rows for MTP target logits.
+    auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
+    ASSERT_NE(lm_head_input_rows, nullptr);
+    ASSERT_EQ(lm_head_input_rows->shape.size(), 2u);
+    EXPECT_EQ(lm_head_input_rows->shape[0], 4u);
+    EXPECT_EQ(lm_head_input_rows->shape[1], 2560u);
+
     // ── MTP sidecar buffers ──
 
     auto *mtp_embedding = findBuf(reqs, "mtp_embedding");
@@ -358,7 +366,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    EXPECT_EQ(reqs.buffers.size(), 37u);
+    EXPECT_EQ(reqs.buffers.size(), 38u);
 
     // Q: [4096, 8*256=2048] under TP=2
     auto *Q = findBuf(reqs, "Q");
@@ -394,6 +402,11 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     ASSERT_NE(lm_head_input_row, nullptr);
     EXPECT_EQ(lm_head_input_row->shape[0], 1u);
     EXPECT_EQ(lm_head_input_row->shape[1], 2560u);
+
+    auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
+    ASSERT_NE(lm_head_input_rows, nullptr);
+    EXPECT_EQ(lm_head_input_rows->shape[0], 4u);
+    EXPECT_EQ(lm_head_input_rows->shape[1], 2560u);
 
     auto *mtp_q = findBuf(reqs, "mtp_q");
     ASSERT_NE(mtp_q, nullptr);

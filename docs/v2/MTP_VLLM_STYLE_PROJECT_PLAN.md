@@ -408,6 +408,39 @@ Open gaps:
   after the batched NativeVNNI all-position path matched serial decode rows, so
   future failures should be treated as real state or publication drift rather
   than a checker-base artifact.
+- Phase 3 row-indexed verifier work is accepted for dense SingleDevice:
+  `HiddenStateRowsSelectStage` packs a fixed small row set into compact
+  `[rows, d_model]` scratch, Qwen forward graphs can feed that scratch to one
+  batched LM head, and `OrchestrationRunner` enables the row count around the
+  all-position verifier. CPU copies compact rows; CUDA/ROCm use explicit-stream
+  graph-workspace row-index arrays with captured replay support. The
+  `HiddenStateRowsSelectStage` GPU direct-tensor path now hard-fails unless the
+  caller already prepared device pointers, keeping new production tensor
+  movement out of `ensureOnDevice()`. Focused slice gate passed:
+  `V2_Unit_MTPGraphConstruction`, `V2_Unit_HiddenStateRowSelectStage`,
+  `V2_Unit_ForwardExecutionEngineAdvanced`,
+  `V2_Integration_CUDAHiddenStateRowSelectStage`, and
+  `V2_Integration_ROCmHiddenStateRowSelectStage`. Dense Qwen3.6
+  CPU/CUDA/ROCm fixed depth-3 greedy and stochastic verifier parity also pass
+  on the row-indexed path. The accepted full bounded matrix
+  `benchmark_results/mtp_vllm_style/20260609T-phase3-row-indexed-accepted-matrix/`
+  covers CUDA/ROCm/CPU, dense/MoE, greedy/stochastic, baseline plus fixed
+  d1/d2/d3 and dynamic, with perfstats enabled. Dense greedy is speed-positive
+  on all three backends: CUDA best d1 60.9 vs 44.6 tok/s, ROCm best d1 45.7
+  vs 31.3 tok/s, and CPU best d3 9.3 vs 4.7 tok/s. Dense stochastic remains
+  policy-sensitive and MoE remains speed-negative, so Phase 3 is accepted for
+  dense SingleDevice row-indexed verifier correctness/perf only; MoE tuning
+  moves to the next slice.
+  `MTPSpecDecodeVerifierInputPlan` now names the current single-request
+  verifier input and compact-row layout. `OrchestrationRunner` scopes that plan
+  around verifier forwards, `DeviceGraphOrchestrator` uploads its row metadata
+  through `MTPSpecDecodeMetadataWorkspaceBinding` on the execution/capture
+  stream, and `HiddenStateRowsSelectStage` reads that persistent row buffer
+  without stage-local uploads. `V2_Unit_PrefillDecodeTransition` now proves the
+  verifier plan is installed, consumed, and cleared for the all-position
+  publication path, and perfstats expose `verifier_row_metadata_path`. The
+  broader MTP unit gate, full `^V2_Unit_` hard commit gate, and required
+  Integration/Release builds pass.
 - CUDA MoE MTP is still speed-negative and must reduce verifier/catch-up cost
   before acceptance. Stochastic also needs acceptance-policy tuning or depth
   policy integration for the default prompt class.
@@ -474,20 +507,29 @@ Work:
 
 - Build verifier graph inputs from persistent metadata, not temporary vectors.
 - Add row-indexed LM-head/logits production for target rows and bonus rows.
-  Full all-position LM head remains only as a guarded compatibility mode until
-  row-indexed parity is proven.
+  The initial Qwen graph wiring is complete for a fixed compact row count, with
+  cache-key protection for different compact depths. The current single-request
+  verifier row layout is now named through `MTPSpecDecodeVerifierInputPlan`.
+  `HiddenStateRowsSelectStage` consumes caller-owned device row metadata from
+  `MTPSpecDecodeMetadataWorkspaceBinding`; GPU uploads happen on the same
+  explicit stream as verifier graph execution. Full all-position LM head remains
+  only as a guarded compatibility mode until benchmark acceptance is proven.
 - Preserve verifier graph capture/replay across accept-all steps and recapture
   only when a true state-boundary invalidation occurs.
 - Add CPU stage attribution for verifier rows so regressions can identify
-  GEMM/GDN/LM-head cost by phase.
+  GEMM/GDN/LM-head cost by phase. Row metadata path diagnostics are in place;
+  stage-level CPU attribution remains to be expanded if CPU verifier cost
+  regresses again.
 
 Exit gate:
 
-- Dense CPU/CUDA/ROCm greedy parity passes with row-indexed verifier logits.
-- Bounded dense greedy benchmarks show verifier time drops versus the current
-  all-position LM-head path without lowering acceptance.
-- Compatibility all-position verifier mode can be disabled in CI for dense
-  SingleDevice.
+- Accepted for dense SingleDevice as of
+  `benchmark_results/mtp_vllm_style/20260609T-phase3-row-indexed-accepted-matrix/`.
+  Dense CPU/CUDA/ROCm greedy and stochastic parity pass with row-indexed
+  verifier logits; dense greedy benchmarks are speed-positive on all three
+  backends.
+- Remaining follow-up: keep the compatibility all-position verifier mode
+  guarded until the next CI cleanup slice removes dead verifier paths.
 
 ### Phase 4: Batched Greedy/Stochastic Rejection Sampler
 

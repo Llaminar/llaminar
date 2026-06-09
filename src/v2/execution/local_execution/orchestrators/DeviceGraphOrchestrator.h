@@ -49,6 +49,7 @@
 #include "../../../memory/BufferArena.h"               // Phase 2: unified buffer management
 #include "../../prefix_cache/PrefixCacheFingerprint.h"
 #include "../../prefix_cache/PrefixCacheStats.h"
+#include "../../mtp/MTPSpecDecodeMetadata.h"
 #include "../../../interfaces/IMPITopology.h"          // For interface-based construction
 #include "../../../interfaces/ICollectiveContext.h"    // For interface-based construction
 #include "../../../config/TPDomain.h"                  // For MultiDomainTPConfig (Phase 6.3)
@@ -1546,6 +1547,10 @@ namespace llaminar2
             forwardReplayCacheObservations() const;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override;
+        bool setMTPSpecVerifierInputPlan(
+            const MTPSpecDecodeVerifierInputPlan &plan) override;
+        void clearMTPSpecVerifierInputPlan() override;
         const float *getAllPositionLogits() const override;
         std::string mtpDecodeUnsupportedReason() const override;
         bool supportsMTPTokenCoordination() const override;
@@ -2264,6 +2269,20 @@ namespace llaminar2
         /** Whether forward graph construction should emit all-position logits. */
         bool computeAllPositionLogitsEnabled() const override { return compute_all_position_logits_; }
 
+        /** Compact verifier logits row count; 0 means full all-position logits. */
+        int allPositionLogitRows() const override
+        {
+            return compute_row_indexed_all_position_logits_
+                       ? row_indexed_all_position_logits_row_count_
+                       : 0;
+        }
+
+        /** Upload any pending compact verifier row metadata before graph execution. */
+        bool prepareAllPositionVerifierGraphMetadata(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device) override;
+
         /** Monotonic live-state epoch used by versioned decode replay. */
         uint64_t liveReplayStateEpoch() const override { return live_replay_state_epoch_; }
 
@@ -2711,6 +2730,16 @@ namespace llaminar2
         uint64_t device_sampling_counter_ = 0;
 
         bool compute_all_position_logits_ = false;
+        bool compute_row_indexed_all_position_logits_ = false;
+        int row_indexed_all_position_logits_row_count_ = 0;
+
+        /// Runner-owned graph metadata workspace for vLLM-style MTP verification.
+        MTPSpecDecodeMetadataWorkspaceBinding mtp_spec_decode_metadata_binding_{
+            MTPSpecDecodeMetadataShape{1, 3}};
+
+        /// Host copy of the verifier row plan waiting to be uploaded before replay.
+        std::optional<MTPSpecDecodeVerifierInputPlan>
+            pending_mtp_spec_verifier_input_plan_;
 
         /// Whether host-resident weight data has been released after first prefill
         bool host_resident_released_ = false;

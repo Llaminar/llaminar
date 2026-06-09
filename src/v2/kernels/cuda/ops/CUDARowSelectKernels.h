@@ -29,6 +29,17 @@ namespace llaminar2::cuda
         int **host_selected_row);
 
     /**
+     * @brief Allocate pinned host storage for several selected rows.
+     *
+     * Device storage should be graph workspace. This helper owns only the
+     * stable host source used for pre-replay uploads.
+     */
+    bool allocateRowSelectHostParams(
+        int device_ordinal,
+        int **host_selected_rows,
+        int row_count);
+
+    /**
      * @brief Free pinned host scalar storage allocated by allocateRowSelectHostParam().
      */
     void freeRowSelectHostParam(
@@ -74,6 +85,21 @@ namespace llaminar2::cuda
         void *stream);
 
     /**
+     * @brief Upload selected-row indices to their stable device address.
+     *
+     * @param device_selected_rows Device int array destination.
+     * @param host_selected_rows Pinned host int array source.
+     * @param row_count Number of selected rows to upload.
+     * @param stream Opaque CUDA stream pointer used for the async copy.
+     * @return true when the copy was enqueued successfully.
+     */
+    bool uploadRowSelectParams(
+        int *device_selected_rows,
+        const int *host_selected_rows,
+        int row_count,
+        void *stream);
+
+    /**
      * @brief Launch FP32 row-select copy: output[0, :] = input[selected_row, :].
      *
      * @param input Device pointer to [seq_len, d_model] FP32 hidden states.
@@ -90,6 +116,27 @@ namespace llaminar2::cuda
         const int *device_selected_row,
         int seq_len,
         int d_model,
+        void *stream);
+
+    /**
+     * @brief Launch FP32 multi-row select: output[row, :] = input[selected_rows[row], :].
+     *
+     * @param input Device pointer to [seq_len, d_model] FP32 hidden states.
+     * @param output Device pointer to [selected_row_count, d_model] FP32 scratch rows.
+     * @param device_selected_rows Device array containing selected row indices.
+     * @param seq_len Number of rows in input, used for defensive clamping.
+     * @param d_model Number of columns to copy.
+     * @param selected_row_count Number of output rows to produce.
+     * @param stream Opaque CUDA stream pointer for the kernel launch.
+     * @return true when launch was successful.
+     */
+    bool launchRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int *device_selected_rows,
+        int seq_len,
+        int d_model,
+        int selected_row_count,
         void *stream);
 
     /**

@@ -29,6 +29,7 @@ namespace llaminar2
     struct SamplingParams;
     struct LogitPenalty;
     struct MTPSpecStepPlan;
+    struct MTPSpecDecodeVerifierInputPlan;
     struct PrefillChunkSchedulerPolicy;
     class MoERebalanceController;
 
@@ -423,6 +424,43 @@ namespace llaminar2
             (void)enabled;
             return false;
         }
+
+        /**
+         * @brief Enable compact row-indexed all-position verifier logits.
+         *
+         * This must preserve the all-position verifier state-publication
+         * contract; it changes only logits production by packing selected
+         * hidden rows before LM head. `row_count` is a graph-shape parameter.
+         */
+        virtual bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count)
+        {
+            (void)enabled;
+            (void)row_count;
+            return false;
+        }
+
+        /**
+         * @brief Publish the current compact verifier row plan to the runner.
+         *
+         * The runner stores this host-side plan until the next row-indexed
+         * all-position verifier forward. Device runners upload the row metadata
+         * from this plan into their graph workspace immediately before execution
+         * on the exact stream used by the cached graph.
+         */
+        virtual bool setMTPSpecVerifierInputPlan(
+            const MTPSpecDecodeVerifierInputPlan &plan)
+        {
+            (void)plan;
+            return true;
+        }
+
+        /**
+         * @brief Clear any pending compact verifier row plan.
+         *
+         * Callers use this after the verifier forward, including failure paths,
+         * so stale row metadata cannot leak into a later cached replay.
+         */
+        virtual void clearMTPSpecVerifierInputPlan() {}
 
         virtual const float *getAllPositionLogits() const
         {

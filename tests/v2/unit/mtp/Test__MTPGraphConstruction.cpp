@@ -3182,3 +3182,62 @@ TEST(Test__MTPGraphConstruction, LiveForwardExposesAllPositionLogitsOnCPU)
 
     ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
 }
+
+TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsMatchFullRowsOnCPU)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    orchestrator.setWeights(fixture.modelWeights());
+    PreparedWeightStore prepared_store;
+    ASSERT_NO_THROW(prepareDenseForwardWeights(orchestrator, *graph_builder, prepared_store, DeviceId::cpu()));
+
+    const std::vector<int> tokens = {1, 2, 3};
+    const int selected_rows = 2;
+    const size_t vocab = static_cast<size_t>(fixture.config.vocab_size);
+
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+    ASSERT_NE(orchestrator.forward(tokens.data(), static_cast<int>(tokens.size()), 1), nullptr);
+    const float *full_logits = orchestrator.getAllPositionLogits();
+    ASSERT_NE(full_logits, nullptr);
+
+    std::vector<float> expected_prefix(
+        full_logits,
+        full_logits + static_cast<size_t>(selected_rows) * vocab);
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
+
+    orchestrator.clearInferenceState();
+
+    // The compact verifier mode keeps the forward sequence length at three
+    // tokens, but asks the graph to run LM-head GEMM over only rows 0 and 1.
+    ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(true, selected_rows));
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+    const float *returned_logits =
+        orchestrator.forward(tokens.data(), static_cast<int>(tokens.size()), 1);
+    ASSERT_NE(returned_logits, nullptr);
+
+    const float *compact_logits = orchestrator.getAllPositionLogits();
+    ASSERT_NE(compact_logits, nullptr);
+    EXPECT_EQ(returned_logits, compact_logits);
+
+    for (size_t i = 0; i < expected_prefix.size(); ++i)
+    {
+        ASSERT_TRUE(std::isfinite(compact_logits[i]))
+            << "non-finite compact verifier logit at " << i;
+        EXPECT_NEAR(compact_logits[i], expected_prefix[i], 1e-5f)
+            << "compact verifier row mismatch at flat index " << i;
+    }
+
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
+    ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(false, 0));
+
+    EXPECT_FALSE(orchestrator.setComputeRowIndexedAllPositionLogits(true, 0));
+    EXPECT_FALSE(orchestrator.setComputeRowIndexedAllPositionLogits(true, 5));
+}

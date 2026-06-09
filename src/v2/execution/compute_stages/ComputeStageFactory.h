@@ -19,6 +19,7 @@
 #include "stages/AttentionComputeStage.h"
 #include "stages/EmbeddingStage.h"
 #include "stages/HiddenStateRowSelectStage.h"
+#include "stages/HiddenStateRowsSelectStage.h"
 #include "stages/LMHeadStage.h"
 #include "stages/AllreduceStage.h"
 #include "stages/AllGatherStage.h"
@@ -365,6 +366,18 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createHiddenStateRowSelect(
             const HiddenStateRowSelectStage::Params &params);
+
+        /**
+         * @brief Create a compact hidden-state rows-select stage for verifier LM-head input.
+         *
+         * Packs a fixed small row set into [rows, d_model] scratch so the
+         * verifier LM head can run one batched projection over selected rows.
+         *
+         * @param params Multi-row select parameters including source, scratch, and dimensions.
+         * @return HiddenStateRowsSelectStage instance.
+         */
+        static std::unique_ptr<IComputeStage> createHiddenStateRowsSelect(
+            const HiddenStateRowsSelectStage::Params &params);
 
         /**
          * @brief Create an LM head projection stage
