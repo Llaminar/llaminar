@@ -810,6 +810,45 @@ TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureOnlyAppliesToReadyOrdinaryD
         << "Unstamped captures are handled by existing reset paths.";
 }
 
+TEST(Test__ForwardReplayStatePolicy, CorrectionReplayResetsOnlyOrdinaryDecodeCaches)
+{
+    ForwardGraphSignature ordinary_decode;
+    ordinary_decode.decode = true;
+    ordinary_decode.all_position_logits = false;
+
+    ForwardGraphSignature all_position_verifier = ordinary_decode;
+    all_position_verifier.all_position_logits = true;
+
+    ForwardGraphSignature prefill;
+    prefill.decode = false;
+
+    EXPECT_EQ(classifyForwardReplayStateCache(ordinary_decode),
+              ForwardReplayStateCacheClass::OrdinaryDecode);
+    EXPECT_EQ(classifyForwardReplayStateCache(all_position_verifier),
+              ForwardReplayStateCacheClass::AllPositionVerifier);
+    EXPECT_EQ(classifyForwardReplayStateCache(prefill),
+              ForwardReplayStateCacheClass::Other);
+
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
+                  classifyForwardReplayStateCache(ordinary_decode)),
+              ForwardReplayStateAction::ResetReplayState);
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
+                  classifyForwardReplayStateCache(all_position_verifier)),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams);
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
+                  classifyForwardReplayStateCache(prefill)),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams);
+
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::GeneralLiveStateMutation,
+                  classifyForwardReplayStateCache(all_position_verifier)),
+              ForwardReplayStateAction::ResetReplayState)
+        << "Only the MTP correction boundary may preserve verifier replay state.";
+}
+
 TEST(Test__ForwardGraphCache, InvalidateDestroysSegmentCaptureStream)
 {
     ForwardGraphCache cache;

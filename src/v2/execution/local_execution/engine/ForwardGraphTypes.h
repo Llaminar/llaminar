@@ -136,6 +136,47 @@ namespace llaminar2
         }
     };
 
+    enum class ForwardReplayStateCacheClass
+    {
+        Other,
+        OrdinaryDecode,
+        AllPositionVerifier,
+    };
+
+    enum class ForwardReplayStateMutationKind
+    {
+        GeneralLiveStateMutation,
+        MTPCorrectionReplayBoundary,
+    };
+
+    enum class ForwardReplayStateAction
+    {
+        ResetReplayState,
+        PreserveReplayStateAndRebindStreams,
+    };
+
+    inline ForwardReplayStateCacheClass classifyForwardReplayStateCache(
+        const ForwardGraphSignature &signature)
+    {
+        if (!signature.decode)
+            return ForwardReplayStateCacheClass::Other;
+        if (signature.all_position_logits)
+            return ForwardReplayStateCacheClass::AllPositionVerifier;
+        return ForwardReplayStateCacheClass::OrdinaryDecode;
+    }
+
+    inline ForwardReplayStateAction chooseForwardReplayStateAction(
+        ForwardReplayStateMutationKind mutation,
+        ForwardReplayStateCacheClass cache_class)
+    {
+        if (mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary &&
+            cache_class != ForwardReplayStateCacheClass::OrdinaryDecode)
+        {
+            return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
+        }
+        return ForwardReplayStateAction::ResetReplayState;
+    }
+
     /**
      * @brief Latest runtime metadata observed for a prefill graph-cache entry.
      *

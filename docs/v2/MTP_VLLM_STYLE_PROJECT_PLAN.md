@@ -200,6 +200,13 @@ Done:
   release fixed-d3 sanity check
   `benchmark_results/mtp_vllm_style/20260609T082255Z-gpu-moe-d3-versioned-replay/`
   preserved acceptance instead of reproducing the stale-capture collapse.
+- Replay-state mutation policy is now an explicit typed contract rather than
+  an implicit `decode && !all_position` check. `ForwardExecutionEngine` exposes
+  read-only replay-cache observations for tests/diagnostics, and focused units
+  assert the correction boundary resets ordinary decode replay while preserving
+  verifier replay only for stream rebinding. The bounded deep correctness gate
+  passed on CPU/CUDA/ROCm dense and MoE depth-3 greedy plus stochastic verifier
+  parity.
 - Rejected-token all-position publication no longer runs an expensive same-step
   correction main forward. The runner now emits the correction token, commits
   its shifted MTP row from current terminal hidden so the sidecar cache remains
@@ -277,6 +284,11 @@ Open gaps:
   plus 346 ms condition-forward time on ROCm, while correction replay remains
   0 ms. Dynamic depth is now stable across d0/d1/d2 transitions but still needs
   better short-run promotion and stochastic depth selection.
+- Reusing the ordinary main-decode capture across rejected-state publication by
+  merely restamping the live epoch was tested and rejected: focused parity was
+  too weak to catch it, but the release MoE benchmark acceptance collapsed.
+  Keep the correction boundary recapture until a stronger backend state-refresh
+  contract exists.
 - CPU vLLM-style state publication is not implemented or benchmarked.
 - CUDA MoE MTP is still speed-negative and must reduce verifier/catch-up cost
   before acceptance. Stochastic also needs acceptance-policy tuning or depth

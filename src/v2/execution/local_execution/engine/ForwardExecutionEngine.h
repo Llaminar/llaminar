@@ -347,6 +347,20 @@ namespace llaminar2
             explicit operator bool() const { return graph != nullptr; }
         };
 
+        struct ReplayCacheObservation
+        {
+            ForwardGraphSignature signature;
+            bool valid = false;
+            bool segment_initialized = false;
+            bool segment_needs_capture = false;
+            bool phase3_active = false;
+            bool gpu_stream_bindings_applied = false;
+            bool has_capture_stream = false;
+            uint64_t segment_decode_step = 0;
+            uint64_t segmented_capture_live_state_epoch = 0;
+            bool requires_live_state_epoch_recapture = false;
+        };
+
         /**
          * @brief Return the cached forward graph used by the most recent
          *        successful cached execution.
@@ -357,6 +371,17 @@ namespace llaminar2
          * not accidentally publish from stale graph-cache entries.
          */
         std::optional<LastExecutedForwardGraphView> lastExecutedForwardGraph();
+
+        /**
+         * @brief Snapshot replay-cache version/capture state for diagnostics/tests.
+         *
+         * The returned state is intentionally read-only. It lets unit and
+         * integration guards prove that live-state mutations advance epochs and
+         * force stale ordinary decode captures to recapture, while verifier
+         * captures remain governed by the accepted-state publication contract.
+         */
+        std::vector<ReplayCacheObservation> replayCacheObservations(
+            uint64_t live_state_epoch) const;
 
         /**
          * @brief Execute one prepared bucketed prefill chunk.

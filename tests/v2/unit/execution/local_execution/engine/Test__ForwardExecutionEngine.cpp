@@ -1224,6 +1224,83 @@ TEST_F(Test__ForwardExecutionEngine, ResetCapturedReplayStatePreservesCachedGrap
         << "Replay reset must preserve the cached ComputeGraph and avoid a rebuild";
 }
 
+TEST_F(Test__ForwardExecutionEngine, ReplayCacheObservationsTrackOrdinaryAndVerifierDecodeEntries)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    int ordinary_token = 42;
+    int ordinary_pos = 7;
+    auto ordinary = makeTestInput(
+        1,
+        1,
+        DeviceId::cpu(),
+        &ordinary_token,
+        &ordinary_pos);
+
+    int verifier_tokens[] = {43, 44, 45};
+    int verifier_positions[] = {8, 9, 10};
+    auto verifier = makeTestInput(
+        3,
+        1,
+        DeviceId::cpu(),
+        verifier_tokens,
+        verifier_positions);
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(ordinary, output, host));
+
+    host.mock_compute_all_position_logits = true;
+    ASSERT_TRUE(engine.execute(verifier, output, host));
+    ASSERT_EQ(host.build_forward_graph_calls, 2);
+
+    const auto observations = engine.replayCacheObservations(/*live_state_epoch=*/99);
+    ASSERT_EQ(observations.size(), 2u);
+
+    const ForwardExecutionEngine::ReplayCacheObservation *ordinary_obs = nullptr;
+    const ForwardExecutionEngine::ReplayCacheObservation *verifier_obs = nullptr;
+    for (const auto &observation : observations)
+    {
+        ASSERT_TRUE(observation.valid);
+        EXPECT_TRUE(observation.signature.decode);
+        EXPECT_FALSE(observation.segment_initialized)
+            << "CPU entries have graph-cache identity but no GPU replay state.";
+        EXPECT_EQ(observation.segmented_capture_live_state_epoch, 0u);
+        EXPECT_FALSE(observation.requires_live_state_epoch_recapture);
+        if (observation.signature.all_position_logits)
+            verifier_obs = &observation;
+        else
+            ordinary_obs = &observation;
+    }
+    ASSERT_NE(ordinary_obs, nullptr);
+    ASSERT_NE(verifier_obs, nullptr);
+    EXPECT_EQ(classifyForwardReplayStateCache(ordinary_obs->signature),
+              ForwardReplayStateCacheClass::OrdinaryDecode);
+    EXPECT_EQ(classifyForwardReplayStateCache(verifier_obs->signature),
+              ForwardReplayStateCacheClass::AllPositionVerifier);
+
+    engine.resetCapturedReplayStateForCorrectionReplay();
+
+    host.mock_compute_all_position_logits = false;
+    ordinary_token = 46;
+    ordinary_pos = 11;
+    ASSERT_TRUE(engine.execute(ordinary, output, host));
+
+    host.mock_compute_all_position_logits = true;
+    verifier_tokens[0] = 47;
+    verifier_tokens[1] = 48;
+    verifier_tokens[2] = 49;
+    verifier_positions[0] = 12;
+    verifier_positions[1] = 13;
+    verifier_positions[2] = 14;
+    ASSERT_TRUE(engine.execute(verifier, output, host));
+
+    EXPECT_EQ(host.build_forward_graph_calls, 2)
+        << "Correction-boundary replay resets must preserve reusable ComputeGraphs; "
+           "only captured replay executables/stream bindings are versioned.";
+}
+
 // =========================================================================
 // execute() — Cache MISS path
 // =========================================================================

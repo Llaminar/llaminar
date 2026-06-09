@@ -616,7 +616,11 @@ namespace llaminar2
     {
         for (auto &[signature, cache] : cache_)
         {
-            if (signature.decode && !signature.all_position_logits)
+            const ForwardReplayStateAction action =
+                chooseForwardReplayStateAction(
+                    ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
+                    classifyForwardReplayStateCache(signature));
+            if (action == ForwardReplayStateAction::ResetReplayState)
             {
                 cache.resetReplayState();
             }
@@ -982,6 +986,36 @@ namespace llaminar2
         view.is_decode = view.signature.decode;
         view.all_position_logits = view.signature.all_position_logits;
         return view;
+    }
+
+    std::vector<ForwardExecutionEngine::ReplayCacheObservation>
+    ForwardExecutionEngine::replayCacheObservations(uint64_t live_state_epoch) const
+    {
+        std::vector<ReplayCacheObservation> observations;
+        observations.reserve(cache_.size());
+        for (const auto &[signature, cache] : cache_)
+        {
+            ReplayCacheObservation observation;
+            observation.signature = signature;
+            observation.valid = cache.valid;
+            observation.segment_initialized = cache.segment_cache.initialized;
+            observation.segment_needs_capture = cache.segment_cache.needs_capture;
+            observation.phase3_active = cache.phase3_active;
+            observation.gpu_stream_bindings_applied = cache.gpu_stream_applied;
+            observation.has_capture_stream =
+                cache.segment_cache.capture_stream != nullptr;
+            observation.segment_decode_step = cache.segment_cache.decode_step;
+            observation.segmented_capture_live_state_epoch =
+                cache.segmented_capture_live_state_epoch;
+            observation.requires_live_state_epoch_recapture =
+                cache.requiresLiveStateEpochRecapture(
+                    classifyForwardReplayStateCache(signature) ==
+                        ForwardReplayStateCacheClass::OrdinaryDecode,
+                    /*segmented_capture_allowed=*/true,
+                    live_state_epoch);
+            observations.push_back(observation);
+        }
+        return observations;
     }
 
     // =========================================================================
