@@ -43,8 +43,10 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   kernel dynamic state before correction main-decode replay.
 - Matrix runner now supports bounded sweeps:
   `scripts/run_mtp_iteration_benchmark_matrix.sh --decode-tokens 16 --perfstats`.
-  CPU lanes are still minutes-long even when bounded; full default-length
-  matrix remains the acceptance capture.
+  `summary.tsv` now includes verifier/correction timing, main-verifier
+  warmup/capture/replay counts, and replay reset/preserve counts. CPU lanes are
+  still minutes-long even when bounded; full default-length matrix remains the
+  acceptance capture.
 
 ## Target Anchors
 
@@ -60,8 +62,8 @@ llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
 
 1. Run the bounded device matrix every iteration: CUDA/ROCm/CPU, dense/MoE,
    greedy/stochastic, baseline plus fixed d1/d2/d3 and dynamic. Schedule CPU
-   separately if needed; record crashes/timeouts explicitly instead of leaving
-   stale numbers.
+   separately if needed; use verifier/capture columns to explain speed deltas,
+   and record crashes/timeouts explicitly instead of leaving stale numbers.
 2. Use full default matrix for acceptance checkpoints after bounded lanes are
    stable.
 3. Attack MoE verifier/catch-up cost; CUDA, ROCm, and CPU MoE are functional

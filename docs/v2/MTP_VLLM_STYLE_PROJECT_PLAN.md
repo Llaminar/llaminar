@@ -329,7 +329,10 @@ the normal tuning instrument, not an occasional acceptance run. Greedy rows use
 production runtime settings with `--temperature 0`, not `--deterministic`;
 stochastic rows use a pinned seed, default `123`, so acceptance and throughput
 can be compared across iterations. The generated `summary.tsv` includes
-`speedup_vs_baseline` for every MTP row.
+`speedup_vs_baseline` for every MTP row plus perfstats-derived verifier health:
+`verifier_ms`, `correction_ms`, `main_verifier_warmup/capture/replay`, and
+replay reset/preserve counts. Use those fields to explain a speed regression
+before changing kernels or depth policy.
 
 Use `cpu:0` for the SingleDevice CPU lane. Bare `cpu` auto-selects two-socket
 CPU TP and belongs to a later multi-device/TP matrix, not this gate.

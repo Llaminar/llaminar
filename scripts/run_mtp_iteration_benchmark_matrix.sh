@@ -262,7 +262,12 @@ metadata_path="${output_dir}/metadata.txt"
   git -C "${repo_root}" status --short || true
 } > "${metadata_path}"
 
-printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tjson\tperfstats\n' > "${summary_path}"
+perf_summary_script="${repo_root}/scripts/summarize_mtp_perfstats.py"
+if [[ ! -x "${perf_summary_script}" ]]; then
+  chmod +x "${perf_summary_script}" 2>/dev/null || true
+fi
+
+printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcorrection_ms\tcorrection_count\tpublish_ms\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\tjson\tperfstats\n' > "${summary_path}"
 : > "${commands_path}"
 
 append_summary() {
@@ -273,13 +278,13 @@ append_summary() {
   local json_path="$5"
   local perf_path="$6"
   local baseline_decode_tps="${7:-0}"
-  jq -r \
+  local perf_summary="${8:-0	0	0	0	0	0	0	0	0	0}"
+  local base_summary
+  base_summary="$(jq -r \
     --arg device "${device}" \
     --arg model "${model}" \
     --arg mode "${mode}" \
     --arg variant "${variant}" \
-    --arg json "${json_path}" \
-    --arg perf "${perf_path}" \
     --argjson baseline_decode_tps "${baseline_decode_tps}" \
     '[
       $device,
@@ -300,10 +305,9 @@ append_summary() {
       (.mtp.rollbacks // 0),
       (((.mtp.acceptance_rate // 0) * 100)),
       (.mtp.verifier_runs // 0),
-      (.mtp.verifier_token_count // 0),
-      $json,
-      $perf
-    ] | @tsv' "${json_path}" >> "${summary_path}"
+      (.mtp.verifier_token_count // 0)
+    ] | @tsv' "${json_path}")"
+  printf '%s\t%s\t%s\t%s\n' "${base_summary}" "${perf_summary}" "${json_path}" "${perf_path}" >> "${summary_path}"
 }
 
 log_level="${LLAMINAR_LOG_LEVEL:-ERROR}"
@@ -386,7 +390,12 @@ for model in $(split_csv "${models}"); do
           baseline_decode_tps_by_lane["${lane_key}"]="${decode_tps}"
         fi
 
-        append_summary "${device}" "${model}" "${mode}" "${variant}" "${json_path}" "${perf_path}" "${baseline_decode_tps}"
+        perf_summary="0	0	0	0	0	0	0	0	0	0"
+        if [[ -n "${perf_path}" ]]; then
+          perf_summary="$("${perf_summary_script}" "${perf_path}")"
+        fi
+
+        append_summary "${device}" "${model}" "${mode}" "${variant}" "${json_path}" "${perf_path}" "${baseline_decode_tps}" "${perf_summary}"
         tail -n 8 "${log_path}" || true
       done
     done
