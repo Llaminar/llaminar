@@ -12,6 +12,7 @@ from typing import Any, Iterable
 FIELDS = (
     "decode_step_ms",
     "verifier_ms",
+    "condition_ms",
     "correction_ms",
     "correction_count",
     "deferred_corrections",
@@ -92,6 +93,7 @@ def summarize(path: Path | None) -> dict[str, float | int]:
     return {
         "decode_step_ms": _sum_total_ms(records, "mtp", "decode_step_total"),
         "verifier_ms": _sum_total_ms(records, "mtp", "verifier_forward"),
+        "condition_ms": _sum_total_ms(records, "mtp", "condition_forward"),
         "correction_ms": _sum_total_ms(records, "mtp", "all_position_correction_forward"),
         "correction_count": _sum_count(records, "mtp", "all_position_correction_forward"),
         "deferred_corrections": _sum_count(

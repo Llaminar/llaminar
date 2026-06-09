@@ -44,15 +44,16 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   promotion, stepwise demotion, and d1-to-d0 all-zero demotion.
 - Matrix runner supports bounded sweeps:
   `scripts/run_mtp_iteration_benchmark_matrix.sh --decode-tokens 16 --perfstats`.
-  `summary.tsv` now includes verifier/correction timing, main-verifier
-  warmup/capture/replay counts, and replay reset/preserve counts. CPU lanes are
-  still minutes-long even when bounded; full default-length matrix remains the
-  acceptance capture.
+  `summary.tsv` now includes verifier/condition/correction timing,
+  main-verifier warmup/capture/replay counts, and replay reset/preserve counts.
+  CPU lanes are still minutes-long even when bounded; full default-length
+  matrix remains the acceptance capture.
 - Runner guard: dynamic evidence now requires same-run baseline plus fixed
   d1/d2/d3 unless `--allow-partial-variants` is used for diagnostics.
-- MoE verifier finding: fixed d3 greedy spends 379 ms total verifier time on
-  CUDA and 684 ms on ROCm; correction replay is 0 ms, so the next target is the
-  524-stage all-position verifier graph.
+- MoE verifier finding: fixed d3 greedy spends 379/214 ms verifier/condition
+  time on CUDA and 684/312 ms on ROCm; correction replay is 0 ms, so the next
+  target is the 524-stage all-position verifier graph and condition-forward
+  frequency.
 
 ## Target Anchors
 

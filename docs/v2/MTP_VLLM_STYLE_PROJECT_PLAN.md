@@ -245,7 +245,8 @@ Open gaps:
 - CUDA/ROCm/CPU MoE bounded matrices are functionally green for greedy and
   stochastic, but MTP is speed-negative everywhere. The common blocker is true
   verifier/catch-up cost. Latest fixed d3 MoE greedy spends about 379 ms total
-  verifier time on CUDA and 684 ms on ROCm, while correction replay remains
+  verifier time plus 214 ms condition-forward time on CUDA, and 684 ms verifier
+  plus 312 ms condition-forward time on ROCm, while correction replay remains
   0 ms. Dynamic depth is now stable across d0/d1/d2 transitions but still needs
   better short-run promotion and stochastic depth selection.
 - CPU vLLM-style state publication is not implemented or benchmarked.
@@ -372,9 +373,10 @@ tune or accept dynamic in isolation. The matrix dynamic lane starts at d1, allow
 per-step d0 adaptive bypass through `--mtp-min-draft-tokens 0`, and probes back
 toward d3 after cooldown. The generated `summary.tsv` includes
 `speedup_vs_baseline` for every MTP row plus perfstats-derived verifier health:
-`verifier_ms`, `correction_ms`, `main_verifier_warmup/capture/replay`, and
-replay reset/preserve counts. Use those fields to explain a speed regression
-before changing kernels or depth policy.
+`verifier_ms`, `condition_ms`, `correction_ms`,
+`main_verifier_warmup/capture/replay`, and replay reset/preserve counts. Use
+those fields to explain a speed regression before changing kernels or depth
+policy.
 
 Use `cpu:0` for the SingleDevice CPU lane. Bare `cpu` auto-selects two-socket
 CPU TP and belongs to a later multi-device/TP matrix, not this gate.

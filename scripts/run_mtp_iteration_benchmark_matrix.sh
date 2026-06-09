@@ -307,7 +307,7 @@ if [[ ! -x "${perf_summary_script}" ]]; then
   chmod +x "${perf_summary_script}" 2>/dev/null || true
 fi
 
-printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcorrection_ms\tcorrection_count\tdeferred_corrections\tpublish_ms\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\tjson\tperfstats\n' > "${summary_path}"
+printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcorrection_ms\tcorrection_count\tdeferred_corrections\tpublish_ms\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\tjson\tperfstats\n' > "${summary_path}"
 : > "${commands_path}"
 
 append_summary() {
@@ -318,7 +318,7 @@ append_summary() {
   local json_path="$5"
   local perf_path="$6"
   local baseline_decode_tps="${7:-0}"
-  local perf_summary="${8:-0	0	0	0	0	0	0	0	0	0	0}"
+  local perf_summary="${8:-0	0	0	0	0	0	0	0	0	0	0	0}"
   local base_summary
   base_summary="$(jq -r \
     --arg device "${device}" \

@@ -36,6 +36,13 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "condition_forward",
+                    "phase": "decode",
+                    "count": 2,
+                    "total_ms": 9.75,
+                },
+                {
+                    "domain": "mtp",
                     "name": "all_position_correction_forward",
                     "phase": "decode",
                     "count": 2,
@@ -117,6 +124,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         summary = json.loads(result.stdout)
         self.assertEqual(summary["decode_step_ms"], 30.5)
         self.assertEqual(summary["verifier_ms"], 18.25)
+        self.assertEqual(summary["condition_ms"], 9.75)
         self.assertEqual(summary["correction_ms"], 7.5)
         self.assertEqual(summary["correction_count"], 2)
         self.assertEqual(summary["deferred_corrections"], 3)
@@ -136,7 +144,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         )
         self.assertEqual(
             result.stdout.strip(),
-            "0.0\t0.0\t0.0\t0\t0\t0.0\t0\t0\t0\t0\t0",
+            "0.0\t0.0\t0.0\t0.0\t0\t0\t0.0\t0\t0\t0\t0\t0",
         )
 
     def test_multiple_paths_emit_table_for_matrix_comparison(self) -> None:
