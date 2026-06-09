@@ -5781,7 +5781,18 @@ namespace llaminar2
         }
         if (state_.device_id.is_gpu() && forward_engine_ && !preserve_gpu_replay_state)
         {
-            forward_engine_->resetCapturedReplayState();
+            const bool correction_replay_boundary =
+                operation && std::string(operation) == "mtp_spec_state_publication";
+            if (correction_replay_boundary)
+            {
+                forward_engine_->resetCapturedReplayStateForCorrectionReplay();
+                tags["forward_replay_reset_scope"] = "correction_replay_decode_only";
+            }
+            else
+            {
+                forward_engine_->resetCapturedReplayState();
+                tags["forward_replay_reset_scope"] = "all";
+            }
             mtp_sidecar_depth0_cache_.resetReplayState();
             mtp_sidecar_depth0_chained_cache_.resetReplayState();
             mtp_sidecar_depth0_kv_only_cache_.resetReplayState();

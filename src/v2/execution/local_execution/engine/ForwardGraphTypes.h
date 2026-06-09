@@ -381,6 +381,21 @@ namespace llaminar2
         }
 
         /**
+         * @brief Force cached stages to rebind their explicit GPU stream.
+         *
+         * KernelFactory::resetAllDynamicState() clears cached kernel stream
+         * bindings. Some correction-replay paths deliberately preserve
+         * verifier graph executables, but those stages still need to receive
+         * the capture stream again before updateDynamicParams() or replay
+         * callbacks can safely touch backend objects.
+         */
+        void markGPUStreamBindingsDirty()
+        {
+            gpu_stream_applied = false;
+            applied_stream = nullptr;
+        }
+
+        /**
          * @brief Reset request-scoped state while preserving reusable graph objects.
          *
          * This is the request-boundary counterpart to invalidate(): it keeps the

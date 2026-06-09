@@ -16,8 +16,8 @@ partial, or not fully measured. Red = fails or lacks required correctness.
 | ROCm | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 26.94/27.31/25.17/26.88 vs 31.26 | speed-negative |
 | CPU | Dense 27B | greedy | Green | 16tok d1/d2/d3/dyn 5.02/5.40/8.51/5.16 vs 4.55 | dynamic conservative |
 | CPU | Dense 27B | stochastic | Amber | 16tok d1/d2/d3/dyn 3.52/3.62/3.62/3.56 vs 4.62 | rollback path slow |
-| CUDA | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 59.20/61.11/72.41/54.91 vs 110.71 | verifier/catch-up cost |
-| CUDA | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 68.72/50.76/52.93/63.58 vs 111.26 | stochastic verifier cost |
+| CUDA | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 62.02/67.35/70.75/63.23 vs 109.90 | verifier/correction cost |
+| CUDA | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 67.64/55.92/49.62/62.72 vs 110.51 | reject-heavy d2/d3 cost |
 | ROCm | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 35.39/36.13/38.21/35.68 vs 64.29 | verifier/catch-up cost |
 | ROCm | MoE 35B | stochastic | Amber | 16tok d1/d2/d3/dyn 32.69/28.76/29.78/32.35 vs 64.26 | sampler/verifier overhead |
 | CPU | MoE 35B | greedy | Amber | 16tok d1/d2/d3/dyn 10.81/11.57/12.85/10.85 vs 17.55 | CPU publication/catch-up |
@@ -34,6 +34,11 @@ partial, or not fully measured. Red = fails or lacks required correctness.
   `benchmark_results/mtp_vllm_style/20260609T003150Z-bounded-gpu-moe-matrix-after-cuda-fix/`.
   CUDA/ROCm greedy and stochastic baseline, d1/d2/d3, and dynamic all completed.
   CUDA graph-capture crash is fixed, but every MoE MTP lane is speed-negative.
+- CUDA MoE scoped replay diagnostics:
+  `benchmark_results/mtp_vllm_style/20260609T011555Z-cuda-moe-greedy-scoped-reset/`
+  and `20260609T011753Z-cuda-moe-stochastic-scoped-reset/`. Verifier replay now
+  occurs in MoE MTP lanes, improving d1/d2/dynamic versus the prior bounded
+  greedy matrix, but verifier plus correction time still keeps MoE speed-negative.
 - Bounded MoE CPU matrix:
   `benchmark_results/mtp_vllm_style/20260609T003744Z-bounded-cpu-moe-matrix-after-cuda-fix/`.
   CPU greedy/stochastic lanes completed. MTP is also speed-negative there.

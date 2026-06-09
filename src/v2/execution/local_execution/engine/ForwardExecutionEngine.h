@@ -382,6 +382,20 @@ namespace llaminar2
         void resetCapturedReplayState();
 
         /**
+         * @brief Drop only replay state that can be consumed by MTP correction replay.
+         *
+         * Rejected speculative steps publish an accepted verifier prefix, then
+         * immediately replay the corrected token through the ordinary main
+         * decode path. That main decode capture must be fresh. All-position
+         * verifier captures are not used for the correction replay itself, so
+         * preserving them lets repeated M=2..4 verifier rows mature to replay.
+         * Preserved caches still have their stage stream bindings dirtied so a
+         * KernelFactory dynamic-state reset cannot leave backend kernels with
+         * null streams before the next updateDynamicParams() call.
+         */
+        void resetCapturedReplayStateForCorrectionReplay();
+
+        /**
          * @brief Reset request/replay state without discarding cached forward graphs.
          *
          * Used at request/session boundaries after the orchestrator clears KV and

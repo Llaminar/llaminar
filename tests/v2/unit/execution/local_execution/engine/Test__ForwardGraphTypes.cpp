@@ -714,6 +714,28 @@ TEST(Test__ForwardGraphCache, ReplayResetPreservesSegmentCaptureStream)
     EXPECT_FALSE(cache.phase3_active);
 }
 
+TEST(Test__ForwardGraphCache, MarkGPUStreamBindingsDirtyPreservesReplayState)
+{
+    ForwardGraphCache cache;
+    void *stream = reinterpret_cast<void *>(0x1234);
+
+    cache.segment_cache.capture_stream = stream;
+    cache.segment_cache.initialized = true;
+    cache.segment_cache.needs_capture = false;
+    cache.gpu_stream_applied = true;
+    cache.applied_stream = stream;
+    cache.phase3_active = true;
+
+    cache.markGPUStreamBindingsDirty();
+
+    EXPECT_EQ(cache.segment_cache.capture_stream, stream);
+    EXPECT_TRUE(cache.segment_cache.initialized);
+    EXPECT_FALSE(cache.segment_cache.needs_capture);
+    EXPECT_FALSE(cache.gpu_stream_applied);
+    EXPECT_EQ(cache.applied_stream, nullptr);
+    EXPECT_TRUE(cache.phase3_active);
+}
+
 TEST(Test__ForwardGraphCache, InvalidateDestroysSegmentCaptureStream)
 {
     ForwardGraphCache cache;

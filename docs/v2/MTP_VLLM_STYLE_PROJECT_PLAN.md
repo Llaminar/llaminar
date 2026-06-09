@@ -175,6 +175,11 @@ Done:
   captured GPU replay and kernel dynamic state before the following main decode
   graph. `Qwen36MoECUDASingleDevicePrefixMTPPathGuards.Depth1CorrectionReplayResetsCapturedStateBoundary`
   covers the former fixed-d1 crash.
+- CUDA MoE correction replay now narrows that replay reset to ordinary decode
+  graphs while dirtying explicit stream bindings on preserved verifier captures.
+  Bounded CUDA MoE diagnostics show verifier replay is now exercised for fixed
+  d1/d2/d3/dynamic lanes, but MoE remains speed-negative because verifier plus
+  correction time still dominates.
 - CUDA MoE graph-captured no-MTP baseline decode crash is fixed. Root cause was
   a split-K down-partials workspace contract mismatch plus missing expert-id
   upper-bound guards in CUDA MoE grouped k-part kernels. The focused regression

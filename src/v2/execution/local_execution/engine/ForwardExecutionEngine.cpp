@@ -612,6 +612,21 @@ namespace llaminar2
         }
     }
 
+    void ForwardExecutionEngine::resetCapturedReplayStateForCorrectionReplay()
+    {
+        for (auto &[signature, cache] : cache_)
+        {
+            if (signature.decode && !signature.all_position_logits)
+            {
+                cache.resetReplayState();
+            }
+            else
+            {
+                cache.markGPUStreamBindingsDirty();
+            }
+        }
+    }
+
     void ForwardExecutionEngine::touchBucketedPrefillForwardCache(
         const ForwardGraphSignature &signature,
         ForwardGraphCache &cache)
