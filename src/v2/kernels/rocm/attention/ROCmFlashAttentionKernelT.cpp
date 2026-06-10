@@ -119,7 +119,14 @@ namespace llaminar2
     {
         // Default number of splits for Flash Decoding
         constexpr int DEFAULT_NUM_SPLITS = 8;
-        constexpr int MAX_SMALL_DECODE_ROWS = 2;
+        /*
+         * MTP target verification runs `draft_count + 1` continuation rows.
+         * The production controller currently uses draft depths 1..3, so the
+         * attention backend must keep M=2..4 on the continuation/decode path.
+         * Falling back to prefill for M=4 changes the causal continuation
+         * semantics and can make ROCm accept a token CUDA/CPU reject.
+         */
+        constexpr int MAX_SMALL_DECODE_ROWS = 4;
 
         static int selectFlashDecodeNumSplits(int kv_len)
         {
@@ -680,8 +687,17 @@ namespace llaminar2
                 {
                     const int row_kv_len = std::max(1, kv_len - (small_decode_rows_ - 1 - row));
                     h_attn_params_[row].kv_len = row_kv_len;
-                    h_attn_params_[row].position_offset = std::max(0, row_kv_len - 1);
-                    h_attn_params_[row].mask_stride = row_kv_len;
+                    /*
+                     * Multi-row verifier continuation must use the same row
+                     * contract as CUDA and CPU: row i is the query at absolute
+                     * position `position_offset + i`, while `kv_len` is the
+                     * full verifier KV span.  Re-deriving position_offset from
+                     * the row-local KV length makes the first verifier row
+                     * attend as if it had already consumed later draft rows,
+                     * which can falsely accept speculative tokens.
+                     */
+                    h_attn_params_[row].position_offset = position_offset + row;
+                    h_attn_params_[row].mask_stride = kv_len;
                 }
             }
             else

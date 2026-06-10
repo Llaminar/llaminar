@@ -5364,6 +5364,24 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
         TIMEOUT 1800
     )
+    add_v2_test(V2_Integration_Parity_Qwen36_ROCm_SingleDevice_MTPGreedyDepth3GraphStreamStress
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen36_rocm_single_device_prefix_mtp>
+                --gtest_filter=Qwen36ROCmSingleDevicePrefixMTPParity.MTPGreedyDepth3MatchesPyTorchDecodeTokens
+                --gtest_repeat=3
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;ROCm;GPU;SingleDevice;PyTorch;GraphCapture;Regression"
+        MPI_PROCS 1
+        TIMEOUT 1800
+    )
+    # add_v2_test skips integration tests in Release/perf-only builds, so the
+    # matching TEST property must be guarded by the same condition.
+    if(NOT V2_PERF_TESTS_ONLY)
+        set_property(TEST V2_Integration_Parity_Qwen36_ROCm_SingleDevice_MTPGreedyDepth3GraphStreamStress
+            APPEND PROPERTY ENVIRONMENT
+            "LLAMINAR_GPU_GRAPHS=1"
+            "LLAMINAR_ROCM_CONCURRENT_DECODE=0"
+            "LLAMINAR_ROCM_CONCURRENT_M2_ROWS=0"
+        )
+    endif()
 
     add_executable(v2_integration_parity_qwen36_cuda_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_CUDA_SingleDevice_PrefixMTP_Parity.cpp
@@ -5382,6 +5400,24 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
         TIMEOUT 1800
     )
+    add_v2_test(V2_Integration_Parity_Qwen36_CUDA_SingleDevice_MTPGreedyDepth3GraphStreamStress
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen36_cuda_single_device_prefix_mtp>
+                --gtest_filter=Qwen36CUDASingleDevicePrefixMTPParity.MTPGreedyDepth3MatchesPyTorchDecodeTokens
+                --gtest_repeat=3
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;CUDA;GPU;SingleDevice;PyTorch;GraphCapture;Regression"
+        MPI_PROCS 1
+        TIMEOUT 1800
+    )
+    # add_v2_test skips integration tests in Release/perf-only builds, so the
+    # matching TEST property must be guarded by the same condition.
+    if(NOT V2_PERF_TESTS_ONLY)
+        set_property(TEST V2_Integration_Parity_Qwen36_CUDA_SingleDevice_MTPGreedyDepth3GraphStreamStress
+            APPEND PROPERTY ENVIRONMENT
+            "LLAMINAR_GPU_GRAPHS=1"
+            "LLAMINAR_ROCM_CONCURRENT_DECODE=0"
+            "LLAMINAR_ROCM_CONCURRENT_M2_ROWS=0"
+        )
+    endif()
     add_executable(v2_integration_parity_qwen36_local_tp_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_LocalTP_PrefixMTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -6464,6 +6500,12 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsSmoke
     MPI_PROCS 1
     TIMEOUT 600
 )
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsSmoke
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36CUDAMTPGpuGraphsRealModelSmoke
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;CUDA;GPU;Regression"
+    MPI_PROCS 1
+    TIMEOUT 600
+)
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticSmoke
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPGpuGraphsStochasticRealModelSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;Sampling;Regression"
@@ -6481,6 +6523,12 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsStochasticSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;CUDA;GPU;Sampling;Regression"
     MPI_PROCS 1
     TIMEOUT 600
+)
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsStochasticClearCacheRepeatabilityLong
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36CUDAMTPGpuGraphsStochasticClearCacheRepeatabilityLong
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;CUDA;GPU;Sampling;Regression"
+    MPI_PROCS 1
+    TIMEOUT 1200
 )
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmoke

@@ -1284,12 +1284,12 @@ TEST_F(Test__ForwardExecutionEngine, ReplayCacheObservationsTrackOrdinaryAndVeri
 
     const ForwardExecutionEngine::ReplayStateResetSummary summary =
         engine.resetCapturedReplayStateForCorrectionReplay(/*live_state_epoch=*/123);
-    EXPECT_EQ(summary.reset_replay_state, 0u);
-    EXPECT_EQ(summary.ordinary_decode_reset, 0u);
-    EXPECT_EQ(summary.preserved_for_stream_rebind, 2u);
+    EXPECT_EQ(summary.reset_replay_state, 1u);
+    EXPECT_EQ(summary.ordinary_decode_reset, 1u);
+    EXPECT_EQ(summary.preserved_for_stream_rebind, 1u);
     EXPECT_EQ(summary.all_position_verifier_preserved, 1u);
-    EXPECT_EQ(summary.other_preserved, 1u)
-        << "The one-token ordinary decode cache is preserved as a stamped condition-forward replay.";
+    EXPECT_EQ(summary.other_preserved, 0u)
+        << "Only the all-position verifier cache is preserved; one-token condition decode must recapture.";
 
     host.mock_compute_all_position_logits = false;
     ordinary_token = 46;

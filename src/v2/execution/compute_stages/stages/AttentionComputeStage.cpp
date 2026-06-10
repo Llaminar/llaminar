@@ -34,6 +34,8 @@ namespace llaminar2
 
     namespace
     {
+        constexpr int kMTPVerifierSmallDecodeMaxRows = 4;
+
         size_t debugElementSize(TensorType type)
         {
             switch (type)
@@ -184,7 +186,6 @@ namespace llaminar2
         kv_len += logical_seq_len; // This step will append logical_seq_len real tokens.
         const int logical_pos_offset = std::max(0, kv_len - logical_seq_len);
 
-        constexpr int kCudaSmallDecodeMaxRows = 4;
         int query_rows_for_params = 1;
         if (params_.device_id.is_rocm())
         {
@@ -203,7 +204,7 @@ namespace llaminar2
                 params_.causal &&
                 !rocm_env.fa_decode_via_prefill &&
                 logical_seq_len > 1 &&
-                logical_seq_len <= 2 &&
+                logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
                 kv_len > logical_seq_len;
             query_rows_for_params = small_native_decode ? logical_seq_len : 1;
         }
@@ -218,7 +219,7 @@ namespace llaminar2
                 params_.batch_size == 1 &&
                 params_.causal &&
                 logical_seq_len > 1 &&
-                logical_seq_len <= kCudaSmallDecodeMaxRows &&
+                logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
                 kv_len > logical_seq_len;
             query_rows_for_params = cuda_small_fp16_decode ? logical_seq_len : 1;
         }
@@ -293,12 +294,15 @@ namespace llaminar2
             return 0;
         }
 
-        // ROCm split-K decode launches are used for one-row decode and the
-        // native-KV M=2 verifier path. M>=3 falls through to prefill-style
-        // attention, whose launch topology is fixed by seq_len rather than KV
-        // growth and therefore does not need a replay variant.
-        const int decode_rows = std::min(params_.seq_len, 2);
-        if (decode_rows <= 0 || params_.seq_len > 2)
+        /*
+         * ROCm split-K decode launches are used for one-row decode and the
+         * native-KV M=2..4 verifier path.  Fixed-depth-3 MTP verifies four
+         * target rows (`draft_count + 1`), so capture signatures must bucket
+         * all four row-local split caps.  Otherwise HIP graph replay can reuse
+         * a capture whose launch topology was prepared for a different row set.
+         */
+        const int decode_rows = std::min(params_.seq_len, kMTPVerifierSmallDecodeMaxRows);
+        if (decode_rows <= 0 || params_.seq_len > kMTPVerifierSmallDecodeMaxRows)
         {
             return 0;
         }

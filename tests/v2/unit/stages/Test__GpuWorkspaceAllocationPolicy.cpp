@@ -508,6 +508,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
     ASSERT_NE(kv_publish, std::string::npos);
     EXPECT_LT(publish_wait, kv_publish)
         << "Accepted-state publication truncates MTP KV and must wait for deferred shifted appends first.";
+    const size_t terminal_hidden_publish = publish_body.find("selectMTPTerminalHiddenRow");
+    const size_t ready_event = publish_body.find("recordAcceptedSpecPublicationReady");
+    ASSERT_NE(terminal_hidden_publish, std::string::npos);
+    ASSERT_NE(ready_event, std::string::npos);
+    EXPECT_LT(terminal_hidden_publish, ready_event)
+        << "Publication readiness must cover the accepted verifier terminal hidden row.";
+    EXPECT_NE(publish_body.find("spec_state_terminal_hidden_publications"), std::string::npos)
+        << "Terminal-hidden publication should be visible in perf stats.";
+
+    const auto row_select_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::executeMTPHiddenRowSelect(",
+        "bool DeviceGraphOrchestrator::executeMTPTerminalHiddenRowSelect(");
+    EXPECT_NE(row_select_body.find("cache.stage->setGPUStream(row_select_stream)"), std::string::npos)
+        << "Publication must be able to bind terminal-hidden row-select to the publication stream.";
 
     const auto sequential_body = sliceBetween(
         source,
@@ -524,6 +539,58 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
     EXPECT_NE(sequential_body.find("waitForPendingShiftedMTPKVReady"), std::string::npos);
     EXPECT_NE(device_target_body.find("waitForPendingShiftedMTPKVReady"), std::string::npos);
     EXPECT_NE(partial_body.find("waitForPendingShiftedMTPKVReady"), std::string::npos);
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPGpuSidecarsStageConditionTokensInArenaBuffer)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto sidecar_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
+        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+    const auto executable_sidecar_body =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sidecar_body));
+
+    /*
+     * GPU graph capture records the embedding kernel's token pointer.  Host
+     * token arrays can be stack-backed and can change address between decode
+     * steps, so every GPU sidecar path stages condition tokens into the
+     * arena-owned MTP_CONDITION_TOKEN device buffer before updating dynamic
+     * params.  Each sidecar graph cache owns a fixed slot in that buffer; a
+     * single shared pointer would let full-sidecar and catch-up graph replay
+     * overwrite each other's mutable token input on different capture streams.
+     */
+    EXPECT_NE(header.find("mtp_sidecar_condition_token_capacity_"), std::string::npos)
+        << "The condition-token buffer must expose its row capacity to runtime validation.";
+    EXPECT_NE(source.find("kMTPSidecarConditionTokenSlotCount"), std::string::npos)
+        << "Graph-captured sidecar roles must have distinct condition-token slots.";
+    EXPECT_NE(source.find("BufferId::MTP_CONDITION_TOKEN,\n"
+                          "                                        1,\n"
+                          "                                        sampling_math::kSpeculativeBatchMaxRows *\n"
+                          "                                            kMTPSidecarConditionTokenSlotCount"),
+              std::string::npos)
+        << "MTP_CONDITION_TOKEN must hold all catch-up rows for every sidecar slot.";
+    EXPECT_NE(sidecar_body.find("sidecar_condition_token_slot"), std::string::npos)
+        << "MTP sidecar caches must map to role-owned condition-token slots.";
+    EXPECT_NE(sidecar_body.find("condition_token_slot * kConditionTokenSlotWidth"), std::string::npos)
+        << "Device-token staging must use the cache-owned slot offset, not the buffer base.";
+    EXPECT_NE(sidecar_body.find("condition_token_device"), std::string::npos)
+        << "Graph construction and token staging must share the same slot pointer.";
+    EXPECT_NE(sidecar_body.find("stage_host_condition_tokens_on_device"), std::string::npos)
+        << "GPU host-token sidecars must be promoted to the graph-safe device-token path.";
+    EXPECT_NE(sidecar_body.find("backend->hostToDeviceOnStream"), std::string::npos)
+        << "Host condition tokens must be staged on the explicit sidecar stream.";
+    EXPECT_NE(sidecar_body.find("sidecar_cache.token_ids.data()"), std::string::npos)
+        << "Async host staging must source from cache-owned stable storage, not stack token arrays.";
+    EXPECT_NE(executable_sidecar_body.find("external_device_condition_tokens&&token_count!=1"),
+              std::string::npos)
+        << "Only externally supplied device-token slots are limited to one row.";
+    EXPECT_EQ(executable_sidecar_body.find("use_device_condition_tokens&&token_count!=1"),
+              std::string::npos)
+        << "Batched GPU catch-up sidecars must be allowed to use the device-token staging path.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPTargetDistributionBuildPreservesDeferredFirstTokenReadyEvent)
@@ -597,6 +664,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecStatePublicationPreservesSidecar
     EXPECT_NE(mutation_body.find("preserved_for_spec_publication"),
               std::string::npos)
         << "Perf stats must make the sidecar replay preservation explicit.";
+    EXPECT_NE(executable_mutation_body.find(
+                  "if(!preserve_gpu_replay_state&&preserves_correction_graph_replay)"),
+              std::string::npos)
+        << "Correction publication must not globally reset kernel dynamic state "
+           "while verifier/sidecar graph executables are preserved.";
+    EXPECT_NE(mutation_body.find("preserved_for_correction_graph_replay"),
+              std::string::npos)
+        << "Perf stats must make kernel dynamic-state preservation explicit.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDARingKVCacheGatherHasNoRawAllocationFallback)
@@ -918,6 +993,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoECombineDoesNotForceFreshGraphS
            "splits Qwen3.6 MoE verifier replay into one graph segment per layer.";
     EXPECT_EQ(combine_section.find("copy_params.graph_capture_boundary_before = true"), std::string::npos)
         << "The no-shared-expert copy form must not reintroduce per-layer graph segmentation either.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPCatchupUsesOneGraphLifecycleContext)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    EXPECT_NE(source.find("kMTPDecodeCatchupContext"), std::string::npos)
+        << "Accepted shifted-MTP KV catch-up needs a named logical graph lifecycle context.";
+    EXPECT_EQ(source.find("\"mtp_decode_sequential_catchup\""), std::string::npos)
+        << "Sequential and batched shifted-MTP catch-up must report the same graph lifecycle lane.";
+    EXPECT_EQ(source.find("\"mtp_decode_sequential_catchup_device_target\""), std::string::npos)
+        << "Device-token shifted-MTP catch-up must not fork graph lifecycle diagnostics.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, LiveHybridCheckpointStorageUsesReusablePool)

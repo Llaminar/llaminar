@@ -169,6 +169,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Order a forward graph after any pending live-state publication.
+         *
+         * MTP accepted-state publication can update KV, recurrent, and short-conv
+         * state asynchronously on the verifier stream.  Before the next forward
+         * reads that live state, the host gets the exact stream chosen for eager
+         * execution, graph warmup, capture, or replay and may queue a GPU-side
+         * wait.  This keeps publication atomic without forcing a CPU stream sync.
+         */
+        virtual bool prepareLiveStateForForwardGraphExecution(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device)
+        {
+            (void)input;
+            (void)execution_stream;
+            (void)execution_device;
+            return true;
+        }
+
+        /**
          * @brief Monotonic live-state epoch for decode graph replay safety.
          *
          * Speculative publication can jump KV/GDN/short-conv state by multiple

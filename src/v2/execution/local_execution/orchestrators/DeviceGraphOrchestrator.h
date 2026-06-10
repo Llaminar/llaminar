@@ -2370,6 +2370,12 @@ namespace llaminar2
             void *execution_stream,
             DeviceId execution_device) override;
 
+        /** Queue live-state publication waits before any forward graph reads live KV/GDN state. */
+        bool prepareLiveStateForForwardGraphExecution(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device) override;
+
         /**
          * @brief Materialize pending verifier token IDs on the graph execution stream.
          *
@@ -2507,6 +2513,15 @@ namespace llaminar2
         bool waitForPendingShiftedMTPKVReady(
             void *consumer_stream,
             const char *consumer_name);
+
+        /** Record that accepted spec-state publication has finished queuing live-state writes. */
+        bool recordAcceptedSpecPublicationReady(void *producer_stream, const char *producer_name);
+
+        /** Make the next live-state consumer wait for accepted spec-state publication. */
+        bool waitForPendingAcceptedSpecPublicationReady(void *consumer_stream, const char *consumer_name);
+
+        /** Clear accepted-publication ownership when a hard restore/reset replaces live state. */
+        void clearPendingAcceptedSpecPublicationReady();
 
         /**
          * @brief Shared implementation for compact device-side stochastic sampling.
@@ -2687,7 +2702,7 @@ namespace llaminar2
             bool use_sharded_cache,
             bool has_tp,
             bool is_global_tp);
-        bool selectMTPTerminalHiddenRow(int row_idx, int seq_len);
+        bool selectMTPTerminalHiddenRow(int row_idx, int seq_len, void *stream = nullptr);
         bool executeMTPDepth0(int32_t draft_condition_token,
                               TensorBase *terminal_hidden,
                               int position_id,
@@ -2728,6 +2743,8 @@ namespace llaminar2
             int position_id = 0;
             int seq_len = 0;
             bool uses_device_token_ids = false;
+            int condition_token_slot = -1;
+            void *condition_token_device = nullptr;
             bool valid = false;
 
             void resetReplayState()
@@ -2771,6 +2788,8 @@ namespace llaminar2
                 position_id = 0;
                 seq_len = 0;
                 uses_device_token_ids = false;
+                condition_token_slot = -1;
+                condition_token_device = nullptr;
                 valid = false;
             }
         };
@@ -3058,7 +3077,8 @@ namespace llaminar2
         void *stochastic_draft_probs_dev_ = nullptr;      ///< FP32 [3, 256]
         void *stochastic_target_sample_tokens_dev_ = nullptr; ///< INT32 [1, 4]
         void *stochastic_draft_sample_tokens_dev_ = nullptr; ///< INT32 [1, 3]
-        void *mtp_sidecar_condition_token_dev_ = nullptr; ///< INT32 [1], stable sidecar token input
+        void *mtp_sidecar_condition_token_dev_ = nullptr; ///< INT32 [1, mtp_sidecar_condition_token_capacity_]
+        int mtp_sidecar_condition_token_capacity_ = 0; ///< Total staged condition-token scalars across all sidecar slots.
         void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 [1, 4], stable verifier token input
         void *stochastic_topk_partial_vals_dev_ = nullptr; ///< FP32 [partial_blocks, 32]
         void *stochastic_topk_partial_idxs_dev_ = nullptr; ///< INT32 [partial_blocks, 32]
@@ -3126,11 +3146,27 @@ namespace llaminar2
             void *producer_stream = nullptr;
             bool valid = false;
         };
+
+        /**
+         * @brief Event-backed ownership state for accepted verifier publication.
+         *
+         * Publication restores KV and hybrid recurrent state on the verifier
+         * stream.  The next decode may replay on a fresh graph stream, so it
+         * must wait on this event before reading live state.
+         */
+        struct PendingAcceptedSpecPublicationReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+            uint64_t live_state_epoch = 0;
+        };
         std::array<StochasticSampleReadyState, 4>
             stochastic_target_sample_ready_;
         std::array<StochasticSampleReadyState, 3>
             stochastic_draft_sample_ready_;
         PendingShiftedMTPKVReadyState shifted_mtp_kv_ready_;
+        PendingAcceptedSpecPublicationReadyState accepted_spec_publication_ready_;
 
         /**
          * @brief Deferred device-token composition plan for the target verifier.
@@ -3360,7 +3396,7 @@ namespace llaminar2
         bool ensureMTPTerminalHiddenBuffer(int min_rows = 1);
 
         /// Execute the cached graph-native row select used for MTP terminal hidden refresh.
-        bool executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len);
+        bool executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len, void *stream = nullptr);
 
         /// Execute a cached graph-native hidden row select into an MTP buffer.
         bool executeMTPHiddenRowSelect(
@@ -3371,7 +3407,8 @@ namespace llaminar2
             MTPTerminalHiddenRowSelectGraphCache &cache,
             const char *node_name,
             int row_idx,
-            int seq_len);
+            int seq_len,
+            void *stream = nullptr);
 
         /// Execute a cached graph-native hidden rows select into an MTP buffer.
         bool executeMTPHiddenRowsSelect(

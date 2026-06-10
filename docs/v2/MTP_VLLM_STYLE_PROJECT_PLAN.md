@@ -938,6 +938,47 @@ Exit gate:
 Goal: make the whole SingleDevice MTP step graph-shaped where the backend can
 support it.
 
+Status:
+
+- Accepted on 2026-06-10. The dense CUDA/ROCm stochastic graph smokes now assert the actual
+  d1 vLLM-style graph lifecycle: `main_verifier`, `mtp_decode_sidecar`, and
+  `mtp_decode_catchup` must warm, capture, and replay during graph warmup, then
+  replay again after `clearCache()`. The smoke intentionally does not require
+  an ordinary `main_decode` replay in this lane because the ready
+  prefill/accepted logits feed the target verifier directly. Focused gate:
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticSmoke` and
+  `V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsStochasticSmoke` pass.
+- ROCm verifier attention now matches CUDA for MTP continuation rows M=2..4.
+  The previous ROCm M=2 limit made fixed-depth-3 verification fall through to
+  a prefill-shaped path and produce wrong verifier tokens. Focused coverage:
+  `V2_Unit_AttentionComputeStage_DynamicKVLen`,
+  `FlashDecode_NativeFP16KV_MultiRowContinuationMatchesSerialRows`,
+  ROCm/CUDA fixed-depth-3 parity, ROCm/CUDA dynamic parity, and both CUDA/ROCm
+  stochastic graph smokes pass.
+- CUDA and ROCm greedy graph smokes now use the same benchmark-style
+  `prefill()` plus `decodeStep()` path as stochastic MTP and require
+  `main_verifier`, `mtp_decode_sidecar`, and `mtp_decode_catchup` to
+  warm/capture/replay. Focused gate:
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsSmoke` and
+  `V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsSmoke` pass.
+- CUDA and ROCm stochastic clear-cache repeatability now use a true
+  long-context 768-token prompt plus 64 decode tokens, graph capture, seeded
+  stochastic sampling, and penalties. The long gate caught a CUDA lifecycle
+  split where one-row catch-up captured as `mtp_decode_sequential_catchup` but
+  replayed as `mtp_decode_catchup`; `DeviceGraphOrchestrator` now uses one
+  canonical `kMTPDecodeCatchupContext`, guarded by
+  `V2_Unit_GpuWorkspaceAllocationPolicy`. Focused long gates:
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticClearCacheRepeatabilityLong`
+  and
+  `V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsStochasticClearCacheRepeatabilityLong`
+  pass. Penalty-free CUDA/ROCm stochastic smokes defer final sync for
+  `main_verifier`, `mtp_decode_sidecar`, and `mtp_decode_catchup`; penalty-bearing
+  long-context stochastic runs keep the verifier boundary synchronized because
+  target-row penalties depend on sampler history between accepted tokens.
+  Final closeout covered CUDA/ROCm graph-stream stress parity, the broad
+  `V2_Unit_` gate, and both integration/release builds. Release configuration
+  now guards graph-stream parity test properties when non-perf tests are skipped.
+
 Work:
 
 - Capture draft prefill, one-token draft decode, target verifier, greedy

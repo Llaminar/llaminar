@@ -920,8 +920,8 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayResetsOnlyOrdinaryDecodeCac
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
                   classifyForwardReplayStateCache(single_token_decode)),
-              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
-        << "One-token condition decode can be rebound and stamped after MTP publication.";
+              ForwardReplayStateAction::ResetReplayState)
+        << "One-token condition decode reads mutable KV/GDN/short-conv state and must recapture after MTP publication.";
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
                   classifyForwardReplayStateCache(ordinary_decode)),

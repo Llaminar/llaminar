@@ -78,6 +78,26 @@ namespace llaminar2
             kStochasticTopKPartialBlocks * kStochasticTopKSmallKCap;
         constexpr size_t kStochasticTargetRows = 4; // verifier M=2..4 includes terminal row
         constexpr size_t kStochasticDraftRows = 3;  // --mtp-draft-tokens max
+        /**
+         * @brief Logical perf/capture lane for publishing accepted shifted MTP KV rows.
+         *
+         * One-row sequential commits, batched hidden-row catch-up, and
+         * device-token target commits use separate graph-cache shapes
+         * internally, but they all implement the same accepted-state
+         * publication contract.  Keeping the diagnostics on one context makes
+         * graph capture/replay ownership easy to audit.
+         */
+        constexpr const char *kMTPDecodeCatchupContext = "mtp_decode_catchup";
+        /**
+         * @brief Fixed token-input slots for graph-captured MTP sidecar caches.
+         *
+         * GPU graph replay records the embedding stage's token pointer.  Each
+         * sidecar cache therefore receives a stable slice of the arena-owned
+         * condition-token buffer so full-draft, chained-draft, catch-up, and
+         * shifted-prefill graphs cannot overwrite each other's mutable input
+         * while another capture stream is still consuming it.
+         */
+        constexpr int kMTPSidecarConditionTokenSlotCount = 10;
 
         class ScopedStringOverride
         {
@@ -1687,7 +1707,8 @@ namespace llaminar2
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::MTP_CONDITION_TOKEN,
                                         1,
-                                        1,
+                                        sampling_math::kSpeculativeBatchMaxRows *
+                                            kMTPSidecarConditionTokenSlotCount,
                                         "INT32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::MTP_VERIFIER_INPUT_TOKENS,
@@ -1817,6 +1838,8 @@ namespace llaminar2
                 arena_->getDevicePtr(BufferId::STOCHASTIC_DRAFT_SAMPLE_TOKENS, state_.device_id);
             mtp_sidecar_condition_token_dev_ =
                 arena_->getDevicePtr(BufferId::MTP_CONDITION_TOKEN, state_.device_id);
+            mtp_sidecar_condition_token_capacity_ =
+                static_cast<int>(arena_->getCols(BufferId::MTP_CONDITION_TOKEN));
             mtp_verifier_input_tokens_dev_ =
                 arena_->getDevicePtr(BufferId::MTP_VERIFIER_INPUT_TOKENS, state_.device_id);
             stochastic_topk_partial_vals_dev_ =
@@ -4014,10 +4037,11 @@ namespace llaminar2
         BufferId input_buffer_id,
         TensorBase *output,
         BufferId output_buffer_id,
-        MTPTerminalHiddenRowSelectGraphCache &cache,
-        const char *node_name,
-        int row_idx,
-        int seq_len)
+            MTPTerminalHiddenRowSelectGraphCache &cache,
+            const char *node_name,
+            int row_idx,
+            int seq_len,
+            void *stream)
     {
         if (row_idx < 0 || row_idx >= seq_len)
         {
@@ -4102,6 +4126,18 @@ namespace llaminar2
         }
 
         cache.stage->setSelectedRowForReplay(row_idx);
+        if (state_.device_id.is_gpu())
+        {
+            void *row_select_stream = stream
+                                          ? stream
+                                          : explicitGPUStreamForOperation("mtp_hidden_row_select");
+            if (!row_select_stream)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP hidden row-select requires an explicit GPU stream");
+                return false;
+            }
+            cache.stage->setGPUStream(row_select_stream);
+        }
 
         IDeviceContext *ctx = getDeviceContext(state_.device_id);
         if (!ctx)
@@ -4110,7 +4146,7 @@ namespace llaminar2
         return execute(*cache.graph, ctx);
     }
 
-    bool DeviceGraphOrchestrator::executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len)
+    bool DeviceGraphOrchestrator::executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len, void *stream)
     {
         if (!state_.hidden)
         {
@@ -4127,7 +4163,8 @@ namespace llaminar2
             mtp_terminal_hidden_row_select_cache_,
             "mtp_terminal_hidden_row_select",
             row_idx,
-            seq_len);
+            seq_len,
+            stream);
     }
 
     bool DeviceGraphOrchestrator::executeMTPHiddenRowsSelect(
@@ -4302,7 +4339,7 @@ namespace llaminar2
         return executeMTPTerminalHiddenRowSelect(seq_len - 1, seq_len);
     }
 
-    bool DeviceGraphOrchestrator::selectMTPTerminalHiddenRow(int row_idx, int seq_len)
+    bool DeviceGraphOrchestrator::selectMTPTerminalHiddenRow(int row_idx, int seq_len, void *stream)
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
@@ -4314,7 +4351,7 @@ namespace llaminar2
         if (seq_len <= 0)
             return false;
 
-        return executeMTPTerminalHiddenRowSelect(row_idx, seq_len);
+        return executeMTPTerminalHiddenRowSelect(row_idx, seq_len, stream);
     }
 
     bool DeviceGraphOrchestrator::executeMTPDepth0(
@@ -4356,21 +4393,28 @@ namespace llaminar2
             (sidecar_perf_context && sidecar_perf_context[0] != '\0')
                 ? sidecar_perf_context
                 : ((phase == "prefill") ? "mtp_shifted_prefill" : "mtp_decode_sidecar");
-        const bool use_device_condition_tokens = draft_condition_tokens_device != nullptr;
-        if ((!draft_condition_tokens && !use_device_condition_tokens) ||
+        const bool external_device_condition_tokens = draft_condition_tokens_device != nullptr;
+        /*
+         * GPU graph replay must not depend on host token storage.  The
+         * embedding kernels can read token IDs from a persistent device
+         * pointer, so even ordinary greedy host tokens are first staged into
+         * the arena-owned MTP_CONDITION_TOKEN buffer.  That keeps the captured
+         * graph shape stable while allowing each replay to observe new token
+         * values.
+         */
+        const bool stage_host_condition_tokens_on_device =
+            state_.device_id.is_gpu() && !external_device_condition_tokens;
+        const bool use_device_condition_tokens =
+            external_device_condition_tokens || stage_host_condition_tokens_on_device;
+        if ((!draft_condition_tokens && !external_device_condition_tokens) ||
             token_count <= 0 || token_count > 4)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar received invalid token_count=" << token_count);
             return false;
         }
-        if (use_device_condition_tokens && token_count != 1)
+        if (external_device_condition_tokens && token_count != 1)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Device-token MTP sidecar currently supports one token per replay");
-            return false;
-        }
-        if (use_device_condition_tokens && !mtp_sidecar_condition_token_dev_)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Device-token MTP sidecar requires MTP_CONDITION_TOKEN arena buffer");
+            LOG_ERROR("[DeviceGraphOrchestrator] External device-token MTP sidecar currently supports one token per replay");
             return false;
         }
         if (!kv_cache_only && token_count != 1)
@@ -4378,7 +4422,7 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP sidecar is only supported for kv_cache_only catchup");
             return false;
         }
-        if (!use_device_condition_tokens)
+        if (draft_condition_tokens)
         {
             const int vocab_size = graph_builder_
                                        ? graph_builder_->config().vocab_size
@@ -4539,20 +4583,6 @@ namespace llaminar2
             return false;
         }
 
-        MTPForwardInput input;
-        input.draft_token_ids = draft_condition_tokens;
-        input.draft_token_ids_device =
-            use_device_condition_tokens ? mtp_sidecar_condition_token_dev_ : nullptr;
-        input.terminal_hidden = terminal_hidden;
-        input.kv_cache = state_.mtp_kv_caches[0].get();
-        input.position_ids = &position_id;
-        input.sequence_lengths = nullptr;
-        input.batch_size = 1;
-        input.seq_len = token_count;
-        input.device = state_.device_id;
-        input.terminal_hidden_buffer_id = terminal_hidden_buffer_id;
-        input.kv_cache_only = kv_cache_only;
-
         MTPForwardOutput output;
         output.logits = mtp_logits;
         output.hidden = mtp_hidden;
@@ -4602,6 +4632,64 @@ namespace llaminar2
                        ? mtp_sidecar_depth0_device_token_cache_
                        : mtp_sidecar_depth0_cache_;
         }();
+
+        auto sidecar_condition_token_slot = [&](const MTPSidecarGraphCache &cache) -> int
+        {
+            if (&cache == &mtp_sidecar_depth0_device_token_cache_)
+                return 0;
+            if (&cache == &mtp_sidecar_depth0_chained_device_token_cache_)
+                return 1;
+            if (&cache == &mtp_sidecar_depth0_kv_only_device_token_cache_)
+                return 2;
+            for (size_t i = 0; i < mtp_sidecar_depth0_kv_only_batch_caches_.size(); ++i)
+            {
+                if (&cache == &mtp_sidecar_depth0_kv_only_batch_caches_[i])
+                    return 3 + static_cast<int>(i);
+            }
+            return -1;
+        };
+
+        const int condition_token_slot =
+            use_device_condition_tokens ? sidecar_condition_token_slot(sidecar_cache) : -1;
+        int32_t *condition_token_device = nullptr;
+        if (use_device_condition_tokens)
+        {
+            constexpr int kConditionTokenSlotWidth =
+                static_cast<int>(sampling_math::kSpeculativeBatchMaxRows);
+            const int required_capacity =
+                (condition_token_slot + 1) * kConditionTokenSlotWidth;
+            if (condition_token_slot < 0 ||
+                !mtp_sidecar_condition_token_dev_ ||
+                mtp_sidecar_condition_token_capacity_ < required_capacity ||
+                token_count > kConditionTokenSlotWidth)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Device-token MTP sidecar requires a role-owned"
+                          << " MTP_CONDITION_TOKEN slot: slot=" << condition_token_slot
+                          << " capacity=" << mtp_sidecar_condition_token_capacity_
+                          << " required=" << required_capacity
+                          << " requested_rows=" << token_count
+                          << " context=" << sidecar_context);
+                return false;
+            }
+            condition_token_device =
+                static_cast<int32_t *>(mtp_sidecar_condition_token_dev_) +
+                condition_token_slot * kConditionTokenSlotWidth;
+        }
+
+        MTPForwardInput input;
+        input.draft_token_ids = draft_condition_tokens;
+        input.draft_token_ids_device =
+            use_device_condition_tokens ? condition_token_device : nullptr;
+        input.terminal_hidden = terminal_hidden;
+        input.kv_cache = state_.mtp_kv_caches[0].get();
+        input.position_ids = &position_id;
+        input.sequence_lengths = nullptr;
+        input.batch_size = 1;
+        input.seq_len = token_count;
+        input.device = state_.device_id;
+        input.terminal_hidden_buffer_id = terminal_hidden_buffer_id;
+        input.kv_cache_only = kv_cache_only;
+
         const uint64_t current_moe_placement_epoch = moePlacementEpoch();
         const bool sidecar_moe_epoch_sensitive = mtp_moe_sidecar && !kv_cache_only;
         const uint64_t sidecar_moe_epoch_key =
@@ -4612,6 +4700,8 @@ namespace llaminar2
             sidecar_cache.terminal_hidden != terminal_hidden ||
             sidecar_cache.seq_len != token_count ||
             sidecar_cache.uses_device_token_ids != use_device_condition_tokens ||
+            sidecar_cache.condition_token_slot != condition_token_slot ||
+            sidecar_cache.condition_token_device != condition_token_device ||
             sidecar_cache.moe_epoch_sensitive != sidecar_moe_epoch_sensitive ||
             sidecar_cache.moe_placement_epoch != sidecar_moe_epoch_key;
 
@@ -4626,6 +4716,8 @@ namespace llaminar2
             sidecar_cache.position_id = position_id;
             sidecar_cache.seq_len = token_count;
             sidecar_cache.uses_device_token_ids = use_device_condition_tokens;
+            sidecar_cache.condition_token_slot = condition_token_slot;
+            sidecar_cache.condition_token_device = condition_token_device;
             sidecar_cache.terminal_hidden = terminal_hidden;
             sidecar_cache.moe_placement_epoch = sidecar_moe_epoch_key;
             sidecar_cache.moe_epoch_sensitive = sidecar_moe_epoch_sensitive;
@@ -4633,7 +4725,7 @@ namespace llaminar2
             MTPForwardInput cached_input = input;
             cached_input.draft_token_ids = sidecar_cache.token_ids.data();
             cached_input.draft_token_ids_device =
-                use_device_condition_tokens ? mtp_sidecar_condition_token_dev_ : nullptr;
+                use_device_condition_tokens ? condition_token_device : nullptr;
             cached_input.position_ids = sidecar_cache.position_ids.data();
 
             PerfStatsCollector::ScopedTimer timer(
@@ -4755,6 +4847,32 @@ namespace llaminar2
         {
             return false;
         }
+        /*
+         * Accepted-state publication is queued by the verifier graph, but the
+         * next speculative step usually begins with a sidecar forward rather
+         * than a main-model forward.  Make that first live-state reader wait on
+         * the publication event so shifted KV, main KV, GDN, and short-conv
+         * state are observed as one atomic commit.
+         */
+        if (state_.device_id.is_gpu() &&
+            !waitForPendingAcceptedSpecPublicationReady(
+                sidecar_dynamic_stream,
+                "mtp_sidecar_before_execute"))
+        {
+            return false;
+        }
+        if (stage_host_condition_tokens_on_device)
+        {
+            if (sidecar_cache.token_ids.size() != static_cast<size_t>(token_count))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar cache has unstable staged token storage for seq_len="
+                          << token_count);
+                return false;
+            }
+            std::copy(draft_condition_tokens,
+                      draft_condition_tokens + token_count,
+                      sidecar_cache.token_ids.begin());
+        }
         if (use_device_condition_tokens)
         {
             if (!sidecar_dynamic_stream)
@@ -4762,7 +4880,8 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Device-token MTP sidecar requires an explicit non-null stream");
                 return false;
             }
-            if (draft_condition_ready_slot >= 0 &&
+            if (external_device_condition_tokens &&
+                draft_condition_ready_slot >= 0 &&
                 !(draft_condition_ready_is_target
                       ? waitForRequiredStochasticTargetSampleReady(
                             draft_condition_ready_slot,
@@ -4777,52 +4896,87 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to order MTP sidecar token copy after deferred sample");
                 return false;
             }
-            /*
-             * Keep the sidecar graph pointer stable by copying the previous
-             * sampler's token slot into a single arena-owned condition buffer.
-             * This tiny D2D copy is ordered on the same explicit stream as the
-             * following embedding kernel, so graph capture/replay sees the new
-             * token value without any host upload or null-stream dependency.
-             */
             IBackend *backend = getBackendFor(state_.device_id);
-            if (!backend ||
-                !backend->deviceCopyAsync(
-                    mtp_sidecar_condition_token_dev_,
-                    draft_condition_tokens_device,
-                    sizeof(int32_t),
-                    state_.device_id.gpu_ordinal(),
-                    sidecar_dynamic_stream))
+            if (!backend)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to stage device-resident MTP sidecar token");
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to resolve backend for MTP sidecar token staging");
                 return false;
             }
+
+            const size_t staged_token_bytes =
+                sizeof(int32_t) * static_cast<size_t>(token_count);
+            bool staged_tokens_ok = false;
+            if (external_device_condition_tokens)
+            {
+                /*
+                 * Keep the sidecar graph pointer stable by copying the
+                 * previous sampler's token slot into an arena-owned condition
+                 * buffer.  The D2D copy is ordered on the same explicit stream
+                 * as the following embedding kernel.
+                 */
+                staged_tokens_ok = backend->deviceCopyAsync(
+                    condition_token_device,
+                    draft_condition_tokens_device,
+                    staged_token_bytes,
+                    state_.device_id.gpu_ordinal(),
+                    sidecar_dynamic_stream);
+            }
+            else
+            {
+                /*
+                 * Greedy and catch-up paths still start with host scalar
+                 * tokens, but captured graphs must never read host token
+                 * memory.  Stage those scalars into the same persistent device
+                 * buffer before dynamic params are updated.
+                 */
+                staged_tokens_ok = backend->hostToDeviceOnStream(
+                    condition_token_device,
+                    sidecar_cache.token_ids.data(),
+                    staged_token_bytes,
+                    state_.device_id.gpu_ordinal(),
+                    sidecar_dynamic_stream);
+            }
+
+            if (!staged_tokens_ok)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to stage MTP sidecar token rows"
+                          << " source=" << (external_device_condition_tokens ? "device" : "host")
+                          << " rows=" << token_count);
+                return false;
+            }
+
             if (debugEnv().validation.validate_buffers)
             {
-                int32_t staged_token = -1;
+                std::array<int32_t, 4> staged_tokens{};
                 if (!backend->deviceToHostFast(
-                        &staged_token,
-                        mtp_sidecar_condition_token_dev_,
-                        sizeof(staged_token),
+                        staged_tokens.data(),
+                        condition_token_device,
+                        staged_token_bytes,
                         state_.device_id.gpu_ordinal(),
                         sidecar_dynamic_stream))
                 {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to validate staged device MTP sidecar token");
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to validate staged device MTP sidecar tokens");
                     return false;
                 }
                 const int vocab_size = graph_builder_
                                            ? graph_builder_->config().vocab_size
                                            : 0;
-                if (staged_token < 0 ||
-                    (vocab_size > 0 && staged_token >= vocab_size))
+                for (int i = 0; i < token_count; ++i)
                 {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Staged device MTP sidecar token is out of range: token="
-                              << staged_token << " vocab=" << vocab_size);
-                    return false;
-                }
-                if (staged_token == 0)
-                {
-                    LOG_WARN("[DeviceGraphOrchestrator] Staged device MTP sidecar token is zero for context="
-                             << sidecar_context);
+                    const int32_t staged_token = staged_tokens[static_cast<size_t>(i)];
+                    if (staged_token < 0 ||
+                        (vocab_size > 0 && staged_token >= vocab_size))
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Staged device MTP sidecar token is out of range: token="
+                                  << staged_token << " row=" << i
+                                  << " vocab=" << vocab_size);
+                        return false;
+                    }
+                    if (staged_token == 0)
+                    {
+                        LOG_WARN("[DeviceGraphOrchestrator] Staged device MTP sidecar token is zero for context="
+                                 << sidecar_context << " row=" << i);
+                    }
                 }
             }
             PerfStatsCollector::addCounter(
@@ -4831,7 +4985,9 @@ namespace llaminar2
                 1.0,
                 phase,
                 device_key,
-                {{"seq_len", std::to_string(token_count)}});
+                {{"seq_len", std::to_string(token_count)},
+                 {"slot", std::to_string(condition_token_slot)},
+                 {"source", external_device_condition_tokens ? "device" : "host"}});
         }
 
         const bool sidecar_uses_gpu_workspace =
@@ -4883,9 +5039,15 @@ namespace llaminar2
                       << token_count);
             return false;
         }
-        if (use_device_condition_tokens)
+        if (external_device_condition_tokens)
         {
             std::fill(sidecar_cache.token_ids.begin(), sidecar_cache.token_ids.end(), 0);
+        }
+        else if (stage_host_condition_tokens_on_device)
+        {
+            std::copy(draft_condition_tokens,
+                      draft_condition_tokens + token_count,
+                      sidecar_cache.token_ids.begin());
         }
         else
         {
@@ -5990,6 +6152,35 @@ namespace llaminar2
             return fail(result.error);
         }
 
+        /*
+         * The next MTP sidecar consumes PREFIX_TERMINAL_HIDDEN as its main-model
+         * hidden input.  GDN/short-conv verifier-state publication restores
+         * recurrent state, and KV publication truncates/appends cache state, but
+         * neither one updates this terminal-hidden buffer.  Select the accepted
+         * verifier row explicitly and enqueue the copy on the same stream used
+         * for publication so the readiness event below covers every live-state
+         * component the next sidecar will read.
+         */
+        if (result.accepted_count > 0)
+        {
+            const int accepted_hidden_row = result.accepted_count - 1;
+            if (!selectMTPTerminalHiddenRow(
+                    accepted_hidden_row,
+                    verifier_graph->signature.seq_len,
+                    stream))
+            {
+                return fail("MTP spec-state publication could not restore accepted terminal hidden row");
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "spec_state_terminal_hidden_publications",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"accepted_row", std::to_string(accepted_hidden_row)},
+                 {"target_rows", std::to_string(verifier_graph->signature.seq_len)}});
+        }
+
         if (!state_.positions.empty())
             state_.positions[0] = plan.target_cached_tokens;
         if (!state_.sequence_lengths.empty())
@@ -6012,6 +6203,14 @@ namespace llaminar2
             mutation_reason,
             "mtp_spec_state_publication",
             /*preserve_gpu_replay_state=*/false);
+
+        if (state_.device_id.is_gpu() &&
+            !recordAcceptedSpecPublicationReady(
+                stream,
+                "mtp_spec_state_publication"))
+        {
+            return fail("MTP spec-state publication could not record live-state readiness");
+        }
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -6165,7 +6364,7 @@ namespace llaminar2
         if (!executeMTPDepth0(token,
                               terminal_hidden,
                               position_offset + already_appended_tokens,
-                              "mtp_decode_sequential_catchup",
+                              kMTPDecodeCatchupContext,
                               true,
                               terminal_hidden_buffer_id,
                               /*defer_final_sync=*/state_.device_id.is_gpu()))
@@ -6339,7 +6538,7 @@ namespace llaminar2
                 /*token_count=*/1,
                 terminal_hidden,
                 position_offset + already_appended_tokens,
-                "mtp_decode_sequential_catchup_device_target",
+                kMTPDecodeCatchupContext,
                 /*kv_cache_only=*/true,
                 terminal_hidden_buffer_id,
                 /*defer_final_sync=*/true,
@@ -6537,7 +6736,7 @@ namespace llaminar2
                                          catchup_token_count,
                                          state_.prefix_terminal_hidden.get(),
                                          position_offset + already_appended_tokens,
-                                         "mtp_decode_catchup",
+                                         kMTPDecodeCatchupContext,
                                          true,
                                          BufferId::PREFIX_TERMINAL_HIDDEN,
                                          /*defer_final_sync=*/state_.device_id.is_gpu()))
@@ -7277,6 +7476,136 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::recordAcceptedSpecPublicationReady(
+        void *producer_stream,
+        const char *producer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+        if (!producer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Accepted spec-state publication readiness requires an explicit producer stream");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        auto &ready = accepted_spec_publication_ready_;
+        if (ready.valid && ready.producer_stream != producer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Accepted spec-state publication attempted to overwrite an unconsumed event from a different stream");
+            return false;
+        }
+        if (!ready.event)
+        {
+            void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
+            if (!raw_event)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create accepted spec-state publication readiness event");
+                return false;
+            }
+            const int device_ordinal = state_.device_id.gpu_ordinal();
+            ready.event = std::shared_ptr<void>(
+                raw_event,
+                [backend, device_ordinal](void *event)
+                {
+                    if (event)
+                        backend->destroyEvent(event, device_ordinal);
+                });
+        }
+
+        if (!backend->recordEvent(
+                ready.event.get(),
+                state_.device_id.gpu_ordinal(),
+                producer_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to record accepted spec-state publication readiness event");
+            ready.valid = false;
+            ready.producer_stream = nullptr;
+            ready.live_state_epoch = 0;
+            return false;
+        }
+
+        ready.valid = true;
+        ready.producer_stream = producer_stream;
+        ready.live_state_epoch = live_replay_state_epoch_;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "accepted_spec_publication_ready_events",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"producer", producer_name && producer_name[0] != '\0'
+                              ? producer_name
+                              : "unknown"},
+             {"live_state_epoch", std::to_string(ready.live_state_epoch)}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::waitForPendingAcceptedSpecPublicationReady(
+        void *consumer_stream,
+        const char *consumer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+        auto &ready = accepted_spec_publication_ready_;
+        if (!ready.valid)
+            return true;
+        if (!consumer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Accepted spec-state publication consumer requires an explicit stream");
+            return false;
+        }
+        if (!ready.event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Accepted spec-state publication readiness is marked valid without an event");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const bool same_stream = ready.producer_stream == consumer_stream;
+        if (!same_stream &&
+            !backend->streamWaitEvent(
+                consumer_stream,
+                ready.event.get(),
+                state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue accepted spec-state publication wait for consumer="
+                      << (consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "accepted_spec_publication_ready_waits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"consumer", consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"},
+             {"same_stream", boolTag(same_stream)},
+             {"live_state_epoch", std::to_string(ready.live_state_epoch)}});
+        ready.valid = false;
+        ready.producer_stream = nullptr;
+        ready.live_state_epoch = 0;
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::clearPendingAcceptedSpecPublicationReady()
+    {
+        accepted_spec_publication_ready_.valid = false;
+        accepted_spec_publication_ready_.producer_stream = nullptr;
+        accepted_spec_publication_ready_.live_state_epoch = 0;
+    }
+
     bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(
         const ForwardInput &input,
         void *execution_stream,
@@ -7370,6 +7699,36 @@ namespace llaminar2
             return false;
         }
         return true;
+    }
+
+    bool DeviceGraphOrchestrator::prepareLiveStateForForwardGraphExecution(
+        const ForwardInput &input,
+        void *execution_stream,
+        DeviceId execution_device)
+    {
+        (void)input;
+        if (!state_.device_id.is_gpu())
+            return true;
+        if (!accepted_spec_publication_ready_.valid)
+            return true;
+        if (!execution_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Pending accepted spec-state publication requires an explicit forward stream");
+            return false;
+        }
+
+        const DeviceId consumer_device =
+            execution_device.is_gpu() ? execution_device : state_.device_id;
+        if (consumer_device != state_.device_id)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Accepted spec-state publication wait requested on "
+                      << consumer_device.toString()
+                      << " but live state belongs to " << state_.device_id.toString());
+            return false;
+        }
+        return waitForPendingAcceptedSpecPublicationReady(
+            execution_stream,
+            "forward_graph_live_state_consumer");
     }
 
     const float *DeviceGraphOrchestrator::getAllPositionLogits() const
@@ -7969,6 +8328,7 @@ namespace llaminar2
 
     void DeviceGraphOrchestrator::recordLivePrefixSessionReset(const char *operation)
     {
+        clearPendingAcceptedSpecPublicationReady();
         PerfStatsCollector::Tags tags{{"operation", operation ? operation : "unknown"}};
         const LivePrefixMutationRecord mutation =
             recordLivePrefixMutation(
@@ -8002,6 +8362,12 @@ namespace llaminar2
         const char *operation,
         bool preserve_gpu_replay_state)
     {
+        if (reason != LivePrefixMutationReason::AcceptedSpecPublication &&
+            reason != LivePrefixMutationReason::RejectedCorrection)
+        {
+            clearPendingAcceptedSpecPublicationReady();
+        }
+
         PerfStatsCollector::Tags tags{{"operation", operation ? operation : "unknown"}};
         const LivePrefixMutationRecord mutation =
             recordLivePrefixMutation(reason, operation);
@@ -8016,6 +8382,7 @@ namespace llaminar2
             tags["model"] = "moe";
             tags["moe_placement_epoch"] = std::to_string(moePlacementEpoch());
         }
+        bool preserves_correction_graph_replay = false;
         if (state_.device_id.is_gpu() && forward_engine_ && !preserve_gpu_replay_state)
         {
             const bool correction_replay_boundary =
@@ -8026,6 +8393,8 @@ namespace llaminar2
                 const ForwardExecutionEngine::ReplayStateResetSummary summary =
                     forward_engine_->resetCapturedReplayStateForCorrectionReplay(
                         live_replay_state_epoch_);
+                preserves_correction_graph_replay =
+                    summary.preserved_for_stream_rebind > 0 || state_.device_id.is_gpu();
                 tags["forward_replay_reset_scope"] = "correction_replay_decode_only";
                 tags["forward_replay_reset_cache_count"] =
                     std::to_string(summary.reset_replay_state);
@@ -8070,6 +8439,7 @@ namespace llaminar2
             else
             {
                 tags["sidecar_replay_state"] = "preserved_for_spec_publication";
+                preserves_correction_graph_replay = true;
             }
             tags["replay_state"] = "reset";
         }
@@ -8083,7 +8453,22 @@ namespace llaminar2
                     operation ? operation : "live_prefix_mutation";
             }
         }
-        if (!preserve_gpu_replay_state)
+        /*
+         * KernelFactory::resetAllDynamicState() clears per-kernel dynamic
+         * device-param validity and stream bindings.  That is correct for a
+         * hard graph reset, but unsafe when this boundary deliberately keeps
+         * graph executables alive: CUDA/HIP graphs capture kernel argument
+         * pointer identity, while updateDynamicParams() only restamps the
+         * already-captured dynamic buffers before replay.  Preserve kernel
+         * dynamic objects for accepted/rejected MTP publication boundaries and
+         * rely on the explicit stream rebind plus per-stage dynamic updates.
+         */
+        if (!preserve_gpu_replay_state && preserves_correction_graph_replay)
+        {
+            tags["kernel_dynamic_state"] =
+                "preserved_for_correction_graph_replay";
+        }
+        else if (!preserve_gpu_replay_state)
         {
             resetKernelDynamicState();
             tags["kernel_dynamic_state"] = "reset";

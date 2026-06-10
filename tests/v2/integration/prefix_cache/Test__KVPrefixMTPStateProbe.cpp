@@ -320,6 +320,55 @@ namespace
         return 0.0;
     }
 
+    /**
+     * @brief Sum a segmented decode graph lifecycle counter by execution context.
+     *
+     * Phase 6 MTP graph capture relies on named forward-graph contexts
+     * (`main_decode`, `main_verifier`, sidecar contexts, and later TP variants).
+     * The lifecycle counter is intentionally small and stable: each record says
+     * which context ran and whether that step was warmup, capture, or replay.
+     * Tests should assert the phase shape without depending on exact decode
+     * token counts, since speculative acceptance can change the number of
+     * iterations a prompt needs.
+     */
+    double segmentedDecodePhaseCount(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context,
+        const std::string &capture_phase)
+    {
+        return findPerfCounterValue(
+            records,
+            "forward_graph",
+            "decode_segmented_phase",
+            "decode",
+            {{"context", context}, {"phase", capture_phase}});
+    }
+
+    /**
+     * @brief Assert that a graph-captured MTP context reached the expected phases.
+     */
+    void expectSegmentedGraphLifecycle(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &backend_name,
+        const std::string &context,
+        bool require_warmup_capture,
+        bool require_replay)
+    {
+        SCOPED_TRACE(backend_name + " " + context);
+        if (require_warmup_capture)
+        {
+            EXPECT_GE(segmentedDecodePhaseCount(records, context, "warmup"), 1.0)
+                << context << " must execute an explicit warmup before graph capture";
+            EXPECT_GE(segmentedDecodePhaseCount(records, context, "capture"), 1.0)
+                << context << " must record a graph capture before replay";
+        }
+        if (require_replay)
+        {
+            EXPECT_GE(segmentedDecodePhaseCount(records, context, "replay"), 1.0)
+                << context << " must replay a previously captured graph";
+        }
+    }
+
     std::string lowercase(std::string value)
     {
         std::transform(value.begin(), value.end(), value.begin(),
@@ -401,13 +450,196 @@ namespace
         return oss.str();
     }
 
+    /**
+     * @brief Build a deterministic prompt with at least the requested token count.
+     *
+     * The graph-stress tests need enough prompt history to exercise long-context
+     * attention bucketing before MTP decode starts.  Using the real tokenizer
+     * keeps the input model-shaped while the repeated numbered clauses make the
+     * token stream stable across runs and easy to reproduce when a test fails.
+     */
+    std::vector<int32_t> buildDeterministicPromptTokens(
+        ITokenizer &tokenizer,
+        size_t requested_tokens)
+    {
+        if (requested_tokens == 0)
+        {
+            const auto encoded = tokenizer.encode(
+                "The quick brown fox",
+                /*add_bos=*/false,
+                /*add_eos=*/false);
+            return std::vector<int32_t>(encoded.begin(), encoded.end());
+        }
+
+        std::ostringstream prompt;
+        for (size_t i = 0; i < requested_tokens; ++i)
+        {
+            prompt << "Section " << i
+                   << ": The quick brown fox writes a deterministic CUDA and ROCm "
+                   << "kernel note with repeated verifier state, graph capture, "
+                   << "attention buckets, and speculative decoding evidence.\n";
+        }
+
+        auto encoded = tokenizer.encode(prompt.str(), /*add_bos=*/false, /*add_eos=*/false);
+        if (encoded.size() < requested_tokens)
+        {
+            ADD_FAILURE()
+                << "deterministic long prompt seed should encode to enough tokens";
+            return {};
+        }
+        encoded.resize(requested_tokens);
+        return std::vector<int32_t>(encoded.begin(), encoded.end());
+    }
+
+    /**
+     * @brief Run one greedy MTP GPU-graph smoke on a concrete backend.
+     *
+     * This is intentionally symmetric with the stochastic helper below: Phase 6
+     * acceptance depends on CUDA and ROCm proving the same captured verifier,
+     * sidecar, and catch-up graph lifecycle for both greedy and stochastic MTP.
+     */
+    void runQwen36MTPGpuGraphsGreedyRealModelSmoke(
+        GlobalDeviceAddress device,
+        const std::string &backend_name,
+        size_t prompt_token_count = 0,
+        size_t decode_token_count = 8,
+        int draft_tokens = 1)
+    {
+        ASSERT_GT(decode_token_count, 0u);
+        ASSERT_GT(draft_tokens, 0);
+
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+            {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_greedy_mtp_graph_stats.json"},
+            {"LLAMINAR_PERF_STATS_FILTER", "mtp,forward_graph"},
+        });
+        PerfStatsCollector::reset();
+
+        const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+        if (!env_model)
+            env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+        const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+        }
+
+        const size_t planned_prompt_tokens =
+            prompt_token_count == 0 ? 16 : prompt_token_count;
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = static_cast<int>(
+            std::max<size_t>(128, planned_prompt_tokens + decode_token_count + 64));
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.device_for_this_rank = device;
+        config.kv_cache_precision = "auto";
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = draft_tokens;
+
+        auto factory = createOrchestrationRunnerFactory();
+        auto runner = factory->createFromOrchestrationConfig(config);
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+        auto tokenizer = runner->tokenizer();
+        ASSERT_NE(tokenizer, nullptr);
+        const std::vector<int32_t> prompt =
+            buildDeterministicPromptTokens(*tokenizer, prompt_token_count);
+        ASSERT_FALSE(prompt.empty());
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        runner->setSamplingParams(greedy);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        auto run_benchmark_style_cycle = [&](int cycle) -> std::vector<int32_t>
+        {
+            runner->clearCache();
+            std::vector<int32_t> tokens;
+            if (!runner->prefill(prompt))
+            {
+                ADD_FAILURE() << "cycle " << cycle << ": " << runner->lastError();
+                return tokens;
+            }
+            while (tokens.size() < decode_token_count)
+            {
+                const int remaining = static_cast<int>(decode_token_count - tokens.size());
+                runner->setDecodeStepTokenBudget(remaining);
+                auto step = runner->decodeStep();
+                runner->setDecodeStepTokenBudget(0);
+                if (!step.error.empty())
+                {
+                    ADD_FAILURE() << "cycle " << cycle << ": " << step.error;
+                    return tokens;
+                }
+                if (step.tokens.empty())
+                {
+                    ADD_FAILURE() << "cycle " << cycle
+                                  << ": greedy MTP benchmark-style decode produced no tokens";
+                    return tokens;
+                }
+                if (step.tokens.size() > static_cast<size_t>(remaining))
+                {
+                    ADD_FAILURE() << "cycle " << cycle
+                                  << ": greedy MTP decode exceeded remaining token budget";
+                    return tokens;
+                }
+                tokens.insert(tokens.end(), step.tokens.begin(), step.tokens.end());
+            }
+            return tokens;
+        };
+
+        const auto warmup_tokens = run_benchmark_style_cycle(-1);
+        ASSERT_EQ(warmup_tokens.size(), decode_token_count);
+        const auto result_tokens = run_benchmark_style_cycle(0);
+        const auto snapshot = runner->prefixStateProbe();
+        const auto records = PerfStatsCollector::snapshot({"mtp", "forward_graph"});
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+        runner->shutdown();
+
+        ASSERT_EQ(result_tokens.size(), decode_token_count);
+        EXPECT_TRUE(snapshot.mtp_config_enabled);
+        EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
+        EXPECT_GE(snapshot.mtp_draft_steps, 1u);
+        EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
+        EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
+
+        expectSegmentedGraphLifecycle(
+            records,
+            backend_name,
+            "main_verifier",
+            /*require_warmup_capture=*/true,
+            /*require_replay=*/true);
+        expectSegmentedGraphLifecycle(
+            records,
+            backend_name,
+            "mtp_decode_sidecar",
+            /*require_warmup_capture=*/true,
+            /*require_replay=*/true);
+        expectSegmentedGraphLifecycle(
+            records,
+            backend_name,
+            "mtp_decode_catchup",
+            /*require_warmup_capture=*/true,
+            /*require_replay=*/true);
+        PerfStatsCollector::reset();
+    }
+
     void runQwen36MTPGpuGraphsStochasticRealModelSmoke(
         GlobalDeviceAddress device,
         const std::string &backend_name,
         size_t decode_token_count = 8,
         int repeat_cycles = 2,
         bool deterministic_repeatability = true,
-        bool use_presence_penalty = false)
+        bool use_presence_penalty = false,
+        size_t prompt_token_count = 0)
     {
         ASSERT_GT(decode_token_count, 0u);
         ASSERT_GE(repeat_cycles, 2);
@@ -441,7 +673,10 @@ namespace
 
         OrchestrationConfig config = OrchestrationConfig::defaults();
         config.model_path = model_path;
-        config.max_seq_len = static_cast<int>(std::max<size_t>(128, decode_token_count + 64));
+        const size_t planned_prompt_tokens =
+            prompt_token_count == 0 ? 16 : prompt_token_count;
+        config.max_seq_len = static_cast<int>(
+            std::max<size_t>(128, planned_prompt_tokens + decode_token_count + 64));
         config.batch_size = 1;
         config.tp_degree = 1;
         config.pp_degree = 1;
@@ -458,9 +693,9 @@ namespace
 
         auto tokenizer = runner->tokenizer();
         ASSERT_NE(tokenizer, nullptr);
-        const auto encoded = tokenizer->encode("The quick brown fox", /*add_bos=*/false, /*add_eos=*/false);
-        ASSERT_FALSE(encoded.empty());
-        const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
+        const std::vector<int32_t> prompt =
+            buildDeterministicPromptTokens(*tokenizer, prompt_token_count);
+        ASSERT_FALSE(prompt.empty());
 
         SamplingParams stochastic;
         stochastic.temperature = 0.6f;
@@ -517,6 +752,33 @@ namespace
         auto first_tokens = run_benchmark_style_cycle(0);
         ASSERT_EQ(first_tokens.size(), decode_token_count);
 
+        const auto graph_lifecycle_records = PerfStatsCollector::snapshot({"forward_graph"});
+        /*
+         * vLLM-style d1 stochastic decode does not need an ordinary
+         * `main_decode` forward after prefill: the target verifier consumes the
+         * ready prefill/accepted logits, while draft/catch-up work runs through
+         * MTP sidecar contexts.  Phase 6 therefore guards the graph-shaped
+         * verifier and sidecar lanes directly.
+         */
+        expectSegmentedGraphLifecycle(
+            graph_lifecycle_records,
+            backend_name,
+            "main_verifier",
+            /*require_warmup_capture=*/true,
+            /*require_replay=*/true);
+        expectSegmentedGraphLifecycle(
+            graph_lifecycle_records,
+            backend_name,
+            "mtp_decode_sidecar",
+            /*require_warmup_capture=*/true,
+            /*require_replay=*/true);
+        expectSegmentedGraphLifecycle(
+            graph_lifecycle_records,
+            backend_name,
+            "mtp_decode_catchup",
+            /*require_warmup_capture=*/true,
+            /*require_replay=*/true);
+
         PerfStatsCollector::reset();
         std::vector<int32_t> result_tokens;
         for (int cycle = 1; cycle < repeat_cycles; ++cycle)
@@ -551,6 +813,25 @@ namespace
         runner->setSkipLogitsGatherDecode(false);
         runner->setSkipLogitsGatherPrefill(false);
         runner->shutdown();
+
+        expectSegmentedGraphLifecycle(
+            records,
+            backend_name,
+            "main_verifier",
+            /*require_warmup_capture=*/false,
+            /*require_replay=*/true);
+        expectSegmentedGraphLifecycle(
+            records,
+            backend_name,
+            "mtp_decode_sidecar",
+            /*require_warmup_capture=*/false,
+            /*require_replay=*/true);
+        expectSegmentedGraphLifecycle(
+            records,
+            backend_name,
+            "mtp_decode_catchup",
+            /*require_warmup_capture=*/false,
+            /*require_replay=*/true);
 
         auto counter = [&](const std::string &name)
         {
@@ -1849,22 +2130,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsRealModelSmoke)
 {
-    ScopedDebugEnv env({
-        {"LLAMINAR_GPU_GRAPHS", "1"},
-        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
-    });
-
-    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
-    if (!env_model)
-        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
-    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
-
-    if (!std::filesystem::exists(model_path))
-    {
-        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
-    }
-
     auto &dm = DeviceManager::instance();
     dm.initialize(-1, false);
     if (dm.rocm_device_count() <= 0)
@@ -1875,42 +2140,26 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsRealModelSmoke)
     ASSERT_GE(rocm_ordinal, 0);
     ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
         << "Selected ROCm device ordinal is outside the available device range";
+    runQwen36MTPGpuGraphsGreedyRealModelSmoke(
+        GlobalDeviceAddress::rocm(rocm_ordinal),
+        "ROCm");
+}
 
-    OrchestrationConfig config = OrchestrationConfig::defaults();
-    config.model_path = model_path;
-    config.max_seq_len = 32;
-    config.batch_size = 1;
-    config.tp_degree = 1;
-    config.pp_degree = 1;
-    config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
-    config.kv_cache_precision = "auto";
-    config.mtp.enabled = true;
-    config.mtp.draft_tokens = 1;
-
-    auto factory = createOrchestrationRunnerFactory();
-    auto runner = factory->createFromOrchestrationConfig(config);
-    ASSERT_NE(runner, nullptr);
-    ASSERT_TRUE(runner->initialize()) << runner->lastError();
-
-    auto tokenizer = runner->tokenizer();
-    ASSERT_NE(tokenizer, nullptr);
-    const auto encoded = tokenizer->encode("Paris is", /*add_bos=*/false, /*add_eos=*/false);
-    ASSERT_FALSE(encoded.empty());
-    const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
-
-    SamplingParams greedy;
-    greedy.temperature = 0.0f;
-    auto result = runner->generate(prompt, 2, greedy);
-    const auto snapshot = runner->prefixStateProbe();
-    runner->shutdown();
-
-    ASSERT_TRUE(result.error.empty()) << result.error;
-    ASSERT_FALSE(result.tokens.empty());
-    EXPECT_TRUE(snapshot.mtp_config_enabled);
-    EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
-    EXPECT_GE(snapshot.mtp_draft_steps, 1u);
-    EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
-    EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
+TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsRealModelSmoke)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No CUDA device available for Qwen3.6 MTP GPU-graphs smoke";
+    }
+    const int cuda_ordinal = qwen36CudaSingleDeviceOrdinal();
+    ASSERT_GE(cuda_ordinal, 0);
+    ASSERT_LT(cuda_ordinal, dm.cuda_device_count())
+        << "Selected CUDA device ordinal is outside the available device range";
+    runQwen36MTPGpuGraphsGreedyRealModelSmoke(
+        GlobalDeviceAddress::cuda(cuda_ordinal),
+        "CUDA");
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticRealModelSmoke)
@@ -1948,7 +2197,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticClearCacheRepe
         /*decode_token_count=*/64,
         /*repeat_cycles=*/4,
         /*deterministic_repeatability=*/true,
-        /*use_presence_penalty=*/true);
+        /*use_presence_penalty=*/true,
+        /*prompt_token_count=*/768);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticRealModelSmoke)
@@ -1966,6 +2216,28 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticRealModelSmoke
     runQwen36MTPGpuGraphsStochasticRealModelSmoke(
         GlobalDeviceAddress::cuda(cuda_ordinal),
         "CUDA");
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticClearCacheRepeatabilityLong)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No CUDA device available for Qwen3.6 stochastic MTP GPU-graphs repeatability";
+    }
+    const int cuda_ordinal = qwen36CudaSingleDeviceOrdinal();
+    ASSERT_GE(cuda_ordinal, 0);
+    ASSERT_LT(cuda_ordinal, dm.cuda_device_count())
+        << "Selected CUDA device ordinal is outside the available device range";
+    runQwen36MTPGpuGraphsStochasticRealModelSmoke(
+        GlobalDeviceAddress::cuda(cuda_ordinal),
+        "CUDA",
+        /*decode_token_count=*/64,
+        /*repeat_cycles=*/4,
+        /*deterministic_repeatability=*/true,
+        /*use_presence_penalty=*/true,
+        /*prompt_token_count=*/768);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmoke)

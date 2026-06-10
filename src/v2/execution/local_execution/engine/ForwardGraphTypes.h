@@ -179,7 +179,8 @@ namespace llaminar2
         ForwardReplayStateCacheClass cache_class)
     {
         if (mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary &&
-            cache_class != ForwardReplayStateCacheClass::OrdinaryDecode)
+            cache_class != ForwardReplayStateCacheClass::OrdinaryDecode &&
+            cache_class != ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode)
         {
             return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
         }
@@ -353,11 +354,11 @@ namespace llaminar2
         bool phase3_active = false;
 
         /// Live replay-state epoch that the current segmented capture is safe for.
-        /// Ordinary multi-token decode graphs are invalidated when speculative
-        /// state publication advances the live state to a newer epoch. One-token
-        /// condition/decode graphs can be explicitly rebound and stamped at the
-        /// MTP publication boundary, because their token/position metadata is
-        /// updated through the usual dynamic-param path before replay.
+        /// Ordinary decode graphs are invalidated when speculative state
+        /// publication advances the live state to a newer epoch.  This includes
+        /// one-token condition/decode graphs: their token/position metadata is
+        /// dynamic, but captured kernels may still retain assumptions about the
+        /// live KV, recurrent, and short-conv state they read.
         uint64_t segmented_capture_live_state_epoch = 0;
 
         bool requiresLiveStateEpochRecapture(bool ordinary_decode_context,
@@ -467,13 +468,11 @@ namespace llaminar2
         }
 
         /**
-         * @brief Stamp a preserved one-token decode capture for the current live state.
+         * @brief Stamp a preserved replay capture for the current live state.
          *
-         * MTP spec-state publication mutates KV/GDN/short-conv buffers in place.
-         * A single-token decode capture remains shape-compatible after the stage
-         * stream and dynamic parameters are rebound, but the epoch guard still
-         * needs to know that the preserved capture has been audited for the new
-         * live state.
+         * This is intentionally reserved for replay classes whose state-safety
+         * has been proven separately.  Ordinary decode caches should recapture
+         * across MTP publication instead of calling this helper.
          */
         void markReplayStateSafeForLiveEpoch(uint64_t live_state_epoch)
         {

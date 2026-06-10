@@ -16,14 +16,15 @@ Latest full dense/MoE matrix:
 `benchmark_results/mtp_vllm_style/20260609T-phase3-row-indexed-accepted-matrix/`
 with `--decode-tokens 16 --perfstats`.
 
-Latest correctness gate: Phase 5 focused units
-`V2_Unit_MTPStateTransaction`, `V2_Unit_MTPGraphConstruction`,
-`V2_Unit_PrefillDecodeTransition`, `V2_Unit_GpuWorkspaceAllocationPolicy`,
-plus MTP perfstats/matrix script units.
+Latest correctness gate: Phase 6 accepted. CUDA/ROCm greedy graph smokes,
+768-token stochastic clear-cache replay, graph-stream d3 parity, broad
+`V2_Unit_`, and integration/release builds are green.
 
 Latest Phase 5 publication-cost slice:
 `benchmark_results/mtp_vllm_style/20260610T-phase5-publication-cost-dense-stochastic-gpu/`
 and `...-cpu8/`.
+
+Latest Phase 6 graph slice: CUDA/ROCm greedy and long stochastic graph lifecycle pass.
 
 ## Matrix
 
@@ -63,11 +64,15 @@ and `...-cpu8/`.
 - Phase 5 publication-cost slice: CUDA publish_avg 0.47-0.56ms, ROCm
   0.29-0.32ms, CPU 3.84-3.86ms. Publication is stable across d1/d2/d3; remaining
   cost is verifier/condition plus debug/prefix checkpoints, not slot publish.
-- Forced-reject replay parity is now covered in the runner unit: when no ready
-  token exists, the debug oracle derives the next token by forwarding the
-  rejected correction, then checks it against full replay.
-- Phase 5 is accepted on the focused gate; stale all-position checkpoint tags
-  are gone.
+- Phase 5 is accepted: forced-reject replay parity is unit-covered and stale
+  all-position checkpoint tags are gone.
+- Phase 6 accepted: CUDA/ROCm greedy and 768-token stochastic graph tests require
+  `main_verifier`, `mtp_decode_sidecar`, and `mtp_decode_catchup`
+  warm/capture/replay. ROCm d3 stays on the M=4 decode-continuation attention
+  path; CUDA catch-up now uses one canonical lifecycle context. Penalty-free
+  stochastic defers final sync; penalty-bearing long runs sync verifier rows by
+  policy. Release CMake now skips graph-stream parity test properties in
+  perf-only builds.
 
 ## Target Anchors
 
@@ -81,6 +86,6 @@ llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
 
 ## Next
 
-1. Enter Phase 6: graph-captured draft/verify/sample/publish stress work.
+1. Commit the accepted Phase 6 slice.
 2. Keep the dense stochastic closeout matrix as the per-iteration regression.
-3. Move MoE speed work after SingleDevice state publication is cheap.
+3. Start Phase 7 MoE speed work.

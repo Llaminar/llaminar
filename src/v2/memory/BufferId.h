@@ -133,7 +133,7 @@ namespace llaminar2
         MTP_UP_PROJ,
         MTP_FFN_OUTPUT,
         MTP_LOGITS,
-        MTP_CONDITION_TOKEN, ///< Arena-owned INT32 condition token for device-resident MTP sidecar input
+        MTP_CONDITION_TOKEN, ///< Arena-owned INT32 condition-token rows for device-resident MTP sidecar input
         MTP_VERIFIER_INPUT_TOKENS, ///< Arena-owned INT32 verifier token row fed directly to GPU embedding
 
         _COUNT ///< Sentinel – must be last

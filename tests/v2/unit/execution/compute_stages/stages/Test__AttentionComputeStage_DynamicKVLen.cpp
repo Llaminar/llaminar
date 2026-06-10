@@ -69,6 +69,19 @@ namespace llaminar2
             return buffer.str();
         }
 
+        std::string sliceFunction(const std::string &source,
+                                  const std::string &begin_marker,
+                                  const std::string &end_marker)
+        {
+            const size_t begin = source.find(begin_marker);
+            if (begin == std::string::npos)
+                return {};
+            const size_t end = source.find(end_marker, begin);
+            if (end == std::string::npos)
+                return source.substr(begin);
+            return source.substr(begin, end - begin);
+        }
+
         /**
          * @brief Mock KV cache for testing dynamic kv_len queries
          *
@@ -1028,6 +1041,46 @@ namespace llaminar2
             const std::string non_capture_section = params_section.substr(non_capture_else);
             EXPECT_NE(non_capture_section.find("setDynamicAttnParams("), std::string::npos)
                 << "Non-captured ROCm attention still prepares params lazily for eager execution";
+        }
+
+        TEST(Test__AttentionComputeStage_ROCmCaptureContract, MultiRowContinuationParamsMatchCudaContract)
+        {
+            const fs::path root = findRepoRoot();
+            const std::string source =
+                readFile(root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp");
+            ASSERT_FALSE(source.empty());
+
+            EXPECT_NE(source.find("constexpr int MAX_SMALL_DECODE_ROWS = 4"),
+                      std::string::npos)
+                << "ROCm fixed-depth-3 MTP verification needs draft_count + 1 == 4 continuation rows on the decode path.";
+
+            const std::string stage_source =
+                readFile(root / "src/v2/execution/compute_stages/stages/AttentionComputeStage.cpp");
+            ASSERT_FALSE(stage_source.empty());
+            EXPECT_NE(stage_source.find("logical_seq_len <= kMTPVerifierSmallDecodeMaxRows"),
+                      std::string::npos)
+                << "ROCm graph-capture preparation must pre-upload four-row verifier attention params.";
+            EXPECT_NE(stage_source.find("native-KV M=2..4 verifier path"),
+                      std::string::npos)
+                << "ROCm graph replay signatures must document and cover the four-row verifier path.";
+            EXPECT_NE(stage_source.find("params_.seq_len > kMTPVerifierSmallDecodeMaxRows"),
+                      std::string::npos)
+                << "ROCm graph replay signatures must be keyed for every MTP verifier row up to M=4.";
+
+            const std::string body = sliceFunction(
+                source,
+                "void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::setDynamicAttnParams(",
+                "bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParams(");
+
+            EXPECT_NE(body.find("h_attn_params_[row].position_offset = position_offset + row"),
+                      std::string::npos)
+                << "ROCm M=2..4 verifier rows must use absolute continuation positions.";
+            EXPECT_NE(body.find("h_attn_params_[row].mask_stride = kv_len"),
+                      std::string::npos)
+                << "ROCm M=2..4 verifier rows must keep the full verifier KV stride.";
+            EXPECT_EQ(body.find("h_attn_params_[row].position_offset = std::max(0, row_kv_len - 1)"),
+                      std::string::npos)
+                << "Row-local KV length must not replace the caller's continuation offset.";
         }
 
     } // namespace

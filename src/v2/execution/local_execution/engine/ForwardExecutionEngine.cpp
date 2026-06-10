@@ -633,14 +633,13 @@ namespace llaminar2
             {
                 cache.resetReplayState();
                 ++summary.reset_replay_state;
-                if (cache_class == ForwardReplayStateCacheClass::OrdinaryDecode)
+                if (cache_class == ForwardReplayStateCacheClass::OrdinaryDecode ||
+                    cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode)
                     ++summary.ordinary_decode_reset;
             }
             else
             {
                 cache.markGPUStreamBindingsDirty();
-                if (cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode)
-                    cache.markReplayStateSafeForLiveEpoch(live_state_epoch);
                 ++summary.preserved_for_stream_rebind;
                 if (cache_class == ForwardReplayStateCacheClass::AllPositionVerifier)
                     ++summary.all_position_verifier_preserved;
@@ -1332,6 +1331,15 @@ namespace llaminar2
         {
             setup_stream_t1 = Clock::now();
             setup_dynamic_params_t0 = setup_stream_t1;
+        }
+
+        if (!host.prepareLiveStateForForwardGraphExecution(
+                input,
+                dynamic_param_stream,
+                stream_device))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Failed to prepare live state for cached forward graph execution");
+            return false;
         }
 
         if (host.computeAllPositionLogitsEnabled() &&
@@ -2263,29 +2271,38 @@ namespace llaminar2
             }
             LOG_DEBUG("[ForwardExecutionEngine] Got device context, starting execution...");
 
+            void *execution_stream = nullptr;
+            if (ctx->deviceId().is_gpu())
+            {
+                try
+                {
+                    execution_stream = GPUDeviceContextPool::instance()
+                                           .getContext(ctx->deviceId())
+                                           .defaultStream();
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_ERROR("[ForwardExecutionEngine] Could not resolve forward graph stream for "
+                              << ctx->deviceId().toString() << ": " << e.what());
+                    return false;
+                }
+            }
+
+            if (!host.prepareLiveStateForForwardGraphExecution(
+                    effective_input,
+                    execution_stream,
+                    ctx->deviceId()))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Failed to prepare live state for forward graph execution");
+                return false;
+            }
+
             if (host.computeAllPositionLogitsEnabled() &&
                 host.allPositionLogitRows() > 0)
             {
-                void *metadata_stream = nullptr;
-                if (ctx->deviceId().is_gpu())
-                {
-                    try
-                    {
-                        metadata_stream = GPUDeviceContextPool::instance()
-                                              .getContext(ctx->deviceId())
-                                              .defaultStream();
-                    }
-                    catch (const std::exception &e)
-                    {
-                        LOG_ERROR("[ForwardExecutionEngine] Could not resolve verifier metadata stream for "
-                                  << ctx->deviceId().toString() << ": " << e.what());
-                        return false;
-                    }
-                }
-
                 if (!host.prepareAllPositionVerifierGraphMetadata(
                         effective_input,
-                        metadata_stream,
+                        execution_stream,
                         ctx->deviceId()))
                 {
                     LOG_ERROR("[ForwardExecutionEngine] Failed to prepare all-position verifier graph metadata");
