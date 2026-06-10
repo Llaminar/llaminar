@@ -515,6 +515,7 @@ namespace llaminar2
         // Adapt generic ForwardInput to ForwardInput
         ForwardInput qwen_input;
         qwen_input.token_ids = input.token_ids;
+        qwen_input.token_ids_device = input.token_ids_device;
         qwen_input.position_ids = input.position_ids;
         qwen_input.batch_size = input.batch_size;
         qwen_input.seq_len = input.seq_len;
@@ -619,6 +620,7 @@ namespace llaminar2
         EmbeddingStage::Params embed_params;
         embed_params.embed_table = modelEmbeddingTable();
         embed_params.token_ids = input.token_ids;
+        embed_params.token_ids_device = input.token_ids_device;
         embed_params.output = embed_output;
         embed_params.num_tokens = total_tokens;
         embed_params.d_model = config_.d_model;
@@ -908,6 +910,7 @@ namespace llaminar2
             EmbeddingStage::Params embed_params;
             embed_params.embed_table = modelEmbeddingTable();
             embed_params.token_ids = input.token_ids;
+            embed_params.token_ids_device = input.token_ids_device;
             embed_params.output = embed_output;
             embed_params.num_tokens = total_tokens;
             embed_params.d_model = config_.d_model;
@@ -1294,6 +1297,7 @@ namespace llaminar2
                 EmbeddingStage::Params embed_params;
                 embed_params.embed_table = modelEmbeddingTable();
                 embed_params.token_ids = input.token_ids;
+                embed_params.token_ids_device = input.token_ids_device;
                 embed_params.output = embed_output;
                 embed_params.num_tokens = total_tokens;
                 embed_params.d_model = config_.d_model;
@@ -1615,6 +1619,7 @@ namespace llaminar2
         EmbeddingStage::Params params;
         params.embed_table = modelEmbeddingTable();
         params.token_ids = input.token_ids;
+        params.token_ids_device = input.token_ids_device;
         params.output = output_hidden;
         params.num_tokens = input.batch_size * input.seq_len;
         params.d_model = config_.d_model;

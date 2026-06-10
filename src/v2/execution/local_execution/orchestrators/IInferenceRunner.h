@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <array>
 #include <optional>
 #include <cstdint>
 #include <string>
@@ -83,6 +84,29 @@ namespace llaminar2
     };
 
     /**
+     * @brief Compact summary of a batched stochastic MTP verification step.
+     *
+     * GPU runners fill this from device-side reduction buffers after row-wise
+     * speculative verification. The structure mirrors the shared sampling math
+     * contract, but uses fixed-size arrays so callers never allocate in the hot
+     * decode path.
+     */
+    struct DeviceSpeculativeVerifyBatchOutcome
+    {
+        bool ok = false;
+        std::array<int32_t, 5> output_tokens = {-1, -1, -1, -1, -1};
+        int output_token_count = 0;
+        int accepted_speculative_prefix = 0;
+        int target_verifier_state_commit_count = 0;
+        int32_t ready_token = -1;
+        int32_t rejected_verified_token = -1;
+        bool stopped_on_output = false;
+        bool all_speculative_accepted = true;
+        int consumed_verifier_rows = 0;
+        bool sampled_terminal = false;
+    };
+
+    /**
      * @brief Lightweight view of a captured snapshot with 2D shape metadata
      *
      * Returned by getSnapshotWithShape() to provide shape information
@@ -148,6 +172,58 @@ namespace llaminar2
         virtual bool forward(const int *tokens, int seq_len) = 0;
 
         /**
+         * @brief Run a single-batch forward pass from device-resident token IDs.
+         *
+         * @param token_shadow Host copy of the same token IDs for bookkeeping,
+         *        logging, and cache metadata. GPU embedding execution must read
+         *        from `token_ids_device`, not from this host pointer.
+         * @param token_ids_device Stable device pointer to INT32 token IDs.
+         *        The pointer must remain valid for any cached graph replay that
+         *        the runner enables for this shape.
+         * @param seq_len Sequence length for this single-batch forward.
+         * @return true when the forward pass succeeds.
+         */
+        virtual bool forwardWithDeviceTokenIds(
+            const int *token_shadow,
+            const void *token_ids_device,
+            int seq_len)
+        {
+            (void)token_shadow;
+            (void)token_ids_device;
+            (void)seq_len;
+            return false;
+        }
+
+        /**
+         * @brief Prepare the compact all-position verifier input token row on device.
+         *
+         * vLLM-style stochastic verification already has sampled draft tokens in a
+         * runner-owned device buffer.  GPU runners can use this hook to build the
+         * verifier input sequence `[accepted_main_token, draft_0, ...]` in another
+         * arena-owned device buffer and then pass that pointer to
+         * forwardWithDeviceTokenIds().  The host `token_shadow` still exists for
+         * metadata and diagnostics, but the embedding graph reads the device row.
+         *
+         * @param first_token The already-sampled main-model token at verifier row 0.
+         * @param first_draft_slot First slot in the runner-owned sampled-draft buffer.
+         * @param draft_token_count Number of draft tokens to copy after `first_token`.
+         * @param total_verifier_input_tokens Total verifier forward sequence length.
+         * @return Stable device pointer on success, nullptr if unsupported or invalid.
+         */
+        virtual const void *prepareMTPVerifierInputTokensOnDevice(
+            int32_t first_token,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens)
+        {
+            (void)first_token;
+            (void)first_draft_slot;
+            (void)draft_token_count;
+            (void)total_verifier_input_tokens;
+            return nullptr;
+        }
+
+        /**
          * @brief Whether this runner can execute a prepared bucketed prefill
          *        chunk schedule for the current request state.
          */
@@ -192,6 +268,18 @@ namespace llaminar2
         }
 
         /**
+         * @brief Run one MTP sidecar row for a following device-side sampler.
+         *
+         * Default runners fall back to the normal synchronized sidecar path.
+         * GPU graph runners can override this to request deferred final sync
+         * and expose the sidecar stream through the device distribution path.
+         */
+        virtual bool forwardMTPForDeviceSampling(int32_t draft_condition_token)
+        {
+            return forwardMTP(draft_condition_token);
+        }
+
+        /**
          * @brief True when the runner can chain depth-0 MTP sidecar calls.
          *
          * Chained drafts use the hidden state produced by the previous sidecar
@@ -207,6 +295,32 @@ namespace llaminar2
          *        combined sidecar/sample path.
          */
         virtual bool supportsMTPSidecarSampleFusion() const { return false; }
+
+        /**
+         * @brief True when sidecar logits can flow into device sampling without an immediate host sync.
+         *
+         * A supporting runner may execute forwardMTPForDeviceSampling() and leave
+         * MTP logits ordered on an explicit pending stream. The next
+         * buildStochasticDistributionOnDevice(DeviceLogitsSource::MTP, ...)
+         * consumes that stream so distribution construction, compact sampling,
+         * and the final scalar D2H copy form one ordered chain.
+         *
+         * This is a partial vLLM-style step: it removes a sidecar completion sync,
+         * but the sampled token may still return to the host until the sidecar
+         * embedding input accepts a device-resident token source.
+         */
+        virtual bool supportsMTPSidecarLogitsStreamHandoff() const { return false; }
+
+        /**
+         * @brief True when a chained MTP sidecar can consume sampled draft tokens on device.
+         *
+         * This is the next step after logits-stream handoff: the sampler writes
+         * draft token IDs into arena/workspace memory, and the following sidecar
+         * embedding reads that device slot directly. A runner that returns true
+         * must not upload the same token through a host pointer for the sidecar
+         * embedding path.
+         */
+        virtual bool supportsMTPDeviceDraftTokenInput() const { return false; }
 
         /**
          * @brief True when MTP sidecar execution is isolated from main live state.
@@ -268,6 +382,55 @@ namespace llaminar2
         virtual bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id)
         {
             (void)draft_condition_token;
+            (void)position_id;
+            return false;
+        }
+
+        /**
+         * @brief Chained sidecar variant of forwardMTPForDeviceSampling().
+         */
+        virtual bool forwardMTPFromLastDraftForDeviceSampling(
+            int32_t draft_condition_token,
+            int position_id)
+        {
+            return forwardMTPFromLastDraft(draft_condition_token, position_id);
+        }
+
+        /**
+         * @brief Run a chained MTP sidecar from a sampled draft token slot.
+         *
+         * @param draft_sample_slot Slot in the runner-owned device draft-token
+         *        buffer written by sampleStochasticDistributionOnDevice(Draft, ...).
+         * @param position_id Logical shifted-cache position for the append.
+         * @return true when the graph ran and left logits ready for sampling.
+         *
+         * The default hard-fails by returning false; callers should gate this
+         * with supportsMTPDeviceDraftTokenInput() and never silently fall back to
+         * a host token upload in the vLLM-style path.
+         */
+        virtual bool forwardMTPFromDeviceDraftForDeviceSampling(
+            int draft_sample_slot,
+            int position_id)
+        {
+            (void)draft_sample_slot;
+            (void)position_id;
+            return false;
+        }
+
+        /**
+         * @brief Run the first MTP sidecar from a sampled main-model token slot.
+         *
+         * Penalty-free stochastic GPU decoding can sample the first token into
+         * runner-owned device memory and defer the host read until the batched
+         * verifier summary. This entry point feeds that token directly to the
+         * sidecar embedding. The default hard-fails; GPU implementations must
+         * provide explicit stream ordering before advertising the path.
+         */
+        virtual bool forwardMTPFromDeviceTargetForDeviceSampling(
+            int target_sample_slot,
+            int position_id)
+        {
+            (void)target_sample_slot;
             (void)position_id;
             return false;
         }
@@ -769,6 +932,51 @@ namespace llaminar2
             return -1;
         }
 
+        /**
+         * @brief Sample a compact stochastic distribution into runner-owned device memory.
+         *
+         * This is the no-host-read companion to sampleStochasticDistributionOnDevice().
+         * It is used when later graph stages consume the sampled token directly
+         * from the runner's device sample slot.  The caller must not require the
+         * sampled scalar on the host before the batch outcome is summarized.
+         *
+         * @param buffer Target or draft distribution buffer to sample from.
+         * @param slot Compact distribution slot.
+         * @param threshold Pre-drawn uniform threshold for deterministic replay.
+         * @return true if the sample kernel was enqueued and wrote the device slot.
+         */
+        virtual bool sampleStochasticDistributionOnDeviceDeferred(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold)
+        {
+            (void)buffer;
+            (void)slot;
+            (void)threshold;
+            return false;
+        }
+
+        /**
+         * @brief Compose verifier input tokens when the first token is on device.
+         *
+         * The returned pointer names a stable runner-owned INT32 row with shape
+         * `[total_verifier_input_tokens]`. Entry zero is copied from the target
+         * sample slot and entries one..N are copied from sampled draft slots on
+         * the graph execution stream.
+         */
+        virtual const void *prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+            int first_target_sample_slot,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens)
+        {
+            (void)first_target_sample_slot;
+            (void)first_draft_slot;
+            (void)draft_token_count;
+            (void)total_verifier_input_tokens;
+            return nullptr;
+        }
+
         virtual bool verifyStochasticDistributionsOnDevice(
             int target_slot,
             int draft_slot,
@@ -801,6 +1009,80 @@ namespace llaminar2
             (void)accept_thresholds;
             (void)residual_thresholds;
             (void)row_count;
+            (void)out;
+            return false;
+        }
+
+        /**
+         * @brief Verify and summarize several stochastic MTP rows on device.
+         *
+         * This is the vLLM-style output contract for penalty-free stochastic
+         * all-position verification: backend kernels decide row acceptance,
+         * reduce the first consumed rejection/stop/all-accepted outcome, and
+         * return only the committed token sequence plus counters to the host.
+         */
+        virtual bool verifyStochasticDistributionsBatchOutcomeOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out)
+        {
+            (void)first_target_slot;
+            (void)first_draft_slot;
+            (void)draft_tokens;
+            (void)accept_thresholds;
+            (void)residual_thresholds;
+            (void)row_count;
+            (void)first_token;
+            (void)stop_tokens;
+            (void)stop_token_count;
+            (void)bonus_target_slot;
+            (void)bonus_threshold;
+            (void)out;
+            return false;
+        }
+
+        /**
+         * @brief Device-first-token form of batched stochastic verification.
+         *
+         * This keeps the initial main-model sample on GPU until the summary
+         * kernel has decided which tokens commit. It should be used only for
+         * penalty-free paths where sampler history does not need the first
+         * token before verifier reduction.
+         */
+        virtual bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out)
+        {
+            (void)first_target_slot;
+            (void)first_draft_slot;
+            (void)draft_tokens;
+            (void)accept_thresholds;
+            (void)residual_thresholds;
+            (void)row_count;
+            (void)first_target_sample_slot;
+            (void)stop_tokens;
+            (void)stop_token_count;
+            (void)bonus_target_slot;
+            (void)bonus_threshold;
             (void)out;
             return false;
         }

@@ -2798,6 +2798,11 @@ namespace
         void *d_batch_accept_flags = nullptr;
         void *d_batch_accept_probabilities = nullptr;
         void *d_batch_accept_thresholds = nullptr;
+        void *d_batch_sampled_draft_tokens = nullptr;
+        void *d_batch_device_token_verify_tokens = nullptr;
+        void *d_batch_device_token_accept_flags = nullptr;
+        void *d_batch_device_token_accept_probabilities = nullptr;
+        void *d_batch_device_token_accept_thresholds = nullptr;
 
         auto cleanup = [&]()
         {
@@ -2831,7 +2836,12 @@ namespace
                 d_batch_verify_tokens,
                 d_batch_accept_flags,
                 d_batch_accept_probabilities,
-                d_batch_accept_thresholds};
+                d_batch_accept_thresholds,
+                d_batch_sampled_draft_tokens,
+                d_batch_device_token_verify_tokens,
+                d_batch_device_token_accept_flags,
+                d_batch_device_token_accept_probabilities,
+                d_batch_device_token_accept_thresholds};
             for (void *ptr : ptrs)
             {
                 if (ptr)
@@ -2869,6 +2879,11 @@ namespace
         d_batch_accept_flags = backend_->allocate(2 * sizeof(int), device_id_);
         d_batch_accept_probabilities = backend_->allocate(2 * sizeof(float), device_id_);
         d_batch_accept_thresholds = backend_->allocate(2 * sizeof(float), device_id_);
+        d_batch_sampled_draft_tokens = backend_->allocate(2 * sizeof(int), device_id_);
+        d_batch_device_token_verify_tokens = backend_->allocate(2 * sizeof(int), device_id_);
+        d_batch_device_token_accept_flags = backend_->allocate(2 * sizeof(int), device_id_);
+        d_batch_device_token_accept_probabilities = backend_->allocate(2 * sizeof(float), device_id_);
+        d_batch_device_token_accept_thresholds = backend_->allocate(2 * sizeof(float), device_id_);
 
         ASSERT_NE(d_target_logits, nullptr);
         ASSERT_NE(d_draft_accept_logits, nullptr);
@@ -2900,6 +2915,11 @@ namespace
         ASSERT_NE(d_batch_accept_flags, nullptr);
         ASSERT_NE(d_batch_accept_probabilities, nullptr);
         ASSERT_NE(d_batch_accept_thresholds, nullptr);
+        ASSERT_NE(d_batch_sampled_draft_tokens, nullptr);
+        ASSERT_NE(d_batch_device_token_verify_tokens, nullptr);
+        ASSERT_NE(d_batch_device_token_accept_flags, nullptr);
+        ASSERT_NE(d_batch_device_token_accept_probabilities, nullptr);
+        ASSERT_NE(d_batch_device_token_accept_thresholds, nullptr);
 
         const int batch_draft_tokens[2] = {accept_draft_token, reject_draft_token};
         const float batch_accept_thresholds[2] = {0.0f, 0.99f};
@@ -2944,6 +2964,14 @@ namespace
                     d_draft_reject_logits,
                     draft_reject_logits.data(),
                     draft_reject_logits.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                // Device-token verifier regression setup: sampled MTP draft
+                // tokens must already live in device scratch before capture.
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_batch_sampled_draft_tokens,
+                    batch_draft_tokens,
+                    sizeof(batch_draft_tokens),
                     device_id_,
                     stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
@@ -3020,6 +3048,24 @@ namespace
                     d_batch_accept_probabilities,
                     d_batch_accept_thresholds))
                     << "batched speculative verifier must reject the legacy default/null stream";
+                EXPECT_FALSE(backend_->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+                    d_batch_target_ids,
+                    d_batch_target_probs,
+                    d_batch_draft_ids,
+                    d_batch_draft_probs,
+                    top_k,
+                    top_k,
+                    d_batch_sampled_draft_tokens,
+                    batch_accept_thresholds,
+                    batch_residual_thresholds,
+                    2,
+                    device_id_,
+                    nullptr,
+                    d_batch_device_token_verify_tokens,
+                    d_batch_device_token_accept_flags,
+                    d_batch_device_token_accept_probabilities,
+                    d_batch_device_token_accept_thresholds))
+                    << "device-token batched verifier must reject the legacy default/null stream";
 
                 auto capture = ctx.createGraphCapture(stream);
                 ASSERT_NE(capture, nullptr);
@@ -3168,6 +3214,23 @@ namespace
                     d_batch_accept_flags,
                     d_batch_accept_probabilities,
                     d_batch_accept_thresholds));
+                ASSERT_TRUE(backend_->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+                    d_batch_target_ids,
+                    d_batch_target_probs,
+                    d_batch_draft_ids,
+                    d_batch_draft_probs,
+                    top_k,
+                    top_k,
+                    d_batch_sampled_draft_tokens,
+                    batch_accept_thresholds,
+                    batch_residual_thresholds,
+                    2,
+                    device_id_,
+                    stream,
+                    d_batch_device_token_verify_tokens,
+                    d_batch_device_token_accept_flags,
+                    d_batch_device_token_accept_probabilities,
+                    d_batch_device_token_accept_thresholds));
                 ASSERT_TRUE(capture->endCapture());
                 ASSERT_TRUE(capture->instantiate());
                 ASSERT_TRUE(capture->launch());
@@ -3205,6 +3268,10 @@ namespace
         std::vector<int> batch_accept_flags(2, -1);
         std::vector<float> batch_accept_probabilities(2, -1.0f);
         std::vector<float> batch_accept_threshold_results(2, -1.0f);
+        std::vector<int> batch_device_token_verify_tokens(2, -1);
+        std::vector<int> batch_device_token_accept_flags(2, -1);
+        std::vector<float> batch_device_token_accept_probabilities(2, -1.0f);
+        std::vector<float> batch_device_token_accept_threshold_results(2, -1.0f);
 
         ASSERT_TRUE(backend_->deviceToHost(target_ids.data(), d_target_ids, top_k * sizeof(int), device_id_));
         ASSERT_TRUE(backend_->deviceToHost(target_probs.data(), d_target_probs, top_k * sizeof(float), device_id_));
@@ -3225,6 +3292,10 @@ namespace
         ASSERT_TRUE(backend_->deviceToHost(batch_accept_flags.data(), d_batch_accept_flags, 2 * sizeof(int), device_id_));
         ASSERT_TRUE(backend_->deviceToHost(batch_accept_probabilities.data(), d_batch_accept_probabilities, 2 * sizeof(float), device_id_));
         ASSERT_TRUE(backend_->deviceToHost(batch_accept_threshold_results.data(), d_batch_accept_thresholds, 2 * sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(batch_device_token_verify_tokens.data(), d_batch_device_token_verify_tokens, 2 * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(batch_device_token_accept_flags.data(), d_batch_device_token_accept_flags, 2 * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(batch_device_token_accept_probabilities.data(), d_batch_device_token_accept_probabilities, 2 * sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(batch_device_token_accept_threshold_results.data(), d_batch_device_token_accept_thresholds, 2 * sizeof(float), device_id_));
 
         cleanup();
 
@@ -3268,11 +3339,24 @@ namespace
         EXPECT_EQ(batch_accept_flags[0], expected_batch_accept.accepted);
         EXPECT_NEAR(batch_accept_probabilities[0], expected_batch_accept.accept_probability, 1e-5f);
         EXPECT_NEAR(batch_accept_threshold_results[0], expected_batch_accept.accept_threshold, 1e-6f);
+        EXPECT_EQ(batch_device_token_verify_tokens[0], expected_batch_accept.token_id);
+        EXPECT_EQ(batch_device_token_accept_flags[0], expected_batch_accept.accepted);
+        EXPECT_NEAR(batch_device_token_accept_probabilities[0], expected_batch_accept.accept_probability, 1e-5f);
+        EXPECT_NEAR(batch_device_token_accept_threshold_results[0], expected_batch_accept.accept_threshold, 1e-6f);
 
         EXPECT_EQ(batch_verify_tokens[1], expected_batch_reject.token_id);
         EXPECT_EQ(batch_accept_flags[1], expected_batch_reject.accepted);
         EXPECT_NEAR(batch_accept_probabilities[1], expected_batch_reject.accept_probability, 1e-5f);
         EXPECT_NEAR(batch_accept_threshold_results[1], expected_batch_reject.accept_threshold, 1e-6f);
+        EXPECT_EQ(batch_device_token_verify_tokens[1], expected_batch_reject.token_id);
+        EXPECT_EQ(batch_device_token_accept_flags[1], expected_batch_reject.accepted);
+        EXPECT_NEAR(batch_device_token_accept_probabilities[1], expected_batch_reject.accept_probability, 1e-5f);
+        EXPECT_NEAR(batch_device_token_accept_threshold_results[1], expected_batch_reject.accept_threshold, 1e-6f);
+
+        EXPECT_EQ(batch_device_token_verify_tokens, batch_verify_tokens)
+            << "device-token batch verifier must match host-token verifier tokens";
+        EXPECT_EQ(batch_device_token_accept_flags, batch_accept_flags)
+            << "device-token batch verifier must match host-token verifier accept flags";
     }
 
     TEST_P(GPUSamplingTest, DRYParity_SimpleRepeat)

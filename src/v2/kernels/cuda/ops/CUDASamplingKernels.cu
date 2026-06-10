@@ -499,13 +499,15 @@ __global__ void cuda_topk_topp_sample_f32_kernel(
         }
 
         float weights[TOPK_MAX_K];
+        const float threshold =
+            llaminar2::sampling_math::uniform01(rng_seed, rng_offset);
         *out_token = llaminar2::sampling_math::sample_topk_topp_from_sorted_with_threshold(
             merged_vals,
             merged_idxs,
             k,
             top_p,
             temperature,
-            llaminar2::sampling_math::uniform01(rng_seed, rng_offset),
+            threshold,
             weights);
     }
 }
@@ -993,6 +995,182 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_kernel(
         out_accept_threshold ? out_accept_threshold + row : nullptr);
 }
 
+/**
+ * @brief Batched verifier variant whose draft tokens are already on device.
+ *
+ * This is the first device-resident-token step toward vLLM-style speculative
+ * sampling. Each row still receives host-generated thresholds as kernel
+ * arguments, but the accepted draft-token sequence is read from arena scratch
+ * produced by the draft sampler instead of from host scalar arguments.
+ */
+__global__ void cuda_speculative_verify_distribution_thresholds_batch_device_tokens_kernel(
+    const int *__restrict__ target_token_ids,
+    const float *__restrict__ target_probs,
+    const int *__restrict__ draft_token_ids,
+    const float *__restrict__ draft_probs,
+    int k,
+    int distribution_stride,
+    const int *__restrict__ sampled_draft_tokens,
+    float accept_threshold0,
+    float accept_threshold1,
+    float accept_threshold2,
+    float accept_threshold3,
+    float residual_threshold0,
+    float residual_threshold1,
+    float residual_threshold2,
+    float residual_threshold3,
+    int row_count,
+    int *__restrict__ out_token,
+    int *__restrict__ out_accepted,
+    float *__restrict__ out_accept_probability,
+    float *__restrict__ out_accept_threshold)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= row_count)
+        return;
+
+    float accept_threshold = accept_threshold0;
+    float residual_threshold = residual_threshold0;
+    if (row == 1)
+    {
+        accept_threshold = accept_threshold1;
+        residual_threshold = residual_threshold1;
+    }
+    else if (row == 2)
+    {
+        accept_threshold = accept_threshold2;
+        residual_threshold = residual_threshold2;
+    }
+    else if (row == 3)
+    {
+        accept_threshold = accept_threshold3;
+        residual_threshold = residual_threshold3;
+    }
+
+    const int offset = row * distribution_stride;
+    llaminar2::sampling_math::speculative_verify_with_thresholds(
+        target_token_ids + offset,
+        target_probs + offset,
+        draft_token_ids + offset,
+        draft_probs + offset,
+        k,
+        sampled_draft_tokens[row],
+        accept_threshold,
+        residual_threshold,
+        out_token + row,
+        out_accepted + row,
+        out_accept_probability ? out_accept_probability + row : nullptr,
+        out_accept_threshold ? out_accept_threshold + row : nullptr);
+}
+
+/**
+ * @brief Reduce row-wise stochastic verifier results into one speculative commit plan.
+ *
+ * The kernel is deliberately one thread: MTP currently verifies at most four
+ * rows, and making the reduction serial keeps the stop/rejection semantics
+ * easy to audit while remaining graph-capturable.
+ */
+__global__ void cuda_summarize_speculative_verify_batch_kernel(
+    const int *__restrict__ verify_tokens,
+    const int *__restrict__ verify_accepted,
+    int row_count,
+    int first_token,
+    int stop_token0,
+    int stop_token1,
+    int stop_token2,
+    int stop_token3,
+    int stop_token4,
+    int stop_token5,
+    int stop_token6,
+    int stop_token7,
+    int stop_token_count,
+    const int *__restrict__ bonus_token,
+    int has_bonus_token,
+    int *__restrict__ out_tokens,
+    int *__restrict__ out_meta)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    int stop_tokens[llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens] = {
+        stop_token0,
+        stop_token1,
+        stop_token2,
+        stop_token3,
+        stop_token4,
+        stop_token5,
+        stop_token6,
+        stop_token7};
+    const int ready_token =
+        has_bonus_token && bonus_token ? *bonus_token : -1;
+    llaminar2::sampling_math::summarize_speculative_verify_batch(
+        first_token,
+        verify_tokens,
+        verify_accepted,
+        row_count,
+        stop_tokens,
+        stop_token_count,
+        ready_token,
+        has_bonus_token,
+        out_tokens,
+        out_meta);
+}
+
+/**
+ * @brief Device-first-token variant of the speculative batch reducer.
+ *
+ * The first sampled main-model token is produced by an earlier sampler kernel.
+ * Reading it here avoids a CPU round trip before MTP verifier summarization.
+ * The actual accept/reject semantics remain in SamplingMath so CUDA, ROCm, and
+ * CPU tests share one source of truth.
+ */
+__global__ void cuda_summarize_speculative_verify_batch_device_first_token_kernel(
+    const int *__restrict__ verify_tokens,
+    const int *__restrict__ verify_accepted,
+    int row_count,
+    const int *__restrict__ first_token,
+    int stop_token0,
+    int stop_token1,
+    int stop_token2,
+    int stop_token3,
+    int stop_token4,
+    int stop_token5,
+    int stop_token6,
+    int stop_token7,
+    int stop_token_count,
+    const int *__restrict__ bonus_token,
+    int has_bonus_token,
+    int *__restrict__ out_tokens,
+    int *__restrict__ out_meta)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    int stop_tokens[llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens] = {
+        stop_token0,
+        stop_token1,
+        stop_token2,
+        stop_token3,
+        stop_token4,
+        stop_token5,
+        stop_token6,
+        stop_token7};
+    const int ready_token =
+        has_bonus_token && bonus_token ? *bonus_token : -1;
+    const int sampled_first_token = first_token ? *first_token : -1;
+    llaminar2::sampling_math::summarize_speculative_verify_batch(
+        sampled_first_token,
+        verify_tokens,
+        verify_accepted,
+        row_count,
+        stop_tokens,
+        stop_token_count,
+        ready_token,
+        has_bonus_token,
+        out_tokens,
+        out_meta);
+}
+
 // ============================================================================
 // Logit Penalty Application Kernel — Subtract sparse penalties from logits
 // ============================================================================
@@ -1209,7 +1387,14 @@ extern "C"
         const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
 
         cuda_topk_topp_sample_f32_kernel<<<1, threads, smem_size, static_cast<cudaStream_t>(stream)>>>(
-            data, n, k, top_p, temperature, rng_seed, rng_offset, out_token);
+            data,
+            n,
+            k,
+            top_p,
+            temperature,
+            rng_seed,
+            rng_offset,
+            out_token);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -1504,6 +1689,201 @@ extern "C"
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA Speculative Verify Batch FP32 kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
+        const int *target_token_ids,
+        const float *target_probs,
+        const int *draft_token_ids,
+        const float *draft_probs,
+        int k,
+        int distribution_stride,
+        const int *sampled_draft_tokens,
+        float accept_threshold0,
+        float accept_threshold1,
+        float accept_threshold2,
+        float accept_threshold3,
+        float residual_threshold0,
+        float residual_threshold1,
+        float residual_threshold2,
+        float residual_threshold3,
+        int row_count,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int device_idx,
+        void *stream)
+    {
+        if (k <= 0 || k > TOPK_MAX_K ||
+            distribution_stride < k ||
+            row_count <= 0 || row_count > 4 ||
+            !target_token_ids || !target_probs ||
+            !draft_token_ids || !draft_probs ||
+            !sampled_draft_tokens ||
+            !out_token || !out_accepted || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+
+        cuda_speculative_verify_distribution_thresholds_batch_device_tokens_kernel<<<1, 4, 0, static_cast<cudaStream_t>(stream)>>>(
+            target_token_ids,
+            target_probs,
+            draft_token_ids,
+            draft_probs,
+            k,
+            distribution_stride,
+            sampled_draft_tokens,
+            accept_threshold0,
+            accept_threshold1,
+            accept_threshold2,
+            accept_threshold3,
+            residual_threshold0,
+            residual_threshold1,
+            residual_threshold2,
+            residual_threshold3,
+            row_count,
+            out_token,
+            out_accepted,
+            out_accept_probability,
+            out_accept_threshold);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA Speculative Verify Batch Device Tokens FP32 kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_summarize_speculative_verify_batch(
+        const int *verify_tokens,
+        const int *verify_accepted,
+        int row_count,
+        int first_token,
+        int stop_token0,
+        int stop_token1,
+        int stop_token2,
+        int stop_token3,
+        int stop_token4,
+        int stop_token5,
+        int stop_token6,
+        int stop_token7,
+        int stop_token_count,
+        const int *bonus_token,
+        int has_bonus_token,
+        int *out_tokens,
+        int *out_meta,
+        int device_idx,
+        void *stream)
+    {
+        if (row_count < 0 ||
+            row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count >
+                llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
+            !verify_tokens || !verify_accepted ||
+            (has_bonus_token && !bonus_token) ||
+            !out_tokens || !out_meta || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_summarize_speculative_verify_batch_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            verify_tokens,
+            verify_accepted,
+            row_count,
+            first_token,
+            stop_token0,
+            stop_token1,
+            stop_token2,
+            stop_token3,
+            stop_token4,
+            stop_token5,
+            stop_token6,
+            stop_token7,
+            stop_token_count,
+            bonus_token,
+            has_bonus_token,
+            out_tokens,
+            out_meta);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA Speculative Verify Batch Summary kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_summarize_speculative_verify_batch_device_first_token(
+        const int *verify_tokens,
+        const int *verify_accepted,
+        int row_count,
+        const int *first_token,
+        int stop_token0,
+        int stop_token1,
+        int stop_token2,
+        int stop_token3,
+        int stop_token4,
+        int stop_token5,
+        int stop_token6,
+        int stop_token7,
+        int stop_token_count,
+        const int *bonus_token,
+        int has_bonus_token,
+        int *out_tokens,
+        int *out_meta,
+        int device_idx,
+        void *stream)
+    {
+        if (row_count < 0 ||
+            row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count >
+                llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
+            !verify_tokens || !verify_accepted || !first_token ||
+            (has_bonus_token && !bonus_token) ||
+            !out_tokens || !out_meta || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_summarize_speculative_verify_batch_device_first_token_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            verify_tokens,
+            verify_accepted,
+            row_count,
+            first_token,
+            stop_token0,
+            stop_token1,
+            stop_token2,
+            stop_token3,
+            stop_token4,
+            stop_token5,
+            stop_token6,
+            stop_token7,
+            stop_token_count,
+            bonus_token,
+            has_bonus_token,
+            out_tokens,
+            out_meta);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA Speculative Verify Batch Device-First Summary kernel launch failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

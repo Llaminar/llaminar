@@ -1351,6 +1351,9 @@ namespace llaminar2
     {
         dynamic_params_active_ = false;
         dynamic_token_count_ = 0;
+        device_token_ids_active_ = false;
+        device_token_ids_ = nullptr;
+        device_token_count_ = 0;
 
         if (!token_ids || num_tokens <= 0)
         {
@@ -1410,10 +1413,26 @@ namespace llaminar2
         preload_stream_ = gpu_stream_;
     }
 
+    void CUDAEmbeddingKernelT::setDynamicDeviceTokenIds(
+        const void *token_ids_device,
+        int num_tokens)
+    {
+        dynamic_params_active_ = false;
+        dynamic_token_count_ = 0;
+        preload_stream_ = nullptr;
+        device_token_ids_ = static_cast<const int *>(token_ids_device);
+        device_token_count_ = num_tokens;
+        device_token_ids_active_ = token_ids_device && num_tokens > 0;
+    }
+
     void CUDAEmbeddingKernelT::resetDynamicState()
     {
         dynamic_params_active_ = false;
         dynamic_token_count_ = 0;
+        device_token_ids_active_ = false;
+        device_token_ids_ = nullptr;
+        device_token_count_ = 0;
+        preload_stream_ = nullptr;
         // h_token_ids_ buffer is preserved — it's reusable for the next session
     }
 
@@ -1463,16 +1482,24 @@ namespace llaminar2
             return false;
         }
 
-        int *d_token_ids = static_cast<int *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
-        if (!d_token_ids)
+        int *workspace_token_ids = static_cast<int *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
+        if (!workspace_token_ids)
         {
             fprintf(stderr, "[CUDAEmbeddingKernelT] Workspace buffer '%s' not found\n",
                     EmbeddingWorkspaceBuffers::TOKEN_IDS);
             return false;
         }
 
+        const bool use_device_token_ids =
+            device_token_ids_active_ &&
+            device_token_count_ == num_tokens &&
+            device_token_ids_ != nullptr;
+        int *d_token_ids = use_device_token_ids
+                               ? const_cast<int *>(device_token_ids_)
+                               : workspace_token_ids;
+
         const bool validate_gpu_ptrs = debugEnv().validation.validate_gpu_ptrs;
-        if (validate_gpu_ptrs &&
+        if (!use_device_token_ids && validate_gpu_ptrs &&
             !validateCudaTokenIdsHost(token_ids, num_tokens, /*vocab_size=*/0, /*fail_on_invalid=*/true))
         {
             return false;
@@ -1494,9 +1521,10 @@ namespace llaminar2
         const bool token_ids_preloaded = dynamic_params_active_ &&
                                          dynamic_token_count_ == num_tokens &&
                                          preload_stream_ == gpu_stream_ &&
+                                         token_ids &&
                                          h_token_ids_ &&
                                          std::memcmp(h_token_ids_, token_ids, token_bytes) == 0;
-        if (!token_ids_preloaded)
+        if (!use_device_token_ids && !token_ids_preloaded)
         {
             if (isGraphCaptureActive())
             {
@@ -1515,9 +1543,14 @@ namespace llaminar2
                 fprintf(stderr, "[CUDAEmbeddingKernelT] Token ID upload requires an explicit non-null stream\n");
                 return false;
             }
+            if (!token_ids)
+            {
+                fprintf(stderr, "[CUDAEmbeddingKernelT] Host token IDs are null and no device token source is active\n");
+                return false;
+            }
             dynamic_params_active_ = false;
             dynamic_token_count_ = 0;
-            err = cudaMemcpyAsync(d_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice,
+            err = cudaMemcpyAsync(workspace_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice,
                                   static_cast<cudaStream_t>(gpu_stream_));
             if (err != cudaSuccess)
             {

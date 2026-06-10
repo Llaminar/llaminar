@@ -343,6 +343,20 @@ TEST(Test__ForwardGraphSignature, DifferentAllPositionLogitsNotEqual)
     EXPECT_NE(terminal_only, all_positions);
 }
 
+TEST(Test__ForwardGraphSignature, DifferentDeviceTokenSourceNotEqual)
+{
+    ForwardGraphSignature host_tokens{.seq_len = 1,
+                                      .batch_size = 1,
+                                      .decode = true,
+                                      .uses_device_token_ids = false};
+    ForwardGraphSignature device_tokens = host_tokens;
+    device_tokens.uses_device_token_ids = true;
+
+    EXPECT_NE(host_tokens, device_tokens);
+    EXPECT_NE(ForwardGraphSignatureHash{}(host_tokens),
+              ForwardGraphSignatureHash{}(device_tokens));
+}
+
 TEST(Test__ForwardGraphSignature, DifferentPPFieldsNotEqual)
 {
     ForwardGraphSignature a{.pp_stage_enabled = true, .pp_first_layer = 0, .pp_last_layer = 13};

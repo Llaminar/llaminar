@@ -16,7 +16,26 @@
 namespace llaminar2::sampling_math
 {
     constexpr int kMaxTopK = 256;
+    constexpr int kSpeculativeBatchMaxRows = 4;
+    constexpr int kSpeculativeBatchMaxOutputTokens =
+        kSpeculativeBatchMaxRows + 1;
+    constexpr int kSpeculativeBatchMaxStopTokens = 8;
+    constexpr int kSpeculativeBatchMetaCount = 10;
     constexpr float kMaxUnitThreshold = 0.99999994f;
+
+    enum SpeculativeBatchMetaIndex : int
+    {
+        kSpecBatchMetaOk = 0,
+        kSpecBatchMetaOutputCount = 1,
+        kSpecBatchMetaAcceptedSpeculativePrefix = 2,
+        kSpecBatchMetaTargetVerifierStateCommitCount = 3,
+        kSpecBatchMetaReadyToken = 4,
+        kSpecBatchMetaRejectedVerifiedToken = 5,
+        kSpecBatchMetaStoppedOnOutput = 6,
+        kSpecBatchMetaAllSpeculativeAccepted = 7,
+        kSpecBatchMetaConsumedVerifierRows = 8,
+        kSpecBatchMetaSampledTerminal = 9
+    };
 
     LLAMINAR_SAMPLING_HD uint64_t splitmix64(uint64_t x)
     {
@@ -297,6 +316,131 @@ namespace llaminar2::sampling_math
 
         *out_token = selected;
         *out_accepted = 0;
+    }
+
+    /**
+     * @brief Reduce row-wise speculative verifier decisions into one commit plan.
+     *
+     * Row kernels decide the stochastic accept/reject token independently. This
+     * reducer applies the autoregressive semantics: emit tokens until the first
+     * rejection or stop token, count the accepted speculative prefix, and expose
+     * a ready token only when every verifier row accepted. The metadata layout
+     * is fixed by SpeculativeBatchMetaIndex so host tests and GPU kernels cannot
+     * drift.
+     */
+    LLAMINAR_SAMPLING_HD void summarize_speculative_verify_batch(
+        int first_token,
+        const int *row_tokens,
+        const int *row_accepted,
+        int row_count,
+        const int *stop_tokens,
+        int stop_token_count,
+        int bonus_ready_token,
+        int has_bonus_ready_token,
+        int *out_tokens,
+        int *out_meta)
+    {
+        if (!out_tokens || !out_meta ||
+            row_count < 0 ||
+            row_count > kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens)
+        {
+            if (out_meta)
+                out_meta[kSpecBatchMetaOk] = 0;
+            return;
+        }
+
+        for (int i = 0; i < kSpeculativeBatchMaxOutputTokens; ++i)
+            out_tokens[i] = -1;
+        for (int i = 0; i < kSpeculativeBatchMetaCount; ++i)
+            out_meta[i] = 0;
+
+        if (first_token < 0)
+        {
+            out_meta[kSpecBatchMetaOk] = 0;
+            return;
+        }
+
+        int output_count = 1;
+        int consumed_rows = 0;
+        int accepted_prefix = 0;
+        int rejected_token = -1;
+        bool stopped = false;
+        for (int i = 0; i < stop_token_count; ++i)
+        {
+            if (stop_tokens && stop_tokens[i] == first_token)
+            {
+                stopped = true;
+                break;
+            }
+        }
+        bool all_accepted = true;
+        out_tokens[0] = first_token;
+
+        for (int row = 0; !stopped && row < row_count; ++row)
+        {
+            if (!row_tokens || !row_accepted || row_tokens[row] < 0)
+            {
+                out_meta[kSpecBatchMetaOk] = 0;
+                return;
+            }
+
+            const int token = row_tokens[row];
+            const bool accepted = row_accepted[row] != 0;
+            out_tokens[output_count++] = token;
+            ++consumed_rows;
+
+            if (accepted)
+            {
+                ++accepted_prefix;
+            }
+            else
+            {
+                all_accepted = false;
+                rejected_token = token;
+            }
+
+            for (int i = 0; i < stop_token_count; ++i)
+            {
+                if (stop_tokens && stop_tokens[i] == token)
+                {
+                    stopped = true;
+                    break;
+                }
+            }
+            if (!accepted)
+                break;
+        }
+
+        int ready_token = -1;
+        int sampled_terminal = 0;
+        if (!stopped && all_accepted)
+        {
+            if (!has_bonus_ready_token || bonus_ready_token < 0)
+            {
+                out_meta[kSpecBatchMetaOk] = 0;
+                return;
+            }
+            ready_token = bonus_ready_token;
+            sampled_terminal = 1;
+        }
+
+        const int commit_count =
+            accepted_prefix + 1 < row_count + 1
+                ? accepted_prefix + 1
+                : row_count + 1;
+
+        out_meta[kSpecBatchMetaOk] = 1;
+        out_meta[kSpecBatchMetaOutputCount] = output_count;
+        out_meta[kSpecBatchMetaAcceptedSpeculativePrefix] = accepted_prefix;
+        out_meta[kSpecBatchMetaTargetVerifierStateCommitCount] = commit_count;
+        out_meta[kSpecBatchMetaReadyToken] = ready_token;
+        out_meta[kSpecBatchMetaRejectedVerifiedToken] = rejected_token;
+        out_meta[kSpecBatchMetaStoppedOnOutput] = stopped ? 1 : 0;
+        out_meta[kSpecBatchMetaAllSpeculativeAccepted] = all_accepted ? 1 : 0;
+        out_meta[kSpecBatchMetaConsumedVerifierRows] = consumed_rows;
+        out_meta[kSpecBatchMetaSampledTerminal] = sampled_terminal;
     }
 
 } // namespace llaminar2::sampling_math

@@ -31,6 +31,7 @@
 #include "config/OrchestrationConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
+#include "kernels/common/SamplingMath.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
@@ -179,6 +180,90 @@ namespace
             return true;
         }
 
+        bool forwardWithDeviceTokenIds(
+            const int *token_shadow,
+            const void *token_ids_device,
+            int seq_len) override
+        {
+            ++forward_with_device_token_ids_count_;
+            last_forward_device_token_ids_ = token_ids_device;
+            last_forward_device_token_seq_len_ = seq_len;
+            return token_shadow && token_ids_device && forward(token_shadow, seq_len);
+        }
+
+        const void *prepareMTPVerifierInputTokensOnDevice(
+            int32_t first_token,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override
+        {
+            ++prepare_mtp_verifier_input_tokens_on_device_count_;
+            last_prepare_mtp_verifier_first_token_ = first_token;
+            last_prepare_mtp_verifier_first_draft_slot_ = first_draft_slot;
+            last_prepare_mtp_verifier_draft_token_count_ = draft_token_count;
+            last_prepare_mtp_verifier_total_tokens_ = total_verifier_input_tokens;
+            if (!supports_stochastic_device_sampling_ ||
+                first_draft_slot < 0 ||
+                draft_token_count < 0 ||
+                total_verifier_input_tokens != draft_token_count + 1 ||
+                total_verifier_input_tokens >
+                    static_cast<int>(device_verifier_input_tokens_.size()) ||
+                first_draft_slot + draft_token_count >
+                    static_cast<int>(device_draft_sample_tokens_.size()))
+            {
+                return nullptr;
+            }
+
+            device_verifier_input_tokens_[0] = first_token;
+            for (int i = 0; i < draft_token_count; ++i)
+            {
+                device_verifier_input_tokens_[static_cast<size_t>(i + 1)] =
+                    device_draft_sample_tokens_[static_cast<size_t>(
+                        first_draft_slot + i)];
+            }
+            return device_verifier_input_tokens_.data();
+        }
+
+        const void *prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+            int first_target_sample_slot,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override
+        {
+            ++prepare_mtp_verifier_input_tokens_on_device_count_;
+            ++prepare_mtp_verifier_input_tokens_device_first_count_;
+            last_prepare_mtp_verifier_first_target_sample_slot_ =
+                first_target_sample_slot;
+            last_prepare_mtp_verifier_first_draft_slot_ = first_draft_slot;
+            last_prepare_mtp_verifier_draft_token_count_ = draft_token_count;
+            last_prepare_mtp_verifier_total_tokens_ = total_verifier_input_tokens;
+            if (!supports_stochastic_device_sampling_ ||
+                first_target_sample_slot < 0 ||
+                first_target_sample_slot >=
+                    static_cast<int>(device_target_sample_tokens_.size()) ||
+                first_draft_slot < 0 ||
+                draft_token_count < 0 ||
+                total_verifier_input_tokens != draft_token_count + 1 ||
+                total_verifier_input_tokens >
+                    static_cast<int>(device_verifier_input_tokens_.size()) ||
+                first_draft_slot + draft_token_count >
+                    static_cast<int>(device_draft_sample_tokens_.size()))
+            {
+                return nullptr;
+            }
+
+            device_verifier_input_tokens_[0] =
+                device_target_sample_tokens_[
+                    static_cast<size_t>(first_target_sample_slot)];
+            for (int i = 0; i < draft_token_count; ++i)
+            {
+                device_verifier_input_tokens_[static_cast<size_t>(i + 1)] =
+                    device_draft_sample_tokens_[static_cast<size_t>(
+                        first_draft_slot + i)];
+            }
+            return device_verifier_input_tokens_.data();
+        }
+
         const float *logits() const override
         {
             if (hide_local_logits_)
@@ -202,6 +287,20 @@ namespace
                 setLocalToken(mtp_logits_local_, 0, MTP_ARGMAX_TOKEN, 10.0f);
             }
             return true;
+        }
+
+        /**
+         * @brief Mock the sidecar path that leaves logits ordered for device sampling.
+         *
+         * The production runner may leave a GPU graph stream pending here. The
+         * unit mock only records that OrchestrationRunner chose this path, then
+         * delegates to the normal sidecar implementation so existing fake logits
+         * stay identical.
+         */
+        bool forwardMTPForDeviceSampling(int32_t draft_condition_token) override
+        {
+            ++forward_mtp_for_device_sampling_count_;
+            return forwardMTP(draft_condition_token);
         }
 
         bool supportsChainedMTPDrafts() const override
@@ -387,6 +486,16 @@ namespace
             return supports_mtp_sidecar_sample_fusion_;
         }
 
+        bool supportsMTPSidecarLogitsStreamHandoff() const override
+        {
+            return supports_mtp_sidecar_stream_handoff_;
+        }
+
+        bool supportsMTPDeviceDraftTokenInput() const override
+        {
+            return supports_mtp_device_draft_token_input_;
+        }
+
         bool supportsMTPSidecarPreservesMainState() const override
         {
             return supports_mtp_sidecar_preserves_main_state_;
@@ -456,6 +565,63 @@ namespace
                 return false;
             *out_token = token;
             return true;
+        }
+
+        /**
+         * @brief Mock the chained sidecar stream handoff entrypoint.
+         *
+         * This mirrors forwardMTPForDeviceSampling(), but starts from the hidden
+         * row produced by the previous fake sidecar step.
+         */
+        bool forwardMTPFromLastDraftForDeviceSampling(
+            int32_t draft_condition_token,
+            int position_id) override
+        {
+            ++forward_mtp_from_last_draft_for_device_sampling_count_;
+            return forwardMTPFromLastDraft(draft_condition_token, position_id);
+        }
+
+        bool forwardMTPFromDeviceDraftForDeviceSampling(
+            int draft_sample_slot,
+            int position_id) override
+        {
+            ++forward_mtp_from_device_draft_for_device_sampling_count_;
+            if (!supports_mtp_device_draft_token_input_ ||
+                draft_sample_slot < 0 ||
+                draft_sample_slot >= static_cast<int>(device_draft_sample_tokens_.size()))
+            {
+                return false;
+            }
+            const int32_t token =
+                device_draft_sample_tokens_[static_cast<size_t>(draft_sample_slot)];
+            if (token < 0)
+                return false;
+            return forwardMTPFromLastDraft(token, position_id);
+        }
+
+        bool forwardMTPFromDeviceTargetForDeviceSampling(
+            int target_sample_slot,
+            int position_id) override
+        {
+            (void)position_id;
+            ++forward_mtp_from_device_target_for_device_sampling_count_;
+            if (!supports_mtp_device_draft_token_input_ ||
+                target_sample_slot < 0 ||
+                target_sample_slot >= static_cast<int>(device_target_sample_tokens_.size()))
+            {
+                return false;
+            }
+            const int32_t token =
+                device_target_sample_tokens_[static_cast<size_t>(target_sample_slot)];
+            if (token < 0)
+                return false;
+            return forwardMTP(token);
+        }
+
+        bool flushPendingMTPWork() override
+        {
+            ++flush_pending_mtp_work_count_;
+            return flush_pending_mtp_work_ok_;
         }
 
         void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override
@@ -654,7 +820,47 @@ namespace
             if (!supports_stochastic_device_sampling_)
                 return -1;
             const auto &distribution = deviceDistribution(buffer, slot);
-            return sampleWithThreshold(distribution, threshold);
+            const int token = sampleWithThreshold(distribution, threshold);
+            if (buffer == DeviceDistributionBuffer::Draft &&
+                slot >= 0 &&
+                slot < static_cast<int>(device_draft_sample_tokens_.size()))
+            {
+                device_draft_sample_tokens_[static_cast<size_t>(slot)] = token;
+            }
+            if (buffer == DeviceDistributionBuffer::Target &&
+                slot >= 0 &&
+                slot < static_cast<int>(device_target_sample_tokens_.size()))
+            {
+                device_target_sample_tokens_[static_cast<size_t>(slot)] = token;
+            }
+            return token;
+        }
+
+        bool sampleStochasticDistributionOnDeviceDeferred(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override
+        {
+            ++device_distribution_sample_deferred_count_;
+            if (!supports_stochastic_device_sampling_)
+                return false;
+            const auto &distribution = deviceDistribution(buffer, slot);
+            const int token = sampleWithThreshold(distribution, threshold);
+            if (token < 0)
+                return false;
+            if (buffer == DeviceDistributionBuffer::Draft &&
+                slot >= 0 &&
+                slot < static_cast<int>(device_draft_sample_tokens_.size()))
+            {
+                device_draft_sample_tokens_[static_cast<size_t>(slot)] = token;
+            }
+            if (buffer == DeviceDistributionBuffer::Target &&
+                slot >= 0 &&
+                slot < static_cast<int>(device_target_sample_tokens_.size()))
+            {
+                device_target_sample_tokens_[static_cast<size_t>(slot)] = token;
+            }
+            return true;
         }
 
         bool verifyStochasticDistributionsOnDevice(
@@ -715,7 +921,18 @@ namespace
                 if (target.empty() || draft.empty())
                     return false;
 
-                const int32_t draft_token = draft_tokens[row];
+                int32_t draft_token = draft_tokens[row];
+                if (draft_token < 0)
+                {
+                    const int device_slot = first_draft_slot + row;
+                    if (device_slot < 0 ||
+                        device_slot >= static_cast<int>(device_draft_sample_tokens_.size()))
+                    {
+                        return false;
+                    }
+                    draft_token =
+                        device_draft_sample_tokens_[static_cast<size_t>(device_slot)];
+                }
                 const float p = Sampler::probability_of_token(target, draft_token);
                 const float q = Sampler::probability_of_token(draft, draft_token);
                 const float accept_probability =
@@ -732,16 +949,200 @@ namespace
             return true;
         }
 
+        bool verifyStochasticDistributionsBatchOutcomeOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out) override
+        {
+            using namespace sampling_math;
+            if (!out ||
+                row_count <= 0 ||
+                row_count > kSpeculativeBatchMaxRows ||
+                stop_token_count < 0 ||
+                stop_token_count > kSpeculativeBatchMaxStopTokens ||
+                (stop_token_count > 0 && !stop_tokens))
+            {
+                return false;
+            }
+            *out = DeviceSpeculativeVerifyBatchOutcome{};
+
+            std::array<DeviceSpeculativeVerifyResult, kSpeculativeBatchMaxRows> rows;
+            if (!verifyStochasticDistributionsBatchOnDevice(
+                    first_target_slot,
+                    first_draft_slot,
+                    draft_tokens,
+                    accept_thresholds,
+                    residual_thresholds,
+                    row_count,
+                    rows.data()))
+            {
+                return false;
+            }
+
+            const int32_t ready_token =
+                bonus_target_slot >= 0
+                    ? sampleStochasticDistributionOnDevice(
+                          DeviceDistributionBuffer::Target,
+                          bonus_target_slot,
+                          bonus_threshold)
+                    : -1;
+
+            std::array<int, kSpeculativeBatchMaxRows> tokens = {-1, -1, -1, -1};
+            std::array<int, kSpeculativeBatchMaxRows> accepted = {0, 0, 0, 0};
+            for (int row = 0; row < row_count; ++row)
+            {
+                tokens[static_cast<size_t>(row)] = rows[static_cast<size_t>(row)].token;
+                accepted[static_cast<size_t>(row)] =
+                    rows[static_cast<size_t>(row)].accepted ? 1 : 0;
+            }
+
+            std::array<int, kSpeculativeBatchMaxStopTokens> packed_stop_tokens =
+                {-1, -1, -1, -1, -1, -1, -1, -1};
+            for (int i = 0; i < stop_token_count; ++i)
+                packed_stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
+
+            std::array<int, kSpeculativeBatchMaxOutputTokens> output_tokens =
+                {-1, -1, -1, -1, -1};
+            std::array<int, kSpeculativeBatchMetaCount> meta = {};
+            summarize_speculative_verify_batch(
+                first_token,
+                tokens.data(),
+                accepted.data(),
+                row_count,
+                packed_stop_tokens.data(),
+                stop_token_count,
+                ready_token,
+                bonus_target_slot >= 0 ? 1 : 0,
+                output_tokens.data(),
+                meta.data());
+
+            if (meta[kSpecBatchMetaOk] == 0)
+                return false;
+
+            out->ok = true;
+            for (size_t i = 0; i < out->output_tokens.size(); ++i)
+                out->output_tokens[i] = output_tokens[i];
+            out->output_token_count = meta[kSpecBatchMetaOutputCount];
+            out->accepted_speculative_prefix =
+                meta[kSpecBatchMetaAcceptedSpeculativePrefix];
+            out->target_verifier_state_commit_count =
+                meta[kSpecBatchMetaTargetVerifierStateCommitCount];
+            out->ready_token = meta[kSpecBatchMetaReadyToken];
+            out->rejected_verified_token = meta[kSpecBatchMetaRejectedVerifiedToken];
+            out->stopped_on_output = meta[kSpecBatchMetaStoppedOnOutput] != 0;
+            out->all_speculative_accepted =
+                meta[kSpecBatchMetaAllSpeculativeAccepted] != 0;
+            out->consumed_verifier_rows = meta[kSpecBatchMetaConsumedVerifierRows];
+            out->sampled_terminal = meta[kSpecBatchMetaSampledTerminal] != 0;
+            return true;
+        }
+
+        bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out) override
+        {
+            ++device_distribution_batch_outcome_device_first_count_;
+            if (first_target_sample_slot < 0 ||
+                first_target_sample_slot >=
+                    static_cast<int>(device_target_sample_tokens_.size()))
+            {
+                return false;
+            }
+            const int32_t first_token =
+                device_target_sample_tokens_[
+                    static_cast<size_t>(first_target_sample_slot)];
+            if (first_token < 0)
+                return false;
+            return verifyStochasticDistributionsBatchOutcomeOnDevice(
+                first_target_slot,
+                first_draft_slot,
+                draft_tokens,
+                accept_thresholds,
+                residual_thresholds,
+                row_count,
+                first_token,
+                stop_tokens,
+                stop_token_count,
+                bonus_target_slot,
+                bonus_threshold,
+                out);
+        }
+
         // =====================================================================
         // Test inspection methods
         // =====================================================================
 
         int forwardCallCount() const { return forward_call_count_; }
+        int forwardWithDeviceTokenIdsCount() const { return forward_with_device_token_ids_count_; }
+        int prepareMTPVerifierInputTokensOnDeviceCount() const
+        {
+            return prepare_mtp_verifier_input_tokens_on_device_count_;
+        }
+        int lastPrepareMTPVerifierFirstToken() const { return last_prepare_mtp_verifier_first_token_; }
+        int lastPrepareMTPVerifierFirstDraftSlot() const
+        {
+            return last_prepare_mtp_verifier_first_draft_slot_;
+        }
+        int lastPrepareMTPVerifierDraftTokenCount() const
+        {
+            return last_prepare_mtp_verifier_draft_token_count_;
+        }
+        int lastPrepareMTPVerifierTotalTokens() const
+        {
+            return last_prepare_mtp_verifier_total_tokens_;
+        }
+        const void *lastForwardDeviceTokenIds() const { return last_forward_device_token_ids_; }
+        int lastForwardDeviceTokenSeqLen() const { return last_forward_device_token_seq_len_; }
+        const std::array<int32_t, 4> &deviceVerifierInputTokens() const
+        {
+            return device_verifier_input_tokens_;
+        }
         int clearCacheCount() const { return clear_cache_count_; }
         int forwardMTPCount() const { return forward_mtp_count_; }
         int forwardMTPFromLastDraftCount() const { return forward_mtp_from_last_draft_count_; }
+        int forwardMTPForDeviceSamplingCount() const { return forward_mtp_for_device_sampling_count_; }
+        int forwardMTPFromLastDraftForDeviceSamplingCount() const
+        {
+            return forward_mtp_from_last_draft_for_device_sampling_count_;
+        }
+        int forwardMTPFromDeviceDraftForDeviceSamplingCount() const
+        {
+            return forward_mtp_from_device_draft_for_device_sampling_count_;
+        }
+        int forwardMTPFromDeviceTargetForDeviceSamplingCount() const
+        {
+            return forward_mtp_from_device_target_for_device_sampling_count_;
+        }
+        int prepareMTPVerifierInputTokensDeviceFirstCount() const
+        {
+            return prepare_mtp_verifier_input_tokens_device_first_count_;
+        }
+        int verifyStochasticDistributionsBatchOutcomeDeviceFirstCount() const
+        {
+            return device_distribution_batch_outcome_device_first_count_;
+        }
         int forwardMTPAndSampleCount() const { return forward_mtp_and_sample_count_; }
         int forwardMTPFromLastDraftAndSampleCount() const { return forward_mtp_from_last_draft_and_sample_count_; }
+        int flushPendingMTPWorkCount() const { return flush_pending_mtp_work_count_; }
         int restoreCount() const { return restore_count_; }
         int captureCheckpointCount() const { return capture_checkpoint_count_; }
         int setAllPositionCount() const { return set_all_position_count_; }
@@ -771,6 +1172,10 @@ namespace
         int applyAllPositionPenaltiesCount() const { return apply_all_position_penalties_count_; }
         int deviceDistributionBuildCount() const { return device_distribution_build_count_; }
         int deviceDistributionSampleCount() const { return device_distribution_sample_count_; }
+        int deviceDistributionSampleDeferredCount() const
+        {
+            return device_distribution_sample_deferred_count_;
+        }
         int deviceDistributionVerifyCount() const { return device_distribution_verify_count_; }
         int deviceDistributionVerifyBatchCount() const { return device_distribution_verify_batch_count_; }
         int allPositionVerifierSyncDeferralSetCount() const { return all_position_verifier_sync_deferral_set_count_; }
@@ -815,6 +1220,14 @@ namespace
         void enableMTPSidecarSampleFusion()
         {
             supports_mtp_sidecar_sample_fusion_ = true;
+        }
+        void enableMTPSidecarLogitsStreamHandoff()
+        {
+            supports_mtp_sidecar_stream_handoff_ = true;
+        }
+        void enableMTPDeviceDraftTokenInput()
+        {
+            supports_mtp_device_draft_token_input_ = true;
         }
         void enableMTPSidecarPreservesMainState()
         {
@@ -1169,10 +1582,17 @@ namespace
         std::shared_ptr<FP32Tensor> mtp_logits_local_;
         std::shared_ptr<FP32Tensor> all_position_logits_local_;
         int forward_call_count_{0};
+        int forward_with_device_token_ids_count_{0};
+        int prepare_mtp_verifier_input_tokens_on_device_count_{0};
         int forward_mtp_count_{0};
         int forward_mtp_from_last_draft_count_{0};
+        int forward_mtp_for_device_sampling_count_{0};
+        int forward_mtp_from_last_draft_for_device_sampling_count_{0};
+        int forward_mtp_from_device_draft_for_device_sampling_count_{0};
+        int forward_mtp_from_device_target_for_device_sampling_count_{0};
         int forward_mtp_and_sample_count_{0};
         int forward_mtp_from_last_draft_and_sample_count_{0};
+        int flush_pending_mtp_work_count_{0};
         int clear_cache_count_{0};
         int restore_count_{0};
         mutable int capture_checkpoint_count_{0};
@@ -1195,8 +1615,11 @@ namespace
         int apply_all_position_penalties_count_{0};
         int device_distribution_build_count_{0};
         int device_distribution_sample_count_{0};
+        int device_distribution_sample_deferred_count_{0};
         int device_distribution_verify_count_{0};
         int device_distribution_verify_batch_count_{0};
+        int device_distribution_batch_outcome_device_first_count_{0};
+        int prepare_mtp_verifier_input_tokens_device_first_count_{0};
         int all_position_verifier_sync_deferral_set_count_{0};
         int all_position_verifier_sync_deferral_enable_count_{0};
         int all_position_verifier_sync_deferral_disable_count_{0};
@@ -1205,6 +1628,12 @@ namespace
         int last_mtp_condition_token_{-1};
         int last_chained_mtp_condition_token_{-1};
         int last_chained_mtp_position_id_{-1};
+        int last_prepare_mtp_verifier_first_token_{-1};
+        int last_prepare_mtp_verifier_first_target_sample_slot_{-1};
+        int last_prepare_mtp_verifier_first_draft_slot_{-1};
+        int last_prepare_mtp_verifier_draft_token_count_{0};
+        int last_prepare_mtp_verifier_total_tokens_{0};
+        int last_forward_device_token_seq_len_{0};
         bool is_first_forward_in_cycle_{true};
         bool mtp_enabled_{false};
         bool accept_mtp_token_{true};
@@ -1215,6 +1644,8 @@ namespace
         bool supports_mtp_token_coordination_{false};
         bool supports_chained_mtp_drafts_{false};
         bool supports_mtp_sidecar_sample_fusion_{false};
+        bool supports_mtp_sidecar_stream_handoff_{false};
+        bool supports_mtp_device_draft_token_input_{false};
         bool supports_mtp_sidecar_preserves_main_state_{false};
         bool supports_mtp_spec_state_publication_{false};
         bool publish_mtp_spec_state_ok_{true};
@@ -1224,6 +1655,7 @@ namespace
         bool hide_local_logits_{false};
         bool use_captured_snapshot_{false};
         bool last_commit_mtp_allow_speculative_discard_{false};
+        bool flush_pending_mtp_work_ok_{true};
         DeviceId primary_device_{DeviceId::cpu()};
         int vocab_start_{0};
         int vocab_local_{VOCAB_SIZE};
@@ -1242,6 +1674,10 @@ namespace
         mutable std::vector<PrefixStateSnapshot> captured_checkpoint_script_;
         std::array<std::vector<SamplingDistributionEntry>, 4> target_device_distributions_;
         std::array<std::vector<SamplingDistributionEntry>, 3> draft_device_distributions_;
+        std::array<int32_t, 4> device_target_sample_tokens_ = {-1, -1, -1, -1};
+        std::array<int32_t, 3> device_draft_sample_tokens_ = {-1, -1, -1};
+        std::array<int32_t, 4> device_verifier_input_tokens_ = {-1, -1, -1, -1};
+        const void *last_forward_device_token_ids_{nullptr};
         std::vector<SamplingDistributionEntry> invalid_distribution_;
         size_t verifier_accepted_prefix_script_index_{0};
         size_t decode_argmax_script_index_{0};
@@ -2679,6 +3115,7 @@ namespace
                 MTPVerifyMode::SpeculativeSampling);
             mock->enableStochasticDeviceSampling();
             mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPSidecarLogitsStreamHandoff();
             mock->requireMTPDecodeEquivalentReplay();
             mock->enableMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({1});
@@ -2713,10 +3150,13 @@ namespace
             EXPECT_EQ(mock->restoreCount(), 0);
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1);
             EXPECT_EQ(mock->deviceDistributionBuildCount(), 4)
-                << "first token, draft, all-position verifier row, and bonus ready distribution";
-            EXPECT_EQ(mock->deviceDistributionSampleCount(), 3);
+                << "first target token, draft, all-position verifier row, and bonus ready distribution";
+            EXPECT_EQ(mock->deviceDistributionSampleCount(), 3)
+                << "first target token, draft, and bonus ready-token sampling stay device-resident";
             EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
-            EXPECT_EQ(mock->applyMainPenaltiesCount(), 1);
+            EXPECT_EQ(mock->applyMainPenaltiesCount(), 0)
+                << "the first stochastic token has no prior sampler history, "
+                   "so an empty penalty map must not hit the device hook";
             EXPECT_EQ(mock->applyMTPPenaltiesCount(), 1);
             EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
 
@@ -2752,6 +3192,203 @@ namespace
         PerfStatsCollector::reset();
     }
 
+    TEST_F(Test__PrefillDecodeTransition, AllPositionSpecPublicationPenaltyFreeStochasticDefersVerifierSync)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_all_position_stochastic_deferred_sync_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::rocm(0),
+                /*mtp_draft_tokens=*/1,
+                /*chained_mtp_support=*/false,
+                /*sidecar_sample_fusion=*/false,
+                {},
+                MTPVerifyMode::SpeculativeSampling);
+            mock->enableStochasticDeviceSampling();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPSidecarLogitsStreamHandoff();
+            mock->requireMTPDecodeEquivalentReplay();
+            mock->enableMTPSpecStatePublication();
+            mock->setVerifierAcceptedPrefixScript({1});
+
+            SamplingParams sampling;
+            sampling.temperature = 0.8f;
+            sampling.top_k = 2;
+            sampling.top_p = 0.95f;
+            sampling.seed = 123;
+            runner->setSamplingParams(sampling);
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->allPositionVerifierSyncDeferralEnableCount(), 1)
+                << "penalty-free device-batched stochastic verification should "
+                   "handoff the verifier graph stream to the sampler path";
+            EXPECT_EQ(mock->allPositionVerifierSyncDeferralDisableCount(), 1);
+            EXPECT_FALSE(mock->allPositionVerifierSyncDeferralEnabled());
+            EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 1);
+            EXPECT_EQ(mock->forwardMTPFromLastDraftForDeviceSamplingCount(), 0);
+            EXPECT_EQ(mock->flushPendingMTPWorkCount(), 1)
+                << "the sidecar/device-sampler stream handoff should skip the "
+                   "intermediate flush and keep only the final pre-verifier guard";
+            EXPECT_EQ(mock->deviceDistributionBuildCount(), 4)
+                << "first target token, draft, verifier row, and bonus distribution remain in "
+                   "compact device-resident buffers";
+            EXPECT_EQ(mock->deviceDistributionSampleCount(), 2)
+                << "first target token and bonus sample are host-visible; "
+                   "the MTP draft sample should stay device-resident";
+            EXPECT_EQ(mock->deviceDistributionSampleDeferredCount(), 1);
+            EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
+            EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0)
+                << "penalties would make row distributions history-dependent "
+                   "and must keep the synchronized verifier boundary";
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *batched_rows =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "all_position_stochastic_device_batched_rows",
+                                       {{"implementation", "device_batch_outcome"},
+                                        {"verifier_path", "all_position_state_publication"}});
+            ASSERT_NE(batched_rows, nullptr);
+            const PerfStatRecord *deferred_draft =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "mtp_token_stochastic_deferred_host_reads",
+                                       {{"draft_idx", "0"}});
+            ASSERT_NE(deferred_draft, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, PenaltyFreeStochasticChainsSidecarFromDeviceDraftToken)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_stochastic_device_draft_token_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true,
+                /*sidecar_sample_fusion=*/false,
+                {},
+                MTPVerifyMode::SpeculativeSampling);
+            mock->enableStochasticDeviceSampling();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPSidecarLogitsStreamHandoff();
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->enableMTPSpecStatePublication();
+            mock->setVerifierAcceptedPrefixScript({2});
+
+            SamplingParams sampling;
+            sampling.temperature = 0.8f;
+            sampling.top_k = 2;
+            sampling.top_p = 0.95f;
+            sampling.seed = 123;
+            runner->setSamplingParams(sampling);
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0);
+            EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(), 1)
+                << "the first stochastic sidecar should consume the deferred "
+                   "main-model target token from its device slot";
+            EXPECT_EQ(mock->forwardMTPFromDeviceDraftForDeviceSamplingCount(), 1)
+                << "depth>1 stochastic sidecar chaining should consume the "
+                   "previous sampled draft token from the device slot";
+            EXPECT_EQ(mock->forwardMTPFromLastDraftForDeviceSamplingCount(), 0)
+                << "the device-token path must not upload draft_tokens.back() "
+                   "through the legacy host-token chained sidecar";
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1)
+                << "penalty-free stochastic all-position verification should "
+                   "compose verifier input IDs from device-resident draft slots";
+            EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1)
+                << "the verifier embedding graph should consume the prepared "
+                   "device token row while host tokens remain a metadata shadow";
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 1);
+            EXPECT_EQ(mock->lastPrepareMTPVerifierFirstDraftSlot(), 0);
+            EXPECT_EQ(mock->lastPrepareMTPVerifierDraftTokenCount(), 2);
+            EXPECT_EQ(mock->lastPrepareMTPVerifierTotalTokens(), 3);
+            EXPECT_EQ(mock->lastForwardDeviceTokenIds(),
+                      mock->deviceVerifierInputTokens().data());
+            EXPECT_EQ(mock->lastForwardDeviceTokenSeqLen(), 3);
+            EXPECT_THAT(mock->deviceVerifierInputTokens(),
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    -1));
+            EXPECT_EQ(mock->lastChainedMTPConditionToken(),
+                      MockInferenceRunner::MTP_ARGMAX_TOKEN);
+            EXPECT_EQ(mock->deviceDistributionBuildCount(), 6)
+                << "main, two draft distributions, two verifier rows, and bonus";
+            EXPECT_EQ(mock->deviceDistributionSampleCount(), 1)
+                << "only the bonus ready-token sample should be host-visible; "
+                   "the first target and draft samples stay device-resident";
+            EXPECT_EQ(mock->deviceDistributionSampleDeferredCount(), 3)
+                << "the first target token and both MTP drafts should stay in "
+                   "device slots until the batched verifier summarizes outcome";
+            EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
+            EXPECT_EQ(mock->verifyStochasticDistributionsBatchOutcomeDeviceFirstCount(), 1);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *device_input =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "stochastic_sidecar_device_token_inputs",
+                                       {{"draft_idx", "1"}});
+            ASSERT_NE(device_input, nullptr);
+            const PerfStatRecord *verifier_device_input =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "all_position_verifier_device_token_inputs",
+                                       {{"total_tokens", "3"}});
+            ASSERT_NE(verifier_device_input, nullptr);
+            const PerfStatRecord *first_target_input =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "stochastic_first_sidecar_device_target_inputs",
+                                       {});
+            ASSERT_NE(first_target_input, nullptr);
+            const PerfStatRecord *deferred_drafts =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "mtp_token_stochastic_deferred_host_reads",
+                                       {{"draft_idx", "1"}});
+            ASSERT_NE(deferred_drafts, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
     TEST_F(Test__PrefillDecodeTransition, AllPositionSpecPublicationStochasticReplaysResidualCorrection)
     {
         const std::filesystem::path export_path =
@@ -2775,6 +3412,7 @@ namespace
                 MTPVerifyMode::SpeculativeSampling);
             mock->enableStochasticDeviceSampling();
             mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPSidecarLogitsStreamHandoff();
             mock->enableMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({0});
             mock->setDecodeArgmaxScript({MockInferenceRunner::DECODE_ARGMAX_TOKEN});
@@ -2799,6 +3437,10 @@ namespace
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
             EXPECT_EQ(mock->allPositionVerifierSyncDeferralSetCount(), 0);
+            EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0)
+                << "penalty-bearing stochastic sampling is history-dependent, "
+                   "so it must not use the deferred sidecar logits handoff";
+            EXPECT_EQ(mock->flushPendingMTPWorkCount(), 2);
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
@@ -2806,10 +3448,12 @@ namespace
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
                 << "only the all-position verifier forward runs in this step";
             EXPECT_EQ(mock->deviceDistributionBuildCount(), 3)
-                << "first token, draft, and all-position verifier row distributions";
+                << "first target token, draft, and all-position verifier row distributions";
             EXPECT_EQ(mock->deviceDistributionSampleCount(), 2);
             EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
-            EXPECT_EQ(mock->applyMainPenaltiesCount(), 1);
+            EXPECT_EQ(mock->applyMainPenaltiesCount(), 0)
+                << "the first stochastic token has no prior sampler history, "
+                   "so an empty penalty map must not hit the device hook";
             EXPECT_EQ(mock->applyMTPPenaltiesCount(), 1);
             EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 1);
 
@@ -3671,12 +4315,14 @@ namespace
         EXPECT_EQ(mock->sampleMTPLogitsCount(), 0);
         EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
         EXPECT_EQ(mock->deviceDistributionBuildCount(), 4)
-            << "first token, MTP draft, verifier row, and terminal ready-token distributions should stay compact/device-resident";
+            << "first target token, MTP draft, verifier row, and terminal ready-token distributions should stay compact/device-resident";
         EXPECT_EQ(mock->deviceDistributionSampleCount(), 3)
-            << "first token, MTP draft, and terminal ready-token sampling should avoid host full-logit sampling";
+            << "first target token, MTP draft, and terminal ready-token sampling should avoid host full-logit sampling";
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0);
         EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
-        EXPECT_EQ(mock->applyMainPenaltiesCount(), 3);
+        EXPECT_EQ(mock->applyMainPenaltiesCount(), 2)
+            << "empty first-token penalties are skipped; the sequential verifier "
+               "and ready-token rows still apply non-empty history penalties";
         EXPECT_EQ(mock->applyMTPPenaltiesCount(), 1);
         EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
         EXPECT_EQ(mock->forwardMTPCount(), 1);
@@ -3738,7 +4384,7 @@ namespace
             << "stateful stochastic verification must not use all-position verifier rows";
         EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
         EXPECT_EQ(mock->deviceDistributionBuildCount(), 4)
-            << "first token, MTP draft, sequential target row, and ready token distributions stay compact/device-resident";
+            << "first target token, MTP draft, sequential target row, and ready token distributions stay compact/device-resident";
         EXPECT_EQ(mock->deviceDistributionSampleCount(), 3);
         EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
         EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2)
@@ -3930,9 +4576,9 @@ namespace
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
         EXPECT_EQ(mock->deviceDistributionBuildCount(), 4)
-            << "first token, MTP draft, verifier row, and terminal row distributions should stay compact/device-resident";
+            << "first target token, MTP draft, verifier row, and terminal row distributions should stay compact/device-resident";
         EXPECT_EQ(mock->deviceDistributionSampleCount(), 3)
-            << "first token, MTP draft, and post-correction ready-token sampling should avoid full-logit host sampling";
+            << "first target token, MTP draft, and post-correction ready-token sampling should avoid full-logit host sampling";
         EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0)
             << "the first rejected row should use the batched residual-capable verifier";

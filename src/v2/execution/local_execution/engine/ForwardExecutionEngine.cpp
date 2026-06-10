@@ -294,6 +294,7 @@ namespace llaminar2
                 {"decode_has_history", boolTag(signature.decode_has_history)},
                 {"all_position_logits", boolTag(signature.all_position_logits)},
                 {"all_position_logit_rows", std::to_string(signature.all_position_logit_rows)},
+                {"uses_device_token_ids", boolTag(signature.uses_device_token_ids)},
                 {"moe_placement_epoch", std::to_string(signature.moe_placement_epoch)}};
         }
 
@@ -755,7 +756,8 @@ namespace llaminar2
         const bool is_pp_non_embedding_stage =
             config_.pp_stage_config.has_value() && !config_.pp_stage_config->has_embedding;
         const bool has_stable_forward_inputs =
-            ((input.token_ids != nullptr) && (input.position_ids != nullptr)) ||
+            (((input.token_ids != nullptr) || (input.token_ids_device != nullptr)) &&
+             (input.position_ids != nullptr)) ||
             (is_pp_non_embedding_stage && (input.position_ids != nullptr));
 
         const auto &env = debugEnv();
@@ -887,6 +889,7 @@ namespace llaminar2
                 decode_has_history,
                 all_position_logits,
                 all_position_logits ? std::max(0, host.allPositionLogitRows()) : 0,
+                input.token_ids_device != nullptr,
                 is_standard_path,
                 config_.pp_stage_config.has_value(),
                 pp_first_layer,

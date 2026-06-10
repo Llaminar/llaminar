@@ -921,6 +921,140 @@ namespace llaminar2
         }
 
         /**
+         * @brief Enqueue batched speculative verification using device draft tokens.
+         *
+         * This is the vLLM-style sibling of
+         * enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatch(): the
+         * sampled draft token sequence already lives in arena-owned device
+         * memory, so the verifier kernel reads `draft_tokens_device[row]`
+         * directly instead of receiving draft tokens as host scalar kernel
+         * arguments. Thresholds remain scalar host values for now because they
+         * are deterministic RNG outputs owned by the runner; moving them to
+         * device memory is a later plumbing step.
+         *
+         * Implementations must only enqueue work on `stream`; they must not
+         * allocate, synchronize, or use a default/null GPU stream.
+         */
+        virtual bool enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            const void *draft_token_ids_device,
+            const void *draft_probs_device,
+            int top_k,
+            int distribution_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            const float *residual_thresholds_host,
+            int row_count,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr)
+        {
+            (void)target_token_ids_device;
+            (void)target_probs_device;
+            (void)draft_token_ids_device;
+            (void)draft_probs_device;
+            (void)top_k;
+            (void)distribution_stride;
+            (void)draft_tokens_device;
+            (void)accept_thresholds_host;
+            (void)residual_thresholds_host;
+            (void)row_count;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue device-side reduction of batched speculative verifier rows.
+         *
+         * The row verifier writes `verify_tokens_device` and
+         * `verify_accepted_device`. This graph-capturable reducer converts those
+         * row-local decisions into the vLLM-style output contract: committed
+         * output tokens plus a small integer metadata table. Stop tokens are
+         * host-side scalars copied into kernel arguments by backend wrappers;
+         * the kernel never dereferences host memory. Requires an explicit
+         * non-null stream.
+         */
+        virtual bool enqueueSummarizeSpeculativeVerifyBatch(
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            int row_count,
+            int first_token,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            const void *bonus_token_device,
+            bool has_bonus_token,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_meta_device)
+        {
+            (void)verify_tokens_device;
+            (void)verify_accepted_device;
+            (void)row_count;
+            (void)first_token;
+            (void)stop_tokens_host;
+            (void)stop_token_count;
+            (void)bonus_token_device;
+            (void)has_bonus_token;
+            (void)device_id;
+            (void)stream;
+            (void)out_tokens_device;
+            (void)out_meta_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue batch summary using a device-resident first token.
+         *
+         * This is the graph-friendly companion to
+         * enqueueSummarizeSpeculativeVerifyBatch(). The first main-model token
+         * is sampled on GPU and remains in arena scratch until this reducer
+         * consumes it. Backends must launch on the explicit `stream`, read
+         * `first_token_device` inside the kernel, and call the same shared
+         * SamplingMath reducer as the host-token variant.
+         *
+         * @param first_token_device Device pointer to one INT32 sampled token.
+         * @return true when the reducer launch was queued successfully.
+         */
+        virtual bool enqueueSummarizeSpeculativeVerifyBatchDeviceFirstToken(
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            int row_count,
+            const void *first_token_device,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            const void *bonus_token_device,
+            bool has_bonus_token,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_meta_device)
+        {
+            (void)verify_tokens_device;
+            (void)verify_accepted_device;
+            (void)row_count;
+            (void)first_token_device;
+            (void)stop_tokens_host;
+            (void)stop_token_count;
+            (void)bonus_token_device;
+            (void)has_bonus_token;
+            (void)device_id;
+            (void)stream;
+            (void)out_tokens_device;
+            (void)out_meta_device;
+            return false;
+        }
+
+        /**
          * @brief GPU-side sparse logit penalty application
          *
          * Applies a sparse set of additive penalties to logits in-place on the GPU.

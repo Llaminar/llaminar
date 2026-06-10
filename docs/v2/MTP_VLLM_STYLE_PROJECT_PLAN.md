@@ -182,8 +182,8 @@ Done:
 - CUDA/ROCm compact stochastic sampling kernels exist for top-k/top-p tables.
 - `V2_Integration_GPUSamplingKernels` now includes Qwen3.6 real-logit-style
   seeded rows with close whitespace/code-token probabilities. CUDA and ROCm
-  graph-captured distribution build, direct sample, and compact sample match
-  the CPU canonical sampler on that fixture.
+  graph-captured distribution build and compact-table sample match the CPU
+  canonical sampler on that fixture.
 - Dense CUDA/ROCm greedy and stochastic have parity/smoke coverage.
 - Dense CPU/CUDA/ROCm SingleDevice Prefix+MTP parity now shares one declarative
   18-case test surface, including prefix restore, split prefill, dynamic/fixed
@@ -448,6 +448,113 @@ Open gaps:
   but the generated token streams still differ at a few real-model samples
   while the real-logit-style sampler fixture passes. This points at full-model
   logits/state/perf differences rather than isolated sampler math.
+- Phase 4 sampler-contract and first device-outcome slices are implemented:
+  `MTPRejectionSampler` owns threshold-driven stochastic row semantics and a
+  backend-neutral batch summary contract. CUDA/ROCm now verify penalty-free
+  all-position stochastic rows in one batch, sample the bonus token into an
+  arena buffer, and reduce committed output tokens/accepted counts with a tiny
+  shared-math summary kernel before copying compact metadata to host. Focused
+  MTP unit gate, dense Qwen3.6 CPU/CUDA/ROCm stochastic parity, Integration and
+  Release builds pass. Focused benchmark
+  `benchmark_results/mtp_vllm_style/20260609T-phase4-device-batch-outcome-dense-stochastic/`
+  shows CUDA best dynamic 38.4 vs 44.7 baseline and ROCm best d1 24.3 vs 31.4
+  baseline; CPU baseline completed but the CPU d1 lane was stopped after
+  excessive wall time. This is still not full Phase 4 acceptance: dense
+  stochastic remains speed-negative and true GPU-resident sampling still needs
+  fewer host round trips plus a speed-positive policy.
+- Phase 4 penalty-free stochastic sidecar stream handoff is implemented:
+  sidecar logits can remain on the explicit capture/replay stream until compact
+  distribution build and device batch-outcome reduction consume them. Penalty
+  paths still force the older synchronized contract because sampler history can
+  mutate logits. `V2_Unit_PrefillDecodeTransition`, the broader MTP unit gate,
+  dense Qwen3.6 CPU/CUDA/ROCm stochastic verifier parity, and Integration/Release
+  builds passed. Focused CUDA/ROCm dense stochastic benchmark
+  `benchmark_results/mtp_vllm_style/20260610T-phase4-stochastic-sidecar-stream-handoff/`
+  shows the handoff counters active on both backends. CUDA now has a short-run
+  stochastic win at fixed d2, 49.5 vs 44.6 tok/s (1.11x), but ROCm remains
+  speed-negative, best fixed d2 29.9 vs 31.3 tok/s (0.96x). Perfstats point at
+  ROCm stochastic device sampling cost as the next blocker:
+  `sample_mtp_token_stochastic_device` is about 4.4 ms/sample on ROCm versus
+  about 1.0 ms/sample on CUDA in this lane. A fused first-token direct sampler
+  experiment was benchmark-rejected and removed; remaining Phase 4 work is
+  ROCm sampler tuning plus true device-resident draft/decision plumbing, not
+  another first-token sampler variant.
+- Trusted compact stochastic result reads now use the backend fast D2H path for
+  orchestrator-owned scratch. The MTP unit gate plus dense Qwen3.6 CPU/CUDA/ROCm
+  stochastic verifier parity passed, and focused benchmark
+  `benchmark_results/mtp_vllm_style/20260610T-phase4-stochastic-fast-d2h/`
+  shows this was hygiene rather than the missing speedup: CUDA best fixed d2 is
+  49.8 vs 44.6 tok/s (1.12x), while ROCm best fixed d2 is 29.2 vs 31.4 tok/s
+  (0.93x) and `sample_mtp_token_stochastic_device` remains about 4.4-4.6
+  ms/sample. The next accepted Phase 4 slice should promote draft tokens,
+  target rows, and verifier bonus metadata to persistent device buffers so MTP
+  does not D2H a sampled draft token between sidecar steps or before verifier
+  input planning.
+- Device-token batch verification and device-resident sidecar token input are
+  now implemented for penalty-free CUDA/ROCm stochastic rows. Draft sample
+  tokens are written into arena buffers, verifier batches consume those device
+  tokens directly, and chained sidecar rows copy the prior sampled token into a
+  stable arena-owned `MTP_CONDITION_TOKEN` on the explicit sidecar stream.
+  ROCm gained the missing non-synchronizing `deviceCopyAsync()` backend hook
+  after the first benchmark exposed a hard failure in fixed d2. Focused
+  `V2_Unit_PrefillDecodeTransition`, broader MTP unit gate,
+  `V2_Integration_GPUSamplingKernels`, and dense Qwen3.6 CPU/CUDA/ROCm
+  stochastic parity passed. Focused benchmark
+  `benchmark_results/mtp_vllm_style/20260610T-phase4-stochastic-device-sidecar-token-input-fixed/`
+  shows CUDA fixed d2 at 46.6 vs 44.7 tok/s (1.04x) and ROCm fixed d2 at
+  29.8 vs 31.3 tok/s (0.95x). Follow-up ROCm attribution
+  `benchmark_results/mtp_vllm_style/20260610T-phase4-rocm-stochastic-sample-sync-attribution/`
+  shows sampler enqueue is cheap, about 0.003 ms/sample, while the compact
+  result D2H/sync costs 2.9-4.7 ms/sample because it drains deferred
+  verifier/sidecar work at the host read boundary. The next Phase 4 target is
+  device-resident verifier input and metadata rather than more top-k kernel
+  tuning. The generic forward graph contract now carries stable device token
+  IDs, Qwen embedding graphs pass the pointer through, forward-cache signatures
+  distinguish host-token and device-token sources, and focused
+  `V2_Unit_IGraphBuilder`, `V2_Unit_ForwardGraphTypes`, and
+  `V2_Unit_ForwardExecutionEngine` pass for that slice. The target verifier
+  can now compose `[first_token, draft_0, ...]` into arena-owned
+  `MTP_VERIFIER_INPUT_TOKENS` on the same explicit stream used for verifier
+  graph replay, then call `forwardWithDeviceTokenIds()` with the host token row
+  retained only as metadata shadow. Focused
+  `V2_Unit_PrefillDecodeTransition`, `V2_Unit_IGraphBuilder`,
+  `V2_Unit_ForwardGraphTypes`, and `V2_Unit_ForwardExecutionEngine` pass for
+  the verifier-input slice. Deferred draft-token host reads are now implemented
+  for penalty-free GPU stochastic rows and guarded by explicit sample-ready
+  events. Chained sidecars, verifier token input staging, and the batched
+  stochastic verifier wait on those events instead of relying on the old scalar
+  D2H read as an accidental synchronization point. Focused
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Integration_GPUSamplingKernels`,
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticSmoke`, and
+  `V2_Integration_Parity_Qwen36_ROCm_SingleDevice_Qwen36ROCmSingleDevicePrefixMTPParity_MTPStochasticSamplingVerifierRuns`
+  pass. Focused ROCm benchmark
+  `benchmark_results/mtp_vllm_style/20260610T-phase4-deferred-draft-host-read-ordered/`
+  restores plausible acceptance and removes draft sample D2H, but fixed d2 is
+  still speed-negative at 26.8 vs 31.2 tok/s; target sampling still performs a
+  compact D2H at about 2.86 ms/read and verifier forward averages about
+  22.7 ms/run. Remaining Phase 4 work is compact outcome/metadata publication
+  without the current target/result D2H/sync boundary.
+- The first target token can now stay device-resident through the first MTP
+  sidecar, verifier-input composition, and batched stochastic summary on
+  CUDA/ROCm. Target and draft sampled-token slots use explicit sample-ready
+  events, the sidecar consumes the target sample through
+  `forwardMTPFromDeviceTargetForDeviceSampling()`, and the summary reducer can
+  read the first token from device memory instead of a host scalar. Focused
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Integration_GPUSamplingKernels`,
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticSmoke`, and
+  `V2_Integration_Parity_Qwen36_ROCm_SingleDevice_Qwen36ROCmSingleDevicePrefixMTPParity_MTPStochasticSamplingVerifierRuns`
+  pass. Focused ROCm benchmark
+  `benchmark_results/mtp_vllm_style/20260610T-phase4-device-first-target-summary/`
+  shows 15 deferred first-token reads, 15 device-first batch summaries, target
+  sample ready events/waits, and only one remaining target-slot D2H sync for
+  the final/budget-limited step. Fixed d2 is still speed-negative at 26.97 vs
+  31.25 tok/s, so the next Phase 4 blocker has moved to shifted-prefill,
+  condition-forward, and verifier-forward host-wall cost rather than token
+  scalar D2H. The post-rebuild Phase 4 gate passed `^V2_Unit_` 500/500 plus
+  focused ROCm stochastic parity, ROCm stochastic graph smoke, and CUDA/ROCm
+  GPU sampling integrations.
 - TP/PP/ExpertParallel MTP is out of scope until SingleDevice is green.
 
 ## Implementation Phases
@@ -540,8 +647,27 @@ Work:
 
 - Implement a shared rejection-sampling interface over flattened target logits,
   draft probabilities, draft tokens, and random thresholds.
+  First slice complete: `MTPRejectionSampler` defines the distribution-row
+  contract and all-position stochastic catch-up construction for the current
+  SingleDevice path.
 - GPU kernels produce output tokens plus `num_accepted_tokens` without CPU
   participation. CPU uses scalar/AVX2/AVX512 dispatch plus OpenMP where useful.
+  First GPU step complete for penalty-free SingleDevice all-position verifier:
+  runner batches stochastic row verification through the existing device batch
+  kernel, samples the bonus token into a device arena buffer, and summarizes
+  output tokens plus accepted counts through a CUDA/ROCm shared-math reduction
+  kernel. The penalty-free CUDA/ROCm lane now also defers verifier final sync
+  into those target distribution and batch-summary kernels, verifies draft rows
+  from device token buffers, and chains sidecar inputs from a stable
+  device-resident condition-token buffer. Generic forward graphs now accept a
+  stable device-token input source, the target verifier input row is composed
+  into arena-owned device storage on the graph execution stream, and the first
+  target sample can feed both the first sidecar and batched summary without a
+  host scalar read. The CUDA path is modestly speed-positive on a short dense
+  stochastic fixed-d2 lane; ROCm remains speed-negative because shifted-prefill,
+  condition-forward, and verifier-forward cost now dominate after token D2H
+  removal. The runner still receives compact outcome metadata on the host, so
+  the full device-resident Phase 4 contract remains open.
 - Greedy uses the same buffers and output contract, with argmax equality as the
   deterministic accept test.
 - Remove decode-equivalent stochastic verifier fallbacks after parity and
@@ -709,7 +835,7 @@ ctest --test-dir build_v2_integration -R "^V2_Unit_" --output-on-failure --paral
 
 ```bash
 ctest --test-dir build_v2_integration \
-  -R "^V2_Unit_(PrefixMTPConfig|MTPDepthController|MTPDecodeCatchup|MTPSpecDecodeTransaction|MTPSpecDecodeMetadata|MTPSpecStateContract|MTPSpecKVPublisher|MTPStateTransaction|MTPVerifierPolicy|MTPWeightManifest|MTPGraphConstruction|PrefillDecodeTransition|PrefillGraphCacheIntegration|ForwardExecutionEngineAdvanced)" \
+  -R "^V2_Unit_(PrefixMTPConfig|MTPDepthController|MTPDecodeCatchup|MTPRejectionSampler|MTPSpecDecodeTransaction|MTPSpecDecodeMetadata|MTPSpecStateContract|MTPSpecKVPublisher|MTPStateTransaction|MTPVerifierPolicy|MTPWeightManifest|MTPGraphConstruction|PrefillDecodeTransition|PrefillGraphCacheIntegration|ForwardExecutionEngineAdvanced)" \
   --output-on-failure --parallel
 ```
 

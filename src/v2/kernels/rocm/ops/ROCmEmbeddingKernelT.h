@@ -126,6 +126,7 @@ namespace llaminar2
             int device_idx = -1) override;
 
         void setDynamicTokenIds(const int *token_ids, int num_tokens) override;
+        void setDynamicDeviceTokenIds(const void *token_ids_device, int num_tokens) override;
 
         // =====================================================================
         // Session Lifecycle (ITensorKernel overrides)
@@ -237,6 +238,9 @@ namespace llaminar2
         int max_token_ids_ = 0;
         int dynamic_token_count_ = 0;
         bool dynamic_params_active_ = false;
+        const int *device_token_ids_ = nullptr;
+        int device_token_count_ = 0;
+        bool device_token_ids_active_ = false;
         void *preload_stream_ = nullptr; ///< Stream used for the last setDynamicTokenIds H2D copy
     };
 

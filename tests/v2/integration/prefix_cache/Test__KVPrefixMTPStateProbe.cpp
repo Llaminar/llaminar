@@ -406,7 +406,8 @@ namespace
         const std::string &backend_name,
         size_t decode_token_count = 8,
         int repeat_cycles = 2,
-        bool deterministic_repeatability = false)
+        bool deterministic_repeatability = false,
+        bool use_presence_penalty = false)
     {
         ASSERT_GT(decode_token_count, 0u);
         ASSERT_GE(repeat_cycles, 2);
@@ -465,7 +466,7 @@ namespace
         stochastic.temperature = 0.6f;
         stochastic.top_k = 20;
         stochastic.top_p = 0.95f;
-        stochastic.presence_penalty = 0.25f;
+        stochastic.presence_penalty = use_presence_penalty ? 0.25f : 0.0f;
         stochastic.seed = 123;
 
         runner->setSamplingParams(stochastic);
@@ -587,14 +588,52 @@ namespace
         EXPECT_GE(snapshot.mtp_request.stochastic_acceptance_rate, 0.0);
         EXPECT_LE(snapshot.mtp_request.stochastic_acceptance_rate, 1.0);
         EXPECT_GE(counter("first_token_stochastic_device_samples"), 1.0);
-        EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0);
-        EXPECT_GE(counter("decode_equivalent_stochastic_verifier_runs"), 1.0)
-            << backend_name << " stochastic MTP must verify stateful Qwen through "
-            << "the decode-equivalent replay path, not all-position state publication";
+        /*
+         * The accepted vLLM-style contract publishes verifier rows from the
+         * all-position target forward.  The older decode-equivalent stochastic
+         * replay path was a migration fallback; keeping this assertion pointed
+         * at the new path prevents us from accidentally reviving it.
+         */
+        EXPECT_GE(counter("all_position_state_publication_verifier_runs"), 1.0)
+            << backend_name << " stochastic MTP must publish accepted verifier rows "
+            << "through all-position state publication";
+        EXPECT_EQ(counter("decode_equivalent_stochastic_verifier_runs"), 0.0)
+            << backend_name << " stochastic MTP must not use the retired "
+            << "decode-equivalent verifier fallback";
         if (backend_name == "ROCm" || backend_name == "CUDA")
         {
             EXPECT_GE(counter("stochastic_topk_smallk_scratch_distribution_builds"), 2.0)
                 << backend_name << " stochastic MTP must use the arena-declared small-k top-k scratch path";
+            if (!use_presence_penalty)
+            {
+                EXPECT_GE(counter("first_token_stochastic_deferred_host_reads"), 1.0)
+                    << backend_name << " penalty-free stochastic first tokens should stay device-resident until summary";
+                EXPECT_GE(counter("mtp_token_stochastic_deferred_host_reads"), 1.0)
+                    << backend_name << " penalty-free stochastic drafts should stay device-resident";
+                EXPECT_GE(counter("sample_stochastic_distribution_deferred_host_reads"), 1.0)
+                    << backend_name << " deferred draft sampling should avoid immediate scalar D2H reads";
+                EXPECT_GE(counter("stochastic_target_sample_ready_events"), 1.0)
+                    << backend_name << " deferred target samples must record a stream dependency";
+                EXPECT_GE(counter("stochastic_target_sample_ready_waits"), 1.0)
+                    << backend_name << " sidecar/verifier consumers must wait on deferred target samples";
+                EXPECT_GE(counter("stochastic_draft_sample_ready_events"), 1.0)
+                    << backend_name << " deferred draft samples must record a stream dependency";
+                EXPECT_GE(counter("stochastic_draft_sample_ready_waits"), 1.0)
+                    << backend_name << " sidecar/verifier consumers must wait on deferred draft samples";
+                EXPECT_GE(counter("verifier_device_token_input_prepares"), 1.0)
+                    << backend_name << " verifier input tokens should be staged from device draft slots";
+                EXPECT_GE(counter("stochastic_batch_summary_device_first_tokens"), 1.0)
+                    << backend_name << " verifier summary should read the first token from device scratch";
+                EXPECT_GE(counter("all_position_stochastic_device_batched_rows"), 1.0)
+                    << backend_name << " penalty-free stochastic verification should use the batched device outcome";
+                EXPECT_EQ(counter("mtp_token_stochastic_device_samples"), 0.0)
+                    << backend_name << " deferred draft samples should not force a host-visible token sample";
+            }
+            else
+            {
+                EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0)
+                    << backend_name << " penalty paths still need a host-visible sampled token for sampler history";
+            }
         }
         EXPECT_GE(counter("stochastic_accept_tests"), 1.0);
         EXPECT_GE(counter("transaction_validation_passes"), 1.0)
@@ -606,8 +645,7 @@ namespace
         EXPECT_EQ(counter("verifier_stochastic_distributions"), 0.0)
             << backend_name << " stochastic MTP must not build verifier distributions from host full logits";
         EXPECT_EQ(counter("phase138_stochastic_spec_decode_runs"), 0.0)
-            << backend_name << " stochastic MTP must not use accepted-count publication "
-            << "for stateful Qwen verifier rows that require decode-equivalent replay";
+            << backend_name << " stochastic MTP must not use the retired accepted-count-only fallback";
     }
 
     int mpiWorldSize()
@@ -1904,7 +1942,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticClearCacheRepe
         "ROCm",
         /*decode_token_count=*/64,
         /*repeat_cycles=*/4,
-        /*deterministic_repeatability=*/true);
+        /*deterministic_repeatability=*/true,
+        /*use_presence_penalty=*/true);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticRealModelSmoke)

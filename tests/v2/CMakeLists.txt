@@ -6306,6 +6306,18 @@ add_v2_test(V2_Unit_MTPDecodeCatchup
     MPI_PROCS 1
 )
 
+# Test: Shared vLLM-style MTP rejection sampler contract
+add_executable(v2_test_mtp_rejection_sampler unit/mtp/Test__MTPRejectionSampler.cpp)
+target_link_libraries(v2_test_mtp_rejection_sampler llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
+target_include_directories(v2_test_mtp_rejection_sampler PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPRejectionSampler
+    COMMAND $<TARGET_FILE:v2_test_mtp_rejection_sampler>
+    LABELS "V2;Unit;MTP;SpecDecode;Sampler"
+    MPI_PROCS 1
+)
+
 # Test: vLLM-style MTP spec-decode transaction metadata
 add_executable(v2_test_mtp_spec_decode_transaction unit/mtp/Test__MTPSpecDecodeTransaction.cpp)
 target_link_libraries(v2_test_mtp_spec_decode_transaction llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)

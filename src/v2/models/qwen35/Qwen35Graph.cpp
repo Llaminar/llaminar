@@ -351,7 +351,8 @@ namespace llaminar2
 
         if (missing("embedding table", modelEmbeddingTable()) ||
             (!kv_cache_only && missing("lm head", modelLMHead())) ||
-            missing("draft_token_ids", input.draft_token_ids) ||
+            (!input.draft_token_ids && !input.draft_token_ids_device &&
+             missing("draft_token_ids", input.draft_token_ids)) ||
             missing("terminal_hidden", input.terminal_hidden) ||
             (kv_cache_only && missing("kv_cache", input.kv_cache)) ||
             missing("mtp.fc", weights.fc) ||
@@ -401,6 +402,7 @@ namespace llaminar2
                           .mpi_ctx = mpi_ctx_.get(),
                           .embed_table = modelEmbeddingTable(),
                           .token_ids = input.draft_token_ids,
+                          .token_ids_device = input.draft_token_ids_device,
                           .output = output.embedding,
                           .num_tokens = total_tokens,
                           .d_model = config_.d_model,

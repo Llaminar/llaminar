@@ -93,12 +93,16 @@ namespace llaminar2
         STOCHASTIC_TARGET_PROBS,     ///< Compact verifier/main distribution probabilities [4, 256]
         STOCHASTIC_DRAFT_TOKEN_IDS,  ///< Compact MTP draft distribution token ids [3, 256]
         STOCHASTIC_DRAFT_PROBS,      ///< Compact MTP draft distribution probabilities [3, 256]
+        STOCHASTIC_TARGET_SAMPLE_TOKENS, ///< Device-resident sampled main/verifier target tokens [1, 4]
+        STOCHASTIC_DRAFT_SAMPLE_TOKENS, ///< Device-resident sampled MTP draft tokens [1, 3]
         STOCHASTIC_TOPK_PARTIAL_VALS, ///< Per-block stochastic top-k partial values [blocks, 32]
         STOCHASTIC_TOPK_PARTIAL_IDXS, ///< Per-block stochastic top-k partial indices [blocks, 32]
         STOCHASTIC_VERIFY_TOKENS,    ///< Scalar stochastic verifier output tokens [1, 4]
         STOCHASTIC_VERIFY_ACCEPTED,  ///< Scalar stochastic verifier accept flags [1, 4]
         STOCHASTIC_VERIFY_ACCEPT_PROBS, ///< Scalar stochastic verifier accept probabilities [1, 4]
         STOCHASTIC_VERIFY_THRESHOLDS,   ///< Scalar stochastic verifier thresholds [1, 4]
+        STOCHASTIC_BATCH_OUTPUT_TOKENS, ///< Reduced stochastic verifier output tokens [1, 5]
+        STOCHASTIC_BATCH_OUTPUT_META,   ///< Reduced stochastic verifier metadata [1, 10]
 
         // ── Prefix cache restore/harvest staging ───────────────────────────
         PREFIX_K_STAGING,
@@ -129,6 +133,8 @@ namespace llaminar2
         MTP_UP_PROJ,
         MTP_FFN_OUTPUT,
         MTP_LOGITS,
+        MTP_CONDITION_TOKEN, ///< Arena-owned INT32 condition token for device-resident MTP sidecar input
+        MTP_VERIFIER_INPUT_TOKENS, ///< Arena-owned INT32 verifier token row fed directly to GPU embedding
 
         _COUNT ///< Sentinel – must be last
     };
@@ -222,6 +228,10 @@ namespace llaminar2
             return "STOCHASTIC_DRAFT_TOKEN_IDS";
         case BufferId::STOCHASTIC_DRAFT_PROBS:
             return "STOCHASTIC_DRAFT_PROBS";
+        case BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS:
+            return "STOCHASTIC_TARGET_SAMPLE_TOKENS";
+        case BufferId::STOCHASTIC_DRAFT_SAMPLE_TOKENS:
+            return "STOCHASTIC_DRAFT_SAMPLE_TOKENS";
         case BufferId::STOCHASTIC_TOPK_PARTIAL_VALS:
             return "STOCHASTIC_TOPK_PARTIAL_VALS";
         case BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS:
@@ -234,6 +244,10 @@ namespace llaminar2
             return "STOCHASTIC_VERIFY_ACCEPT_PROBS";
         case BufferId::STOCHASTIC_VERIFY_THRESHOLDS:
             return "STOCHASTIC_VERIFY_THRESHOLDS";
+        case BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS:
+            return "STOCHASTIC_BATCH_OUTPUT_TOKENS";
+        case BufferId::STOCHASTIC_BATCH_OUTPUT_META:
+            return "STOCHASTIC_BATCH_OUTPUT_META";
         case BufferId::PREFIX_K_STAGING:
             return "PREFIX_K_STAGING";
         case BufferId::PREFIX_V_STAGING:
@@ -286,6 +300,10 @@ namespace llaminar2
             return "MTP_FFN_OUTPUT";
         case BufferId::MTP_LOGITS:
             return "MTP_LOGITS";
+        case BufferId::MTP_CONDITION_TOKEN:
+            return "MTP_CONDITION_TOKEN";
+        case BufferId::MTP_VERIFIER_INPUT_TOKENS:
+            return "MTP_VERIFIER_INPUT_TOKENS";
         case BufferId::MOE_GATE_SCRATCH:
             return "MOE_GATE_SCRATCH";
         case BufferId::MOE_UP_SCRATCH:

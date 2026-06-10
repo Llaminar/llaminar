@@ -40,6 +40,7 @@ namespace llaminar2
             // Input/output tensors
             const ITensor *embed_table = nullptr;
             const int *token_ids = nullptr;
+            const void *token_ids_device = nullptr; ///< Optional GPU INT32 token IDs [num_tokens]
             ITensor *output = nullptr;
 
             // Dimensions
@@ -88,10 +89,19 @@ namespace llaminar2
         {
             (void)pos_offset;
             (void)seq_len;
-            if (cached_kernel_ && params_.token_ids && params_.num_tokens > 0)
+            if (cached_kernel_ && params_.num_tokens > 0)
             {
                 cached_kernel_->setGPUStream(gpuStream());
-                cached_kernel_->setDynamicTokenIds(params_.token_ids, params_.num_tokens);
+                if (params_.token_ids_device)
+                {
+                    cached_kernel_->setDynamicDeviceTokenIds(
+                        params_.token_ids_device,
+                        params_.num_tokens);
+                }
+                else if (params_.token_ids)
+                {
+                    cached_kernel_->setDynamicTokenIds(params_.token_ids, params_.num_tokens);
+                }
             }
         }
 

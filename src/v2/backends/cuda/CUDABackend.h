@@ -164,6 +164,49 @@ namespace llaminar2
             void *out_accepted_device,
             void *out_accept_probability_device = nullptr,
             void *out_accept_threshold_device = nullptr) override;
+        bool enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            const void *draft_token_ids_device,
+            const void *draft_probs_device,
+            int top_k,
+            int distribution_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            const float *residual_thresholds_host,
+            int row_count,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr) override;
+        bool enqueueSummarizeSpeculativeVerifyBatch(
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            int row_count,
+            int first_token,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            const void *bonus_token_device,
+            bool has_bonus_token,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_meta_device) override;
+        bool enqueueSummarizeSpeculativeVerifyBatchDeviceFirstToken(
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            int row_count,
+            const void *first_token_device,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            const void *bonus_token_device,
+            bool has_bonus_token,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_meta_device) override;
 
         // GPU-side sparse logit penalty application
         bool applyLogitPenaltiesF32(void *logits_device,

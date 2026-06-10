@@ -55,6 +55,16 @@ namespace llaminar2
     struct ForwardInput
     {
         const int *token_ids = nullptr;    ///< Token IDs [batch_size * seq_len]
+        /**
+         * @brief Optional device-resident INT32 token IDs.
+         *
+         * GPU verifier and sidecar graphs can use this to keep token IDs in
+         * arena/workspace memory across graph capture/replay. When this pointer
+         * is set, embedding stages treat it as the execution source of truth;
+         * `token_ids` may still be populated as a stable host shadow for logs,
+         * cache bookkeeping, and CPU-only helpers.
+         */
+        const void *token_ids_device = nullptr;
         const int *position_ids = nullptr; ///< Position IDs [batch_size * seq_len]
         int batch_size = 1;                ///< Number of sequences
         int seq_len = 0;                   ///< Sequence length per batch

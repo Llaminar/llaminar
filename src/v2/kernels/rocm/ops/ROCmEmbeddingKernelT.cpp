@@ -139,6 +139,9 @@ namespace llaminar2
     {
         dynamic_params_active_ = false;
         dynamic_token_count_ = 0;
+        device_token_ids_active_ = false;
+        device_token_ids_ = nullptr;
+        device_token_count_ = 0;
 
         if (!token_ids || num_tokens <= 0)
         {
@@ -217,10 +220,25 @@ namespace llaminar2
         preload_stream_ = getStream();
     }
 
+    void ROCmEmbeddingKernelT::setDynamicDeviceTokenIds(
+        const void *token_ids_device,
+        int num_tokens)
+    {
+        dynamic_params_active_ = false;
+        dynamic_token_count_ = 0;
+        preload_stream_ = nullptr;
+        device_token_ids_ = static_cast<const int *>(token_ids_device);
+        device_token_count_ = num_tokens;
+        device_token_ids_active_ = token_ids_device && num_tokens > 0;
+    }
+
     void ROCmEmbeddingKernelT::resetDynamicState()
     {
         dynamic_params_active_ = false;
         dynamic_token_count_ = 0;
+        device_token_ids_active_ = false;
+        device_token_ids_ = nullptr;
+        device_token_count_ = 0;
         preload_stream_ = nullptr;
         {
             std::lock_guard<std::mutex> lock(stream_mutex_);
@@ -520,17 +538,26 @@ namespace llaminar2
             return false;
         }
 
-        int *d_token_ids = static_cast<int *>(workspace->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
-        if (!d_token_ids)
+        int *workspace_token_ids = static_cast<int *>(workspace->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
+        if (!workspace_token_ids)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Workspace buffer '" << EmbeddingWorkspaceBuffers::TOKEN_IDS << "' not found");
             return false;
         }
 
         const DeviceId workspace_device = workspace->device();
+        const bool use_device_token_ids =
+            device_token_ids_active_ &&
+            device_token_count_ == num_tokens &&
+            device_token_ids_ != nullptr;
+        int *d_token_ids = use_device_token_ids
+                               ? const_cast<int *>(device_token_ids_)
+                               : workspace_token_ids;
 
         const bool validate_gpu_ptrs = debugEnv().validation.validate_gpu_ptrs;
-        if (validate_gpu_ptrs && !validateTokenIdsHost(token_ids, num_tokens, static_cast<int>(embed_table->rows()), /*fail_on_invalid=*/true))
+        if (!use_device_token_ids &&
+            validate_gpu_ptrs &&
+            !validateTokenIdsHost(token_ids, num_tokens, static_cast<int>(embed_table->rows()), /*fail_on_invalid=*/true))
         {
             return false;
         }
@@ -554,8 +581,14 @@ namespace llaminar2
         // Also verify stream match: setDynamicTokenIds() may have run on a
         // different stream than the current gpu_stream_ if the graph capture
         // controller reassigned stage streams after updateDynamicParams().
-        const bool token_ids_preloaded = dynamic_params_active_ && dynamic_token_count_ == num_tokens && preload_stream_ == getStream() && h_token_ids_ && std::memcmp(h_token_ids_, token_ids, static_cast<size_t>(num_tokens) * sizeof(int)) == 0;
-        if (!token_ids_preloaded)
+        const bool token_ids_preloaded =
+            dynamic_params_active_ &&
+            dynamic_token_count_ == num_tokens &&
+            preload_stream_ == getStream() &&
+            token_ids &&
+            h_token_ids_ &&
+            std::memcmp(h_token_ids_, token_ids, static_cast<size_t>(num_tokens) * sizeof(int)) == 0;
+        if (!use_device_token_ids && !token_ids_preloaded)
         {
             if (isGraphCaptureActive())
             {
@@ -565,7 +598,12 @@ namespace llaminar2
             }
             dynamic_params_active_ = false;
             dynamic_token_count_ = 0;
-            err = hipMemcpyAsync(d_token_ids, token_ids, token_bytes, hipMemcpyHostToDevice, stream);
+            if (!token_ids)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] Host token IDs are null and no device token source is active");
+                return false;
+            }
+            err = hipMemcpyAsync(workspace_token_ids, token_ids, token_bytes, hipMemcpyHostToDevice, stream);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmEmbeddingKernelT] Failed to copy token_ids to GPU: " << hipGetErrorString(err));

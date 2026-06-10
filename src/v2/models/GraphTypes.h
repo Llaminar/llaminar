@@ -690,6 +690,16 @@ namespace llaminar2
     struct MTPForwardInput
     {
         const int *draft_token_ids = nullptr;
+        /**
+         * @brief Optional device-resident draft token IDs.
+         *
+         * When set on a GPU graph, embedding stages read token IDs directly
+         * from this stable device buffer instead of uploading `draft_token_ids`
+         * from host memory. The host pointer may still be populated for logging,
+         * CPU fallback, or graph-cache bookkeeping, but the device pointer is
+         * the execution source of truth.
+         */
+        const void *draft_token_ids_device = nullptr;
         TensorBase *terminal_hidden = nullptr;
         IKVCache *kv_cache = nullptr;
         const int *position_ids = nullptr;

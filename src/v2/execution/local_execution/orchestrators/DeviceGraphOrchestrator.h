@@ -1499,6 +1499,15 @@ namespace llaminar2
             const int *tokens,
             int seq_len,
             int batch_size = 1);
+        bool forwardWithDeviceTokenIds(
+            const int *token_shadow,
+            const void *token_ids_device,
+            int seq_len) override;
+        const void *prepareMTPVerifierInputTokensOnDevice(
+            int32_t first_token,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override;
 
         /**
          * @brief Get logits from last forward pass
@@ -1508,10 +1517,22 @@ namespace llaminar2
         const float *logits() const override;
 
         bool forwardMTP(int32_t draft_condition_token) override;
+        bool forwardMTPForDeviceSampling(int32_t draft_condition_token) override;
         bool supportsChainedMTPDrafts() const override { return true; }
         bool supportsMTPSidecarSampleFusion() const override;
+        bool supportsMTPSidecarLogitsStreamHandoff() const override;
+        bool supportsMTPDeviceDraftTokenInput() const override;
         bool supportsMTPSidecarPreservesMainState() const override;
         bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
+        bool forwardMTPFromLastDraftForDeviceSampling(
+            int32_t draft_condition_token,
+            int position_id) override;
+        bool forwardMTPFromDeviceDraftForDeviceSampling(
+            int draft_sample_slot,
+            int position_id) override;
+        bool forwardMTPFromDeviceTargetForDeviceSampling(
+            int target_sample_slot,
+            int position_id) override;
         bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override;
         bool forwardMTPFromLastDraftAndSampleGreedy(
             int32_t draft_condition_token,
@@ -1898,6 +1919,15 @@ namespace llaminar2
             DeviceDistributionBuffer buffer,
             int slot,
             float threshold) override;
+        bool sampleStochasticDistributionOnDeviceDeferred(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override;
+        const void *prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+            int first_target_sample_slot,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override;
         bool verifyStochasticDistributionsOnDevice(
             int target_slot,
             int draft_slot,
@@ -1913,6 +1943,32 @@ namespace llaminar2
             const float *residual_thresholds,
             int row_count,
             DeviceSpeculativeVerifyResult *out) override;
+        bool verifyStochasticDistributionsBatchOutcomeOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out) override;
+        bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out) override;
 
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)
@@ -1955,6 +2011,10 @@ namespace llaminar2
             mtp_terminal_hidden_row_select_cache_.resetSessionState();
             last_pos_offset_ = -1;
             pending_mtp_logits_stream_ = nullptr;
+            stochastic_target_distribution_streams_.fill(nullptr);
+            stochastic_draft_distribution_streams_.fill(nullptr);
+            clearStochasticTargetSampleReadySlots();
+            clearStochasticDraftSampleReadySlots();
             cache_stats_ = CacheStats{};
             state_.clear();
             // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
@@ -2170,6 +2230,19 @@ namespace llaminar2
         // =========================================================================
 
         /**
+         * @brief Shared implementation for host-token and device-token forwards.
+         *
+         * `tokens` is always the host shadow used for request bookkeeping. When
+         * `token_ids_device` is non-null, graph embedding stages read token IDs
+         * from that stable device buffer instead of uploading from `tokens`.
+         */
+        const float *forwardImpl(
+            const int *tokens,
+            const void *token_ids_device,
+            int seq_len,
+            int batch_size);
+
+        /**
          * @brief Update dynamic parameters in a cached graph
          *
          * Updates position offset and sequence length in all stages
@@ -2282,6 +2355,127 @@ namespace llaminar2
             const ForwardInput &input,
             void *execution_stream,
             DeviceId execution_device) override;
+
+        /**
+         * @brief Materialize pending verifier token IDs on the graph execution stream.
+         *
+         * The all-position verifier metadata hook receives the exact stream that
+         * the forward engine will use for graph replay/capture.  Copying the
+         * compact token row here keeps the device-token embedding input ordered
+         * with the verifier graph without relying on the default stream or a
+         * host-side synchronization.
+         */
+        bool materializePendingMTPVerifierInputTokensOnDevice(
+            void *execution_stream,
+            DeviceId execution_device);
+
+        /**
+         * @brief Clear the device-side "sample token is ready" marker for one draft slot.
+         *
+         * Draft sample slots are reused across decode iterations.  Clearing
+         * the marker before a new distribution build prevents later verifier or
+         * sidecar stages from accidentally waiting on a previous sample's event.
+         */
+        void clearStochasticDraftSampleReadySlot(int slot);
+
+        /** @brief Clear every draft sample readiness marker for request reset paths. */
+        void clearStochasticDraftSampleReadySlots();
+
+        /**
+         * @brief Clear the device-side "sample token is ready" marker for one target slot.
+         *
+         * Target sample slots feed the first sidecar and the stochastic batch
+         * reducer. Clearing stale state keeps the next decode iteration from
+         * waiting on a previous sample event or consuming an old token.
+         */
+        void clearStochasticTargetSampleReadySlot(int slot);
+
+        /** @brief Clear every target sample readiness marker for request reset paths. */
+        void clearStochasticTargetSampleReadySlots();
+
+        /**
+         * @brief Record that a deferred GPU sampler has written a draft token slot.
+         *
+         * The deferred stochastic path avoids a host D2H token read, so the host
+         * can no longer act as an ordering point.  This helper records a backend
+         * event on the producer stream immediately after the sample kernel so
+         * later GPU consumers can wait without synchronizing the CPU.
+         */
+        bool recordStochasticDraftSampleReady(int slot, void *producer_stream);
+
+        /**
+         * @brief Record that a deferred GPU sampler has written a target token slot.
+         *
+         * This mirrors recordStochasticDraftSampleReady(), but target samples
+         * live in a separate arena buffer so verifier row outputs can overwrite
+         * STOCHASTIC_VERIFY_TOKENS without corrupting the first generated token.
+         */
+        bool recordStochasticTargetSampleReady(int slot, void *producer_stream);
+
+        /**
+         * @brief Make a consumer stream wait for deferred draft sample tokens.
+         *
+         * @param first_slot First draft-token slot consumed by the next stage.
+         * @param slot_count Number of contiguous slots consumed.
+         * @param consumer_stream Explicit stream used by the consuming copy/kernel.
+         * @param consumer_name Short perf/log tag naming the consumer.
+         * @return true if all required waits were queued successfully.
+         */
+        bool waitForStochasticDraftSampleReadyRange(
+            int first_slot,
+            int slot_count,
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Make a consumer stream wait for a deferred target sample token.
+         *
+         * @param slot Target-token sample slot consumed by the next stage.
+         * @param consumer_stream Explicit stream used by the consuming copy/kernel.
+         * @param consumer_name Short perf/log tag naming the consumer.
+         * @return true if the required wait was queued successfully.
+         */
+        bool waitForStochasticTargetSampleReady(
+            int slot,
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Shared implementation for compact device-side stochastic sampling.
+         *
+         * When `out_token_host` is non-null the helper also performs the trusted
+         * fast D2H scalar read used by legacy host-driven callers.  When it is
+         * null, the sampled token remains only in the runner-owned device slot
+         * for later sidecar/verifier graph stages to consume.
+         */
+        bool sampleStochasticDistributionOnDeviceImpl(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold,
+            int32_t *out_token_host);
+
+        /**
+         * @brief Shared implementation for host-token and device-token batch summaries.
+         *
+         * `first_token_from_device=false` preserves the legacy host-scalar
+         * summary contract.  `true` reads the first sampled token from
+         * STOCHASTIC_TARGET_SAMPLE_TOKENS inside the backend summary kernel.
+         */
+        bool verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            int first_target_sample_slot,
+            bool first_token_from_device,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out);
 
         /** Monotonic live-state epoch used by versioned decode replay. */
         uint64_t liveReplayStateEpoch() const override { return live_replay_state_epoch_; }
@@ -2402,7 +2596,10 @@ namespace llaminar2
                                      const char *sidecar_perf_context,
                                      bool kv_cache_only = false,
                                      BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
-                                     bool defer_final_sync = false);
+                                     bool defer_final_sync = false,
+                                     const void *draft_condition_tokens_device = nullptr,
+                                     int draft_condition_ready_slot = -1,
+                                     bool draft_condition_ready_is_target = false);
         bool populateMTPShiftedCacheFromPrefill(const int *tokens,
                                                 int seq_len,
                                                 int batch_size,
@@ -2424,6 +2621,7 @@ namespace llaminar2
             int32_t token_id = 0;
             int position_id = 0;
             int seq_len = 0;
+            bool uses_device_token_ids = false;
             bool valid = false;
 
             void resetReplayState()
@@ -2466,6 +2664,7 @@ namespace llaminar2
                 token_id = 0;
                 position_id = 0;
                 seq_len = 0;
+                uses_device_token_ids = false;
                 valid = false;
             }
         };
@@ -2579,6 +2778,10 @@ namespace llaminar2
         void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [4, 256]
         void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [3, 256]
         void *stochastic_draft_probs_dev_ = nullptr;      ///< FP32 [3, 256]
+        void *stochastic_target_sample_tokens_dev_ = nullptr; ///< INT32 [1, 4]
+        void *stochastic_draft_sample_tokens_dev_ = nullptr; ///< INT32 [1, 3]
+        void *mtp_sidecar_condition_token_dev_ = nullptr; ///< INT32 [1], stable sidecar token input
+        void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 [1, 4], stable verifier token input
         void *stochastic_topk_partial_vals_dev_ = nullptr; ///< FP32 [partial_blocks, 32]
         void *stochastic_topk_partial_idxs_dev_ = nullptr; ///< INT32 [partial_blocks, 32]
         int stochastic_topk_partial_capacity_ = 0;
@@ -2586,8 +2789,75 @@ namespace llaminar2
         void *stochastic_verify_accepted_dev_ = nullptr;  ///< INT32 [1, 4]
         void *stochastic_verify_accept_probs_dev_ = nullptr; ///< FP32 [1, 4]
         void *stochastic_verify_thresholds_dev_ = nullptr;   ///< FP32 [1, 4]
+        void *stochastic_batch_output_tokens_dev_ = nullptr; ///< INT32 [1, 5]
+        void *stochastic_batch_output_meta_dev_ = nullptr;   ///< INT32 [1, 10]
         std::array<int, 4> stochastic_target_top_k_ = {0, 0, 0, 0};
         std::array<int, 3> stochastic_draft_top_k_ = {0, 0, 0};
+
+        /**
+         * @brief Producer stream for each compact stochastic distribution slot.
+         *
+         * A distribution build can consume logits produced by captured replay on
+         * a non-context stream. The later sample kernel must run on that same
+         * explicit stream so it observes the finished token/probability arrays
+         * without inserting a host synchronization. Slots are cleared when the
+         * paired sampler consumes them or when request-scoped state is reset.
+         */
+        std::array<void *, 4> stochastic_target_distribution_streams_ =
+            {nullptr, nullptr, nullptr, nullptr};
+
+        /**
+         * @brief Producer streams for MTP draft compact distributions.
+         *
+         * Draft distributions are normally built immediately after a sidecar
+         * graph. Keeping the stream here lets stochastic sampling follow a
+         * deferred sidecar graph replay on CUDA/ROCm without touching the device
+         * null stream or synchronizing the whole context.
+         */
+        std::array<void *, 3> stochastic_draft_distribution_streams_ =
+            {nullptr, nullptr, nullptr};
+
+        /**
+         * @brief Event-backed readiness state for deferred stochastic sample tokens.
+         *
+         * Each slot corresponds to one row in a stochastic sample-token buffer.
+         * The event is recorded after the sampler kernel writes the token; GPU
+         * consumers such as chained sidecars and all-position verifiers wait on
+         * it before reading the slot. `std::shared_ptr<void>` gives the raw
+         * backend event a move-safe owner, which matters because this
+         * orchestrator is movable in tests and factory paths.
+         */
+        struct StochasticSampleReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+        };
+        std::array<StochasticSampleReadyState, 4>
+            stochastic_target_sample_ready_;
+        std::array<StochasticSampleReadyState, 3>
+            stochastic_draft_sample_ready_;
+
+        /**
+         * @brief Deferred device-token composition plan for the target verifier.
+         *
+         * OrchestrationRunner knows which host token and sampled draft slots
+         * should feed the verifier, but DeviceGraphOrchestrator knows the graph
+         * execution stream.  Keeping this plan pending until
+         * prepareAllPositionVerifierGraphMetadata() lets us compose the compact
+         * `[first_token, draft_0, ...]` device row on that same stream.
+         */
+        struct PendingMTPVerifierDeviceTokenPlan
+        {
+            int32_t first_token = -1;
+            int first_target_sample_slot = -1;
+            bool first_token_from_device = false;
+            int first_draft_slot = 0;
+            int draft_token_count = 0;
+            int total_verifier_input_tokens = 0;
+        };
+        std::optional<PendingMTPVerifierDeviceTokenPlan>
+            pending_mtp_verifier_device_token_plan_;
 
         /// Owned tensors when using graph-managed allocation
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;

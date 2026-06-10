@@ -104,6 +104,7 @@ namespace
         bool has_last_forward_input = false;
         ForwardInput last_forward_input{};
         const int *last_token_ids_pointer = nullptr;
+        const void *last_token_ids_device_pointer = nullptr;
         const int *last_position_ids_pointer = nullptr;
         std::vector<int> last_token_ids;
         std::vector<int> last_position_ids;
@@ -142,6 +143,7 @@ namespace
             has_last_forward_input = true;
             last_forward_input = input;
             last_token_ids_pointer = input.token_ids;
+            last_token_ids_device_pointer = input.token_ids_device;
             last_position_ids_pointer = input.position_ids;
             last_token_ids.clear();
             last_position_ids.clear();
@@ -1374,6 +1376,44 @@ TEST_F(Test__ForwardExecutionEngine, CacheMiss_NullInputIds_NoCachePopulated)
     EXPECT_TRUE(engine.cacheEmpty());
 }
 
+TEST_F(Test__ForwardExecutionEngine, DeviceTokenSourceUsesSeparateDecodeCacheSignature)
+{
+    auto engine = makeEngine();
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    int host_token = 42;
+    int device_token_shadow = 43;
+    int position = 7;
+    const void *device_tokens = reinterpret_cast<const void *>(0x12340000);
+
+    auto host_input = makeTestInput(1, 1, DeviceId::cpu(), &host_token, &position);
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(host_input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+    EXPECT_EQ(host.last_token_ids_device_pointer, nullptr);
+
+    auto device_input = makeTestInput(1, 1, DeviceId::cpu(), &device_token_shadow, &position);
+    device_input.token_ids_device = device_tokens;
+    ASSERT_TRUE(engine.execute(device_input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 2)
+        << "A host-token decode graph and a device-token decode graph have the same shape "
+           "but different embedding pointer contracts.";
+    EXPECT_EQ(host.last_token_ids_device_pointer, device_tokens);
+
+    device_token_shadow = 44;
+    position = 8;
+    ASSERT_TRUE(engine.execute(device_input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 2)
+        << "The stable device-token graph should be reusable once the device-token signature exists.";
+
+    host_token = 45;
+    position = 9;
+    ASSERT_TRUE(engine.execute(host_input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 2)
+        << "Returning to host-token decode should hit the original host-token cache entry.";
+}
+
 TEST_F(Test__ForwardExecutionEngine, CacheMiss_NullPositionIds_NoCachePopulated)
 {
     auto engine = makeEngine();
@@ -1469,6 +1509,7 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
         {"all_position_logit_rows", "0"},
         {"moe_placement_epoch", "0"},
         {"result", "miss"},
+        {"uses_device_token_ids", "false"},
         {"seq_len", "2"}};
     const PerfStatsCollector::Tags hit_tags = {
         {"all_position_logits", "true"},
@@ -1477,6 +1518,7 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
         {"all_position_logit_rows", "0"},
         {"moe_placement_epoch", "0"},
         {"result", "hit"},
+        {"uses_device_token_ids", "false"},
         {"seq_len", "2"}};
 
     EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "forward_cache_lookup", miss_tags), 1.0);

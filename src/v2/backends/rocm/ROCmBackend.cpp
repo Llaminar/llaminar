@@ -13,6 +13,7 @@
 #include "HipDeviceGuard.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "../../utils/Logger.h"
+#include "../../kernels/common/SamplingMath.h"
 #include <hip/hip_runtime.h>
 #include <chrono>
 #include <stdexcept>
@@ -514,6 +515,49 @@ namespace llaminar2
         float *out_accept_probability,
         float *out_accept_threshold,
         int device_idx, void *stream);
+    extern "C" bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
+        const int *target_token_ids, const float *target_probs,
+        const int *draft_token_ids, const float *draft_probs,
+        int k, int distribution_stride,
+        const int *sampled_draft_tokens,
+        float accept_threshold0, float accept_threshold1,
+        float accept_threshold2, float accept_threshold3,
+        float residual_threshold0, float residual_threshold1,
+        float residual_threshold2, float residual_threshold3,
+        int row_count,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_summarize_speculative_verify_batch(
+        const int *verify_tokens,
+        const int *verify_accepted,
+        int row_count,
+        int first_token,
+        int stop_token0, int stop_token1, int stop_token2, int stop_token3,
+        int stop_token4, int stop_token5, int stop_token6, int stop_token7,
+        int stop_token_count,
+        const int *bonus_token,
+        int has_bonus_token,
+        int *out_tokens,
+        int *out_meta,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_summarize_speculative_verify_batch_device_first_token(
+        const int *verify_tokens,
+        const int *verify_accepted,
+        int row_count,
+        const int *first_token,
+        int stop_token0, int stop_token1, int stop_token2, int stop_token3,
+        int stop_token4, int stop_token5, int stop_token6, int stop_token7,
+        int stop_token_count,
+        const int *bonus_token,
+        int has_bonus_token,
+        int *out_tokens,
+        int *out_meta,
+        int device_idx,
+        void *stream);
 
     bool ROCmBackend::topKF32(const void *data_device, int n, int k, int device_id,
                               float *out_values, int *out_indices, void *stream)
@@ -881,6 +925,182 @@ namespace llaminar2
             static_cast<int *>(out_accepted_device),
             static_cast<float *>(out_accept_probability_device),
             static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+        const void *target_token_ids_device,
+        const void *target_probs_device,
+        const void *draft_token_ids_device,
+        const void *draft_probs_device,
+        int top_k,
+        int distribution_stride,
+        const void *draft_tokens_device,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
+        int row_count,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_token_ids_device || !target_probs_device ||
+            !draft_token_ids_device || !draft_probs_device ||
+            !draft_tokens_device ||
+            top_k <= 0 || top_k > 256 ||
+            distribution_stride < top_k ||
+            row_count <= 0 || row_count > 4 ||
+            !accept_thresholds_host || !residual_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float residual_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+        {
+            accept_thresholds[i] = accept_thresholds_host[i];
+            residual_thresholds[i] = residual_thresholds_host[i];
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
+            static_cast<const int *>(target_token_ids_device),
+            static_cast<const float *>(target_probs_device),
+            static_cast<const int *>(draft_token_ids_device),
+            static_cast<const float *>(draft_probs_device),
+            top_k,
+            distribution_stride,
+            static_cast<const int *>(draft_tokens_device),
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            residual_thresholds[0],
+            residual_thresholds[1],
+            residual_thresholds[2],
+            residual_thresholds[3],
+            row_count,
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSummarizeSpeculativeVerifyBatch(
+        const void *verify_tokens_device,
+        const void *verify_accepted_device,
+        int row_count,
+        int first_token,
+        const int *stop_tokens_host,
+        int stop_token_count,
+        const void *bonus_token_device,
+        bool has_bonus_token,
+        int device_id,
+        void *stream,
+        void *out_tokens_device,
+        void *out_meta_device)
+    {
+        using namespace sampling_math;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !verify_tokens_device || !verify_accepted_device ||
+            row_count < 0 || row_count > kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens_host) ||
+            (has_bonus_token && !bonus_token_device) ||
+            !stream || !out_tokens_device || !out_meta_device)
+        {
+            return false;
+        }
+
+        int stop_tokens[kSpeculativeBatchMaxStopTokens] =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            stop_tokens[i] = stop_tokens_host[i];
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_summarize_speculative_verify_batch(
+            static_cast<const int *>(verify_tokens_device),
+            static_cast<const int *>(verify_accepted_device),
+            row_count,
+            first_token,
+            stop_tokens[0],
+            stop_tokens[1],
+            stop_tokens[2],
+            stop_tokens[3],
+            stop_tokens[4],
+            stop_tokens[5],
+            stop_tokens[6],
+            stop_tokens[7],
+            stop_token_count,
+            static_cast<const int *>(bonus_token_device),
+            has_bonus_token ? 1 : 0,
+            static_cast<int *>(out_tokens_device),
+            static_cast<int *>(out_meta_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSummarizeSpeculativeVerifyBatchDeviceFirstToken(
+        const void *verify_tokens_device,
+        const void *verify_accepted_device,
+        int row_count,
+        const void *first_token_device,
+        const int *stop_tokens_host,
+        int stop_token_count,
+        const void *bonus_token_device,
+        bool has_bonus_token,
+        int device_id,
+        void *stream,
+        void *out_tokens_device,
+        void *out_meta_device)
+    {
+        using namespace sampling_math;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !verify_tokens_device || !verify_accepted_device ||
+            !first_token_device ||
+            row_count < 0 || row_count > kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens_host) ||
+            (has_bonus_token && !bonus_token_device) ||
+            !stream || !out_tokens_device || !out_meta_device)
+        {
+            return false;
+        }
+
+        int stop_tokens[kSpeculativeBatchMaxStopTokens] =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            stop_tokens[i] = stop_tokens_host[i];
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_summarize_speculative_verify_batch_device_first_token(
+            static_cast<const int *>(verify_tokens_device),
+            static_cast<const int *>(verify_accepted_device),
+            row_count,
+            static_cast<const int *>(first_token_device),
+            stop_tokens[0],
+            stop_tokens[1],
+            stop_tokens[2],
+            stop_tokens[3],
+            stop_tokens[4],
+            stop_tokens[5],
+            stop_tokens[6],
+            stop_tokens[7],
+            stop_token_count,
+            static_cast<const int *>(bonus_token_device),
+            has_bonus_token ? 1 : 0,
+            static_cast<int *>(out_tokens_device),
+            static_cast<int *>(out_meta_device),
             device_id,
             stream);
     }
@@ -2121,6 +2341,78 @@ namespace llaminar2
             return false;
         err = hipStreamSynchronize(s);
         return (err == hipSuccess);
+    }
+
+    bool ROCmBackend::deviceCopyAsync(void *dst, const void *src, size_t bytes,
+                                      int device_id, void *stream)
+    {
+        if (bytes == 0)
+            return true;
+        if (!dst || !src)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] null pointer: dst=" << dst
+                                                                          << " src=" << src
+                                                                          << " bytes=" << bytes);
+            return false;
+        }
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] invalid device_id=" << device_id);
+            return false;
+        }
+
+        HipDeviceSaveRestore device_guard;
+        hipError_t err_set = hipSetDevice(device_id);
+        if (err_set != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] hipSetDevice(" << device_id
+                                                                      << ") failed: "
+                                                                      << hipGetErrorString(err_set));
+            return false;
+        }
+
+        hipStream_t s = resolveStream(device_id, stream);
+        if (!s)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] refused to use HIP null stream");
+            return false;
+        }
+
+        /*
+         * The MTP sidecar path copies tiny INT32 token slots between arena
+         * buffers. Checking both endpoints here gives junior maintainers a
+         * useful failure message if a future caller accidentally passes a host
+         * shadow pointer or a pointer from a different GPU.
+         */
+        hipPointerAttribute_t dst_attrs{};
+        hipPointerAttribute_t src_attrs{};
+        hipError_t dst_attr_err = hipPointerGetAttributes(&dst_attrs, dst);
+        hipError_t src_attr_err = hipPointerGetAttributes(&src_attrs, src);
+        if (dst_attr_err != hipSuccess || src_attr_err != hipSuccess)
+        {
+            (void)hipGetLastError(); // clear any sticky pointer-query error
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] pointer attribute query failed: dst_err="
+                      << hipGetErrorString(dst_attr_err)
+                      << " src_err=" << hipGetErrorString(src_attr_err));
+            return false;
+        }
+        if (dst_attrs.device != device_id || src_attrs.device != device_id)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] device mismatch: dst_device="
+                      << dst_attrs.device << " src_device=" << src_attrs.device
+                      << " requested_device=" << device_id);
+            return false;
+        }
+
+        hipError_t err =
+            hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, s);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] hipMemcpyAsync failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+        return true;
     }
 
     bool ROCmBackend::registerIoMemory(void *ptr, size_t size, void **device_ptr)

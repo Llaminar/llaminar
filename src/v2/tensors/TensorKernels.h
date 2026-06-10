@@ -2602,6 +2602,25 @@ namespace llaminar2
         }
 
         /**
+         * @brief Use token IDs that already live in device memory.
+         *
+         * GPU graph paths call this when a previous device-side sampler produced
+         * the next token into an arena/workspace buffer. Implementations should
+         * make the next apply_tensor() consume `token_ids_device` directly on the
+         * bound explicit stream, without uploading host token IDs or touching the
+         * CUDA/HIP null stream. CPU kernels keep the default no-op and continue to
+         * use setDynamicTokenIds()/apply_tensor() host pointers.
+         *
+         * @param token_ids_device Device pointer to INT32 token IDs [num_tokens].
+         * @param num_tokens Number of token IDs available at the device pointer.
+         */
+        virtual void setDynamicDeviceTokenIds(const void *token_ids_device, int num_tokens)
+        {
+            (void)token_ids_device;
+            (void)num_tokens;
+        }
+
+        /**
          * @brief Set local vocab range for vocab-parallel embedding shards.
          *
          * Local TP runs multiple devices inside one MPI rank, so MPI rank cannot

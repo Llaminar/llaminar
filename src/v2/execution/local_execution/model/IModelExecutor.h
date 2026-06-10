@@ -128,6 +128,14 @@ namespace llaminar2
     {
         // Token input (one of these must be set)
         const int *token_ids = nullptr;                         ///< Token IDs [seq_len] (single sequence)
+        /**
+         * @brief Optional device-resident INT32 token IDs.
+         *
+         * This mirrors the graph-builder forward contract. Device execution can
+         * read tokens from a stable GPU buffer while `token_ids` remains a host
+         * shadow for diagnostics and request bookkeeping.
+         */
+        const void *token_ids_device = nullptr;
         const std::vector<std::vector<int>> *batches = nullptr; ///< Batched tokens
 
         // Dimensions

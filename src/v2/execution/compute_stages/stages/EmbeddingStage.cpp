@@ -137,7 +137,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!params_.token_ids && !params_.token_batches)
+        if (!params_.token_ids && !params_.token_ids_device && !params_.token_batches)
         {
             LOG_ERROR("[EmbeddingStage] No token input provided");
             return false;
@@ -241,6 +241,18 @@ namespace llaminar2
         else
         {
             // Single sequence input: delegate directly to kernel
+            // For GPU MTP sidecar/verifier graphs, token_ids may be a harmless
+            // stable host shadow while token_ids_device is the real execution
+            // source. Rebind the device pointer here as well as in
+            // updateDynamicParams(); cached graph stages can be replayed after
+            // their token source changes, and this host-side state update keeps
+            // the embedding kernel from falling back to the shadow sentinel.
+            if (params_.token_ids_device)
+            {
+                kernel->setDynamicDeviceTokenIds(
+                    params_.token_ids_device,
+                    params_.num_tokens);
+            }
             if (!kernel->apply_tensor(embed_table_base, params_.token_ids, params_.num_tokens,
                                       params_.d_model, output_base, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex()))
             {
