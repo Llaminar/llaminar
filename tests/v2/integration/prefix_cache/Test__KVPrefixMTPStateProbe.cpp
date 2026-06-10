@@ -406,7 +406,7 @@ namespace
         const std::string &backend_name,
         size_t decode_token_count = 8,
         int repeat_cycles = 2,
-        bool deterministic_repeatability = false,
+        bool deterministic_repeatability = true,
         bool use_presence_penalty = false)
     {
         ASSERT_GT(decode_token_count, 0u);
@@ -528,17 +528,22 @@ namespace
                 result_tokens.end(),
                 first_tokens.begin(),
                 first_tokens.end());
-            if (mismatch.first != result_tokens.end() ||
-                mismatch.second != first_tokens.end())
+            if (deterministic_repeatability &&
+                (mismatch.first != result_tokens.end() ||
+                 mismatch.second != first_tokens.end()))
             {
                 const size_t index = static_cast<size_t>(
                     std::distance(result_tokens.begin(), mismatch.first));
                 ADD_FAILURE()
-                    << "Deterministic stochastic MTP graph replay must be reproducible after clearCache() "
-                    << "with the same prompt and seed after graph warmup (cycle=" << cycle
+                    << "Deterministic stochastic MTP graph replay must be reproducible "
+                    << "under LLAMINAR_DETERMINISTIC after clearCache() with the same "
+                    << "prompt and seed after graph warmup (cycle=" << cycle
                     << ", first_mismatch_index=" << index << ")\n"
                     << "result window: " << formatTokenWindow(result_tokens, index) << "\n"
-                    << "first  window: " << formatTokenWindow(first_tokens, index);
+                    << "first  window: " << formatTokenWindow(first_tokens, index) << "\n"
+                    << "warmup window: " << formatTokenWindow(warmup_tokens, index) << "\n"
+                    << "result_matches_warmup=" << (result_tokens == warmup_tokens ? "true" : "false")
+                    << ", first_matches_warmup=" << (first_tokens == warmup_tokens ? "true" : "false");
             }
         }
         const auto snapshot = runner->prefixStateProbe();

@@ -279,7 +279,7 @@ TEST(Test__MTPDepthController, DynamicCanDemoteToZeroBypassAndProbeAfterCooldown
     EXPECT_EQ(controller.stats().promotions, 1u);
 }
 
-TEST(Test__MTPDepthController, DynamicDemotesDepthOneToZeroOnlyAfterAllZeroWindow)
+TEST(Test__MTPDepthController, DynamicHoldsHealthyDepthOneWindowBeforeZeroBypass)
 {
     auto config = dynamicConfig(
         /*initial_depth=*/1,
@@ -305,6 +305,7 @@ TEST(Test__MTPDepthController, DynamicDemotesDepthOneToZeroOnlyAfterAllZeroWindo
         auto decision = all_zero.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
         EXPECT_FALSE(decision.evaluated);
     }
+
     auto demote = all_zero.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
     ASSERT_TRUE(demote.evaluated);
     ASSERT_TRUE(demote.changed);
@@ -312,6 +313,130 @@ TEST(Test__MTPDepthController, DynamicDemotesDepthOneToZeroOnlyAfterAllZeroWindo
     EXPECT_EQ(demote.old_depth, 1);
     EXPECT_EQ(demote.new_depth, 0);
     EXPECT_EQ(all_zero.currentDepth(), 0);
+}
+
+TEST(Test__MTPDepthController, DynamicKeepsDepthOneOnLowButNonzeroAcceptance)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/4,
+        /*cooldown_steps=*/0);
+    config.min_depth = 0;
+    config.min_samples = 4;
+    /*
+     * Keep the zero-accept threshold above this 50% zero-accept window so the
+     * regression isolates low acceptance.  Depth 1 should remain active unless
+     * the dedicated zero-acceptance bypass signal fires.
+     */
+    config.demote_zero_accept_rate = 0.75;
+    config.demote_acceptance_rate = 0.75;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto hold = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
+
+    ASSERT_TRUE(hold.evaluated);
+    EXPECT_FALSE(hold.changed);
+    EXPECT_EQ(hold.reason, MTPDepthDecisionReason::Hold);
+    EXPECT_EQ(hold.old_depth, 1);
+    EXPECT_EQ(hold.new_depth, 1);
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.stats().demotions, 0u);
+}
+
+TEST(Test__MTPDepthController, DynamicSlowlyExploresFromHealthyNonPerfectFloorWindows)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/2,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 2;
+    config.promote_full_accept_rate = 0.50;
+    config.demote_acceptance_rate = 0.45;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto first_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
+    ASSERT_TRUE(first_window.evaluated);
+    EXPECT_FALSE(first_window.changed);
+    EXPECT_EQ(first_window.reason, MTPDepthDecisionReason::PromotionHysteresisActive);
+    EXPECT_EQ(controller.currentDepth(), 1);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto second_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
+    ASSERT_TRUE(second_window.evaluated);
+    ASSERT_TRUE(second_window.changed);
+    EXPECT_EQ(second_window.reason, MTPDepthDecisionReason::PromoteFullAcceptRate);
+    EXPECT_EQ(second_window.old_depth, 1);
+    EXPECT_EQ(second_window.new_depth, 2);
+    EXPECT_EQ(controller.currentDepth(), 2);
+}
+
+TEST(Test__MTPDepthController, DynamicDefaultFloorHoldsOnNonPerfectWindows)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/4,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 2;
+    config.promote_full_accept_rate = 1.0;
+    config.demote_acceptance_rate = 0.55;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    /*
+     * This is profitable enough to keep depth 1 alive, but it is not strong
+     * enough to pay for deeper probes under the production default.  The
+     * default benchmark prompt often looks like this: d1 can win, while
+     * probing d2/d3 spends more sidecar and verifier work than it earns.
+     */
+    for (int window = 0; window < 2; ++window)
+    {
+        controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+        controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+        controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+        auto decision = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
+        ASSERT_TRUE(decision.evaluated);
+        EXPECT_FALSE(decision.changed);
+        EXPECT_EQ(decision.reason, MTPDepthDecisionReason::Hold);
+        EXPECT_EQ(controller.currentDepth(), 1);
+    }
+    EXPECT_EQ(controller.stats().promotions, 0u);
+}
+
+TEST(Test__MTPDepthController, DynamicDoesNotExploreFromUnhealthyFloorWindows)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/2,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 2;
+    config.promote_full_accept_rate = 1.0;
+    config.demote_acceptance_rate = 0.75;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto first_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
+    ASSERT_TRUE(first_window.evaluated);
+    EXPECT_FALSE(first_window.changed);
+    EXPECT_EQ(first_window.reason, MTPDepthDecisionReason::Hold);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto second_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
+    ASSERT_TRUE(second_window.evaluated);
+    EXPECT_FALSE(second_window.changed);
+    EXPECT_EQ(second_window.reason, MTPDepthDecisionReason::Hold);
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.stats().promotions, 0u);
 }
 
 TEST(Test__MTPDepthController, DynamicRequiresConsecutivePromotableWindows)
@@ -417,6 +542,215 @@ TEST(Test__MTPDepthController, DefaultHysteresisHoldsAfterMiddlingAcceptanceWind
     EXPECT_EQ(controller.currentDepth(), 2);
     EXPECT_EQ(controller.stats().promotions, 0u);
     EXPECT_EQ(controller.stats().demotions, 1u);
+}
+
+TEST(Test__MTPDepthController, DynamicProbesHigherDepthOnceBeforeDemotingIntermediateDepth)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/2,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 1;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    /*
+     * Depth 1 is perfect, so the controller first promotes to the normal
+     * intermediate probe depth 2.
+     */
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto promote_to_two = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    ASSERT_TRUE(promote_to_two.changed);
+    ASSERT_EQ(promote_to_two.new_depth, 2);
+
+    /*
+     * An ambiguous weak depth-2 window should not permanently hide depth 3.
+     * The controller marks depth 2 as rejected and spends one window testing
+     * depth 3 before it settles downward.
+     */
+    controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+    auto probe_three = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
+    ASSERT_TRUE(probe_three.evaluated);
+    ASSERT_TRUE(probe_three.changed);
+    EXPECT_EQ(probe_three.reason, MTPDepthDecisionReason::ProbeHigherBeforeDemote);
+    EXPECT_EQ(probe_three.old_depth, 2);
+    EXPECT_EQ(probe_three.new_depth, 3);
+    EXPECT_EQ(controller.currentDepth(), 3);
+    EXPECT_EQ(controller.stats().promotions, 2u);
+    EXPECT_EQ(controller.stats().demotions, 0u);
+
+    controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/3));
+    auto hold_three = controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/3));
+    ASSERT_TRUE(hold_three.evaluated);
+    EXPECT_FALSE(hold_three.changed);
+    EXPECT_EQ(hold_three.reason, MTPDepthDecisionReason::Hold);
+    EXPECT_EQ(controller.currentDepth(), 3);
+}
+
+TEST(Test__MTPDepthController, DynamicDemotesInsteadOfProbingOnCatastrophicZeroAcceptWindow)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/2,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 1;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto promote_to_two = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    ASSERT_TRUE(promote_to_two.changed);
+    ASSERT_EQ(controller.currentDepth(), 2);
+
+    controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
+    auto demote_to_one = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
+    ASSERT_TRUE(demote_to_one.evaluated);
+    ASSERT_TRUE(demote_to_one.changed);
+    EXPECT_EQ(demote_to_one.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
+    EXPECT_EQ(demote_to_one.old_depth, 2);
+    EXPECT_EQ(demote_to_one.new_depth, 1)
+        << "a clearly bad depth-2 window should not pay for a depth-3 probe";
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.stats().promotions, 1u);
+    EXPECT_EQ(controller.stats().demotions, 1u);
+}
+
+TEST(Test__MTPDepthController, DynamicRequiresFreshHysteresisBeforeRetryingRejectedDepth)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/1,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 2;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    ASSERT_EQ(controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1)).new_depth, 2);
+    auto probe_three = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+    ASSERT_EQ(probe_three.reason, MTPDepthDecisionReason::ProbeHigherBeforeDemote);
+    ASSERT_EQ(controller.currentDepth(), 3);
+
+    auto reject_three = controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/0));
+    ASSERT_EQ(reject_three.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
+    ASSERT_EQ(controller.currentDepth(), 2);
+
+    auto reject_two_again = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
+    ASSERT_EQ(reject_two_again.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
+    EXPECT_EQ(reject_two_again.old_depth, 2);
+    EXPECT_EQ(reject_two_again.new_depth, 1)
+        << "rejected depth 3 must not be probed again immediately";
+    EXPECT_EQ(controller.currentDepth(), 1);
+
+    auto first_fresh_full_accept =
+        controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    ASSERT_TRUE(first_fresh_full_accept.evaluated);
+    EXPECT_FALSE(first_fresh_full_accept.changed);
+    EXPECT_EQ(first_fresh_full_accept.reason, MTPDepthDecisionReason::PromotionHysteresisActive)
+        << "retrying a rejected depth should require the configured hysteresis";
+    EXPECT_EQ(controller.currentDepth(), 1);
+
+    auto second_fresh_full_accept =
+        controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    ASSERT_TRUE(second_fresh_full_accept.changed);
+    EXPECT_EQ(second_fresh_full_accept.reason, MTPDepthDecisionReason::PromoteFullAcceptRate);
+    EXPECT_EQ(second_fresh_full_accept.new_depth, 2);
+    EXPECT_EQ(controller.currentDepth(), 2);
+}
+
+TEST(Test__MTPDepthController, DynamicDoesNotForgetRejectedHigherDepthDuringProbe)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/1,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 1;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    ASSERT_EQ(controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1)).new_depth, 2);
+
+    auto first_probe_three =
+        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+    ASSERT_TRUE(first_probe_three.changed);
+    ASSERT_EQ(first_probe_three.reason, MTPDepthDecisionReason::ProbeHigherBeforeDemote);
+    ASSERT_EQ(controller.currentDepth(), 3);
+
+    auto reject_three =
+        controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/0));
+    ASSERT_TRUE(reject_three.changed);
+    ASSERT_EQ(reject_three.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
+    ASSERT_EQ(controller.currentDepth(), 2);
+
+    /*
+     * This is the ROCm stochastic failure shape from the Phase 4 benchmark:
+     * depth 2 is weak but not catastrophic, so the old controller would clear
+     * the rejected-depth bit while probing d3 and then repeat the bad d3 lane.
+     */
+    auto weak_two_after_bad_three =
+        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+    ASSERT_TRUE(weak_two_after_bad_three.evaluated);
+    EXPECT_FALSE(weak_two_after_bad_three.changed);
+    EXPECT_EQ(weak_two_after_bad_three.reason,
+              MTPDepthDecisionReason::Hold);
+    EXPECT_EQ(weak_two_after_bad_three.old_depth, 2);
+    EXPECT_EQ(weak_two_after_bad_three.new_depth, 2)
+        << "rejected depth 3 must not be probed again, but d2 should remain "
+           "active on a low-but-nonzero survivor window";
+    EXPECT_EQ(controller.currentDepth(), 2);
+}
+
+TEST(Test__MTPDepthController, DynamicHoldsHighestUnrejectedDepthAfterDeeperRejection)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/1,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 1;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    ASSERT_EQ(controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1)).new_depth, 2);
+
+    auto probe_three =
+        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+    ASSERT_TRUE(probe_three.changed);
+    ASSERT_EQ(probe_three.reason, MTPDepthDecisionReason::ProbeHigherBeforeDemote);
+    ASSERT_EQ(controller.currentDepth(), 3);
+
+    auto reject_three =
+        controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/0));
+    ASSERT_TRUE(reject_three.changed);
+    ASSERT_EQ(reject_three.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
+    ASSERT_EQ(controller.currentDepth(), 2);
+
+    /*
+     * This mirrors the current ROCm stochastic evidence: fixed d2 is the best
+     * surviving lane after d3 proves bad, but individual d2 windows can still
+     * be imperfect.  Hold d2 on a low-but-nonzero window instead of collapsing
+     * to d1; the explicit zero-accept path remains the hard demotion signal.
+     */
+    auto weak_but_nonzero_two =
+        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+    ASSERT_TRUE(weak_but_nonzero_two.evaluated);
+    EXPECT_FALSE(weak_but_nonzero_two.changed);
+    EXPECT_EQ(weak_but_nonzero_two.reason, MTPDepthDecisionReason::Hold);
+    EXPECT_EQ(weak_but_nonzero_two.old_depth, 2);
+    EXPECT_EQ(weak_but_nonzero_two.new_depth, 2);
+    EXPECT_EQ(controller.currentDepth(), 2);
+
+    auto zero_two =
+        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
+    ASSERT_TRUE(zero_two.evaluated);
+    ASSERT_TRUE(zero_two.changed);
+    EXPECT_EQ(zero_two.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
+    EXPECT_EQ(zero_two.old_depth, 2);
+    EXPECT_EQ(zero_two.new_depth, 1);
+    EXPECT_EQ(controller.currentDepth(), 1);
 }
 
 TEST(Test__MTPDepthController, CooldownPreventsImmediateOscillation)

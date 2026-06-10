@@ -755,6 +755,77 @@ TEST(Test__MTPSpecDecodeMetadata, UsesExplicitVerifierStateCommitCountForRejecte
     EXPECT_EQ(batch.bonus_ready_state_slot_indices[0], kMTPSpecDecodeInvalidToken);
 }
 
+TEST(Test__MTPSpecDecodeMetadata, BuildsMetadataFromAcceptedOutcomeWithoutSyntheticDraftTokens)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeAcceptedOutcome outcome;
+    outcome.request_id = 0;
+    outcome.vocab_size = 100;
+    outcome.draft_count = 3;
+    outcome.committed_output_tokens = {7, 9, 3};
+    outcome.accepted_verifier_input_prefix = 2;
+    outcome.target_verifier_state_commit_count = 2;
+    outcome.all_drafts_accepted = false;
+    outcome.stopped_on_output = false;
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromAcceptedOutcome(shape, outcome);
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    ASSERT_THAT(batch.transactions, SizeIs(1));
+    EXPECT_FALSE(batch.transactions.front().allDraftsAccepted());
+    EXPECT_THAT(batch.valid_sampled_counts, ElementsAre(3));
+    EXPECT_THAT(batch.accepted_draft_prefixes, ElementsAre(2));
+    EXPECT_THAT(batch.committed_output_counts, ElementsAre(3));
+    EXPECT_THAT(batch.target_verifier_state_commit_counts, ElementsAre(2));
+    EXPECT_THAT(batch.accepted_state_counts, ElementsAre(2));
+    EXPECT_THAT(batch.correction_replay_start_indices, ElementsAre(2));
+    EXPECT_THAT(batch.correction_replay_counts, ElementsAre(1));
+    EXPECT_THAT(batch.draft_tokens,
+                ElementsAre(7, 9, kMTPSpecDecodeInvalidToken))
+        << "unknown rejected draft slots should remain invalid instead of "
+           "being populated with host-invented placeholder tokens";
+    EXPECT_THAT(batch.sampled_tokens,
+                ElementsAre(7, 9, 3, kMTPSpecDecodeInvalidToken));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, BuildsAcceptedOutcomeWithBonusReadyToken)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeAcceptedOutcome outcome;
+    outcome.request_id = 0;
+    outcome.vocab_size = 100;
+    outcome.draft_count = 3;
+    outcome.committed_output_tokens = {7, 9, 8};
+    outcome.bonus_ready_token = 4;
+    outcome.accepted_verifier_input_prefix = 3;
+    outcome.target_verifier_state_commit_count = 3;
+    outcome.all_drafts_accepted = true;
+    outcome.stopped_on_output = false;
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromAcceptedOutcome(shape, outcome);
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    ASSERT_THAT(batch.transactions, SizeIs(1));
+    EXPECT_TRUE(batch.transactions.front().allDraftsAccepted());
+    EXPECT_THAT(batch.valid_sampled_counts, ElementsAre(4));
+    EXPECT_THAT(batch.accepted_draft_prefixes, ElementsAre(3));
+    EXPECT_THAT(batch.rejected_token_counts, ElementsAre(0));
+    EXPECT_THAT(batch.next_condition_tokens, ElementsAre(4));
+    EXPECT_THAT(batch.bonus_ready_token_rows, ElementsAre(3));
+    EXPECT_THAT(batch.bonus_ready_token_indices, ElementsAre(3));
+    EXPECT_THAT(batch.bonus_ready_state_slot_indices, ElementsAre(3));
+    EXPECT_THAT(batch.draft_tokens, ElementsAre(7, 9, 8));
+    EXPECT_THAT(batch.sampled_tokens, ElementsAre(7, 9, 8, 4));
+}
+
 TEST(Test__MTPSpecDecodeMetadata, StateCommitPlanDoesNotReplayStoppedCorrectionSuffix)
 {
     MTPSpecDecodeMetadataShape shape;

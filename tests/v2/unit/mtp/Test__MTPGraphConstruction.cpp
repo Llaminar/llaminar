@@ -1964,11 +1964,29 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto plain_after_build_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}, {"seq_len", "1"}};
+        PerfStatsCollector::Tags{
+            {"context", "mtp_decode_sidecar"},
+            {"depth", "0"},
+            {"device_tokens", "false"},
+            {"kv_cache_only", "false"},
+            {"path", "plain_after_build"},
+            {"seq_len", "1"}};
     const auto plain_reuse_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}, {"seq_len", "1"}};
+        PerfStatsCollector::Tags{
+            {"context", "mtp_decode_sidecar"},
+            {"depth", "0"},
+            {"device_tokens", "false"},
+            {"kv_cache_only", "false"},
+            {"path", "plain"},
+            {"seq_len", "1"}};
     const auto epoch0_depth_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
+        PerfStatsCollector::Tags{
+            {"context", "mtp_decode_sidecar"},
+            {"depth", "0"},
+            {"device_tokens", "false"},
+            {"kv_cache_only", "false"},
+            {"moe_placement_epoch", "0"},
+            {"seq_len", "1"}};
     const auto dense_collective_scan_tags =
         PerfStatsCollector::Tags{{"depth", "0"}, {"has_collectives", "false"}, {"node_count", "0"}, {"seq_len", "1"}};
 
@@ -2057,11 +2075,29 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto epoch0_depth_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
+        PerfStatsCollector::Tags{
+            {"context", "mtp_decode_sidecar"},
+            {"depth", "0"},
+            {"device_tokens", "false"},
+            {"kv_cache_only", "false"},
+            {"moe_placement_epoch", "0"},
+            {"seq_len", "1"}};
     const auto plain_after_build_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}, {"seq_len", "1"}};
+        PerfStatsCollector::Tags{
+            {"context", "mtp_decode_sidecar"},
+            {"depth", "0"},
+            {"device_tokens", "false"},
+            {"kv_cache_only", "false"},
+            {"path", "plain_after_build"},
+            {"seq_len", "1"}};
     const auto plain_reuse_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}, {"seq_len", "1"}};
+        PerfStatsCollector::Tags{
+            {"context", "mtp_decode_sidecar"},
+            {"depth", "0"},
+            {"device_tokens", "false"},
+            {"kv_cache_only", "false"},
+            {"path", "plain"},
+            {"seq_len", "1"}};
 
     const PerfStatRecord *cache_misses = findMTPRecord(
         records,
@@ -2154,7 +2190,13 @@ TEST(Test__MTPGraphConstruction, DenseSidecarGraphCacheIgnoresMoEPlacementEpochC
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto epoch0_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
+        PerfStatsCollector::Tags{
+            {"context", "mtp_decode_sidecar"},
+            {"depth", "0"},
+            {"device_tokens", "false"},
+            {"kv_cache_only", "false"},
+            {"moe_placement_epoch", "0"},
+            {"seq_len", "1"}};
     const PerfStatRecord *epoch0_miss = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
@@ -2245,9 +2287,21 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto epoch0_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
+        PerfStatsCollector::Tags{
+            {"context", "mtp_decode_sidecar"},
+            {"depth", "0"},
+            {"device_tokens", "false"},
+            {"kv_cache_only", "false"},
+            {"moe_placement_epoch", "0"},
+            {"seq_len", "1"}};
     const auto epoch1_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "1"}, {"seq_len", "1"}};
+        PerfStatsCollector::Tags{
+            {"context", "mtp_decode_sidecar"},
+            {"depth", "0"},
+            {"device_tokens", "false"},
+            {"kv_cache_only", "false"},
+            {"moe_placement_epoch", "1"},
+            {"seq_len", "1"}};
 
     const PerfStatRecord *epoch0_miss = findMTPRecord(
         records,
@@ -2341,8 +2395,20 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCap
     EXPECT_GT(abs_sum, 0.0f);
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
-    const auto plain_tags = PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}, {"seq_len", "1"}};
-    const auto segmented_tags = PerfStatsCollector::Tags{{"depth", "0"}, {"path", "segmented"}, {"seq_len", "1"}};
+    const auto plain_tags = PerfStatsCollector::Tags{
+        {"context", "mtp_decode_sidecar"},
+        {"depth", "0"},
+        {"device_tokens", "false"},
+        {"kv_cache_only", "false"},
+        {"path", "plain_after_build"},
+        {"seq_len", "1"}};
+    const auto segmented_tags = PerfStatsCollector::Tags{
+        {"context", "mtp_decode_sidecar"},
+        {"depth", "0"},
+        {"device_tokens", "false"},
+        {"kv_cache_only", "false"},
+        {"path", "segmented"},
+        {"seq_len", "1"}};
 
     const PerfStatRecord *plain_path = findMTPRecord(
         records,
@@ -2365,6 +2431,7 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCap
         {"collective_segmented", "false"},
         {"collectives_graph_capturable", "false"},
         {"context", "mtp_decode_sidecar"},
+        {"defer_final_sync", "false"},
         {"force_recapture", "false"},
         {"has_collectives", "false"},
         {"seq_len", "1"}};
@@ -2375,6 +2442,141 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCap
         policy_tags);
     ASSERT_NE(policy_record, nullptr);
     EXPECT_GE(policy_record->value, 3.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFromHostTokenCache)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    const auto device = firstAvailableGraphCaptureGPU();
+    if (!device.has_value())
+        GTEST_SKIP() << "No GPU backend available for device-token MTP sidecar cache regression";
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.default_device = *device;
+
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        *device));
+
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    float *terminal_hidden = hidden->mutable_data();
+    ASSERT_NE(terminal_hidden, nullptr);
+    for (int i = 0; i < fixture.config.d_model; ++i)
+        terminal_hidden[i] = 0.01f * static_cast<float>((i % 29) + 1);
+    hidden->mark_host_dirty();
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture, *device);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForDevice(*orchestrator.frozenWeightSet(), store, *device);
+    graph_builder->setPreparedWeightStore(&store);
+    ASSERT_TRUE(orchestrator.supportsDeviceStochasticMTPVerification());
+
+    SamplingParams sampling;
+    sampling.temperature = 1.0f;
+    sampling.top_k = 4;
+    sampling.top_p = 1.0f;
+
+    for (int step = 0; step < 4; ++step)
+    {
+        ASSERT_TRUE(orchestrator.forwardMTPForDeviceSampling(/*draft_condition_token=*/3 + step))
+            << "host-token first sidecar failed at step " << step;
+        ASSERT_TRUE(orchestrator.buildStochasticDistributionOnDevice(
+            DeviceLogitsSource::MTP,
+            /*row=*/0,
+            DeviceDistributionBuffer::Target,
+            /*slot=*/0,
+            sampling,
+            fixture.config.vocab_size));
+        ASSERT_TRUE(orchestrator.sampleStochasticDistributionOnDeviceDeferred(
+            DeviceDistributionBuffer::Target,
+            /*slot=*/0,
+            /*threshold=*/0.25f));
+        ASSERT_TRUE(orchestrator.forwardMTPFromDeviceTargetForDeviceSampling(
+            /*target_sample_slot=*/0,
+            orchestrator.getPosition(0)))
+            << "device-token first sidecar failed at step " << step;
+        ASSERT_TRUE(orchestrator.flushPendingMTPWork());
+    }
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    auto capture_tags = [](const char *context, const char *device_tokens, const char *path)
+    {
+        return PerfStatsCollector::Tags{
+            {"context", context},
+            {"depth", "0"},
+            {"device_tokens", device_tokens},
+            {"kv_cache_only", "false"},
+            {"path", path},
+            {"seq_len", "1"}};
+    };
+    auto cache_tags = [](const char *context, const char *device_tokens)
+    {
+        return PerfStatsCollector::Tags{
+            {"context", context},
+            {"depth", "0"},
+            {"device_tokens", device_tokens},
+            {"kv_cache_only", "false"},
+            {"moe_placement_epoch", "0"},
+            {"seq_len", "1"}};
+    };
+
+    const auto host_plain_tags = capture_tags("mtp_decode_sidecar", "false", "plain_after_build");
+    const auto host_segmented_tags = capture_tags("mtp_decode_sidecar", "false", "segmented");
+    const auto device_plain_tags = capture_tags("mtp_decode_sidecar_device_target_token", "true", "plain_after_build");
+    const auto device_segmented_tags = capture_tags("mtp_decode_sidecar_device_target_token", "true", "segmented");
+
+    const PerfStatRecord *host_plain = findMTPRecord(
+        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", host_plain_tags);
+    ASSERT_NE(host_plain, nullptr);
+    EXPECT_DOUBLE_EQ(host_plain->value, 1.0);
+
+    const PerfStatRecord *host_segmented = findMTPRecord(
+        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", host_segmented_tags);
+    ASSERT_NE(host_segmented, nullptr);
+    EXPECT_GE(host_segmented->value, 3.0);
+
+    const PerfStatRecord *device_plain = findMTPRecord(
+        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", device_plain_tags);
+    ASSERT_NE(device_plain, nullptr);
+    EXPECT_DOUBLE_EQ(device_plain->value, 1.0);
+
+    const PerfStatRecord *device_segmented = findMTPRecord(
+        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", device_segmented_tags);
+    ASSERT_NE(device_segmented, nullptr);
+    EXPECT_GE(device_segmented->value, 3.0);
+
+    const PerfStatRecord *host_misses = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_misses",
+        cache_tags("mtp_decode_sidecar", "false"));
+    ASSERT_NE(host_misses, nullptr);
+    EXPECT_DOUBLE_EQ(host_misses->value, 1.0);
+
+    const PerfStatRecord *device_misses = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_misses",
+        cache_tags("mtp_decode_sidecar_device_target_token", "true"));
+    ASSERT_NE(device_misses, nullptr);
+    EXPECT_DOUBLE_EQ(device_misses->value, 1.0);
 
     PerfStatsCollector::reset();
 }
@@ -2412,7 +2614,7 @@ TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefil
     prepareFrozenGemmWeightsForDevice(*orchestrator.frozenWeightSet(), store, *device);
     graph_builder->setPreparedWeightStore(&store);
 
-    const std::vector<int> prefix_tokens = {1, 2, 3, 4};
+    const std::vector<int> prefix_tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9};
     ASSERT_NE(orchestrator.forward(prefix_tokens.data(), static_cast<int>(prefix_tokens.size()), 1), nullptr);
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
@@ -2421,16 +2623,86 @@ TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefil
         {"collective_segmented", "false"},
         {"collectives_graph_capturable", "false"},
         {"context", "mtp_shifted_prefill"},
+        {"defer_final_sync", "false"},
         {"force_recapture", "false"},
         {"has_collectives", "false"},
-        {"seq_len", "1"}};
+        {"seq_len", "4"}};
     const PerfStatRecord *policy_record = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_decode_capture_policy",
         policy_tags);
     ASSERT_NE(policy_record, nullptr);
-    EXPECT_GE(policy_record->value, 2.0);
+    EXPECT_GE(policy_record->value, 1.0);
+
+    const auto batch_tags = PerfStatsCollector::Tags{{"rows", "4"}};
+    const PerfStatRecord *batch_record = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "shifted_prefill_sidecar_batches",
+        batch_tags);
+    ASSERT_NE(batch_record, nullptr);
+    EXPECT_DOUBLE_EQ(batch_record->value, 2.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__MTPGraphConstruction, CPUShiftedPrefillBatchesRowsIntoSingleKVOnlySidecar)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    const std::vector<int> prefix_tokens = {1, 2, 3, 4, 5};
+    ASSERT_NE(orchestrator.forward(prefix_tokens.data(), static_cast<int>(prefix_tokens.size()), 1), nullptr);
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto sidecar_tags = PerfStatsCollector::Tags{
+        {"context", "mtp_shifted_prefill"},
+        {"depth", "0"},
+        {"device_tokens", "false"},
+        {"kv_cache_only", "true"},
+        {"seq_len", "4"}};
+    const PerfStatRecord *sidecar_record = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_depth0_calls",
+        sidecar_tags);
+    ASSERT_NE(sidecar_record, nullptr);
+    EXPECT_DOUBLE_EQ(sidecar_record->value, 1.0);
+
+    const auto batch_tags = PerfStatsCollector::Tags{{"rows", "4"}};
+    const PerfStatRecord *batch_record = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "shifted_prefill_sidecar_batches",
+        batch_tags);
+    ASSERT_NE(batch_record, nullptr);
+    EXPECT_DOUBLE_EQ(batch_record->value, 1.0);
+
+    const auto after_prefill = orchestrator.prefixStateProbe();
+    EXPECT_EQ(maxCachedTokens(after_prefill.mtp_kv_caches),
+              static_cast<int>(prefix_tokens.size()) - 1);
 
     PerfStatsCollector::reset();
 }

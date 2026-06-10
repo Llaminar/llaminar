@@ -287,4 +287,127 @@ namespace llaminar2
         return result;
     }
 
+    MTPRejectionBatchOutcome summarizeDeviceMTPRejectionBatchOutcome(
+        const MTPDecodeCatchupGreedyRequest &request,
+        const MTPDeviceRejectionBatchOutcome &device_outcome)
+    {
+        if (request.draft_tokens.empty())
+            return stochasticOutcomeFailure(
+                "device stochastic verifier received no draft tokens");
+        if (!device_outcome.ok)
+            return stochasticOutcomeFailure(
+                "device stochastic verifier batch outcome is invalid");
+        if (device_outcome.output_token_count < 1 ||
+            device_outcome.output_token_count >
+                static_cast<int>(device_outcome.output_tokens.size()))
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier batch outcome token count is invalid");
+        }
+        if (device_outcome.output_token_count >
+            static_cast<int>(request.draft_tokens.size()))
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier emitted more tokens than the draft batch");
+        }
+        if (device_outcome.consumed_verifier_rows < 0 ||
+            device_outcome.consumed_verifier_rows >
+                static_cast<int>(request.draft_tokens.size()) - 1)
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier consumed row count is invalid");
+        }
+        if (device_outcome.accepted_speculative_prefix < 0 ||
+            device_outcome.accepted_speculative_prefix >
+                device_outcome.consumed_verifier_rows)
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier accepted prefix is invalid");
+        }
+        if (device_outcome.target_verifier_state_commit_count < 0 ||
+            device_outcome.target_verifier_state_commit_count >
+                static_cast<int>(request.draft_tokens.size()))
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier state commit count is invalid");
+        }
+        if (device_outcome.sampled_terminal &&
+            device_outcome.ready_token < 0)
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier sampled terminal token is invalid");
+        }
+
+        MTPRejectionBatchOutcome result;
+        result.ok = true;
+        result.output_tokens.reserve(
+            static_cast<size_t>(device_outcome.output_token_count));
+        for (int i = 0; i < device_outcome.output_token_count; ++i)
+        {
+            const int32_t token =
+                device_outcome.output_tokens[static_cast<size_t>(i)];
+            if (token < 0)
+            {
+                return stochasticOutcomeFailure(
+                    "device stochastic verifier emitted an invalid token");
+            }
+            result.output_tokens.push_back(token);
+            if (i > 0)
+                result.verifier_tokens.push_back(token);
+        }
+
+        result.consumed_verifier_rows =
+            device_outcome.consumed_verifier_rows;
+        result.accepted_speculative_prefix =
+            device_outcome.accepted_speculative_prefix;
+        result.target_verifier_state_commit_count =
+            device_outcome.target_verifier_state_commit_count;
+        result.ready_token = device_outcome.ready_token;
+        result.rejected_verified_token =
+            device_outcome.rejected_verified_token;
+        result.stopped_on_output = device_outcome.stopped_on_output;
+        result.all_speculative_accepted =
+            device_outcome.all_speculative_accepted;
+        result.sampled_terminal = device_outcome.sampled_terminal;
+        return result;
+    }
+
+    MTPDecodeCatchupGreedyResult buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+        const MTPDecodeCatchupGreedyRequest &request,
+        const MTPDeviceRejectionBatchOutcome &device_outcome)
+    {
+        MTPRejectionBatchOutcome outcome =
+            summarizeDeviceMTPRejectionBatchOutcome(
+                request,
+                device_outcome);
+        if (!outcome.ok)
+            return stochasticCatchupFailure(outcome.error);
+
+        MTPDecodeCatchupGreedyResult result;
+        result.ok = true;
+        result.main_forward_token_count =
+            static_cast<int>(request.draft_tokens.size());
+        result.accepted_tokens = std::move(outcome.output_tokens);
+        result.verifier_tokens = std::move(outcome.verifier_tokens);
+        result.accepted_speculative_prefix =
+            outcome.accepted_speculative_prefix;
+        result.target_verifier_state_commit_count =
+            outcome.target_verifier_state_commit_count;
+        result.ready_token = outcome.ready_token;
+        result.rejected_verified_token = outcome.rejected_verified_token;
+        result.stopped_on_output = outcome.stopped_on_output;
+        result.all_speculative_accepted = outcome.all_speculative_accepted;
+        result.shifted_commit_count =
+            static_cast<int>(result.accepted_tokens.size());
+
+        std::ostringstream trace;
+        trace << "device_stochastic_rows=" << outcome.consumed_verifier_rows
+              << ", accepted_prefix=" << result.accepted_speculative_prefix
+              << ", publish_state_count="
+              << result.target_verifier_state_commit_count
+              << ", ready_token=" << result.ready_token;
+        result.debug_trace = trace.str();
+        return result;
+    }
+
 } // namespace llaminar2

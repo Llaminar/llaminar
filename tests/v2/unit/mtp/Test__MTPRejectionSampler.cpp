@@ -111,6 +111,40 @@ namespace llaminar2::test
         EXPECT_TRUE(outcome.sampled_terminal);
     }
 
+    TEST(Test__MTPRejectionSampler, BuildsCatchupFromDeviceAcceptAllOutcome)
+    {
+        MTPDecodeCatchupGreedyRequest request;
+        request.draft_tokens = {10, 11, 12};
+
+        MTPDeviceRejectionBatchOutcome outcome;
+        outcome.ok = true;
+        outcome.output_tokens[0] = 10;
+        outcome.output_tokens[1] = 11;
+        outcome.output_tokens[2] = 12;
+        outcome.output_token_count = 3;
+        outcome.accepted_speculative_prefix = 2;
+        outcome.target_verifier_state_commit_count = 3;
+        outcome.ready_token = 99;
+        outcome.all_speculative_accepted = true;
+        outcome.consumed_verifier_rows = 2;
+        outcome.sampled_terminal = true;
+
+        MTPDecodeCatchupGreedyResult result =
+            buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+                request,
+                outcome);
+
+        ASSERT_TRUE(result.ok) << result.error;
+        EXPECT_TRUE(result.all_speculative_accepted);
+        EXPECT_THAT(result.accepted_tokens, ElementsAre(10, 11, 12));
+        EXPECT_THAT(result.verifier_tokens, ElementsAre(11, 12));
+        EXPECT_EQ(result.accepted_speculative_prefix, 2);
+        EXPECT_EQ(result.target_verifier_state_commit_count, 3);
+        EXPECT_EQ(result.ready_token, 99);
+        EXPECT_THAT(result.debug_trace,
+                    testing::HasSubstr("device_stochastic_rows=2"));
+    }
+
     TEST(Test__MTPRejectionSampler, BuildsRejectCatchupWithAcceptedStatePrefix)
     {
         MTPDecodeCatchupGreedyRequest request;
@@ -155,6 +189,65 @@ namespace llaminar2::test
         EXPECT_EQ(outcome.rejected_verified_token, 77);
         EXPECT_EQ(outcome.ready_token, -1);
         EXPECT_FALSE(outcome.sampled_terminal);
+    }
+
+    TEST(Test__MTPRejectionSampler, BuildsCatchupFromDeviceRejectOutcome)
+    {
+        MTPDecodeCatchupGreedyRequest request;
+        request.draft_tokens = {10, 11, 12};
+
+        MTPDeviceRejectionBatchOutcome outcome;
+        outcome.ok = true;
+        outcome.output_tokens[0] = 10;
+        outcome.output_tokens[1] = 11;
+        outcome.output_tokens[2] = 77;
+        outcome.output_token_count = 3;
+        outcome.accepted_speculative_prefix = 1;
+        outcome.target_verifier_state_commit_count = 2;
+        outcome.ready_token = -1;
+        outcome.rejected_verified_token = 77;
+        outcome.all_speculative_accepted = false;
+        outcome.consumed_verifier_rows = 2;
+
+        MTPDecodeCatchupGreedyResult result =
+            buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+                request,
+                outcome);
+
+        ASSERT_TRUE(result.ok) << result.error;
+        EXPECT_FALSE(result.all_speculative_accepted);
+        EXPECT_THAT(result.accepted_tokens, ElementsAre(10, 11, 77));
+        EXPECT_THAT(result.verifier_tokens, ElementsAre(11, 77));
+        EXPECT_EQ(result.accepted_speculative_prefix, 1);
+        EXPECT_EQ(result.target_verifier_state_commit_count, 2);
+        EXPECT_EQ(result.rejected_verified_token, 77);
+        EXPECT_EQ(result.ready_token, -1);
+    }
+
+    TEST(Test__MTPRejectionSampler, RejectsInvalidDeviceOutcome)
+    {
+        MTPDecodeCatchupGreedyRequest request;
+        request.draft_tokens = {10, 11};
+
+        MTPDeviceRejectionBatchOutcome outcome;
+        outcome.ok = true;
+        outcome.output_token_count = 0;
+
+        MTPDecodeCatchupGreedyResult result =
+            buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+                request,
+                outcome);
+
+        EXPECT_FALSE(result.ok);
+        EXPECT_THAT(result.error, testing::HasSubstr("token count"));
+
+        outcome.output_token_count = 3;
+        result = buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+            request,
+            outcome);
+
+        EXPECT_FALSE(result.ok);
+        EXPECT_THAT(result.error, testing::HasSubstr("more tokens"));
     }
 
     TEST(Test__MTPRejectionSampler, StopsOnFirstTokenWithoutRows)

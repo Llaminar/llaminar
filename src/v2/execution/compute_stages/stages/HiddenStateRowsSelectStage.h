@@ -5,6 +5,11 @@
  * Packs a small fixed number of FP32 hidden-state rows into a dense scratch
  * tensor. This is used by MTP verifier paths to feed one batched LM-head GEMM
  * instead of either projecting every verifier row or looping one-row helpers.
+ *
+ * Lifecycle: replay setters update host-side intent only. GPU row-index uploads
+ * happen from executeGPU(), after DeviceGraphExecutor has rebound the current
+ * workspace manager and an explicit non-null stream. This avoids stale workspace
+ * handoff bugs when cached graph objects outlive a previous workspace manager.
  */
 
 #pragma once
@@ -26,9 +31,10 @@ namespace llaminar2
     /**
      * @brief Selects several source rows into a compact scratch tensor.
      *
-     * CPU execution copies each selected contiguous row. GPU execution reads the
-     * selected row indices from a declared graph-workspace device array and runs
-     * one fixed-shape row-packing kernel on the explicit stage stream.
+     * CPU execution copies each selected contiguous row. GPU execution uploads
+     * the selected row indices only while the stage is executed under executor
+     * ownership, then runs one fixed-shape row-packing kernel on the explicit
+     * stage stream.
      */
     class HiddenStateRowsSelectStage : public IComputeStage, public IWorkspaceConsumer
     {
@@ -75,13 +81,17 @@ namespace llaminar2
         void unbindWorkspace() override;
         bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        bool needsGraphLaunchPreparation() const override { return params_.device_id.is_gpu(); }
 
         /**
          * @brief Update selected source rows for direct graph replay users.
          *
          * The selected-row count is fixed by construction. The new vector must
          * have exactly that size; the method returns false and leaves previous
-         * indices intact when the shape would change.
+         * indices intact when the shape would change. This method never
+         * dereferences a bound workspace; executeGPU() performs the upload after
+         * executor-managed workspace and stream binding.
          */
         bool setSelectedRowsForReplay(const std::vector<int> &selected_row_indices);
 

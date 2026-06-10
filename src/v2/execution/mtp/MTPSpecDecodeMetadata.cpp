@@ -83,6 +83,11 @@ namespace llaminar2
         {
             values.assign(static_cast<size_t>(std::max(0, count)), 0);
         }
+
+        bool tokenInVocab(int32_t token, int vocab_size)
+        {
+            return token >= 0 && (vocab_size <= 0 || token < vocab_size);
+        }
     } // namespace
 
     WorkspaceRequirements buildMTPSpecDecodeWorkspaceRequirements(
@@ -823,6 +828,206 @@ namespace llaminar2
                 "MTP spec-decode next-condition-token mismatch between catch-up result and transaction");
         }
 
+        return batch;
+    }
+
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchFromAcceptedOutcome(
+        const MTPSpecDecodeMetadataShape &shape,
+        const MTPSpecDecodeAcceptedOutcome &outcome)
+    {
+        if (!shape.valid())
+            return metadataFailure(shape, "invalid MTP spec-decode metadata shape");
+        if (shape.max_requests < 1)
+            return metadataFailure(shape, "accepted outcome requires at least one request slot");
+        if (outcome.draft_count <= 0 ||
+            outcome.draft_count > shape.max_draft_tokens)
+        {
+            return metadataFailure(shape, "accepted outcome draft count is outside metadata shape");
+        }
+        if (outcome.vocab_size < 0)
+            return metadataFailure(shape, "accepted outcome has negative vocabulary size");
+        if (outcome.committed_output_tokens.empty())
+            return metadataFailure(shape, "accepted outcome has no committed output tokens");
+        if (outcome.accepted_verifier_input_prefix < 0 ||
+            outcome.accepted_verifier_input_prefix > outcome.draft_count)
+        {
+            return metadataFailure(shape, "accepted outcome verifier prefix is outside draft count");
+        }
+
+        const int target_query_len = outcome.draft_count + 1;
+        const int committed_count =
+            static_cast<int>(outcome.committed_output_tokens.size());
+        if (committed_count > target_query_len)
+            return metadataFailure(shape, "accepted outcome committed output count exceeds verifier rows");
+        for (int32_t token : outcome.committed_output_tokens)
+        {
+            if (!tokenInVocab(token, outcome.vocab_size))
+                return metadataFailure(shape, "accepted outcome committed token is outside the vocabulary");
+        }
+
+        const bool has_bonus_ready =
+            outcome.all_drafts_accepted &&
+            !outcome.stopped_on_output &&
+            outcome.bonus_ready_token.has_value();
+        if (outcome.all_drafts_accepted)
+        {
+            if (outcome.accepted_verifier_input_prefix != outcome.draft_count)
+                return metadataFailure(shape, "all-accepted outcome must publish every verifier input row");
+            if (!outcome.stopped_on_output &&
+                !outcome.bonus_ready_token.has_value())
+            {
+                return metadataFailure(shape, "all-accepted outcome is missing its bonus ready token");
+            }
+        }
+        if (outcome.bonus_ready_token.has_value() &&
+            !tokenInVocab(*outcome.bonus_ready_token, outcome.vocab_size))
+        {
+            return metadataFailure(shape, "accepted outcome bonus ready token is outside the vocabulary");
+        }
+
+        const int valid_sampled_count = committed_count + (has_bonus_ready ? 1 : 0);
+        if (valid_sampled_count <= 0 || valid_sampled_count > target_query_len)
+            return metadataFailure(shape, "accepted outcome valid sampled count is outside verifier rows");
+
+        const int state_commit_count =
+            outcome.target_verifier_state_commit_count >= 0
+                ? outcome.target_verifier_state_commit_count
+                : outcome.accepted_verifier_input_prefix;
+        if (state_commit_count < 0 ||
+            state_commit_count > outcome.accepted_verifier_input_prefix ||
+            state_commit_count > committed_count ||
+            state_commit_count > outcome.draft_count)
+        {
+            return metadataFailure(shape, "accepted outcome state commit count is outside committed prefix");
+        }
+
+        MTPSpecDecodeMetadataBatch batch;
+        batch.ok = true;
+        batch.shape = shape;
+        batch.request_count = 1;
+        batch.total_target_query_tokens = target_query_len;
+
+        const int request_slots = shape.max_requests;
+        const int draft_slots = shape.max_requests * shape.max_draft_tokens;
+        const int target_slots = shape.max_requests * shape.maxTargetQueryLen();
+        fillZero(batch.draft_counts, request_slots);
+        fillZero(batch.target_query_lens, request_slots);
+        fillZero(batch.valid_sampled_counts, request_slots);
+        fillZero(batch.accepted_draft_prefixes, request_slots);
+        fillZero(batch.committed_output_counts, request_slots);
+        fillZero(batch.target_verifier_state_commit_counts, request_slots);
+        fillZero(batch.rejected_token_counts, request_slots);
+        fillInvalid(batch.token_indices_to_sample, request_slots);
+        fillInvalid(batch.next_condition_tokens, request_slots);
+        fillZero(batch.all_drafts_accepted_flags, request_slots);
+        fillZero(batch.stopped_flags, request_slots);
+        fillZero(batch.query_start_locs, request_slots + 1);
+        fillInvalid(batch.state_indices, target_slots);
+        fillZero(batch.accepted_state_counts, request_slots);
+        fillInvalid(batch.speculative_state_slot_indices, target_slots);
+        fillInvalid(batch.committed_state_rows, request_slots);
+        fillInvalid(batch.committed_state_indices, request_slots);
+        fillInvalid(batch.accepted_state_slot_indices, request_slots);
+        fillInvalid(batch.correction_replay_start_indices, request_slots);
+        fillZero(batch.correction_replay_counts, request_slots);
+        fillInvalid(batch.bonus_ready_token_rows, request_slots);
+        fillInvalid(batch.bonus_ready_token_indices, request_slots);
+        fillInvalid(batch.bonus_ready_state_slot_indices, request_slots);
+        fillInvalid(batch.draft_tokens, draft_slots);
+        fillInvalid(batch.sampled_tokens, target_slots);
+
+        batch.draft_counts[0] = outcome.draft_count;
+        batch.target_query_lens[0] = target_query_len;
+        batch.valid_sampled_counts[0] = valid_sampled_count;
+        batch.accepted_draft_prefixes[0] =
+            outcome.accepted_verifier_input_prefix;
+        batch.committed_output_counts[0] = committed_count;
+        batch.target_verifier_state_commit_counts[0] = state_commit_count;
+        batch.accepted_state_counts[0] = state_commit_count;
+        batch.rejected_token_counts[0] = target_query_len - valid_sampled_count;
+        batch.token_indices_to_sample[0] = valid_sampled_count - 1;
+        batch.next_condition_tokens[0] =
+            has_bonus_ready ? *outcome.bonus_ready_token
+                            : outcome.committed_output_tokens.back();
+        batch.all_drafts_accepted_flags[0] =
+            outcome.all_drafts_accepted ? 1 : 0;
+        batch.stopped_flags[0] = outcome.stopped_on_output ? 1 : 0;
+        batch.query_start_locs[0] = 0;
+        batch.query_start_locs[1] = target_query_len;
+
+        for (int row = 0; row < target_query_len; ++row)
+        {
+            batch.state_indices[static_cast<size_t>(row)] = row;
+            batch.speculative_state_slot_indices[static_cast<size_t>(row)] = row;
+        }
+
+        /*
+         * Draft tokens are diagnostic metadata here.  Copy only the verifier
+         * rows whose token identity was actually committed; keep unknown
+         * device-only rejected slots invalid instead of manufacturing tokens.
+         */
+        for (int row = 0;
+             row < outcome.accepted_verifier_input_prefix &&
+             row < committed_count;
+             ++row)
+        {
+            batch.draft_tokens[static_cast<size_t>(row)] =
+                outcome.committed_output_tokens[static_cast<size_t>(row)];
+        }
+        for (int row = 0; row < committed_count; ++row)
+        {
+            batch.sampled_tokens[static_cast<size_t>(row)] =
+                outcome.committed_output_tokens[static_cast<size_t>(row)];
+        }
+        if (has_bonus_ready)
+        {
+            batch.sampled_tokens[static_cast<size_t>(committed_count)] =
+                *outcome.bonus_ready_token;
+        }
+
+        MTPSpecDecodeTransaction tx;
+        tx.ok = true;
+        tx.request_id = outcome.request_id;
+        tx.draft_count = outcome.draft_count;
+        tx.target_query_len = target_query_len;
+        tx.valid_sampled_count = valid_sampled_count;
+        tx.accepted_speculative_prefix =
+            outcome.accepted_verifier_input_prefix;
+        tx.rejected_token_count = target_query_len - valid_sampled_count;
+        tx.token_index_to_sample = valid_sampled_count - 1;
+        tx.next_condition_token = batch.next_condition_tokens[0];
+        tx.committed_output_tokens = outcome.committed_output_tokens;
+        tx.rejected_draft_tokens.assign(
+            static_cast<size_t>(
+                std::max(
+                    0,
+                    outcome.draft_count -
+                        outcome.accepted_verifier_input_prefix)),
+            kMTPSpecDecodeInvalidToken);
+        batch.transactions.push_back(std::move(tx));
+
+        MTPSpecDecodeStateCommitPlan commit_plan =
+            buildMTPSpecDecodeStateCommitPlan(batch);
+        if (!commit_plan.ok)
+            return metadataFailure(shape, commit_plan.error);
+        batch.committed_state_rows =
+            std::move(commit_plan.committed_state_rows);
+        batch.committed_state_indices =
+            std::move(commit_plan.committed_state_indices);
+        batch.accepted_state_counts =
+            std::move(commit_plan.accepted_state_counts);
+        batch.accepted_state_slot_indices =
+            std::move(commit_plan.accepted_state_slot_indices);
+        batch.correction_replay_start_indices =
+            std::move(commit_plan.correction_replay_start_indices);
+        batch.correction_replay_counts =
+            std::move(commit_plan.correction_replay_counts);
+        batch.bonus_ready_token_rows =
+            std::move(commit_plan.bonus_ready_token_rows);
+        batch.bonus_ready_token_indices =
+            std::move(commit_plan.bonus_ready_token_indices);
+        batch.bonus_ready_state_slot_indices =
+            std::move(commit_plan.bonus_ready_state_slot_indices);
         return batch;
     }
 

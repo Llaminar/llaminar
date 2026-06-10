@@ -131,7 +131,7 @@ Current Llaminar shape versus target:
 | Area | Current shape | vLLM-shaped target |
 |------|---------------|--------------------|
 | Greedy dense | All-position verifier publication exists and is speed-positive | Row-indexed verifier logits and graph transaction |
-| Stochastic dense | Correct, but short-lane speed-negative and CPU evidence includes stepwise cost | Batched rejection sampler over target/draft probs |
+| Stochastic dense | Batched sampler contract is accepted for SingleDevice CPU/CUDA/ROCm; performance remains policy-sensitive | Publish compact outcome/state fully from spec slots |
 | CPU verifier | Full target forward plus batched all-position LM-head rows | Target/bonus row LM head and shared metadata buffers |
 | MoE | Functionally green, speed-negative | Graph-native sidecar plus batched verifier/rejection |
 | State publication | Captured-stage restore works | Spec state slots are the primary live-state mechanism |
@@ -141,8 +141,11 @@ Current Llaminar shape versus target:
 
 Done:
 
-- MTP config, sidecar loading, fixed/dynamic depth controller, benchmark JSON
-  counters, and per-request MTP summaries exist.
+- MTP config, sidecar loading, fixed/dynamic depth controller, per-request MTP
+  summaries, and benchmark JSON/table reporting exist. Benchmark mode now
+  aggregates request-scoped MTP counters across measured iterations after
+  warmup and emits `measurement_iterations`, so acceptance/rollback counters
+  match averaged throughput.
 - `MTPSpecDecodeMetadata`, workspace declarations, upload guards, transaction
   counters, and accepted-count publication planning units exist.
 - `MTPSpecStateContract` now materializes per-request `MTPSpecStepPlan` objects
@@ -183,7 +186,10 @@ Done:
 - `V2_Integration_GPUSamplingKernels` now includes Qwen3.6 real-logit-style
   seeded rows with close whitespace/code-token probabilities. CUDA and ROCm
   graph-captured distribution build and compact-table sample match the CPU
-  canonical sampler on that fixture.
+  canonical sampler on that fixture. Top-k ties are now a documented
+  value-descending/token-id-ascending contract in CUDA, ROCm, and the CPU test
+  oracle; this fixed the ROCm stochastic clear-cache repeatability drift where
+  equal quantized logits could produce different draft candidate orderings.
 - Dense CUDA/ROCm greedy and stochastic have parity/smoke coverage.
 - Dense CPU/CUDA/ROCm SingleDevice Prefix+MTP parity now shares one declarative
   18-case test surface, including prefix restore, split prefill, dynamic/fixed
@@ -217,19 +223,21 @@ Done:
   Greedy is speed-positive on all three backends, with best lanes CUDA d3 66.7
   vs 44.6 tok/s, ROCm d1 43.9 vs 31.4 tok/s, and CPU d3 9.1 vs 4.6 tok/s.
   Stochastic is speed-negative on all three backends on this short seeded lane.
-- Dynamic depth now has a production-shaped depth-zero policy: dynamic matrix
-  runs start at d1 with `min_depth=0`, d0 normal decode maintains shifted MTP KV
-  so later probes can resume safely, demotion is stepwise, d1 only demotes to d0
-  after an all-zero window, and perfect probes can promote early without waiting
-  for the long default promotion hysteresis. Focused controller and runner
-  regressions cover d0 cooldown/probe, shifted-cache maintenance, stepwise
-  demotion, and perfect-probe promotion. The post-tune bounded matrix
+- Dynamic depth now has production-shaped exploration: standard matrix runs
+  start at d1 with d1 as the adaptive floor, while d0 remains a diagnostic
+  bypass lane. Demotion is stepwise, depth 1 only demotes to d0 after an all-zero
+  diagnostic window, perfect probes can promote early, floor-depth windows must
+  meet the promotion threshold before exploring, and a bad intermediate depth
+  probes each un-rejected deeper depth once before settling downward.
+  Focused controller and runner regressions cover d0 cooldown/probe,
+  shifted-cache maintenance, stepwise demotion, perfect-probe promotion,
+  rejected-depth hysteresis, and d2-bad/d3-untested exploration. The post-tune bounded matrix
   `benchmark_results/mtp_vllm_style/20260609T-post-hysteresis-tune-matrix/`
   completed all CUDA/ROCm/CPU dense/MoE greedy/stochastic lanes with fixed
   d1/d2/d3/dynamic. Dense greedy is still speed-positive; dynamic is less
   cliffy but remains short-run conservative versus the best fixed depth.
 - `V2_Perf_MTPDepthController` now characterizes dynamic policy overhead. The
-  controller is scalar counter bookkeeping, measuring about 11-25 ns per update
+  controller is scalar counter bookkeeping, measuring about 16-26 ns per update
   in Release, so CPU dynamic-depth tuning should target verifier, condition, and
   accepted-state publication costs rather than threading or vectorizing the
   controller itself.
@@ -533,8 +541,29 @@ Open gaps:
   restores plausible acceptance and removes draft sample D2H, but fixed d2 is
   still speed-negative at 26.8 vs 31.2 tok/s; target sampling still performs a
   compact D2H at about 2.86 ms/read and verifier forward averages about
-  22.7 ms/run. Remaining Phase 4 work is compact outcome/metadata publication
-  without the current target/result D2H/sync boundary.
+  22.7 ms/run. Later Phase 4 slices removed the token-D2H boundary and moved
+  the remaining compact outcome/publication cost into the Phase 5/6 state-slot
+  work.
+- Penalty-free stochastic all-position verification now repairs the first
+  shifted MTP KV row from the device-resident target sample when the host token
+  is intentionally deferred. `HiddenStateRowSelectStage` and
+  `HiddenStateRowsSelectStage` replay mutators are host-intent-only: they never
+  dereference stale workspace bindings or upload GPU metadata before
+  executor-owned workspace/stream binding. Graph launch preparation now uploads
+  dirty row metadata through a typed `prepareGraphLaunch()` hook after the
+  executor has rebound the current workspace and explicit stream, and the
+  CUDA/ROCm row-select integrations exercise that contract without recapture.
+  CUDA and ROCm embedding validation readbacks are skipped during graph capture
+  because D2H plus stream sync is capture-illegal; ordinary validation still
+  checks device token IDs outside capture. Focused gates passed:
+  post-relink MTP unit gate,
+  `V2_Unit_ForwardGraphTypes`,
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_HiddenStateRowSelectStage`,
+  `V2_Unit_PrefillGraphCaptureDynamicParams`,
+  CUDA/ROCm `HiddenStateRowSelectStage`,
+  `V2_Integration_GPUSamplingKernels`, and CUDA/ROCm
+  `Qwen36*GpuGraphsStochasticSmoke`.
 - The first target token can now stay device-resident through the first MTP
   sidecar, verifier-input composition, and batched stochastic summary on
   CUDA/ROCm. Target and draft sampled-token slots use explicit sample-ready
@@ -555,6 +584,133 @@ Open gaps:
   scalar D2H. The post-rebuild Phase 4 gate passed `^V2_Unit_` 500/500 plus
   focused ROCm stochastic parity, ROCm stochastic graph smoke, and CUDA/ROCm
   GPU sampling integrations.
+- `clearCache()` now treats adaptive MTP depth as request-scoped state. The
+  prior behavior preserved learned depth across benchmark iterations while
+  resetting MTP counters, producing inconsistent summaries such as
+  `current_depth=2` with `updates=0`. Focused
+  `V2_Unit_PrefillDecodeTransition` passes after updating the regression. The
+  follow-up ROCm stochastic reset check
+  `benchmark_results/mtp_vllm_style/20260610T-phase4-rocm-dense-stochastic-dynamic-reset-check/`
+  shows cold-request dynamic still trails baseline, 27.36 vs 30.74 tok/s,
+  while follow-up policy probes rejected aggressive controller-only tuning:
+  d1->d0 churn fell to 23.52 tok/s, optimistic d3 start reached 25.29-26.79
+  tok/s, and a same-build fixed d3 control reached 28.33 tok/s. The standard
+  matrix runner now keeps dynamic depth on a d1 floor; depth-zero bypass is a
+  diagnostic/experimental lane until it is faster than d1. The accepted focused
+  ROCm stochastic lane
+  `benchmark_results/mtp_vllm_style/20260610T-phase4-rocm-dense-stochastic-fixed-dynamic-floor1/`
+  shows baseline 30.68 tok/s, fixed d1 31.88, fixed d2 26.01, fixed d3 29.64,
+  and dynamic 31.78 with 75% acceptance and no depth churn.
+- Main-decode stream handoff now covers MTP condition forward, MTP depth-zero
+  direct state advance, and ordinary GPU decode sampling. The forward engine
+  reports actual deferred final-sync events and publishes the capture stream
+  only to the immediate GPU sampler/distribution consumer. Focused units plus
+  ROCm stochastic parity/smoke pass. The perfstats confirm `main_decode`
+  replay syncs are gone on the corrected ROCm dynamic lane; the remaining
+  shifted-prefill, sequential shifted-row commit, verifier, and
+  condition-forward costs became the concrete follow-up tuning targets.
+- Pending logits stream handoff is now structurally owned by private role
+  slots (`MTPSidecar`, `MainDecode`, `AllPositionVerifier`) instead of raw
+  nullable fields. The stream pointer is private to a one-shot handoff object:
+  producers may republish the same explicit stream after an in-place logits
+  mutation, but replacing an unconsumed handoff with a different stream is a
+  hard logic error. The source hygiene unit strips comments/strings and fails
+  if production code accesses the slot table or reintroduces a raw mutable
+  slot-reference helper. The post-relink focused gate passed
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, row-select/graph-launch units, CUDA
+  and ROCm row-select integrations, GPU sampler integration, and CUDA/ROCm
+  Qwen3.6 stochastic graph smokes. `V2_Unit_DeviceGraphOrchestrator` now also
+  covers the runtime one-shot rule through the public host interface: same
+  stream republish is allowed, different unconsumed stream overwrite throws,
+  explicit clear and `clear_cache()` reset ownership, and verifier/main roles
+  are independent.
+- Correction-replay publication reset now returns a typed
+  `ReplayStateResetSummary` and exports cache-class counts in the
+  `live_prefix_replay_state_after_mutation` perf record. Focused
+  `V2_Unit_ForwardExecutionEngine` coverage proves ordinary decode cache
+  identities are reset while all-position verifier identities are preserved for
+  explicit-stream rebind. `scripts/summarize_mtp_perfstats.py` and the matrix
+  TSV now surface reset-cache, stream-rebind, ordinary-decode, verifier, and
+  other-cache counts for each benchmark lane. The next telemetry slice added
+  decode-only sidecar, shifted-row, stochastic sampling, checkpoint, and
+  sidecar graph hit/miss columns so ROCm/CUDA tuning can distinguish verifier
+  cost from shifted-cache maintenance. The script unit, shell syntax check, a
+  one-row baseline TSV sanity check, and an extended ROCm dense d1 field-count
+  smoke pass.
+- The long ROCm stochastic clear-cache repeatability regression split the state
+  problem into two boundaries. Dense sidecar execution can now advertise
+  `supportsMTPSidecarPreservesMainState()` and skip the verifier-base restore,
+  after the preservation checker was corrected to compare against the
+  post-condition verifier-base checkpoint. Accepted-state publication, however,
+  is still a hard live-state mutation and now always resets GPU replay state.
+  The previous accept-all replay preservation changed ROCm stochastic
+  trajectories after `clearCache()`. A source hygiene guard locks the replay
+  reset in `publishAcceptedMTPSpecState()`, and the focused gate passes:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Integration_Parity_Qwen36_ROCm_SingleDevice_Qwen36ROCmSingleDevicePrefixMTPParity_MTPStochasticSamplingVerifierRuns`,
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticSmoke`,
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticClearCacheRepeatabilityLong`,
+  and `V2_Integration_GPUSamplingKernels`. The short CUDA/ROCm stochastic
+  smokes now set `LLAMINAR_DETERMINISTIC` before asserting token equality; a
+  Qwen3.6 top-k=20 repeated graph-replay sampler regression rules out compact
+  sampler drift, while non-deterministic fast-path near-ties remain a benchmark
+  signal rather than a repeatability assertion.
+- KV-only MTP sidecar replay now has its own event-backed shifted-MTP-KV
+  handoff instead of borrowing the pending-logits stream marker. The old
+  ownership mix skipped both explicit stream sync and shifted-KV readiness
+  events for segmented KV-only replay. The source hygiene unit now enforces
+  that KV-only sidecars do not call the deferred sampling/logits handoff, and
+  that accepted-state publication waits before touching shifted MTP KV. Focused
+  units, CUDA/ROCm stochastic graph smokes, GPU sampler integration, and the
+  release relink pass. Refreshed ROCm dense stochastic focused matrix
+  `benchmark_results/mtp_vllm_style/20260610T-focused-rocm-dense-stochastic-dynamic-shifted-kv-shape-fixed/`
+  shows baseline 32.55 tok/s, fixed d1 34.39, fixed d2 29.83, fixed d3 24.34,
+  and dynamic 34.49 after one promotion. Follow-up condition telemetry and
+  dynamic-depth tuning culminated in
+  `benchmark_results/mtp_vllm_style/20260610T-focused-rocm-dense-stochastic-long64-depth-explore/`:
+  baseline 30.37 tok/s, fixed d1 32.35, fixed d2 29.11, fixed d3 33.66, and
+  dynamic 30.84. Dynamic now reaches d3 through d1 floor promotion plus
+  `probe_higher_before_demote`, but it still trails fixed d3 because verifier
+  and rejection-driven condition-forward cost dominate; sampling remains below
+  13 ms/request. The added main-decode replay telemetry first showed the
+  dynamic condition path did 28 warmups, 1 capture, and 0 replay, so ordinary
+  decode replay preservation/rebinding after spec-state publication became
+  the next concrete speed target. That slice is now implemented:
+  `ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode` keeps one-token
+  condition/decode captures alive across MTP accepted-state publication by
+  marking them dirty for explicit-stream rebind and stamping them with the new
+  live replay-state epoch. Focused real-model telemetry in
+  `benchmark_results/mtp_vllm_style/20260610T-focused-rocm-dense-stochastic-long64-ordinary-replay-preserve/`
+  moved the dynamic condition path to 4 warmups, 4 captures, and 65 replays,
+  with `replay_ordinary_decode_resets=0`, zero transaction validation failures,
+  and zero rollbacks. The next accepted slice reuses the first shifted MTP KV
+  row appended by main-state-preserving sidecars instead of truncating it away
+  and rerunning a KV-only depth-0 sidecar. Focused
+  `V2_Unit_PrefillDecodeTransition` coverage proves all-position publication
+  reuses that first row while still sequentially committing rejected correction
+  rows, and the matrix schema now reports `shifted_initial_commits` plus
+  `shifted_initial_reused`. Real-model ROCm telemetry in
+  `benchmark_results/mtp_vllm_style/20260610T-focused-rocm-dense-stochastic-long64-shifted-first-reuse/`
+  shows `shifted_initial_commits=0`, reused sidecar rows on every MTP lane,
+  dynamic `shifted_row_ms` dropping from about 1006 ms to about 102 ms, zero
+  transaction validation failures, and zero rollbacks. Controller probes then
+  tightened `probe_higher_before_demote`, floor-promotion thresholds, and
+  rejected-depth hysteresis while benchmark-rejecting early bad-probe aborts
+  and stricter perfect-floor hysteresis.
+- Phase 4 dense SingleDevice closeout is accepted. The final slice split
+  first-sidecar host-token and device-token graph caches, preserved sidecar
+  replay state across accepted-state publication, and added a GPU regression for
+  alternating host/device first-sidecar calls. The focused gate passed
+  `V2_Unit_MTPRejectionSampler`, `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_MTPGraphConstruction`, `V2_Unit_DeviceGraphOrchestrator`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, `V2_Integration_GPUSamplingKernels`,
+  dense Qwen3.6 stochastic parity on CPU/CUDA/ROCm, and CUDA/ROCm stochastic
+  graph smokes. The closeout matrix
+  `benchmark_results/mtp_vllm_style/20260610T-phase4-dense-stochastic-closeout-matrix-v2/`
+  shows useful speed-positive stochastic lanes on every backend: CUDA fixed d3
+  59.44 vs 43.88 tok/s, ROCm fixed d1 33.48 and dynamic 32.57 vs 30.33 tok/s,
+  and CPU fixed d2 5.78 vs 4.46 tok/s. ROCm fixed d2/d3 are documented
+  acceptance-limited, not contract failures.
 - TP/PP/ExpertParallel MTP is out of scope until SingleDevice is green.
 
 ## Implementation Phases
@@ -663,25 +819,47 @@ Work:
   stable device-token input source, the target verifier input row is composed
   into arena-owned device storage on the graph execution stream, and the first
   target sample can feed both the first sidecar and batched summary without a
-  host scalar read. The CUDA path is modestly speed-positive on a short dense
-  stochastic fixed-d2 lane; ROCm remains speed-negative because shifted-prefill,
-  condition-forward, and verifier-forward cost now dominate after token D2H
-  removal. The runner still receives compact outcome metadata on the host, so
-  the full device-resident Phase 4 contract remains open.
+  host scalar read. The compact device-batch outcome now lives in the shared
+  `MTPRejectionSampler` contract, and the runner no longer passes a host
+  draft-token shadow into the outcome verifier; CUDA/ROCm must read sampled
+  draft tokens from device slots. Focused sampler, prefill/decode transition,
+  DeviceGraphOrchestrator units, GPU sampling integration, and CUDA/ROCm
+  stochastic graph smokes cover that boundary. The final Phase 4 closeout slice
+  also split host-token and device-token first-sidecar graph caches and
+  preserves sidecar replay state across accepted-state publication. Those fixes
+  let ROCm sidecar contexts reach capture/replay instead of staying in warmup.
+  The accepted dense stochastic matrix
+  `benchmark_results/mtp_vllm_style/20260610T-phase4-dense-stochastic-closeout-matrix-v2/`
+  is speed-positive in useful bounded lanes on all three backends: CUDA fixed d3
+  59.44 vs 43.88 tok/s, ROCm fixed d1 33.48 and dynamic 32.57 vs 30.33 tok/s,
+  and CPU fixed d2 5.78 vs 4.46 tok/s. ROCm fixed d2/d3 are documented
+  acceptance-limited on this prompt, at 28.6% and 46.2% acceptance. The runner
+  still receives compact outcome metadata on the host; completing fully
+  device-resident publication is Phase 5/6 work, not a Phase 4 blocker.
 - Greedy uses the same buffers and output contract, with argmax equality as the
   deterministic accept test.
-- Remove decode-equivalent stochastic verifier fallbacks after parity and
-  benchmark acceptance.
+- Retire decode-equivalent stochastic verifier use from accepted dense
+  SingleDevice lanes. The remaining compatibility code is guarded for
+  unsupported future topologies/features only and must not fire in the Phase 4
+  dense gates.
 
 Exit gate:
 
-- CPU/CUDA/ROCm sampler parity passes on synthetic and saved Qwen3.6 real-logit
+- Accepted for dense SingleDevice CPU/CUDA/ROCm as of the closeout gate:
+  `V2_Unit_MTPRejectionSampler`, `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_MTPGraphConstruction`, `V2_Unit_DeviceGraphOrchestrator`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, `V2_Integration_GPUSamplingKernels`,
+  dense Qwen3.6 stochastic parity on CPU/CUDA/ROCm, and CUDA/ROCm stochastic
+  graph smokes all pass.
+- CPU/CUDA/ROCm sampler parity passes on synthetic and Qwen3.6 real-logit-style
   fixtures for greedy, top-k/top-p, temperature, residual sampling, and seeded
   RNG.
-- Dense stochastic MTP no longer emits `decode_equivalent_stochastic_forward_one`
-  in accepted lanes.
-- Bounded stochastic dense benchmarks are speed-positive or have a documented
-  acceptance-limit reason.
+- Dense stochastic MTP no longer emits the retired
+  `decode_equivalent_stochastic_verifier_runs` counter in accepted lanes; parity
+  and prefix-cache MTP probes assert the all-position publication path instead.
+- Bounded stochastic dense benchmarks are speed-positive on each backend at
+  least one fixed/dynamic lane, with ROCm d2/d3 documented as
+  acceptance-limited rather than contract failures.
 
 ### Phase 5: Publish From Spec Slots, Not Checkpoints
 
@@ -874,12 +1052,19 @@ production runtime settings with `--temperature 0`, not `--deterministic`;
 stochastic rows use a pinned seed, default `123`, so acceptance and throughput
 can be compared across iterations. Dynamic depth must always be reported beside
 the fixed d1/d2/d3 rows from the same git hash and runtime configuration; do not
-tune or accept dynamic in isolation. The matrix dynamic lane starts at d1, allows
-per-step d0 adaptive bypass through `--mtp-min-draft-tokens 0`, and probes back
-toward d3 after cooldown. The generated `summary.tsv` includes
+tune or accept dynamic in isolation. The standard matrix dynamic lane starts at
+d1 and keeps d1 as the adaptive floor; d0 bypass must be run as an explicit
+diagnostic until it is proven faster than d1 on a matching benchmark. The
+generated `summary.tsv` includes
 `speedup_vs_baseline` for every MTP row plus perfstats-derived verifier health:
-`verifier_ms`, `condition_ms`, `correction_ms`,
-`main_verifier_warmup/capture/replay`, and replay reset/preserve counts. Use
+`verifier_ms`, `condition_ms/count/skipped_ready`, `rejection_no_ready`,
+`correction_ms`,
+`sidecar_ms`, `sidecar_depth0_decode_ms`, `shifted_*_ms`, `sampling_ms`,
+`shifted_kv_ready_events/waits/syncs_deferred`, `checkpoint_ms`,
+`sidecar_graph_hits/misses`,
+`shifted_initial_commits/reused`,
+`main_decode_warmup/capture/replay`, `main_verifier_warmup/capture/replay`,
+and replay reset/preserve counts. Use
 those fields to explain a speed regression before changing kernels or depth
 policy.
 

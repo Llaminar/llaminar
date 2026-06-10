@@ -15,8 +15,8 @@ Default matrix:
   modes:    greedy,stochastic
   variants: baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
 
-The dynamic variant starts at depth 1, allows adaptive depth-0 bypass, and may
-probe/promote back up to the configured max depth 3.
+The dynamic variant starts at depth 1, keeps depth 1 as the normal adaptive
+floor, and may probe/promote back up to the configured max depth 3.
 
 Options:
   --binary PATH          llaminar2 binary (default: build_v2_release/llaminar2)
@@ -247,7 +247,7 @@ describe_variant() {
         --mtp
         --mtp-draft-tokens 3
         --mtp-depth-policy dynamic
-        --mtp-min-draft-tokens 0
+        --mtp-min-draft-tokens 1
         --mtp-initial-draft-tokens 1
       )
       ;;
@@ -307,8 +307,18 @@ if [[ ! -x "${perf_summary_script}" ]]; then
   chmod +x "${perf_summary_script}" 2>/dev/null || true
 fi
 
-printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcorrection_ms\tcorrection_count\tdeferred_corrections\tpublish_ms\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\tjson\tperfstats\n' > "${summary_path}"
+printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
 : > "${commands_path}"
+
+zero_perf_summary() {
+  local fields=38
+  local values=()
+  for ((i = 0; i < fields; ++i)); do
+    values+=("0")
+  done
+  local IFS=$'\t'
+  printf '%s' "${values[*]}"
+}
 
 append_summary() {
   local device="$1"
@@ -318,7 +328,7 @@ append_summary() {
   local json_path="$5"
   local perf_path="$6"
   local baseline_decode_tps="${7:-0}"
-  local perf_summary="${8:-0	0	0	0	0	0	0	0	0	0	0	0}"
+  local perf_summary="${8:-$(zero_perf_summary)}"
   local base_summary
   base_summary="$(jq -r \
     --arg device "${device}" \
@@ -430,7 +440,7 @@ for model in $(split_csv "${models}"); do
           baseline_decode_tps_by_lane["${lane_key}"]="${decode_tps}"
         fi
 
-        perf_summary="0	0	0	0	0	0	0	0	0	0	0"
+        perf_summary="$(zero_perf_summary)"
         if [[ -n "${perf_path}" ]]; then
           perf_summary="$("${perf_summary_script}" "${perf_path}")"
         fi

@@ -182,6 +182,98 @@ namespace llaminar2
                    : 0.0;
     }
 
+    /**
+     * @brief Merge one measured benchmark request into the benchmark-level MTP view.
+     *
+     * MTP counters are reset by OrchestrationRunner::clearCache(), and benchmark
+     * mode intentionally runs several independent measured requests after warmup.
+     * This helper makes the reported JSON/table counters match the same measured
+     * window as the averaged decode throughput while keeping the latest runtime
+     * identity fields (position, depth, device state) for diagnostics.
+     */
+    static void accumulateMeasuredMTPState(
+        PrefixRuntimeStateSnapshot *aggregate,
+        const PrefixRuntimeStateSnapshot &sample)
+    {
+        if (!aggregate)
+            return;
+
+        const PrefixRuntimeStateSnapshot previous = *aggregate;
+        *aggregate = sample;
+
+        aggregate->mtp_draft_steps = previous.mtp_draft_steps + sample.mtp_draft_steps;
+        aggregate->mtp_accepted_tokens =
+            previous.mtp_accepted_tokens + sample.mtp_accepted_tokens;
+        aggregate->mtp_rejected_tokens =
+            previous.mtp_rejected_tokens + sample.mtp_rejected_tokens;
+        aggregate->mtp_rollbacks = previous.mtp_rollbacks + sample.mtp_rollbacks;
+        aggregate->mtp_bypasses = previous.mtp_bypasses + sample.mtp_bypasses;
+        aggregate->mtp_verifier_runs =
+            previous.mtp_verifier_runs + sample.mtp_verifier_runs;
+        aggregate->mtp_verifier_token_count =
+            previous.mtp_verifier_token_count + sample.mtp_verifier_token_count;
+        aggregate->mtp_stochastic_accept_tests =
+            previous.mtp_stochastic_accept_tests + sample.mtp_stochastic_accept_tests;
+        aggregate->mtp_stochastic_accepts =
+            previous.mtp_stochastic_accepts + sample.mtp_stochastic_accepts;
+        aggregate->mtp_stochastic_residual_samples =
+            previous.mtp_stochastic_residual_samples + sample.mtp_stochastic_residual_samples;
+        aggregate->mtp_stochastic_terminal_samples =
+            previous.mtp_stochastic_terminal_samples + sample.mtp_stochastic_terminal_samples;
+        aggregate->mtp_transaction_commits =
+            previous.mtp_transaction_commits + sample.mtp_transaction_commits;
+        aggregate->mtp_transaction_rollbacks =
+            previous.mtp_transaction_rollbacks + sample.mtp_transaction_rollbacks;
+        aggregate->mtp_transaction_validation_failures =
+            previous.mtp_transaction_validation_failures +
+            sample.mtp_transaction_validation_failures;
+        aggregate->mtp_unsafe_verifier_state_rejections =
+            previous.mtp_unsafe_verifier_state_rejections +
+            sample.mtp_unsafe_verifier_state_rejections;
+        aggregate->mtp_depth_policy_windows =
+            previous.mtp_depth_policy_windows + sample.mtp_depth_policy_windows;
+        aggregate->mtp_depth_policy_updates =
+            previous.mtp_depth_policy_updates + sample.mtp_depth_policy_updates;
+        aggregate->mtp_depth_policy_promotions =
+            previous.mtp_depth_policy_promotions + sample.mtp_depth_policy_promotions;
+        aggregate->mtp_depth_policy_demotions =
+            previous.mtp_depth_policy_demotions + sample.mtp_depth_policy_demotions;
+        aggregate->mtp_depth_policy_observe_recommendations =
+            previous.mtp_depth_policy_observe_recommendations +
+            sample.mtp_depth_policy_observe_recommendations;
+
+        aggregate->mtp_request.draft_steps =
+            previous.mtp_request.draft_steps + sample.mtp_request.draft_steps;
+        aggregate->mtp_request.accepted_tokens =
+            previous.mtp_request.accepted_tokens + sample.mtp_request.accepted_tokens;
+        aggregate->mtp_request.rejected_tokens =
+            previous.mtp_request.rejected_tokens + sample.mtp_request.rejected_tokens;
+        aggregate->mtp_request.rollbacks =
+            previous.mtp_request.rollbacks + sample.mtp_request.rollbacks;
+        aggregate->mtp_request.depth_policy_updates =
+            previous.mtp_request.depth_policy_updates +
+            sample.mtp_request.depth_policy_updates;
+        aggregate->mtp_request.stochastic_accept_tests =
+            previous.mtp_request.stochastic_accept_tests +
+            sample.mtp_request.stochastic_accept_tests;
+        aggregate->mtp_request.stochastic_accepts =
+            previous.mtp_request.stochastic_accepts + sample.mtp_request.stochastic_accepts;
+        aggregate->mtp_request.stochastic_residual_samples =
+            previous.mtp_request.stochastic_residual_samples +
+            sample.mtp_request.stochastic_residual_samples;
+        aggregate->mtp_request.stochastic_terminal_samples =
+            previous.mtp_request.stochastic_terminal_samples +
+            sample.mtp_request.stochastic_terminal_samples;
+        aggregate->mtp_request.acceptance_rate =
+            mtpTokenAcceptanceRate(aggregate->mtp_request.accepted_tokens,
+                                   aggregate->mtp_request.rejected_tokens);
+        aggregate->mtp_request.stochastic_acceptance_rate =
+            aggregate->mtp_request.stochastic_accept_tests > 0
+                ? static_cast<double>(aggregate->mtp_request.stochastic_accepts) /
+                      static_cast<double>(aggregate->mtp_request.stochastic_accept_tests)
+                : 0.0;
+    }
+
     std::string benchmarkResultToJsonString(
         const BenchmarkResult &result,
         const OrchestrationConfig *config)
@@ -194,6 +286,7 @@ namespace llaminar2
             {"failure_reason", result.failure_reason},
             {"prefill_success", result.prefill_success},
             {"decode_success", result.decode_success},
+            {"measurement_iterations", BENCHMARK_ITERATIONS},
             {"tokens", {{"prefill", result.prefill_tokens},
                          {"decode", result.decode_tokens},
                          {"total", result.prefill_tokens + result.decode_tokens}}},
@@ -707,10 +800,15 @@ namespace llaminar2
     {
         BenchmarkResult result;
         last_failure_reason_.clear();
+        PrefixRuntimeStateSnapshot measured_mtp_state;
+        bool has_measured_mtp_state = false;
         auto capture_and_return = [&]() -> BenchmarkResult
         {
             result.failure_reason = last_failure_reason_;
-            result.prefix_state = runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+            result.prefix_state =
+                result.success && has_measured_mtp_state
+                    ? measured_mtp_state
+                    : (runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{});
             return result;
         };
 
@@ -1037,6 +1135,17 @@ namespace llaminar2
                 decode_token_counts.push_back(decode_result.tokens_generated);
                 last_generated_text = decode_result.generated_text;
                 result.generated_token_ids = std::move(decode_result.generated_token_ids);
+                const PrefixRuntimeStateSnapshot iteration_state =
+                    runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+                if (!has_measured_mtp_state)
+                {
+                    measured_mtp_state = iteration_state;
+                    has_measured_mtp_state = true;
+                }
+                else
+                {
+                    accumulateMeasuredMTPState(&measured_mtp_state, iteration_state);
+                }
                 logGPUMemorySnapshot(("after-decode iter=" + std::to_string(iter + 1)).c_str());
             }
 

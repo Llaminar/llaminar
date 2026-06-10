@@ -18,7 +18,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -121,6 +124,35 @@ namespace
         }
         return max_difference;
     }
+
+    /// @brief Read a source file relative to the repository root derived from __FILE__.
+    std::string readRepoFile(const std::string &relative_path)
+    {
+        const std::filesystem::path test_file(__FILE__);
+        const std::filesystem::path repo_root =
+            test_file.parent_path().parent_path().parent_path().parent_path().parent_path();
+        std::ifstream input(repo_root / relative_path);
+        if (!input)
+            return {};
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        return buffer.str();
+    }
+
+    /// @brief Extract a method body between two stable signature markers.
+    std::string extractMethodBody(
+        const std::string &source,
+        const std::string &begin_marker,
+        const std::string &end_marker)
+    {
+        const size_t begin = source.find(begin_marker);
+        if (begin == std::string::npos)
+            return {};
+        const size_t end = source.find(end_marker, begin + begin_marker.size());
+        if (end == std::string::npos)
+            return source.substr(begin);
+        return source.substr(begin, end - begin);
+    }
 }
 
 TEST(Test__HiddenStateRowSelectStage, CPUReplayParamsChangeSelectedRow)
@@ -215,6 +247,31 @@ TEST(Test__HiddenStateRowSelectStage, UsesExplicitStableWorkspaceBufferName)
     const WorkspaceRequirements after = stage.getWorkspaceRequirements(8, 32, 0);
     ASSERT_EQ(after.buffers.size(), 1u);
     EXPECT_EQ(after.buffers[0].name, "mtp_terminal_hidden_selected_row");
+}
+
+TEST(Test__HiddenStateRowSelectStage, GPUStagesOptIntoGraphLaunchPreparation)
+{
+    HiddenStateRowSelectStage::Params single_gpu_params;
+    single_gpu_params.device_id = DeviceId::cuda(0);
+    single_gpu_params.seq_len = 8;
+    single_gpu_params.d_model = 32;
+    HiddenStateRowSelectStage single_gpu(single_gpu_params);
+    EXPECT_TRUE(single_gpu.needsGraphLaunchPreparation());
+
+    HiddenStateRowsSelectStage::Params multi_gpu_params;
+    multi_gpu_params.device_id = DeviceId::rocm(0);
+    multi_gpu_params.seq_len = 8;
+    multi_gpu_params.d_model = 32;
+    multi_gpu_params.selected_row_count = 3;
+    HiddenStateRowsSelectStage multi_gpu(multi_gpu_params);
+    EXPECT_TRUE(multi_gpu.needsGraphLaunchPreparation());
+
+    HiddenStateRowSelectStage::Params cpu_params;
+    cpu_params.device_id = DeviceId::cpu();
+    cpu_params.seq_len = 8;
+    cpu_params.d_model = 32;
+    HiddenStateRowSelectStage cpu_stage(cpu_params);
+    EXPECT_FALSE(cpu_stage.needsGraphLaunchPreparation());
 }
 
 TEST(Test__HiddenStateRowSelectStage, LMHeadUsesScratchOffsetZeroWhenSelectedRowChanges)
@@ -382,6 +439,43 @@ TEST(Test__HiddenStateRowSelectStage, MultiRowReplayUpdateKeepsDeclaredWorkspace
 
     EXPECT_FALSE(stage.setSelectedRowsForReplay({1, 2}));
     EXPECT_EQ(stage.selectedRowsForTesting(), std::vector<int>({5, 0, 7}));
+}
+
+TEST(Test__HiddenStateRowSelectStage, ReplayMutatorsDoNotTouchGpuWorkspace)
+{
+    const std::string single_source =
+        readRepoFile("src/v2/execution/compute_stages/stages/HiddenStateRowSelectStage.cpp");
+    const std::string multi_source =
+        readRepoFile("src/v2/execution/compute_stages/stages/HiddenStateRowsSelectStage.cpp");
+    ASSERT_FALSE(single_source.empty());
+    ASSERT_FALSE(multi_source.empty());
+
+    const std::string single_update = extractMethodBody(
+        single_source,
+        "void HiddenStateRowSelectStage::updatePrefillReplayParams",
+        "void HiddenStateRowSelectStage::setSelectedRowForReplay");
+    const std::string single_setter = extractMethodBody(
+        single_source,
+        "void HiddenStateRowSelectStage::setSelectedRowForReplay",
+        "bool HiddenStateRowSelectStage::prepareGraphLaunch");
+    const std::string multi_setter = extractMethodBody(
+        multi_source,
+        "bool HiddenStateRowsSelectStage::setSelectedRowsForReplay",
+        "bool HiddenStateRowsSelectStage::prepareGraphLaunch");
+
+    ASSERT_FALSE(single_update.empty());
+    ASSERT_FALSE(single_setter.empty());
+    ASSERT_FALSE(multi_setter.empty());
+
+    for (const auto *body : {&single_update, &single_setter, &multi_setter})
+    {
+        EXPECT_EQ(body->find("bound_workspace_"), std::string::npos)
+            << "Replay setters must not dereference stale workspace bindings";
+        EXPECT_EQ(body->find("uploadGpu"), std::string::npos)
+            << "Replay setters must not upload GPU metadata before executor-owned workspace/stream binding";
+        EXPECT_EQ(body->find("ensureGpuParamStateInitialized"), std::string::npos)
+            << "Replay setters must not initialize GPU params outside executor-owned execution";
+    }
 }
 
 TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataDoesNotDeclareOrMutateWorkspace)

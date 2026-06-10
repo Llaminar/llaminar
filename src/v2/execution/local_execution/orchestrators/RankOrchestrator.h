@@ -442,6 +442,11 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromDeviceTargetSample(
+            int target_sample_slot,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
         bool flushPendingMTPWork() override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;

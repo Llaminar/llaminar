@@ -390,6 +390,31 @@ namespace
             return already_appended_tokens >= 0;
         }
 
+        bool commitMTPShiftedRowFromDeviceTargetSample(
+            int target_sample_slot,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override
+        {
+            ++device_target_shifted_commit_count_;
+            if (!supports_mtp_device_draft_token_input_ ||
+                target_sample_slot < 0 ||
+                target_sample_slot >= static_cast<int>(device_target_sample_tokens_.size()))
+            {
+                return false;
+            }
+            const int32_t token =
+                device_target_sample_tokens_[static_cast<size_t>(target_sample_slot)];
+            if (token < 0)
+                return false;
+            last_device_target_shifted_commit_token_ = token;
+            return commitMTPShiftedRowFromCurrentTerminalHidden(
+                token,
+                already_appended_tokens,
+                allow_speculative_discard,
+                position_offset_override);
+        }
+
         bool hasMTPLogitsLocal() const override
         {
             return column_parallel_logits_ && mtp_logits_local_ != nullptr;
@@ -904,7 +929,7 @@ namespace
         {
             ++device_distribution_verify_batch_count_;
             if (!supports_stochastic_device_sampling_ ||
-                !draft_tokens || !accept_thresholds || !residual_thresholds || !out ||
+                !accept_thresholds || !residual_thresholds || !out ||
                 first_target_slot < 0 || first_draft_slot < 0 || row_count <= 0)
             {
                 return false;
@@ -921,7 +946,8 @@ namespace
                 if (target.empty() || draft.empty())
                     return false;
 
-                int32_t draft_token = draft_tokens[row];
+                int32_t draft_token =
+                    draft_tokens ? draft_tokens[row] : -1;
                 if (draft_token < 0)
                 {
                     const int device_slot = first_draft_slot + row;
@@ -964,6 +990,7 @@ namespace
             DeviceSpeculativeVerifyBatchOutcome *out) override
         {
             using namespace sampling_math;
+            batch_outcome_used_host_draft_tokens_ = draft_tokens != nullptr;
             if (!out ||
                 row_count <= 0 ||
                 row_count > kSpeculativeBatchMaxRows ||
@@ -1132,6 +1159,14 @@ namespace
         {
             return forward_mtp_from_device_target_for_device_sampling_count_;
         }
+        int deviceTargetShiftedCommitCount() const
+        {
+            return device_target_shifted_commit_count_;
+        }
+        int lastDeviceTargetShiftedCommitToken() const
+        {
+            return last_device_target_shifted_commit_token_;
+        }
         int prepareMTPVerifierInputTokensDeviceFirstCount() const
         {
             return prepare_mtp_verifier_input_tokens_device_first_count_;
@@ -1178,6 +1213,10 @@ namespace
         }
         int deviceDistributionVerifyCount() const { return device_distribution_verify_count_; }
         int deviceDistributionVerifyBatchCount() const { return device_distribution_verify_batch_count_; }
+        bool batchOutcomeUsedHostDraftTokens() const
+        {
+            return batch_outcome_used_host_draft_tokens_;
+        }
         int allPositionVerifierSyncDeferralSetCount() const { return all_position_verifier_sync_deferral_set_count_; }
         int allPositionVerifierSyncDeferralEnableCount() const { return all_position_verifier_sync_deferral_enable_count_; }
         int allPositionVerifierSyncDeferralDisableCount() const { return all_position_verifier_sync_deferral_disable_count_; }
@@ -1619,7 +1658,9 @@ namespace
         int device_distribution_verify_count_{0};
         int device_distribution_verify_batch_count_{0};
         int device_distribution_batch_outcome_device_first_count_{0};
+        bool batch_outcome_used_host_draft_tokens_{false};
         int prepare_mtp_verifier_input_tokens_device_first_count_{0};
+        int device_target_shifted_commit_count_{0};
         int all_position_verifier_sync_deferral_set_count_{0};
         int all_position_verifier_sync_deferral_enable_count_{0};
         int all_position_verifier_sync_deferral_disable_count_{0};
@@ -1628,6 +1669,7 @@ namespace
         int last_mtp_condition_token_{-1};
         int last_chained_mtp_condition_token_{-1};
         int last_chained_mtp_position_id_{-1};
+        int last_device_target_shifted_commit_token_{-1};
         int last_prepare_mtp_verifier_first_token_{-1};
         int last_prepare_mtp_verifier_first_target_sample_slot_{-1};
         int last_prepare_mtp_verifier_first_draft_slot_{-1};
@@ -2429,7 +2471,7 @@ namespace
         EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "depth_zero_bypass");
     }
 
-    TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthPersistsAcrossClearCachePrefillCycles)
+    TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthResetsAcrossClearCachePrefillCycles)
     {
         MTPDepthPolicyConfig depth_policy;
         depth_policy.mode = MTPDepthPolicyMode::Dynamic;
@@ -2475,11 +2517,13 @@ namespace
         ASSERT_TRUE(step2.success()) << step2.error;
 
         EXPECT_EQ(mock->forwardMTPCount(), 2);
-        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 3)
-            << "the second request should start from the learned depth 2, not reset to depth 3";
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 4)
+            << "clearCache() is a request boundary, so adaptive MTP must "
+               "restart from the configured initial depth instead of carrying "
+               "a learned depth into the next request";
 
         probe = runner->prefixStateProbe();
-        EXPECT_EQ(probe.mtp_current_depth, 1);
+        EXPECT_EQ(probe.mtp_current_depth, 2);
         EXPECT_EQ(probe.mtp_depth_policy_demotions, 1u);
         EXPECT_EQ(probe.mtp_depth_policy_updates, 1u);
     }
@@ -2847,10 +2891,10 @@ namespace
             EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
             EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 3);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1)
-                << "the first shifted MTP row is committed from terminal hidden before the all-position verifier";
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 2)
-                << "accepted verifier hidden rows should fill the shifted prefix without sequential verifier replay";
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
+                << "a main-state-preserving sidecar already appended the first shifted MTP row";
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1)
+                << "accepted verifier hidden rows should fill the remaining shifted prefix without sequential verifier replay";
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 3);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
@@ -2886,6 +2930,12 @@ namespace
                                         {"correction_replay_tokens", "0"},
                                         {"ready_token", "3"}});
             ASSERT_NE(trace, nullptr);
+            const PerfStatRecord *reused_first_shifted =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "all_position_initial_shifted_reused_sidecar_rows");
+            ASSERT_NE(reused_first_shifted, nullptr);
+            EXPECT_DOUBLE_EQ(reused_first_shifted->value, 1.0);
 
             const PerfStatRecord *publication_runs =
                 findPerfRecordWithTags(records,
@@ -2979,8 +3029,8 @@ namespace
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2)
-                << "the first shifted row is committed before the verifier; "
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1)
+                << "the sidecar-owned first shifted row is reused; only "
                    "the rejected correction gets a shifted row while its "
                    "main-model condition forward is deferred";
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
@@ -3023,6 +3073,11 @@ namespace
                                         {"accepted_state_count", "1"},
                                         {"target_cached_tokens", "6"}});
             ASSERT_NE(publication_runs, nullptr);
+            const PerfStatRecord *reused_first_shifted =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "all_position_initial_shifted_reused_sidecar_rows");
+            ASSERT_NE(reused_first_shifted, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -3066,9 +3121,9 @@ namespace
             EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 3)
                 << "depth-2 all-position verification includes a bonus-ready row";
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2)
-                << "first condition row plus deferred correction shifted row";
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 3)
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1)
+                << "only the deferred correction shifted row is rebuilt sequentially";
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 2)
                 << "accepted verifier prefix must be committed from verifier hidden rows";
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 2)
                 << "the final shifted commit is the deferred correction row";
@@ -3141,10 +3196,10 @@ namespace
             EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
             EXPECT_EQ(mock->allPositionVerifierSyncDeferralSetCount(), 0);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1)
-                << "the first shifted MTP row is committed before the stochastic all-position verifier";
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 2)
-                << "the accepted stochastic verifier row should fill the shifted prefix without replay";
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
+                << "the first stochastic sidecar row is reused for shifted MTP KV";
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1)
+                << "the accepted stochastic verifier row should fill the remaining shifted prefix without replay";
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 2);
             EXPECT_EQ(mock->restoreCount(), 0);
@@ -3187,6 +3242,12 @@ namespace
                                         {"decode_equivalent_replay_required", "false"},
                                         {"correction_replay_tokens", "0"}});
             ASSERT_NE(trace, nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Timer,
+                                     "decode_equivalent_stochastic_forward_one"),
+                      nullptr)
+                << "accepted all-position stochastic lanes must not fall back "
+                   "to the decode-equivalent stepwise verifier";
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -3252,6 +3313,9 @@ namespace
                    "the MTP draft sample should stay device-resident";
             EXPECT_EQ(mock->deviceDistributionSampleDeferredCount(), 1);
             EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
+            EXPECT_FALSE(mock->batchOutcomeUsedHostDraftTokens())
+                << "compact device outcome verification should read sampled "
+                   "draft tokens from device slots, not from a host shadow";
             EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0)
                 << "penalties would make row distributions history-dependent "
                    "and must keep the synchronized verifier boundary";
@@ -3270,6 +3334,12 @@ namespace
                                        "mtp_token_stochastic_deferred_host_reads",
                                        {{"draft_idx", "0"}});
             ASSERT_NE(deferred_draft, nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Timer,
+                                     "decode_equivalent_stochastic_forward_one"),
+                      nullptr)
+                << "penalty-free compact device outcomes should stay on the "
+                   "all-position verifier path";
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -3322,6 +3392,9 @@ namespace
             EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(), 1)
                 << "the first stochastic sidecar should consume the deferred "
                    "main-model target token from its device slot";
+            EXPECT_EQ(mock->deviceTargetShiftedCommitCount(), 0)
+                << "the all-position publication path reuses the first shifted "
+                   "row appended by the device-target sidecar";
             EXPECT_EQ(mock->forwardMTPFromDeviceDraftForDeviceSamplingCount(), 1)
                 << "depth>1 stochastic sidecar chaining should consume the "
                    "previous sampled draft token from the device slot";
@@ -3358,6 +3431,9 @@ namespace
                    "device slots until the batched verifier summarizes outcome";
             EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
             EXPECT_EQ(mock->verifyStochasticDistributionsBatchOutcomeDeviceFirstCount(), 1);
+            EXPECT_FALSE(mock->batchOutcomeUsedHostDraftTokens())
+                << "device-first stochastic MTP keeps all verifier draft "
+                   "tokens in device slots until the summary is produced";
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *device_input =
@@ -3378,6 +3454,11 @@ namespace
                                        "stochastic_first_sidecar_device_target_inputs",
                                        {});
             ASSERT_NE(first_target_input, nullptr);
+            const PerfStatRecord *reused_first_shifted =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "all_position_initial_shifted_reused_sidecar_rows");
+            ASSERT_NE(reused_first_shifted, nullptr);
             const PerfStatRecord *deferred_drafts =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,
@@ -3441,7 +3522,7 @@ namespace
                 << "penalty-bearing stochastic sampling is history-dependent, "
                    "so it must not use the deferred sidecar logits handoff";
             EXPECT_EQ(mock->flushPendingMTPWorkCount(), 2);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
                         ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
@@ -3545,7 +3626,7 @@ namespace
             EXPECT_EQ(mock->applyMainPenaltiesCount(), 0);
             EXPECT_EQ(mock->applyMTPPenaltiesCount(), 0);
             EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 2);
 
@@ -3642,8 +3723,8 @@ namespace
             EXPECT_EQ(mock->deviceDistributionBuildCount(), 0);
             EXPECT_EQ(mock->deviceDistributionSampleCount(), 0);
             EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 0);
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
                         ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));

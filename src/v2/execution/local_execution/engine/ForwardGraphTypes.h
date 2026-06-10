@@ -146,6 +146,7 @@ namespace llaminar2
     {
         Other,
         OrdinaryDecode,
+        SingleTokenOrdinaryDecode,
         AllPositionVerifier,
     };
 
@@ -168,6 +169,8 @@ namespace llaminar2
             return ForwardReplayStateCacheClass::Other;
         if (signature.all_position_logits)
             return ForwardReplayStateCacheClass::AllPositionVerifier;
+        if (signature.seq_len == 1 && signature.batch_size <= 1)
+            return ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode;
         return ForwardReplayStateCacheClass::OrdinaryDecode;
     }
 
@@ -350,10 +353,11 @@ namespace llaminar2
         bool phase3_active = false;
 
         /// Live replay-state epoch that the current segmented capture is safe for.
-        /// Ordinary main-decode graphs are invalidated when speculative state
-        /// publication advances the live state to a newer epoch. All-position
-        /// verifier captures keep their own publication contract and do not use
-        /// this stamp for preservation.
+        /// Ordinary multi-token decode graphs are invalidated when speculative
+        /// state publication advances the live state to a newer epoch. One-token
+        /// condition/decode graphs can be explicitly rebound and stamped at the
+        /// MTP publication boundary, because their token/position metadata is
+        /// updated through the usual dynamic-param path before replay.
         uint64_t segmented_capture_live_state_epoch = 0;
 
         bool requiresLiveStateEpochRecapture(bool ordinary_decode_context,
@@ -460,6 +464,20 @@ namespace llaminar2
         {
             gpu_stream_applied = false;
             applied_stream = nullptr;
+        }
+
+        /**
+         * @brief Stamp a preserved one-token decode capture for the current live state.
+         *
+         * MTP spec-state publication mutates KV/GDN/short-conv buffers in place.
+         * A single-token decode capture remains shape-compatible after the stage
+         * stream and dynamic parameters are rebound, but the epoch guard still
+         * needs to know that the preserved capture has been audited for the new
+         * live state.
+         */
+        void markReplayStateSafeForLiveEpoch(uint64_t live_state_epoch)
+        {
+            segmented_capture_live_state_epoch = live_state_epoch;
         }
 
         /**

@@ -482,6 +482,16 @@ namespace llaminar2
         int promote_consecutive_windows = 3;
         double promote_full_accept_rate = 1.0;
         double demote_zero_accept_rate = 0.30;
+        /**
+         * @brief Draft-token acceptance rate below which dynamic depth demotes.
+         *
+         * This threshold shrinks deeper speculative drafts toward depth 1.
+         * Depth 0 is an explicit bypass mode and is entered only through the
+         * zero-acceptance threshold. Keep the default conservative:
+         * stochastic requests can have noisy short windows, and over-eager
+         * demotion causes depth churn before the verifier path has enough
+         * samples to prove that a lower depth is actually faster.
+         */
         double demote_acceptance_rate = 0.55;
     };
 

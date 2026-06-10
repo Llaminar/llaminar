@@ -11,10 +11,12 @@
  * ComputeGraph and updated by the forward execution engine on that graph's
  * execution thread.
  *
- * Lifecycle: the device scalar is a declared graph workspace buffer. The stage
- * owns only a pinned host scalar used to upload the selected row before capture
- * or graph replay. Captured execution reads the already-resident device scalar
- * and must not record a host-to-device scalar copy.
+ * Lifecycle: the device scalar is a declared graph workspace buffer. Replay
+ * setters update only host-side intent and mark the scalar dirty. The GPU upload
+ * is performed from executeGPU(), after DeviceGraphExecutor has rebound the
+ * current workspace manager and an explicit non-null stream. Captured execution
+ * reads the already-resident device scalar and must not record a host-to-device
+ * scalar copy.
  */
 
 #pragma once
@@ -36,8 +38,9 @@ namespace llaminar2
      * @brief Selects the last real prefill row into a stable one-row buffer.
      *
      * CPU execution performs a direct memcpy. GPU execution uploads the selected
-     * row scalar before capture/replay, then records only a fixed-grid row-copy
-     * kernel that reads the graph-workspace device scalar.
+     * row scalar only while the stage is executed under executor ownership, then
+     * records only a fixed-grid row-copy kernel that reads the graph-workspace
+     * device scalar.
      */
     class HiddenStateRowSelectStage : public IComputeStage, public IWorkspaceConsumer
     {
@@ -82,6 +85,8 @@ namespace llaminar2
         void unbindWorkspace() override;
         bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        bool needsGraphLaunchPreparation() const override { return params_.device_id.is_gpu(); }
 
         /**
          * @brief Update selected source row for fixed-bucket prefill replay.
@@ -96,8 +101,9 @@ namespace llaminar2
         /**
          * @brief Update the selected source row for direct graph replay users.
          *
-         * The workspace buffer name and bound workspace remain stable; only the
-         * pinned scalar value consumed by the captured GPU row-select path changes.
+         * The workspace buffer name remains stable; this method never dereferences
+         * a bound workspace. executeGPU() consumes the dirty value after the
+         * executor binds the current workspace and stream.
          */
         void setSelectedRowForReplay(int selected_row_idx);
 

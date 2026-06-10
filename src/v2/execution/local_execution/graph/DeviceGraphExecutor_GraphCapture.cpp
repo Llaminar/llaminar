@@ -235,6 +235,35 @@ namespace llaminar2
             return executeFastDecode(graph, ctx, collective_nodes);
         }
 
+        const auto &order = graph.getExecutionOrder();
+
+        // Set GPU stream on all stages before any capture starts. Some stages
+        // own tiny graph metadata buffers and must upload them on this explicit
+        // stream before beginCapture(); doing so from execute() would record an
+        // illegal H2D operation into the graph.
+        if (gpu_stream)
+        {
+            for (const auto &name : order)
+            {
+                auto *node = graph.getNode(name);
+                if (node && node->stage)
+                    node->stage->setGPUStream(gpu_stream);
+            }
+        }
+
+        for (const auto &name : order)
+        {
+            auto *node = graph.getNode(name);
+            if (!node || !node->stage || !node->stage->needsGraphLaunchPreparation())
+                continue;
+            if (!node->stage->prepareGraphLaunch(ctx, gpu_stream))
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Graph launch metadata preparation failed before capture: "
+                          << name);
+                return executeFastDecode(graph, ctx, collective_nodes);
+            }
+        }
+
         // Step 1: Begin capture
         if (!capture->beginCapture())
         {
@@ -246,19 +275,7 @@ namespace llaminar2
         // Set GPU device once before the loop (same as executeFastDecode)
         DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
 
-        const auto &order = graph.getExecutionOrder();
         bool exec_success = true;
-
-        // Set GPU stream on all stages so kernels dispatch to the capture stream
-        if (gpu_stream)
-        {
-            for (const auto &name : order)
-            {
-                auto *node = graph.getNode(name);
-                if (node && node->stage)
-                    node->stage->setGPUStream(gpu_stream);
-            }
-        }
 
         for (const auto &name : order)
         {

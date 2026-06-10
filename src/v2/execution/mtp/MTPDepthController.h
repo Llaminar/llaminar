@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
@@ -18,6 +19,7 @@ namespace llaminar2
         PromoteFullAcceptRate,
         DemoteZeroAcceptRate,
         DemoteLowAcceptanceRate,
+        ProbeHigherBeforeDemote,
         DepthZeroBypass,
         Hold,
     };
@@ -90,6 +92,30 @@ namespace llaminar2
         MTPDepthDecision recordBypassStep();
 
     private:
+        /**
+         * @brief Return true when a previously tried depth produced a demotion
+         * signal and should not be retried through the fast perfect-probe path.
+         */
+        bool depthRejected(int depth) const;
+
+        /**
+         * @brief Mark a draft depth as rejected or clear that rejection.
+         *
+         * Dynamic mode uses this small memory to distinguish "untested" from
+         * "known bad for the current request".  A rejected depth can still be
+         * retried later, but only through the normal promotion hysteresis.
+         */
+        void setDepthRejected(int depth, bool rejected);
+
+        /**
+         * @brief Find the nearest un-rejected deeper draft depth.
+         *
+         * This lets a bad intermediate probe try the next candidate once before
+         * settling downward.  It is deliberately depth-only bookkeeping: timing
+         * remains in the benchmark harness, not in the online controller.
+         */
+        int nextUnrejectedDepthAbove(int depth) const;
+
         MTPDepthDecision evaluateWindow() const;
         bool windowReady() const;
         bool depthZeroProbeReady() const;
@@ -101,6 +127,7 @@ namespace llaminar2
         MTPDepthWindow window_;
         MTPDepthDecision last_decision_;
         MTPDepthControllerStats stats_;
+        std::vector<uint8_t> rejected_depths_;
     };
 
 } // namespace llaminar2

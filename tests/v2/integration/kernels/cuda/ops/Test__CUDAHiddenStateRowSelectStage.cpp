@@ -3,7 +3,8 @@
  * @brief CUDA integration tests for graph-capturable hidden-state row selection.
  *
  * Captures one row-select stage into a CUDA graph, replays it twice, and verifies
- * that changing PrefillReplayParams changes the selected row without recapture.
+ * that replay metadata can be refreshed on the explicit launch stream without
+ * recapturing the graph.
  */
 
 #include <gtest/gtest.h>
@@ -50,10 +51,17 @@ namespace
 
 #ifdef HAVE_CUDA
     /// @brief Copy scratch row from CUDA device memory for assertion.
-    std::vector<float> downloadScratchRow(FP32Tensor &scratch, int d_model)
+    std::vector<float> downloadScratchRow(FP32Tensor &scratch, int d_model, cudaStream_t stream)
     {
         std::vector<float> row(static_cast<size_t>(d_model), 0.0f);
-        cudaMemcpy(row.data(), scratch.gpu_data_ptr(), static_cast<size_t>(d_model) * sizeof(float), cudaMemcpyDeviceToHost);
+        EXPECT_EQ(cudaMemcpyAsync(
+                      row.data(),
+                      scratch.gpu_data_ptr(),
+                      static_cast<size_t>(d_model) * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      stream),
+                  cudaSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
         return row;
     }
 
@@ -142,7 +150,7 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
     stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{2, bucket_seq_len, 0});
     ASSERT_TRUE(stage.execute(nullptr));
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    expectRow(downloadScratchRow(*scratch, d_model), *hidden, 1, d_model);
+    expectRow(downloadScratchRow(*scratch, d_model, stream), *hidden, 1, d_model);
 
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
@@ -157,13 +165,15 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
 
     ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    expectRow(downloadScratchRow(*scratch, d_model), *hidden, 1, d_model);
+    expectRow(downloadScratchRow(*scratch, d_model, stream), *hidden, 1, d_model);
 
-    // No recapture: update only the pinned scalar and replay the same graph exec.
+    // No recapture: update host intent, then let the graph-launch preparation
+    // hook upload the scalar on the same explicit stream used for graph launch.
     stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{6, bucket_seq_len, 0});
+    ASSERT_TRUE(stage.prepareGraphLaunch(nullptr, stream));
     ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    expectRow(downloadScratchRow(*scratch, d_model), *hidden, 5, d_model);
+    expectRow(downloadScratchRow(*scratch, d_model, stream), *hidden, 5, d_model);
 
     cudaGraphExecDestroy(graph_exec);
     cudaGraphDestroy(graph);
@@ -231,12 +241,12 @@ TEST(Test__CUDAHiddenStateRowSelectStage, GraphManagedExecutionOwnsCoherenceThro
     stage_ptr->setSelectedRowForReplay(1);
     ASSERT_TRUE(executor.execute(graph, ctx.get()));
     ASSERT_EQ(cudaStreamSynchronize(static_cast<cudaStream_t>(stage_ptr->gpuStream())), cudaSuccess);
-    expectRow(downloadScratchRow(*scratch, d_model), *hidden, 1, d_model);
+    expectRow(downloadScratchRow(*scratch, d_model, stream), *hidden, 1, d_model);
 
     stage_ptr->setSelectedRowForReplay(5);
     ASSERT_TRUE(executor.execute(graph, ctx.get()));
     ASSERT_EQ(cudaStreamSynchronize(static_cast<cudaStream_t>(stage_ptr->gpuStream())), cudaSuccess);
-    expectRow(downloadScratchRow(*scratch, d_model), *hidden, 5, d_model);
+    expectRow(downloadScratchRow(*scratch, d_model, stream), *hidden, 5, d_model);
 
     ASSERT_TRUE(scratch->ensureOnHost(stage_ptr->gpuStream()))
         << "Graph-managed row-select output must be readable after executor-owned coherence";
@@ -315,6 +325,7 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
                d_model);
 
     ASSERT_TRUE(stage.setSelectedRowsForReplay(replay_rows));
+    ASSERT_TRUE(stage.prepareGraphLaunch(nullptr, stream));
     ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
     expectRows(downloadScratchRows(*scratch, static_cast<int>(replay_rows.size()), d_model, stream),
                *hidden,

@@ -11,6 +11,7 @@
 #include <gmock/gmock.h>
 #include <vector>
 #include <algorithm>
+#include <string>
 
 #include "utils/BenchmarkRunner.h"
 #include "config/OrchestrationConfig.h"
@@ -215,6 +216,86 @@ namespace
         int emitted_tokens_ = 0;
         bool sampling_params_set_ = false;
         SamplingParams last_sampling_params_;
+    };
+
+    class MockMeasuredMTPStatsRunner : public MockOrchestratedDecodeRunner
+    {
+    public:
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override
+        {
+            ++probe_count_;
+            PrefixRuntimeStateSnapshot snapshot;
+            snapshot.initialized = true;
+            snapshot.architecture = "mock_cpu";
+            snapshot.execution_path = "graph";
+            snapshot.primary_device = DeviceId::cpu();
+            snapshot.mtp_config_enabled = true;
+            snapshot.mtp_current_depth = static_cast<int>(probe_count_);
+            snapshot.mtp_min_depth = 1;
+            snapshot.mtp_max_depth = 3;
+
+            /*
+             * Use non-identical per-request counters so the test below proves
+             * benchmark reporting is an aggregate over the measured iterations,
+             * not a final live snapshot.
+             */
+            snapshot.mtp_draft_steps = probe_count_;
+            snapshot.mtp_accepted_tokens = probe_count_ * 10;
+            snapshot.mtp_rejected_tokens = probe_count_;
+            snapshot.mtp_rollbacks = probe_count_ * 2;
+            snapshot.mtp_bypasses = probe_count_ % 2;
+            snapshot.mtp_verifier_runs = probe_count_ * 3;
+            snapshot.mtp_verifier_token_count = probe_count_ * 4;
+            snapshot.mtp_stochastic_accept_tests = probe_count_ * 5;
+            snapshot.mtp_stochastic_accepts = probe_count_ * 4;
+            snapshot.mtp_stochastic_residual_samples = probe_count_;
+            snapshot.mtp_stochastic_terminal_samples = probe_count_ * 2;
+            snapshot.mtp_transaction_commits = probe_count_;
+            snapshot.mtp_transaction_rollbacks = probe_count_ + 1;
+            snapshot.mtp_transaction_validation_failures = probe_count_ + 2;
+            snapshot.mtp_unsafe_verifier_state_rejections = probe_count_ + 3;
+            snapshot.mtp_depth_policy_windows = probe_count_ * 6;
+            snapshot.mtp_depth_policy_updates = probe_count_;
+            snapshot.mtp_depth_policy_promotions = probe_count_ + 4;
+            snapshot.mtp_depth_policy_demotions = probe_count_ + 5;
+            snapshot.mtp_depth_policy_observe_recommendations = probe_count_ + 6;
+
+            snapshot.mtp_request.enabled = true;
+            snapshot.mtp_request.verify_mode = "speculative-sampling";
+            snapshot.mtp_request.stochastic_verify = true;
+            snapshot.mtp_request.adaptive_depth_enabled = true;
+            snapshot.mtp_request.depth_policy_mode = "dynamic";
+            snapshot.mtp_request.current_depth = snapshot.mtp_current_depth;
+            snapshot.mtp_request.min_depth = snapshot.mtp_min_depth;
+            snapshot.mtp_request.max_depth = snapshot.mtp_max_depth;
+            snapshot.mtp_request.depth_policy_updates = snapshot.mtp_depth_policy_updates;
+            snapshot.mtp_request.last_depth_policy_reason =
+                "probe_" + std::to_string(probe_count_);
+            snapshot.mtp_request.draft_steps = snapshot.mtp_draft_steps;
+            snapshot.mtp_request.accepted_tokens = snapshot.mtp_accepted_tokens;
+            snapshot.mtp_request.rejected_tokens = snapshot.mtp_rejected_tokens;
+            snapshot.mtp_request.rollbacks = snapshot.mtp_rollbacks;
+            snapshot.mtp_request.acceptance_rate =
+                static_cast<double>(snapshot.mtp_accepted_tokens) /
+                static_cast<double>(snapshot.mtp_accepted_tokens +
+                                    snapshot.mtp_rejected_tokens);
+            snapshot.mtp_request.stochastic_accept_tests =
+                snapshot.mtp_stochastic_accept_tests;
+            snapshot.mtp_request.stochastic_accepts = snapshot.mtp_stochastic_accepts;
+            snapshot.mtp_request.stochastic_residual_samples =
+                snapshot.mtp_stochastic_residual_samples;
+            snapshot.mtp_request.stochastic_terminal_samples =
+                snapshot.mtp_stochastic_terminal_samples;
+            snapshot.mtp_request.stochastic_acceptance_rate =
+                static_cast<double>(snapshot.mtp_stochastic_accepts) /
+                static_cast<double>(snapshot.mtp_stochastic_accept_tests);
+            return snapshot;
+        }
+
+        int probeCount() const { return static_cast<int>(probe_count_); }
+
+    private:
+        mutable uint64_t probe_count_ = 0;
     };
 
     /**
@@ -464,6 +545,68 @@ TEST(Test__BenchmarkRunnerCPU, UsesRequestedSamplingParamsForSpeculativeMTPBench
     EXPECT_EQ(params.seed, 123u);
 }
 
+TEST(Test__BenchmarkRunnerCPU, AggregatesMeasuredIterationMTPStats)
+{
+    auto runner = std::make_shared<MockMeasuredMTPStatsRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.mtp.enabled = true;
+    config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+    config.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+
+    auto result = bench.run(config);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(runner->probeCount(), 3)
+        << "Only measured iterations should be probed for aggregate reporting";
+
+    EXPECT_EQ(result.prefix_state.mtp_draft_steps, 6u);
+    EXPECT_EQ(result.prefix_state.mtp_accepted_tokens, 60u);
+    EXPECT_EQ(result.prefix_state.mtp_rejected_tokens, 6u);
+    EXPECT_EQ(result.prefix_state.mtp_rollbacks, 12u);
+    EXPECT_EQ(result.prefix_state.mtp_bypasses, 2u);
+    EXPECT_EQ(result.prefix_state.mtp_verifier_runs, 18u);
+    EXPECT_EQ(result.prefix_state.mtp_verifier_token_count, 24u);
+    EXPECT_EQ(result.prefix_state.mtp_stochastic_accept_tests, 30u);
+    EXPECT_EQ(result.prefix_state.mtp_stochastic_accepts, 24u);
+    EXPECT_EQ(result.prefix_state.mtp_stochastic_residual_samples, 6u);
+    EXPECT_EQ(result.prefix_state.mtp_stochastic_terminal_samples, 12u);
+    EXPECT_EQ(result.prefix_state.mtp_transaction_commits, 6u);
+    EXPECT_EQ(result.prefix_state.mtp_transaction_rollbacks, 9u);
+    EXPECT_EQ(result.prefix_state.mtp_transaction_validation_failures, 12u);
+    EXPECT_EQ(result.prefix_state.mtp_unsafe_verifier_state_rejections, 15u);
+    EXPECT_EQ(result.prefix_state.mtp_depth_policy_windows, 36u);
+    EXPECT_EQ(result.prefix_state.mtp_depth_policy_updates, 6u);
+    EXPECT_EQ(result.prefix_state.mtp_depth_policy_promotions, 18u);
+    EXPECT_EQ(result.prefix_state.mtp_depth_policy_demotions, 21u);
+    EXPECT_EQ(result.prefix_state.mtp_depth_policy_observe_recommendations, 24u);
+
+    EXPECT_EQ(result.prefix_state.mtp_current_depth, 3)
+        << "Current depth remains the latest measured request's diagnostic value";
+    EXPECT_EQ(result.prefix_state.mtp_request.current_depth, 3);
+    EXPECT_EQ(result.prefix_state.mtp_request.last_depth_policy_reason, "probe_3");
+    EXPECT_EQ(result.prefix_state.mtp_request.accepted_tokens, 60u);
+    EXPECT_EQ(result.prefix_state.mtp_request.rejected_tokens, 6u);
+    EXPECT_DOUBLE_EQ(result.prefix_state.mtp_request.acceptance_rate, 60.0 / 66.0);
+    EXPECT_EQ(result.prefix_state.mtp_request.stochastic_accept_tests, 30u);
+    EXPECT_EQ(result.prefix_state.mtp_request.stochastic_accepts, 24u);
+    EXPECT_DOUBLE_EQ(result.prefix_state.mtp_request.stochastic_acceptance_rate, 0.8);
+
+    const auto doc = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
+    EXPECT_EQ(doc.at("mtp").at("accepted_tokens"), 60);
+    EXPECT_EQ(doc.at("mtp").at("rejected_tokens"), 6);
+    EXPECT_DOUBLE_EQ(doc.at("mtp").at("acceptance_rate").get<double>(), 60.0 / 66.0);
+    EXPECT_EQ(doc.at("mtp").at("request").at("stochastic_accepts"), 24);
+    EXPECT_DOUBLE_EQ(doc.at("mtp").at("request").at("stochastic_acceptance_rate").get<double>(),
+                     0.8);
+}
+
 /**
  * @brief Verify benchmark captures prefix-cache and MTP observability.
  */
@@ -563,18 +706,18 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     EXPECT_EQ(result.prefix_state.prefix_cache_bypasses, 1u);
     EXPECT_TRUE(result.prefix_state.prefix_request.partial_hit);
     EXPECT_EQ(result.prefix_state.prefix_request.matched_tokens, 6);
-    EXPECT_EQ(result.prefix_state.mtp_draft_steps, 3u);
-    EXPECT_EQ(result.prefix_state.mtp_rejected_tokens, 1u);
+    EXPECT_EQ(result.prefix_state.mtp_draft_steps, 9u);
+    EXPECT_EQ(result.prefix_state.mtp_rejected_tokens, 3u);
     EXPECT_TRUE(result.prefix_state.mtp_bypassed);
-    EXPECT_EQ(result.prefix_state.mtp_bypasses, 1u);
-    EXPECT_EQ(result.prefix_state.mtp_request.accepted_tokens, 2u);
+    EXPECT_EQ(result.prefix_state.mtp_bypasses, 3u);
+    EXPECT_EQ(result.prefix_state.mtp_request.accepted_tokens, 6u);
     EXPECT_DOUBLE_EQ(result.prefix_state.mtp_request.acceptance_rate, 2.0 / 3.0);
     EXPECT_EQ(result.prefix_state.mtp_request.verify_mode, "speculative-sampling");
-    EXPECT_EQ(result.prefix_state.mtp_request.stochastic_residual_samples, 1u);
-    EXPECT_EQ(result.prefix_state.mtp_verifier_runs, 4u);
-    EXPECT_EQ(result.prefix_state.mtp_verifier_token_count, 8u);
-    EXPECT_EQ(result.prefix_state.mtp_stochastic_accept_tests, 3u);
-    EXPECT_EQ(result.prefix_state.mtp_depth_policy_updates, 1u);
+    EXPECT_EQ(result.prefix_state.mtp_request.stochastic_residual_samples, 3u);
+    EXPECT_EQ(result.prefix_state.mtp_verifier_runs, 12u);
+    EXPECT_EQ(result.prefix_state.mtp_verifier_token_count, 24u);
+    EXPECT_EQ(result.prefix_state.mtp_stochastic_accept_tests, 9u);
+    EXPECT_EQ(result.prefix_state.mtp_depth_policy_updates, 3u);
     EXPECT_EQ(result.prefix_state.mtp_current_depth, 1);
     EXPECT_EQ(result.prefix_state.mtp_max_depth, 3);
     EXPECT_EQ(result.prefix_state.prefill_chunk_schedules, 2u);
@@ -598,7 +741,7 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     EXPECT_NE(output.find("MTP request"), std::string::npos);
     EXPECT_NE(output.find("66.67% acceptance"), std::string::npos);
     EXPECT_NE(output.find("depth_policy=dynamic"), std::string::npos);
-    EXPECT_NE(output.find("updates=1"), std::string::npos);
+    EXPECT_NE(output.find("updates=3"), std::string::npos);
     EXPECT_NE(output.find("MTP decode"), std::string::npos);
     EXPECT_NE(output.find("Prefill chunks"), std::string::npos);
     EXPECT_NE(output.find("1/2 schedules"), std::string::npos);
@@ -711,6 +854,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
 
     EXPECT_EQ(doc.at("schema"), "llaminar.benchmark.v1");
     EXPECT_TRUE(doc.at("success").get<bool>());
+    EXPECT_EQ(doc.at("measurement_iterations"), 3);
     EXPECT_EQ(doc.at("tokens").at("prefill"), 10);
     EXPECT_EQ(doc.at("tokens").at("decode"), 2);
     EXPECT_DOUBLE_EQ(doc.at("timing_ms").at("total").get<double>(), 6.0);

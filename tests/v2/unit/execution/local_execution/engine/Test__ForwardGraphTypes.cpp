@@ -72,6 +72,48 @@ namespace
         const uint64_t *variant_signature_ = nullptr;
     };
 
+    class FakeGraphLaunchPrepStage final : public IComputeStage
+    {
+    public:
+        explicit FakeGraphLaunchPrepStage(DeviceId device)
+            : IComputeStage(device)
+        {
+        }
+
+        bool execute(IDeviceContext *) override
+        {
+            ++execute_calls_;
+            executed_after_prepare_ = prepare_calls_ > 0;
+            return true;
+        }
+
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        std::string name() const override { return "fake_graph_launch_prep_stage"; }
+        bool supportsBackend(ComputeBackendType) const override { return true; }
+        bool isGraphCapturable() const override { return true; }
+        bool needsGraphLaunchPreparation() const override { return true; }
+
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override
+        {
+            ++prepare_calls_;
+            last_ctx_ = ctx;
+            last_stream_ = stream;
+            if (stream)
+                setGPUStream(stream);
+            stream_seen_by_stage_ = gpuStream();
+            return stream != nullptr;
+        }
+
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+        int prepare_calls_ = 0;
+        int execute_calls_ = 0;
+        bool executed_after_prepare_ = false;
+        IDeviceContext *last_ctx_ = nullptr;
+        void *last_stream_ = nullptr;
+        void *stream_seen_by_stage_ = nullptr;
+    };
+
     class FakeReplayGraphCapture final : public IGPUGraphCapture
     {
     public:
@@ -201,6 +243,17 @@ namespace
                 segment_boundary_after,
                 variant_signature),
             DeviceId::cpu());
+    }
+
+    FakeGraphLaunchPrepStage *addFakeGraphLaunchPrepStage(
+        ComputeGraph &graph,
+        const std::string &name,
+        DeviceId device)
+    {
+        auto stage = std::make_unique<FakeGraphLaunchPrepStage>(device);
+        auto *raw_stage = stage.get();
+        graph.addNode(name, std::move(stage), device);
+        return raw_stage;
     }
 
     class ScopedEnvVar
@@ -754,6 +807,20 @@ TEST(Test__ForwardGraphCache, MarkGPUStreamBindingsDirtyPreservesReplayState)
     EXPECT_EQ(cache.segmented_capture_live_state_epoch, 42u);
 }
 
+TEST(Test__ForwardGraphCache, MarkReplayStateSafeForLiveEpochStampsPreservedCapture)
+{
+    ForwardGraphCache cache;
+    cache.segment_cache.initialized = true;
+    cache.segment_cache.needs_capture = false;
+    cache.segmented_capture_live_state_epoch = 17;
+
+    cache.markReplayStateSafeForLiveEpoch(23);
+
+    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 23u);
+    EXPECT_TRUE(cache.segment_cache.initialized);
+    EXPECT_FALSE(cache.segment_cache.needs_capture);
+}
+
 TEST(Test__ForwardGraphCache, ReplayStateEpochClearsOnStateInvalidatingResets)
 {
     ForwardGraphCache cache;
@@ -826,16 +893,23 @@ TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureOnlyAppliesToReadyOrdinaryD
 
 TEST(Test__ForwardReplayStatePolicy, CorrectionReplayResetsOnlyOrdinaryDecodeCaches)
 {
-    ForwardGraphSignature ordinary_decode;
-    ordinary_decode.decode = true;
-    ordinary_decode.all_position_logits = false;
+    ForwardGraphSignature single_token_decode;
+    single_token_decode.decode = true;
+    single_token_decode.seq_len = 1;
+    single_token_decode.batch_size = 1;
+    single_token_decode.all_position_logits = false;
 
-    ForwardGraphSignature all_position_verifier = ordinary_decode;
+    ForwardGraphSignature ordinary_decode = single_token_decode;
+    ordinary_decode.seq_len = 2;
+
+    ForwardGraphSignature all_position_verifier = single_token_decode;
     all_position_verifier.all_position_logits = true;
 
     ForwardGraphSignature prefill;
     prefill.decode = false;
 
+    EXPECT_EQ(classifyForwardReplayStateCache(single_token_decode),
+              ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode);
     EXPECT_EQ(classifyForwardReplayStateCache(ordinary_decode),
               ForwardReplayStateCacheClass::OrdinaryDecode);
     EXPECT_EQ(classifyForwardReplayStateCache(all_position_verifier),
@@ -843,6 +917,11 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayResetsOnlyOrdinaryDecodeCac
     EXPECT_EQ(classifyForwardReplayStateCache(prefill),
               ForwardReplayStateCacheClass::Other);
 
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
+                  classifyForwardReplayStateCache(single_token_decode)),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "One-token condition decode can be rebound and stamped after MTP publication.";
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
                   classifyForwardReplayStateCache(ordinary_decode)),
@@ -1204,6 +1283,86 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
     EXPECT_EQ(gpu_ctx.events_destroyed_, 4);
 
     PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCaptureStream)
+{
+    ComputeGraph graph;
+    auto *prep_stage = addFakeGraphLaunchPrepStage(graph, "row_select", DeviceId::cuda(0));
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"row_select"};
+    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        nullptr,
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*current_step=*/3,
+        hooks);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(prep_stage->prepare_calls_, 1);
+    EXPECT_EQ(prep_stage->execute_calls_, 0)
+        << "Captured replay must update launch metadata without re-executing the stage body.";
+    EXPECT_EQ(prep_stage->last_ctx_, &ctx);
+    EXPECT_EQ(prep_stage->last_stream_, cache.capture_stream);
+    EXPECT_NE(prep_stage->last_stream_, nullptr);
+    EXPECT_EQ(prep_stage->stream_seen_by_stage_, cache.capture_stream);
+}
+
+TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecording)
+{
+    ComputeGraph graph;
+    auto *prep_stage = addFakeGraphLaunchPrepStage(graph, "row_select", DeviceId::rocm(0));
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"row_select"};
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        nullptr,
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeCapturePhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*current_step=*/2,
+        hooks);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_FALSE(result.fallback_to_fast_decode);
+    EXPECT_FALSE(result.reset_cache);
+    EXPECT_EQ(prep_stage->prepare_calls_, 1);
+    EXPECT_EQ(prep_stage->execute_calls_, 1);
+    EXPECT_TRUE(prep_stage->executed_after_prepare_)
+        << "Mutable row metadata must be uploaded before beginCapture records the stage body.";
+    EXPECT_EQ(prep_stage->last_ctx_, &ctx);
+    EXPECT_EQ(prep_stage->last_stream_, cache.capture_stream);
+    EXPECT_NE(prep_stage->last_stream_, nullptr);
+    EXPECT_EQ(prep_stage->stream_seen_by_stage_, cache.capture_stream);
 }
 
 TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapturedEvents)

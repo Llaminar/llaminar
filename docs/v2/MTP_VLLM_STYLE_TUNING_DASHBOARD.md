@@ -6,25 +6,31 @@ Contract: refresh CUDA/ROCm/CPU with no-MTP, fixed d1/d2/d3, and dynamic. Dynami
 
 RAG: Green = correct and speed-positive near target. Amber = correct but slow, partial, or policy-sensitive. Red = failing or unproven.
 
-## Matrix
+## Evidence
 
-Latest full matrix:
+Latest dense stochastic closeout:
+`benchmark_results/mtp_vllm_style/20260610T-phase4-dense-stochastic-closeout-matrix-v2/`
+with `--decode-tokens 64 --perfstats`.
+
+Latest full dense/MoE matrix:
 `benchmark_results/mtp_vllm_style/20260609T-phase3-row-indexed-accepted-matrix/`
 with `--decode-tokens 16 --perfstats`.
 
-Latest focused Phase 4 stochastic slice:
-`benchmark_results/mtp_vllm_style/20260610T-phase4-device-first-target-summary/`.
+Latest correctness gate: Phase 4 focused units, dense Qwen3.6 stochastic parity
+on CPU/CUDA/ROCm, CUDA/ROCm stochastic graph smokes, and GPU sampling integration.
+
+## Matrix
 
 | Backend | Model | Sampling | RAG | Latest decode tok/s | Main blocker |
 |---|---|---|---|---|---|
 | CUDA | Dense 27B | greedy | Green | base 44.6; d1/d2/d3/dyn 60.9/55.7/60.0/49.3 | dynamic short-run lag |
-| CUDA | Dense 27B | stochastic | Amber | base 44.7; d1/d2/d3/dyn 45.0/46.6/43.5/45.0 | modest d2 only |
-| ROCm | Dense 27B | greedy | Green | base 31.3; d1/d2/d3/dyn 45.7/33.4/41.9/40.7 | d2 weak, dynamic shallow |
-| ROCm | Dense 27B | stochastic | Amber | base 31.25; focused d2 26.97 | shifted-prefill/condition/verifier cost |
+| CUDA | Dense 27B | stochastic | Green | base 43.88; d1/d2/d3/dyn 37.25/58.09/59.44/53.43 | d1 low acceptance |
+| ROCm | Dense 27B | greedy | Green | base 31.3; d1/d2/d3/dyn 45.7/33.4/41.9/40.7 | d2 weak |
+| ROCm | Dense 27B | stochastic | Green | base 30.33; d1/d2/d3/dyn 33.48/23.71/24.52/32.57 | d2/d3 acceptance-limited |
 | CPU | Dense 27B | greedy | Green | base 4.7; d1/d2/d3/dyn 5.9/6.0/9.3/6.1 | dynamic shallow |
-| CPU | Dense 27B | stochastic | Amber | base 4.7; d1/d2/d3/dyn 4.7/5.4/4.8/4.6 | verifier/policy cost |
+| CPU | Dense 27B | stochastic | Green | base 4.46; d1/d2/d3/dyn 5.06/5.78/4.85/5.41 | verifier/condition cost |
 | CUDA | MoE 35B | greedy | Amber | base 112.9; d1/d2/d3/dyn 62.8/66.8/69.6/57.9 | verifier dominates |
-| CUDA | MoE 35B | stochastic | Amber | base 114.5; d1/d2/d3/dyn 49.8/45.0/42.5/53.6 | zero acceptance |
+| CUDA | MoE 35B | stochastic | Amber | base 114.5; d1/d2/d3/dyn 49.8/45.0/42.5/53.6 | low/zero acceptance |
 | ROCm | MoE 35B | greedy | Amber | base 64.7; d1/d2/d3/dyn 38.2/35.7/40.3/35.9 | verifier dominates |
 | ROCm | MoE 35B | stochastic | Amber | base 64.8; d1/d2/d3/dyn 29.7/25.8/23.1/30.5 | verifier dominates |
 | CPU | MoE 35B | greedy | Amber | base 17.7; d1/d2/d3/dyn 13.5/13.9/12.4/13.3 | host verifier cost |
@@ -32,13 +38,24 @@ Latest focused Phase 4 stochastic slice:
 
 ## Current Read
 
-- Phase 3 row-indexed verifier is accepted for dense SingleDevice: focused row-select units/integrations, dense CPU/CUDA/ROCm greedy+stochastic parity, full `^V2_Unit_`, Integration/Release builds, and the full matrix above pass.
-- Dense greedy is speed-positive on every backend. Best fixed depth: CUDA d1 1.37x, ROCm d1 1.46x, CPU d3 1.97x.
-- Phase 4 sidecar stream handoff, device-token batch verify, sidecar token input, verifier token input, deferred draft-token host reads, and device-first target-token summary are active for penalty-free stochastic GPU rows. Post-rebuild gates pass: `^V2_Unit_` 500/500 plus ROCm stochastic parity/smoke and GPU sampling integrations. CUDA dense short-run has a modest d2 win, 1.04x.
-- ROCm stochastic is functionally guarded but speed-negative: latest focused d2 is 26.97 vs 31.25 tok/s. Target-token D2H is reduced to one final/budget read; counters show 15 deferred first-token reads, 15 device-first batch summaries, and target ready events/waits. Next fix: reduce shifted-prefill/condition/verifier host-wall cost.
-- MoE is functionally alive on all backends but speed-negative everywhere. Next tuning target is MoE verifier/catch-up cost before any MoE MTP acceptance claim.
-- Dynamic depth is safe but conservative on 16-token runs. It should stay a policy-tuning target after the verifier path is cheaper.
-- Phase 4 direct first-token sampling was benchmark-rejected and removed. Continue with true device-resident draft/decision plumbing.
+- Phase 4 dense SingleDevice is accepted. The closeout gate passed
+  `V2_Unit_MTPRejectionSampler`, `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_MTPGraphConstruction`, `V2_Unit_DeviceGraphOrchestrator`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, `V2_Integration_GPUSamplingKernels`,
+  dense stochastic parity on CPU/CUDA/ROCm, and CUDA/ROCm stochastic graph
+  smokes.
+- Phase 4 fixes: host/device first-sidecar graph caches are split, sidecar
+  replay state survives accepted-state publication, GPU batch outcomes no
+  longer accept host draft shadows, and prefix/parity tests assert the retired
+  decode-equivalent stochastic verifier is not used.
+- Dense stochastic is speed-positive on all backends in useful bounded lanes:
+  CUDA d3 1.35x, ROCm d1 1.10x and dynamic 1.07x, CPU d2 1.30x.
+- ROCm d2/d3 stochastic are bad because acceptance collapses to 28.6%/46.2% on
+  this prompt, not because of rollbacks or transaction failures.
+- CPU stochastic is correct and speed-positive, but verifier and condition
+  forward dominate: CPU d2 reports 22.9s verifier and 6.6s condition time for
+  the measured decode section.
+- MoE is functionally alive on all backends but speed-negative everywhere.
 
 ## Target Anchors
 
@@ -52,6 +69,6 @@ llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
 
 ## Next
 
-1. Keep running the full bounded matrix every iteration.
-2. Finish Phase 4 by reducing shifted-prefill/condition/verifier cost now that target/draft token D2H is no longer the main ROCm blocker.
-3. Revisit dynamic-depth promotion once verifier cost no longer dominates short requests.
+1. Enter Phase 5: publish from spec slots, not checkpoints.
+2. Keep the dense stochastic closeout matrix as the per-iteration regression.
+3. Move MoE speed work after SingleDevice state publication is cheap.

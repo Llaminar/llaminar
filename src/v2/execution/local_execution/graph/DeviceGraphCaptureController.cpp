@@ -1586,6 +1586,30 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphCaptureController::prepareGraphLaunchMetadata(
+        ComputeGraph &graph,
+        const DeviceGraphExecutor::GraphSegment &segment,
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        for (const auto &stage_name : segment.stage_names)
+        {
+            auto *node = graph.getNode(stage_name);
+            if (!node || !node->stage || !node->stage->needsGraphLaunchPreparation())
+                continue;
+
+            if (stream)
+                node->stage->setGPUStream(stream);
+            if (!node->stage->prepareGraphLaunch(ctx, stream))
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Graph launch metadata preparation failed for stage: "
+                          << stage_name);
+                return false;
+            }
+        }
+        return true;
+    }
+
     DeviceGraphCaptureController::ReplayCapturableResult DeviceGraphCaptureController::executeReplayCapturableSegment(
         ComputeGraph &graph,
         DeviceGraphExecutor::GraphSegment &segment,
@@ -1621,6 +1645,11 @@ namespace llaminar2
         const std::string device_name = ctx->deviceId().toString();
 
         if (!skip_coherence && !cohere_inputs_cb(segment))
+        {
+            return result;
+        }
+
+        if (!prepareGraphLaunchMetadata(graph, segment, ctx, capture_stream))
         {
             return result;
         }
@@ -1788,6 +1817,13 @@ namespace llaminar2
                         result.reset_cache = true;
                         return result;
                     }
+                }
+
+                if (!prepareGraphLaunchMetadata(graph, seg, ctx, capture_stream))
+                {
+                    result.reset_cache = true;
+                    result.fallback_to_fast_decode = true;
+                    return result;
                 }
 
                 // Drain any pending warmup work on the capture stream before

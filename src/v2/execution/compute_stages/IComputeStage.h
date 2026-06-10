@@ -732,8 +732,10 @@ namespace llaminar2
          * When GPU graph capture is active, the executor sets this to the
          * capture stream so all GPU kernels submit work on the correct stream.
          * The pointer is backend-agnostic: cast to hipStream_t (ROCm) or
-         * cudaStream_t (CUDA) as needed. nullptr means "use default/legacy
-         * stream" (backward compatible).
+         * cudaStream_t (CUDA) as needed. New GPU stages must treat nullptr as
+         * "no explicit stream was assigned" and fail before launching GPU work
+         * that requires stream ordering; the device-default stream is not a
+         * valid fallback for graph-capturable execution.
          *
          * @param stream Opaque GPU stream pointer (hipStream_t / cudaStream_t as void*)
          */
@@ -840,6 +842,38 @@ namespace llaminar2
          * normal graph-capture readiness.
          */
         virtual bool supportsPaddedPrefillGraphCapturePreflight() const { return isGraphCapturable(); }
+
+        /**
+         * @brief Prepare mutable device metadata before a captured graph launch.
+         *
+         * Device graphs may read tiny metadata buffers whose contents change
+         * between launches while the graph topology stays fixed, such as
+         * row-select indices for bucketed prefill or compact verifier rows.
+         * The executor calls this after it has rebound workspace ownership and
+         * assigned an explicit stream, but before starting capture or replaying
+         * an already captured segment. Implementations may enqueue small
+         * workspace uploads on @p stream, but must not allocate ad-hoc device
+         * memory or synchronize the device.
+         *
+         * @param ctx Device context for the launch.
+         * @param stream Explicit backend stream used for the upcoming launch.
+         * @return true on success.
+         */
+        virtual bool prepareGraphLaunch(IDeviceContext *ctx, void *stream)
+        {
+            (void)ctx;
+            if (stream)
+                setGPUStream(stream);
+            return true;
+        }
+
+        /**
+         * @brief Whether this stage needs prepareGraphLaunch() callbacks.
+         *
+         * Used by graph replay/capture code to avoid calling the hook on every
+         * stage in hot paths.
+         */
+        virtual bool needsGraphLaunchPreparation() const { return false; }
 
         /**
          * @brief Called after a captured GPU graph segment is replayed.

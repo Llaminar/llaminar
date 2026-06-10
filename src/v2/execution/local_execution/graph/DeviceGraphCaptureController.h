@@ -285,6 +285,15 @@ namespace llaminar2
             const std::function<bool(ComputeNode &)> &execute_node_cb);
 
         /**
+         * @brief Run stage-owned dynamic metadata uploads before capture/replay.
+         */
+        static bool prepareGraphLaunchMetadata(
+            ComputeGraph &graph,
+            const DeviceGraphExecutor::GraphSegment &segment,
+            IDeviceContext *ctx,
+            void *stream);
+
+        /**
          * @brief Execute one capturable replay segment under selected diagnostics mode.
          */
         static ReplayCapturableResult executeReplayCapturableSegment(

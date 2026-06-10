@@ -815,10 +815,9 @@ namespace
         // Peak at idx 2 (10.0), then idx 1 and 4 (0.2 each), then idx 0 and 3 (0.1 each)
         EXPECT_EQ(indices[0], 2) << "Peak token should be rank 0";
         EXPECT_FLOAT_EQ(values[0], 10.0f);
-        // Remaining two from {1, 4} (both 0.2)
-        std::set<int> remaining(indices.begin() + 1, indices.begin() + 3);
-        EXPECT_TRUE(remaining.count(1) || remaining.count(4))
-            << "Rank 1-2 should be from indices 1 or 4 (value 0.2)";
+        // Equal logits are part of the sampler contract: lower token id wins.
+        EXPECT_EQ(indices[1], 1);
+        EXPECT_EQ(indices[2], 4);
 
         freeDevice(d_ptr);
     }
@@ -865,7 +864,7 @@ namespace
 
     TEST_P(GPUSamplingTest, TopK_UniformLogits)
     {
-        // All same value — top-k should return k elements (order may vary, but values match)
+        // All same value: top-k should return the lowest token ids in order.
         void *d_ptr = uploadLogits(uniform_logits_);
         ASSERT_NE(d_ptr, nullptr);
 
@@ -876,19 +875,11 @@ namespace
                                     k, device_id_, values.data(), indices.data());
         ASSERT_TRUE(ok);
 
-        // All values should be 2.0
+        // All values should be 2.0 and ties should resolve by token id.
         for (int i = 0; i < k; ++i)
         {
             EXPECT_FLOAT_EQ(values[i], 2.0f) << "Position " << i;
-        }
-
-        // Indices should be valid and distinct
-        std::set<int> idx_set(indices.begin(), indices.end());
-        EXPECT_EQ(static_cast<int>(idx_set.size()), k) << "Indices should be distinct";
-        for (int idx : indices)
-        {
-            EXPECT_GE(idx, 0);
-            EXPECT_LT(idx, static_cast<int>(uniform_logits_.size()));
+            EXPECT_EQ(indices[i], i) << "Top-k ties must be deterministic";
         }
 
         freeDevice(d_ptr);
@@ -910,12 +901,8 @@ namespace
         for (int i = 0; i < k; ++i)
         {
             EXPECT_FLOAT_EQ(values[i], 0.0f);
-            EXPECT_GE(indices[i], 0);
-            EXPECT_LT(indices[i], 4);
+            EXPECT_EQ(indices[i], i);
         }
-
-        // Indices must be distinct
-        EXPECT_NE(indices[0], indices[1]);
 
         freeDevice(d_ptr);
     }
@@ -1149,7 +1136,7 @@ namespace
 
     TEST_P(GPUSamplingTest, TopK_DuplicateValues)
     {
-        // Multiple elements with same value — top-k should still return k distinct indices
+        // Multiple elements with same value: lower token ids define the tie order.
         std::vector<float> dups = {5.0f, 5.0f, 5.0f, 3.0f, 3.0f, 1.0f};
         void *d_ptr = uploadLogits(dups);
         ASSERT_NE(d_ptr, nullptr);
@@ -1167,16 +1154,10 @@ namespace
         EXPECT_FLOAT_EQ(values[2], 5.0f);
         EXPECT_FLOAT_EQ(values[3], 3.0f);
 
-        // All indices should be distinct
-        std::set<int> idx_set(indices.begin(), indices.end());
-        EXPECT_EQ(static_cast<int>(idx_set.size()), k) << "All indices should be distinct";
-
-        // First three indices should be from {0, 1, 2}
-        for (int i = 0; i < 3; ++i)
-        {
-            EXPECT_TRUE(indices[i] == 0 || indices[i] == 1 || indices[i] == 2)
-                << "Top-3 indices should be 0, 1, or 2 (value 5.0), got " << indices[i];
-        }
+        EXPECT_EQ(indices[0], 0);
+        EXPECT_EQ(indices[1], 1);
+        EXPECT_EQ(indices[2], 2);
+        EXPECT_EQ(indices[3], 3);
 
         freeDevice(d_ptr);
     }
@@ -1518,6 +1499,23 @@ namespace
         return sampling_math::uniform01(seed, offset);
     }
 
+    /**
+     * @brief Comparator used by CPU-side expected top-k/top-p helpers.
+     *
+     * The GPU kernels sort candidates by logit descending and token id ascending.
+     * Keeping the test oracle on the same rule makes ties explicit and prevents
+     * future sampler changes from reintroducing backend-dependent ordering.
+     */
+    static bool topKCandidateBefore(const std::pair<float, int> &a,
+                                    const std::pair<float, int> &b)
+    {
+        if (a.first > b.first)
+            return true;
+        if (a.first < b.first)
+            return false;
+        return a.second < b.second;
+    }
+
     static int expectedTopKTopPSample(const std::vector<float> &logits,
                                       int top_k,
                                       float top_p,
@@ -1534,10 +1532,7 @@ namespace
         std::partial_sort(candidates.begin(),
                           candidates.begin() + top_k,
                           candidates.end(),
-                          [](const auto &a, const auto &b)
-                          {
-                              return a.first > b.first;
-                          });
+                          topKCandidateBefore);
         candidates.resize(static_cast<size_t>(top_k));
 
         std::vector<float> sorted_logits(static_cast<size_t>(top_k));
@@ -1579,10 +1574,7 @@ namespace
         std::partial_sort(candidates.begin(),
                           candidates.begin() + top_k,
                           candidates.end(),
-                          [](const auto &a, const auto &b)
-                          {
-                              return a.first > b.first;
-                          });
+                          topKCandidateBefore);
         candidates.resize(static_cast<size_t>(top_k));
 
         std::vector<float> sorted_logits(static_cast<size_t>(top_k));
@@ -2513,6 +2505,169 @@ namespace
             << "Qwen3.6 compact distribution sample mismatch";
         EXPECT_EQ(direct_token, expected_direct_sample)
             << "Qwen3.6 direct top-k/top-p sample mismatch";
+    }
+
+    TEST_P(GPUSamplingTest, TopKTopP_Qwen36TopK20RepeatedGraphReplayIsStable)
+    {
+        /*
+         * ROCm stochastic MTP repeatability is very sensitive to the first
+         * token sampled from prefill logits. This test mirrors that production
+         * lane: Qwen3.6 vocab size, Qwen chat-like sampling params, a compact
+         * distribution build, then repeated graph replays on one explicit
+         * stream. Any drift here means the sampler kernel itself is not a safe
+         * building block for graph-captured MTP.
+         */
+        constexpr int vocab_size = 248320;
+        constexpr int top_k = 20;
+        constexpr float top_p = 0.95f;
+        constexpr float temperature = 0.6f;
+        constexpr uint64_t seed = 123;
+        constexpr uint64_t offset = 4;
+        constexpr int replay_count = 24;
+        const float threshold = samplingUniform01(seed, offset);
+
+        struct HotToken
+        {
+            int token_id;
+            float logit;
+        };
+
+        const std::vector<HotToken> hot_tokens = {
+            {33075, 9.0000f}, {25174, 8.9950f}, {888, 8.25f},
+            {279, 8.05f},    {15217, 7.91f},   {5388, 7.80f},
+            {13, 7.65f},     {198, 7.62f},     {271, 7.60f},
+            {471, 7.30f},    {262, 7.18f},     {256, 7.16f},
+            {2972, 7.02f},   {2425, 6.91f},    {2824, 6.80f},
+            {64700, 6.69f},  {357, 6.58f},     {15352, 6.47f},
+            {11, 6.36f},     {1575, 6.25f},
+        };
+
+        std::vector<float> logits(static_cast<size_t>(vocab_size), -18.0f);
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            logits[static_cast<size_t>(i)] -=
+                0.00023f * static_cast<float>((i * 47) % 997);
+        }
+        for (const HotToken &hot : hot_tokens)
+            logits[static_cast<size_t>(hot.token_id)] = hot.logit;
+
+        const auto expected_distribution =
+            expectedTopKTopPDistribution(logits, top_k, top_p, temperature);
+        const int expected_sample =
+            expectedSampleDistributionWithThreshold(expected_distribution, threshold);
+        ASSERT_GE(expected_sample, 0);
+
+        void *d_logits = nullptr;
+        void *d_token_ids = nullptr;
+        void *d_probs = nullptr;
+        void *d_sample_token = nullptr;
+
+        auto cleanup = [&]()
+        {
+            if (d_logits)
+                backend_->free(d_logits, device_id_);
+            if (d_token_ids)
+                backend_->free(d_token_ids, device_id_);
+            if (d_probs)
+                backend_->free(d_probs, device_id_);
+            if (d_sample_token)
+                backend_->free(d_sample_token, device_id_);
+        };
+
+        d_logits = backend_->allocate(logits.size() * sizeof(float), device_id_);
+        d_token_ids = backend_->allocate(top_k * sizeof(int), device_id_);
+        d_probs = backend_->allocate(top_k * sizeof(float), device_id_);
+        d_sample_token = backend_->allocate(sizeof(int), device_id_);
+        ASSERT_NE(d_logits, nullptr);
+        ASSERT_NE(d_token_ids, nullptr);
+        ASSERT_NE(d_probs, nullptr);
+        ASSERT_NE(d_sample_token, nullptr);
+
+        auto run_replays = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_logits,
+                    logits.data(),
+                    logits.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_logits,
+                    vocab_size,
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    d_token_ids,
+                    d_probs));
+                ASSERT_TRUE(backend_->enqueueSampleDistributionF32Device(
+                    d_token_ids,
+                    d_probs,
+                    top_k,
+                    threshold,
+                    device_id_,
+                    stream,
+                    d_sample_token));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+
+                for (int replay = 0; replay < replay_count; ++replay)
+                {
+                    ASSERT_TRUE(capture->launch()) << "replay=" << replay;
+                    ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_))
+                        << "replay=" << replay;
+
+                    int sample_token = -1;
+                    ASSERT_TRUE(backend_->deviceToHost(
+                        &sample_token, d_sample_token, sizeof(int), device_id_))
+                        << "replay=" << replay;
+                    EXPECT_EQ(sample_token, expected_sample)
+                        << "Qwen3.6 top-k/top-p graph replay changed sampled token at replay "
+                        << replay;
+                }
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_replays(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_replays(ctx);
+        }
+
+        std::vector<int> gpu_ids(top_k, -1);
+        std::vector<float> gpu_probs(top_k, 0.0f);
+        ASSERT_TRUE(backend_->deviceToHost(
+            gpu_ids.data(), d_token_ids, top_k * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            gpu_probs.data(), d_probs, top_k * sizeof(float), device_id_));
+        cleanup();
+
+        for (int i = 0; i < top_k; ++i)
+        {
+            EXPECT_EQ(gpu_ids[static_cast<size_t>(i)],
+                      expected_distribution[static_cast<size_t>(i)].token_id)
+                << "repeated graph replay compact distribution token mismatch at slot " << i;
+            EXPECT_NEAR(gpu_probs[static_cast<size_t>(i)],
+                        expected_distribution[static_cast<size_t>(i)].probability,
+                        1e-5f)
+                << "repeated graph replay compact distribution probability mismatch at slot " << i;
+        }
     }
 
     TEST_P(GPUSamplingTest, TopKTopP_Qwen36RealLogitStyleRowsSeededSamplesMatchCPU)

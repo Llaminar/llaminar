@@ -136,6 +136,50 @@ namespace
             << "Updating the attention cache variant must not make a stale FFN graph reusable";
     }
 
+    TEST_F(Test__DeviceGraphOrchestrator, PendingLogitsStreamHandoffIsOneShotPerRole)
+    {
+        DeviceGraphOrchestrator orchestrator(graph_builder_, nullptr);
+        IForwardExecutionHost &host = orchestrator;
+
+        int main_stream_a = 0;
+        int main_stream_b = 0;
+        int verifier_stream = 0;
+
+        ASSERT_NO_THROW(host.setPendingMainDecodeStream(&main_stream_a));
+        EXPECT_NO_THROW(host.setPendingMainDecodeStream(&main_stream_a))
+            << "A producer may republish the same explicit stream after in-place logits mutation.";
+        EXPECT_THROW(host.setPendingMainDecodeStream(&main_stream_b), std::logic_error)
+            << "Publishing a different stream before consumption would race the pending consumer.";
+
+        EXPECT_NO_THROW(host.setPendingAllPositionVerifierStream(&verifier_stream))
+            << "Different logits roles must have independent one-shot slots.";
+
+        ASSERT_NO_THROW(host.setPendingMainDecodeStream(nullptr));
+        EXPECT_NO_THROW(host.setPendingMainDecodeStream(&main_stream_b))
+            << "Explicit clear transfers ownership back to the next producer.";
+    }
+
+    TEST_F(Test__DeviceGraphOrchestrator, ClearCacheReleasesPendingLogitsStreamHandoffs)
+    {
+        DeviceGraphOrchestrator orchestrator(graph_builder_, nullptr);
+        IForwardExecutionHost &host = orchestrator;
+
+        int main_stream_before_reset = 0;
+        int main_stream_after_reset = 0;
+        int verifier_stream_before_reset = 0;
+        int verifier_stream_after_reset = 0;
+
+        ASSERT_NO_THROW(host.setPendingMainDecodeStream(&main_stream_before_reset));
+        ASSERT_NO_THROW(host.setPendingAllPositionVerifierStream(&verifier_stream_before_reset));
+
+        orchestrator.clear_cache();
+
+        EXPECT_NO_THROW(host.setPendingMainDecodeStream(&main_stream_after_reset))
+            << "Request reset must release stale main-decode stream ownership.";
+        EXPECT_NO_THROW(host.setPendingAllPositionVerifierStream(&verifier_stream_after_reset))
+            << "Request reset must release stale verifier stream ownership.";
+    }
+
     class ScopedEnv
     {
     public:
@@ -312,26 +356,37 @@ TEST_F(Test__DeviceGraphOrchestrator, NullGraphBuilderThrows)
         std::invalid_argument);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, CPUMoESidecarDoesNotAdvertiseMainStatePreservation)
+TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsDenseInitializedOnly)
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.mtp.enabled = true;
     DeviceGraphOrchestrator moe_orchestrator(
         std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
         nullptr);
+    ASSERT_TRUE(moe_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     EXPECT_FALSE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
-        << "CPU MoE sidecar graphs share verifier scratch with the main graph; "
-           "the runner must restore the verifier-base checkpoint before target verification.";
+        << "MoE sidecar preservation stays disabled until routed/shared expert "
+           "scratch and sparse collective state have a dedicated equivalence proof.";
 
     auto dense_config = config_;
     dense_config.mtp.enabled = true;
     DeviceGraphOrchestrator dense_orchestrator(
         std::make_shared<QwenStandardGraph>(dense_config, nullptr),
         nullptr);
+    EXPECT_FALSE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
+        << "The capability requires initialized KV/MTP cache state, not just config.";
+    ASSERT_TRUE(dense_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    /*
+     * Dense sidecars use MTP-prefixed activation buffers and request-local MTP
+     * KV.  Real-model ROCm preservation coverage compares verifier rows before
+     * and after sidecar execution; this unit guard keeps the advertised
+     * capability narrow enough for that proof to remain meaningful.
+     */
     EXPECT_TRUE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
-        << "The CPU MoE capability correction must not disable the generic "
-           "sidecar-isolated path for non-MoE graphs.";
+        << "Initialized dense MTP runners can skip the full verifier-base restore; "
+           "speculative MTP KV rows are discarded by the shifted-row commit path.";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeLazyCallback)

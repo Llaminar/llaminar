@@ -1540,6 +1540,7 @@ namespace llaminar2
             int32_t *out_token) override;
         bool flushPendingMTPWork() override;
         void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;
+        void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
         bool supportsMTPSpecStatePublication() const override;
         bool publishAcceptedMTPSpecState(
             const MTPSpecStepPlan &plan,
@@ -1557,6 +1558,11 @@ namespace llaminar2
             int position_offset_override = -1) override;
         bool commitMTPShiftedRowFromCurrentTerminalHidden(
             int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromDeviceTargetSample(
+            int target_sample_slot,
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
@@ -2004,17 +2010,24 @@ namespace llaminar2
                 forward_engine_->resetSessionReplayState();
             }
             mtp_sidecar_depth0_cache_.resetSessionState();
+            mtp_sidecar_depth0_device_token_cache_.resetSessionState();
             mtp_sidecar_depth0_chained_cache_.resetSessionState();
+            mtp_sidecar_depth0_chained_device_token_cache_.resetSessionState();
             mtp_sidecar_depth0_kv_only_cache_.resetSessionState();
+            mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionState();
             for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
                 cache.resetSessionState();
             mtp_terminal_hidden_row_select_cache_.resetSessionState();
             last_pos_offset_ = -1;
-            pending_mtp_logits_stream_ = nullptr;
+            defer_next_mtp_main_decode_sync_ = false;
+            defer_all_position_verifier_sync_ = false;
+            clearAllPendingLogitsStreams("clear_cache");
             stochastic_target_distribution_streams_.fill(nullptr);
             stochastic_draft_distribution_streams_.fill(nullptr);
             clearStochasticTargetSampleReadySlots();
             clearStochasticDraftSampleReadySlots();
+            shifted_mtp_kv_ready_.valid = false;
+            shifted_mtp_kv_ready_.producer_stream = nullptr;
             cache_stats_ = CacheStats{};
             state_.clear();
             // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
@@ -2385,8 +2398,12 @@ namespace llaminar2
          * @brief Clear the device-side "sample token is ready" marker for one target slot.
          *
          * Target sample slots feed the first sidecar and the stochastic batch
-         * reducer. Clearing stale state keeps the next decode iteration from
-         * waiting on a previous sample event or consuming an old token.
+         * reducer.  They are deliberately separate from target distribution
+         * slots: all-position verifier rows can reuse distribution slot 0
+         * after the first token is sampled, but must keep this ready marker so
+         * the summary kernel still waits for STOCHASTIC_TARGET_SAMPLE_TOKENS.
+         * Only request-reset paths and actual target-token sampling should
+         * clear this marker.
          */
         void clearStochasticTargetSampleReadySlot(int slot);
 
@@ -2428,6 +2445,20 @@ namespace llaminar2
             const char *consumer_name);
 
         /**
+         * @brief Wait for draft sample slots that must have a deferred producer.
+         *
+         * Device-token MTP paths consume sample slots without a host readback.
+         * In those paths a missing ready event is a correctness bug, not a
+         * synchronized fallback, because the consumer would otherwise read an
+         * uninitialized or stale token from the arena slot.
+         */
+        bool waitForRequiredStochasticDraftSampleReadyRange(
+            int first_slot,
+            int slot_count,
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
          * @brief Make a consumer stream wait for a deferred target sample token.
          *
          * @param slot Target-token sample slot consumed by the next stage.
@@ -2437,6 +2468,42 @@ namespace llaminar2
          */
         bool waitForStochasticTargetSampleReady(
             int slot,
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Wait for a target sample slot that must have a deferred producer.
+         *
+         * This is the target-token counterpart to
+         * waitForRequiredStochasticDraftSampleReadyRange(). It is used by the
+         * vLLM-style first-token fast lane where the MTP sidecar consumes the
+         * sampled target token directly on device.
+         */
+        bool waitForRequiredStochasticTargetSampleReady(
+            int slot,
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Record that an asynchronous shifted-MTP-KV append has been queued.
+         *
+         * KV-only MTP sidecar replay can avoid a CPU stream synchronization when
+         * the next operation does not need the cache immediately.  This helper
+         * records a backend event on the producer stream so the next MTP-KV
+         * consumer can establish a GPU-side dependency instead of racing or
+         * falling back to the legacy default stream.
+         */
+        bool recordShiftedMTPKVReady(void *producer_stream, const char *producer_name);
+
+        /**
+         * @brief Queue a wait for any deferred shifted-MTP-KV append.
+         *
+         * @param consumer_stream Explicit stream that will read, append, truncate,
+         *        or publish the shifted MTP KV cache.
+         * @param consumer_name Short perf/log tag naming the consumer boundary.
+         * @return true if no wait was needed or if the backend wait was queued.
+         */
+        bool waitForPendingShiftedMTPKVReady(
             void *consumer_stream,
             const char *consumer_name);
 
@@ -2485,6 +2552,12 @@ namespace llaminar2
 
         /** Store the verifier replay stream for the next all-position logits consumer. */
         void setPendingAllPositionVerifierStream(void *stream) override;
+
+        /** Whether the next MTP main condition forward may hand its stream to the sampler. */
+        bool shouldDeferMainDecodeFinalSync() const override;
+
+        /** Store the main-decode replay stream for the next main-logits consumer. */
+        void setPendingMainDecodeStream(void *stream) override;
 
         /** Report host-side safety state for chunk-boundary maintenance. */
         PrefillChunkMaintenanceState prefillChunkMaintenanceState(
@@ -2669,13 +2742,145 @@ namespace llaminar2
             }
         };
 
+        /**
+         * @brief Depth-0 MTP sidecar graph caches partitioned by input source.
+         *
+         * Host token IDs and device-resident token IDs build different graph
+         * signatures because the embedding stage reads from different stable
+         * buffers.  Keeping them in separate caches lets both paths progress
+         * from warmup to capture/replay independently; sharing one cache would
+         * make stochastic decode alternate signatures and repeatedly rebuild.
+         */
         MTPSidecarGraphCache mtp_sidecar_depth0_cache_;
+        MTPSidecarGraphCache mtp_sidecar_depth0_device_token_cache_;
         MTPSidecarGraphCache mtp_sidecar_depth0_chained_cache_;
+        MTPSidecarGraphCache mtp_sidecar_depth0_chained_device_token_cache_;
         MTPSidecarGraphCache mtp_sidecar_depth0_kv_only_cache_;
+        MTPSidecarGraphCache mtp_sidecar_depth0_kv_only_device_token_cache_;
         std::array<MTPSidecarGraphCache, 5> mtp_sidecar_depth0_kv_only_batch_caches_;
-        void *pending_mtp_logits_stream_ = nullptr;
+
+        /**
+         * @brief Identifies the logits stream handoff slot being manipulated.
+         *
+         * Captured GPU graph replay may finish asynchronously and hand its
+         * stream to the next logits consumer.  Keeping those handoffs behind a
+         * role-specific API avoids scattered raw pointer writes, which are hard
+         * to reason about and easy to turn into cross-stream races.
+         */
+        enum class PendingLogitsStreamRole
+        {
+            MTPSidecar,
+            MainDecode,
+            AllPositionVerifier,
+        };
+
+        /**
+         * @brief Publish a stream that produced logits for the next consumer.
+         *
+         * @param role Which logits buffer owns the handoff.
+         * @param stream Explicit backend stream; must be non-null to create a
+         *        real handoff.
+         * @param producer Human-readable producer name for debug/profiling.
+         *
+         * Publishing is a one-shot ownership transfer. A producer may refresh
+         * the same stream after an in-place logits mutation, but replacing an
+         * unconsumed stream with a different stream is a logic error because it
+         * would lose the ordering edge between graph replay and sampling.
+         */
+        void publishPendingLogitsStream(
+            PendingLogitsStreamRole role,
+            void *stream,
+            const char *producer);
+
+        /**
+         * @brief Consume and clear a one-shot pending logits stream.
+         *
+         * Use this for samplers or reducers that become the next ordered GPU
+         * operation after logits production.  The returned stream is never the
+         * device default/null stream; callers must request an explicit fallback
+         * if no handoff is pending.
+         */
+        void *consumePendingLogitsStream(
+            PendingLogitsStreamRole role,
+            const char *consumer);
+
+        /**
+         * @brief Inspect a pending stream without clearing ownership.
+         *
+         * This is intentionally rare.  It is used for in-place mutations such
+         * as logit penalties, where the mutator must remain in the same stream
+         * chain and then republish the stream for the final sampler.
+         */
+        void *peekPendingLogitsStream(PendingLogitsStreamRole role) const;
+
+        /** @brief Clear a pending stream because the associated state is reset. */
+        void clearPendingLogitsStream(
+            PendingLogitsStreamRole role,
+            const char *reason);
+
+        /** @brief Clear every pending logits handoff during session teardown. */
+        void clearAllPendingLogitsStreams(const char *reason);
+
+        /**
+         * @brief Storage for one pending logits stream handoff.
+         *
+         * The raw pointer is deliberately nested so production code cannot
+         * casually grab a role-specific member such as "main decode stream".
+         * All ownership checks and perf counters live in the helper API below.
+         */
+        struct PendingLogitsStreamHandoff
+        {
+            /** @brief True when a producer has handed off a stream. */
+            bool hasStream() const { return stream_ != nullptr; }
+
+            /**
+             * @brief Return whether `candidate` may replace the current state.
+             *
+             * A producer may republish the same stream after mutating logits in
+             * place. Publishing a different non-null stream before consumption
+             * would break the one-producer/one-consumer ordering contract.
+             */
+            bool canPublish(void *candidate) const
+            {
+                return !stream_ || stream_ == candidate;
+            }
+
+            /** @brief Publish a new pending stream after the caller validates it. */
+            void publish(void *candidate) { stream_ = candidate; }
+
+            /** @brief Observe the pending stream without consuming ownership. */
+            void *peek() const { return stream_; }
+
+            /** @brief Transfer ownership to the consumer and clear the slot. */
+            void *consume()
+            {
+                void *pending = stream_;
+                stream_ = nullptr;
+                return pending;
+            }
+
+            /** @brief Drop any pending stream without transferring ownership. */
+            void clear() { stream_ = nullptr; }
+
+        private:
+            void *stream_ = nullptr;
+        };
+
+        /** @brief Map a role to its storage slot. Only handoff helpers use this. */
+        PendingLogitsStreamHandoff &pendingLogitsStreamHandoff(PendingLogitsStreamRole role);
+
+        /** @brief Const view of a role's storage slot. */
+        const PendingLogitsStreamHandoff &pendingLogitsStreamHandoff(PendingLogitsStreamRole role) const;
+
+        /** @brief Const view of a role's raw storage slot. */
+        void *pendingLogitsStreamValue(PendingLogitsStreamRole role) const;
+
+        /** @brief Stable label used in profiling/debug records. */
+        static const char *pendingLogitsStreamRoleName(PendingLogitsStreamRole role);
+
+        std::array<PendingLogitsStreamHandoff, 3> pending_logits_streams_{};
+        bool defer_next_mtp_main_decode_sync_ = false;
         bool defer_all_position_verifier_sync_ = false;
-        void *pending_all_position_logits_stream_ = nullptr;
 
         struct MTPTerminalHiddenRowSelectGraphCache
         {
@@ -2714,7 +2919,47 @@ namespace llaminar2
             }
         };
 
+        struct MTPTerminalHiddenRowsSelectGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            HiddenStateRowsSelectStage *stage = nullptr;
+            TensorBase *input = nullptr;
+            TensorBase *output = nullptr;
+            DeviceId device = DeviceId::invalid();
+            int seq_capacity = 0;
+            int d_model = 0;
+            int selected_row_count = 0;
+            bool valid = false;
+
+            void resetSessionState()
+            {
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->resetSessionState();
+                }
+            }
+
+            void invalidate()
+            {
+                graph.reset();
+                stage = nullptr;
+                input = nullptr;
+                output = nullptr;
+                device = DeviceId::invalid();
+                seq_capacity = 0;
+                d_model = 0;
+                selected_row_count = 0;
+                valid = false;
+            }
+        };
+
         MTPTerminalHiddenRowSelectGraphCache mtp_terminal_hidden_row_select_cache_;
+        MTPTerminalHiddenRowsSelectGraphCache mtp_terminal_hidden_rows_select_cache_;
 
         // =========================================================================
         // Full Forward Graph Cache (Decode Optimization)
@@ -2833,10 +3078,26 @@ namespace llaminar2
             void *producer_stream = nullptr;
             bool valid = false;
         };
+
+        /**
+         * @brief Event-backed ownership state for deferred shifted-MTP-KV writes.
+         *
+         * Unlike logits handoff, the consumer is not a single sampler call: the
+         * next boundary may be another sidecar append, a cache truncate, or
+         * accepted-state publication.  Keeping one explicit event-backed slot
+         * makes that ownership transfer visible and testable.
+         */
+        struct PendingShiftedMTPKVReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+        };
         std::array<StochasticSampleReadyState, 4>
             stochastic_target_sample_ready_;
         std::array<StochasticSampleReadyState, 3>
             stochastic_draft_sample_ready_;
+        PendingShiftedMTPKVReadyState shifted_mtp_kv_ready_;
 
         /**
          * @brief Deferred device-token composition plan for the target verifier.
@@ -3044,8 +3305,17 @@ namespace llaminar2
             const std::unordered_map<int, LayerWeights> &resolved_layers,
             int first_layer, int last_layer);
 
-        /// Ensure a stable one-row terminal hidden buffer exists for MTP sidecar input.
-        bool ensureMTPTerminalHiddenBuffer();
+        /**
+         * @brief Ensure a stable terminal-hidden scratch buffer exists for MTP sidecar input.
+         *
+         * Most callers need only row zero, which stores the live terminal
+         * hidden state restored from prefix cache or selected from the last
+         * forward. Batched shifted-cache catch-up asks for up to four rows so a
+         * single graph-native MTP sidecar can append several shifted KV rows at
+         * once. Growing the buffer invalidates row-select caches because their
+         * output tensor pointer changes.
+         */
+        bool ensureMTPTerminalHiddenBuffer(int min_rows = 1);
 
         /// Execute the cached graph-native row select used for MTP terminal hidden refresh.
         bool executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len);
@@ -3060,6 +3330,21 @@ namespace llaminar2
             const char *node_name,
             int row_idx,
             int seq_len);
+
+        /// Execute a cached graph-native hidden rows select into an MTP buffer.
+        bool executeMTPHiddenRowsSelect(
+            TensorBase *input,
+            BufferId input_buffer_id,
+            TensorBase *output,
+            BufferId output_buffer_id,
+            MTPTerminalHiddenRowsSelectGraphCache &cache,
+            const char *node_name,
+            int row_start,
+            int row_count,
+            int seq_len);
+
+        /// Copy a contiguous verifier/prefill row range into the stable MTP input buffer.
+        bool selectMTPTerminalHiddenRows(int row_start, int row_count, int seq_len);
 
         /// Copy the latest forward pass terminal hidden row into the stable MTP input buffer.
         bool refreshMTPTerminalHiddenState(int seq_len, int batch_size);

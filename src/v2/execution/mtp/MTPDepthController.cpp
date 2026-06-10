@@ -26,6 +26,8 @@ namespace llaminar2
             return "demote_zero_accept_rate";
         case MTPDepthDecisionReason::DemoteLowAcceptanceRate:
             return "demote_low_acceptance_rate";
+        case MTPDepthDecisionReason::ProbeHigherBeforeDemote:
+            return "probe_higher_before_demote";
         case MTPDepthDecisionReason::DepthZeroBypass:
             return "depth_zero_bypass";
         case MTPDepthDecisionReason::Hold:
@@ -109,6 +111,9 @@ namespace llaminar2
         last_decision_.new_depth = current_depth_;
         last_decision_.recommended_depth = current_depth_;
         stats_ = {};
+        rejected_depths_.assign(
+            static_cast<size_t>(std::max(0, config_.max_depth) + 1),
+            uint8_t{0});
     }
 
     bool MTPDepthController::depthZeroProbeReady() const
@@ -136,6 +141,31 @@ namespace llaminar2
         last_decision_.new_depth = current_depth_;
         last_decision_.recommended_depth = current_depth_;
         stats_ = {};
+        std::fill(rejected_depths_.begin(), rejected_depths_.end(), uint8_t{0});
+    }
+
+    bool MTPDepthController::depthRejected(int depth) const
+    {
+        return depth >= 0 &&
+               static_cast<size_t>(depth) < rejected_depths_.size() &&
+               rejected_depths_[static_cast<size_t>(depth)] != 0;
+    }
+
+    void MTPDepthController::setDepthRejected(int depth, bool rejected)
+    {
+        if (depth < 0 || static_cast<size_t>(depth) >= rejected_depths_.size())
+            return;
+        rejected_depths_[static_cast<size_t>(depth)] = rejected ? uint8_t{1} : uint8_t{0};
+    }
+
+    int MTPDepthController::nextUnrejectedDepthAbove(int depth) const
+    {
+        for (int candidate = depth + 1; candidate <= config_.max_depth; ++candidate)
+        {
+            if (!depthRejected(candidate))
+                return candidate;
+        }
+        return depth;
     }
 
     bool MTPDepthController::windowReady() const
@@ -147,7 +177,6 @@ namespace llaminar2
 
         if (config_.mode == MTPDepthPolicyMode::Fixed ||
             steps_since_change_ < config_.cooldown_steps ||
-            window_.verifier_runs < static_cast<uint64_t>(config_.min_samples) ||
             window_.attempted_draft_tokens == 0)
         {
             return false;
@@ -160,8 +189,12 @@ namespace llaminar2
             static_cast<double>(window_.zero_accepts) /
             static_cast<double>(window_.verifier_runs);
 
+        if (window_.verifier_runs < static_cast<uint64_t>(config_.min_samples))
+            return false;
+
         const bool perfect_probe =
             current_depth_ < config_.max_depth &&
+            !depthRejected(current_depth_ + 1) &&
             window_.full_accepts == window_.verifier_runs &&
             window_.zero_accepts == 0;
         if (perfect_probe)
@@ -171,7 +204,8 @@ namespace llaminar2
             return false;
 
         return zero_accept_rate >= config_.demote_zero_accept_rate ||
-               acceptance_rate < config_.demote_acceptance_rate;
+               (current_depth_ > std::max(config_.min_depth, 1) &&
+                acceptance_rate < config_.demote_acceptance_rate);
     }
 
     MTPDepthDecision MTPDepthController::evaluateWindow() const
@@ -211,34 +245,112 @@ namespace llaminar2
         }
 
         int proposed_depth = current_depth_;
-        const bool demoting_d1_to_zero =
-            config_.min_depth == 0 && current_depth_ == 1;
-        const double zero_accept_demote_threshold =
-            demoting_d1_to_zero ? 1.0 : config_.demote_zero_accept_rate;
+        /*
+         * Low acceptance can shrink deeper drafts down to depth 1, but depth 0
+         * is a qualitatively different bypass mode.  Enter it only on the
+         * dedicated zero-acceptance signal so a noisy stochastic window does
+         * not throw away the cheap depth-1 probe that keeps the controller
+         * connected to MTP speedup opportunities.
+         */
         const bool perfect_accept_window =
             window_.verifier_runs > 0 &&
             window_.full_accepts == window_.verifier_runs &&
             window_.zero_accepts == 0;
 
-        if (current_depth_ > config_.min_depth &&
-            decision.zero_accept_rate >= zero_accept_demote_threshold)
+        const bool zero_accept_demote =
+            current_depth_ > config_.min_depth &&
+            decision.zero_accept_rate >= config_.demote_zero_accept_rate;
+        const bool low_accept_demote =
+            current_depth_ > std::max(config_.min_depth, 1) &&
+            decision.acceptance_rate < config_.demote_acceptance_rate;
+        const bool highest_unrejected_depth =
+            current_depth_ < config_.max_depth &&
+            nextUnrejectedDepthAbove(current_depth_) == current_depth_;
+
+        if (zero_accept_demote ||
+            (low_accept_demote && !highest_unrejected_depth))
         {
-            proposed_depth = current_depth_ - 1;
-            decision.reason = MTPDepthDecisionReason::DemoteZeroAcceptRate;
+            const int upward_probe_depth = nextUnrejectedDepthAbove(current_depth_);
+            /*
+             * Probing past a weak intermediate depth is useful only when the
+             * signal is ambiguous.  A window dominated by zero-accept steps is
+             * already telling us the current draft depth is too expensive for
+             * this request, so spending another window at an even deeper draft
+             * repeats the same mistake.  The cutoff is derived from the
+             * configured zero-accept demotion threshold: halfway from that
+             * threshold to a completely zero-accept window is "catastrophic".
+             */
+            const double catastrophic_zero_accept_rate =
+                config_.demote_zero_accept_rate +
+                (1.0 - config_.demote_zero_accept_rate) * 0.5;
+            const bool ambiguous_demote_signal =
+                decision.zero_accept_rate < catastrophic_zero_accept_rate;
+            /*
+             * A bad intermediate depth proves this candidate is poor, but it
+             * does not prove deeper candidates are poor.  Probe each untested
+             * deeper depth once before settling downward; rejected depths can
+             * be retried later through the normal promotion hysteresis.
+             */
+            if (config_.mode == MTPDepthPolicyMode::Dynamic &&
+                current_depth_ > std::max(config_.min_depth, 1) &&
+                upward_probe_depth > current_depth_ &&
+                ambiguous_demote_signal)
+            {
+                proposed_depth = upward_probe_depth;
+                decision.reason = MTPDepthDecisionReason::ProbeHigherBeforeDemote;
+            }
+            else
+            {
+                proposed_depth = current_depth_ - 1;
+                decision.reason = zero_accept_demote
+                                      ? MTPDepthDecisionReason::DemoteZeroAcceptRate
+                                      : MTPDepthDecisionReason::DemoteLowAcceptanceRate;
+            }
         }
-        else if (current_depth_ > config_.min_depth &&
-                 !demoting_d1_to_zero &&
-                 decision.acceptance_rate < config_.demote_acceptance_rate)
+        else if (low_accept_demote && highest_unrejected_depth)
         {
-            proposed_depth = current_depth_ - 1;
-            decision.reason = MTPDepthDecisionReason::DemoteLowAcceptanceRate;
+            /*
+             * Once a deeper depth has been rejected, the highest remaining
+             * candidate is often still the best throughput lane even with
+             * imperfect token acceptance.  Demoting on a merely low-acceptance
+             * window makes the controller abandon the best fixed-depth lane
+             * after it has already learned that going deeper is bad.  Keep the
+             * stronger zero-accept demotion above for truly unproductive
+             * windows; otherwise hold and gather another window at this depth.
+             */
+            decision.reason = MTPDepthDecisionReason::Hold;
         }
         else if (current_depth_ < config_.max_depth &&
                  decision.full_accept_rate >= config_.promote_full_accept_rate &&
                  window_.zero_accepts == 0)
         {
-            if (perfect_accept_window ||
+            const bool next_depth_was_rejected = depthRejected(current_depth_ + 1);
+            if ((perfect_accept_window && !next_depth_was_rejected) ||
                 promotion_streak_ + 1 >= config_.promote_consecutive_windows)
+            {
+                proposed_depth = current_depth_ + 1;
+                decision.reason = MTPDepthDecisionReason::PromoteFullAcceptRate;
+            }
+            else
+            {
+                decision.reason = MTPDepthDecisionReason::PromotionHysteresisActive;
+            }
+        }
+        else if (config_.min_depth >= 1 &&
+                 current_depth_ == config_.min_depth &&
+                 current_depth_ < config_.max_depth &&
+                 decision.acceptance_rate >= config_.promote_full_accept_rate)
+        {
+            /*
+             * Depth 1 is the cheapest useful speculative lane.  Climbing from
+             * it is intentionally stricter than "not bad enough to demote":
+             * a deeper probe pays extra sidecar and verifier work, so require
+             * the same promotion threshold that governs ordinary depth growth.
+             * Operators can still lower promote_full_accept_rate to explore
+             * noisier stochastic/code prompts, while the default sticks near
+             * fixed d1 unless depth 1 is essentially perfect.
+             */
+            if (promotion_streak_ + 1 >= config_.promote_consecutive_windows)
             {
                 proposed_depth = current_depth_ + 1;
                 decision.reason = MTPDepthDecisionReason::PromoteFullAcceptRate;
@@ -331,9 +443,34 @@ namespace llaminar2
         else if (decision.reason == MTPDepthDecisionReason::PromoteFullAcceptRate ||
                  decision.reason == MTPDepthDecisionReason::DemoteZeroAcceptRate ||
                  decision.reason == MTPDepthDecisionReason::DemoteLowAcceptanceRate ||
+                 decision.reason == MTPDepthDecisionReason::ProbeHigherBeforeDemote ||
                  decision.reason == MTPDepthDecisionReason::Hold)
         {
             promotion_streak_ = 0;
+        }
+        if (config_.mode == MTPDepthPolicyMode::Dynamic)
+        {
+            if (decision.reason == MTPDepthDecisionReason::DemoteZeroAcceptRate ||
+                decision.reason == MTPDepthDecisionReason::DemoteLowAcceptanceRate ||
+                decision.reason == MTPDepthDecisionReason::ProbeHigherBeforeDemote)
+            {
+                setDepthRejected(decision.old_depth, true);
+            }
+            /*
+             * A normal promotion is earned by healthy lower-depth windows, so
+             * it is allowed to forgive the destination depth and retest it.
+             * ProbeHigherBeforeDemote is different: it is a diagnostic jump
+             * taken from a bad intermediate window.  Do not clear a previously
+             * rejected destination depth merely because we are probing upward;
+             * otherwise the controller can churn back into an expensive bad
+             * depth on every ambiguous demotion window.
+             */
+            if (decision.changed &&
+                decision.new_depth > decision.old_depth &&
+                decision.reason == MTPDepthDecisionReason::PromoteFullAcceptRate)
+            {
+                setDepthRejected(decision.new_depth, false);
+            }
         }
         if (decision.changed)
         {

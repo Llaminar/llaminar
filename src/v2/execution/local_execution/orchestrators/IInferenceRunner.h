@@ -17,7 +17,7 @@
 #include <stdexcept>
 
 #include "../../../backends/DeviceId.h"
-#include "../../mtp/MTPDecodeCatchup.h"
+#include "../../mtp/MTPRejectionSampler.h"
 #include "../../prefix_cache/PrefixCacheStateProbe.h"
 #include "../../prefix_cache/PrefixStateSnapshot.h"
 
@@ -83,28 +83,8 @@ namespace llaminar2
         float accept_threshold = 0.0f;
     };
 
-    /**
-     * @brief Compact summary of a batched stochastic MTP verification step.
-     *
-     * GPU runners fill this from device-side reduction buffers after row-wise
-     * speculative verification. The structure mirrors the shared sampling math
-     * contract, but uses fixed-size arrays so callers never allocate in the hot
-     * decode path.
-     */
-    struct DeviceSpeculativeVerifyBatchOutcome
-    {
-        bool ok = false;
-        std::array<int32_t, 5> output_tokens = {-1, -1, -1, -1, -1};
-        int output_token_count = 0;
-        int accepted_speculative_prefix = 0;
-        int target_verifier_state_commit_count = 0;
-        int32_t ready_token = -1;
-        int32_t rejected_verified_token = -1;
-        bool stopped_on_output = false;
-        bool all_speculative_accepted = true;
-        int consumed_verifier_rows = 0;
-        bool sampled_terminal = false;
-    };
+    using DeviceSpeculativeVerifyBatchOutcome =
+        MTPDeviceRejectionBatchOutcome;
 
     /**
      * @brief Lightweight view of a captured snapshot with 2D shape metadata
@@ -502,6 +482,20 @@ namespace llaminar2
         }
 
         /**
+         * @brief Opt in to deferring the next MTP main condition-forward sync.
+         *
+         * This is a one-shot stream handoff for MTP: the main decode graph
+         * replays on its capture stream, then the first-token GPU sampler or
+         * stochastic distribution builder consumes logits on that same stream.
+         * Runners that do not implement the handoff keep the synchronized
+         * boundary by ignoring the request.
+         */
+        virtual void setMTPMainDecodeSyncDeferralEnabled(bool enabled)
+        {
+            (void)enabled;
+        }
+
+        /**
          * @brief Commit shifted MTP KV rows from the most recent main forward.
          *
          * MTP decode calls forwardMTP() before verifier/replay; that sidecar
@@ -571,6 +565,28 @@ namespace llaminar2
             int position_offset_override = -1)
         {
             (void)token;
+            (void)already_appended_tokens;
+            (void)allow_speculative_discard;
+            (void)position_offset_override;
+            return false;
+        }
+
+        /**
+         * @brief Append one shifted MTP KV row from a device-resident target token.
+         *
+         * Penalty-free stochastic GPU decode can defer the first main-token host
+         * read.  The initial shifted-cache repair after verifier-base restore
+         * must still append that token's row, so supporting runners read the
+         * token from the same target sample slot used by
+         * forwardMTPFromDeviceTargetForDeviceSampling().
+         */
+        virtual bool commitMTPShiftedRowFromDeviceTargetSample(
+            int target_sample_slot,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1)
+        {
+            (void)target_sample_slot;
             (void)already_appended_tokens;
             (void)allow_speculative_discard;
             (void)position_offset_override;
@@ -1020,6 +1036,9 @@ namespace llaminar2
          * all-position verification: backend kernels decide row acceptance,
          * reduce the first consumed rejection/stop/all-accepted outcome, and
          * return only the committed token sequence plus counters to the host.
+         * `draft_tokens` may be null for runners that keep sampled draft tokens
+         * in device slots; those implementations must use `first_draft_slot`
+         * as the source of truth instead of a host token shadow.
          */
         virtual bool verifyStochasticDistributionsBatchOutcomeOnDevice(
             int first_target_slot,
@@ -1056,7 +1075,8 @@ namespace llaminar2
          * This keeps the initial main-model sample on GPU until the summary
          * kernel has decided which tokens commit. It should be used only for
          * penalty-free paths where sampler history does not need the first
-         * token before verifier reduction.
+         * token before verifier reduction. `draft_tokens` follows the same
+         * nullable device-slot contract as the host-first overload.
          */
         virtual bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
             int first_target_slot,

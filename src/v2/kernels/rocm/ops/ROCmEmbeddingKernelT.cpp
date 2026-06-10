@@ -769,6 +769,56 @@ namespace llaminar2
                     blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
                 }
             }
+            // Validation readbacks require D2H plus stream synchronization, both
+            // illegal inside HIP graph capture. The launch itself still consumes
+            // the device token IDs and remains graph-capturable.
+            if (use_device_token_ids &&
+                debugEnv().validation.validate_buffers &&
+                num_tokens > 0 &&
+                !capture_active)
+            {
+                std::vector<int> sampled_tokens(static_cast<size_t>(num_tokens), -1);
+                hipError_t token_copy_err = hipMemcpyAsync(
+                    sampled_tokens.data(),
+                    d_token_ids,
+                    static_cast<size_t>(num_tokens) * sizeof(int),
+                    hipMemcpyDeviceToHost,
+                    stream);
+                if (token_copy_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to read device token IDs for validation: "
+                              << hipGetErrorString(token_copy_err));
+                    return false;
+                }
+                token_copy_err = hipStreamSynchronize(stream);
+                if (token_copy_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to synchronize device token validation: "
+                              << hipGetErrorString(token_copy_err));
+                    return false;
+                }
+                const bool single_participant =
+                    !mpi_ctx || mpi_ctx->world_size() <= 1;
+                for (int i = 0; i < num_tokens; ++i)
+                {
+                    const int token_id = sampled_tokens[static_cast<size_t>(i)];
+                    const bool in_local_range =
+                        token_id >= vocab_offset &&
+                        token_id < vocab_offset + local_vocab_size;
+                    if (!in_local_range && single_participant)
+                    {
+                        LOG_ERROR("[ROCmEmbeddingKernelT] Device-token embedding would zero single-device token="
+                                  << token_id << " local_vocab_size=" << local_vocab_size
+                                  << " vocab_offset=" << vocab_offset
+                                  << " num_tokens=" << num_tokens);
+                        return false;
+                    }
+                    LOG_DEBUG("[ROCmEmbeddingKernelT] Device-token embedding validation token="
+                              << token_id << " local_vocab_size=" << local_vocab_size
+                              << " vocab_offset=" << vocab_offset
+                              << " in_local_range=" << (in_local_range ? 1 : 0));
+                }
+            }
             const size_t output_bytes = static_cast<size_t>(num_tokens) * static_cast<size_t>(d_model) * sizeof(float);
             const bool use_dev0_canary = validate_gpu_ptrs && (dev == 0) && !capture_active;
             float *kernel_output = d_output;

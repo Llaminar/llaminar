@@ -616,23 +616,39 @@ namespace llaminar2
         }
     }
 
-    void ForwardExecutionEngine::resetCapturedReplayStateForCorrectionReplay()
+    ForwardExecutionEngine::ReplayStateResetSummary
+    ForwardExecutionEngine::resetCapturedReplayStateForCorrectionReplay(
+        uint64_t live_state_epoch)
     {
+        ReplayStateResetSummary summary;
         for (auto &[signature, cache] : cache_)
         {
+            const ForwardReplayStateCacheClass cache_class =
+                classifyForwardReplayStateCache(signature);
             const ForwardReplayStateAction action =
                 chooseForwardReplayStateAction(
                     ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
-                    classifyForwardReplayStateCache(signature));
+                    cache_class);
             if (action == ForwardReplayStateAction::ResetReplayState)
             {
                 cache.resetReplayState();
+                ++summary.reset_replay_state;
+                if (cache_class == ForwardReplayStateCacheClass::OrdinaryDecode)
+                    ++summary.ordinary_decode_reset;
             }
             else
             {
                 cache.markGPUStreamBindingsDirty();
+                if (cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode)
+                    cache.markReplayStateSafeForLiveEpoch(live_state_epoch);
+                ++summary.preserved_for_stream_rebind;
+                if (cache_class == ForwardReplayStateCacheClass::AllPositionVerifier)
+                    ++summary.all_position_verifier_preserved;
+                else
+                    ++summary.other_preserved;
             }
         }
+        return summary;
     }
 
     void ForwardExecutionEngine::touchBucketedPrefillForwardCache(
@@ -1420,6 +1436,9 @@ namespace llaminar2
         // is not amortized.
         bool used_segmented_capture = false;
         bool requested_deferred_all_position_sync = false;
+        bool requested_deferred_main_decode_sync = false;
+        bool executed_deferred_all_position_sync = false;
+        bool executed_deferred_main_decode_sync = false;
 
         auto exec_t0 = std::chrono::high_resolution_clock::now();
         if (profiling_setup)
@@ -1459,14 +1478,31 @@ namespace llaminar2
 
             const bool all_position_verifier =
                 host.computeAllPositionLogitsEnabled();
-            if (all_position_verifier &&
-                capture_policy.allow_segmented_capture &&
-                host.shouldDeferAllPositionVerifierFinalSync())
+            const bool wants_all_position_sync_defer =
+                all_position_verifier &&
+                host.shouldDeferAllPositionVerifierFinalSync();
+            const bool wants_main_decode_sync_defer =
+                !all_position_verifier &&
+                host.shouldDeferMainDecodeFinalSync();
+
+            if (capture_policy.allow_segmented_capture &&
+                wants_all_position_sync_defer)
+            {
+                capture_policy.defer_final_sync = true;
+            }
+            else if (capture_policy.allow_segmented_capture &&
+                     wants_main_decode_sync_defer)
             {
                 capture_policy.defer_final_sync = true;
             }
             requested_deferred_all_position_sync =
-                all_position_verifier && capture_policy.defer_final_sync;
+                wants_all_position_sync_defer;
+            requested_deferred_main_decode_sync =
+                wants_main_decode_sync_defer;
+            executed_deferred_all_position_sync =
+                wants_all_position_sync_defer && capture_policy.defer_final_sync;
+            executed_deferred_main_decode_sync =
+                wants_main_decode_sync_defer && capture_policy.defer_final_sync;
 
             PerfStatsCollector::addCounter(
                 "forward_graph",
@@ -1547,7 +1583,12 @@ namespace llaminar2
         const bool all_position_verifier_sync_deferred =
             success &&
             forward_cache.phase3_active &&
-            requested_deferred_all_position_sync &&
+            executed_deferred_all_position_sync &&
+            forward_cache.segment_cache.capture_stream != nullptr;
+        const bool main_decode_sync_deferred =
+            success &&
+            forward_cache.phase3_active &&
+            executed_deferred_main_decode_sync &&
             forward_cache.segment_cache.capture_stream != nullptr;
         if (all_position_verifier_sync_deferred)
         {
@@ -1558,6 +1599,15 @@ namespace llaminar2
         {
             host.setPendingAllPositionVerifierStream(nullptr);
         }
+        if (main_decode_sync_deferred)
+        {
+            host.setPendingMainDecodeStream(
+                forward_cache.segment_cache.capture_stream);
+        }
+        else if (requested_deferred_main_decode_sync)
+        {
+            host.setPendingMainDecodeStream(nullptr);
+        }
 
         // Sync the stream at the forward pass boundary so logits are
         // immediately available to the caller without per-access event waits.
@@ -1566,11 +1616,12 @@ namespace llaminar2
             if (forward_cache.phase3_active)
             {
                 // Phase 3 replay normally synchronizes both capture_stream
-                // and defaultStream at the end of executeReplayPhase(). When
-                // an all-position verifier explicitly defers that sync, the
-                // next device-side sampler owns the ordering and host-visible
-                // mapped logits must not be marked fresh here.
-                if (!all_position_verifier_sync_deferred)
+                // and defaultStream at the end of executeReplayPhase(). When a
+                // GPU logits consumer explicitly inherits the replay stream,
+                // that consumer owns ordering and host-visible mapped logits
+                // must not be marked fresh at this boundary.
+                if (!all_position_verifier_sync_deferred &&
+                    !main_decode_sync_deferred)
                 {
                     TensorBase *logits = host.logitsTensor();
                     if (logits && logits->isMapped())

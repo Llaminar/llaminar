@@ -153,9 +153,28 @@ namespace llaminar2
         if (gpu_state_)
             gpu_state_->device_value_uploaded = false;
 
-        if (params_.device_id.is_gpu() && gpuStream() && bound_workspace_ && !isGraphCaptureActive())
-            return uploadGpuSelectedRows();
+        // Keep replay mutation side-effect free with respect to GPU workspace.
+        // Cached graphs can retain a stage after the previous workspace manager
+        // has been destroyed or replaced.  The executor is the only code that
+        // may bind a current workspace and explicit stream; executeGPU() uploads
+        // the dirty row array after that binding is in place.
         return true;
+    }
+
+    bool HiddenStateRowsSelectStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
+    {
+        (void)ctx;
+        if (!params_.device_id.is_gpu())
+            return true;
+        if (stream)
+            setGPUStream(stream);
+        if (!gpuStream())
+        {
+            LOG_ERROR("[HiddenStateRowsSelectStage] Graph launch preparation requires an explicit non-null stream on "
+                      << params_.device_id.toString());
+            return false;
+        }
+        return uploadGpuSelectedRows();
     }
 
     bool HiddenStateRowsSelectStage::validateCommon(TensorBase **input_base, TensorBase **output_base)

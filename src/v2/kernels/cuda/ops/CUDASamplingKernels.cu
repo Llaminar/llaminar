@@ -37,6 +37,29 @@ constexpr int topkSmallKPartialBlockCap(int k)
     return k > 32 ? TOPK_SMALL_K_WIDE_PARTIAL_BLOCKS : TOPK_SMALL_K_PARTIAL_BLOCKS;
 }
 
+/**
+ * @brief Deterministic ordering for Top-K candidates.
+ *
+ * A parallel reduction should not let equal logits depend on thread traversal
+ * order.  We therefore sort by logit descending and token id ascending.  This
+ * is the same contract as the ROCm sampler and keeps seeded stochastic decode
+ * reproducible when quantized logits contain ties.
+ */
+__device__ __forceinline__ bool topkCandidateBetter(
+    float candidate_value,
+    int candidate_index,
+    float current_value,
+    int current_index)
+{
+    if (candidate_index < 0)
+        return false;
+    if (current_index < 0)
+        return true;
+    return candidate_value > current_value ||
+           (candidate_value == current_value &&
+            candidate_index < current_index);
+}
+
 // ── Argmax multi-block reduction tuning ─────────────────────────────────────
 // Threads per block for both reduction passes. Must be a power of two because
 // the in-block tree reduction halves the active range each step.
@@ -319,13 +342,14 @@ __global__ void cuda_topk_f32_kernel(
     {
         float val = data[i];
 
-        if (local_count >= k && val <= local_vals[k - 1])
+        if (local_count >= k &&
+            !topkCandidateBetter(val, i, local_vals[k - 1], local_idxs[k - 1]))
             continue;
 
         int pos = (local_count < k) ? local_count : k - 1;
         for (int j = pos - 1; j >= 0; --j)
         {
-            if (val > local_vals[j])
+            if (topkCandidateBetter(val, i, local_vals[j], local_idxs[j]))
             {
                 local_vals[j + 1] = local_vals[j];
                 local_idxs[j + 1] = local_idxs[j];
@@ -365,6 +389,7 @@ __global__ void cuda_topk_f32_kernel(
         for (int out_i = 0; out_i < k; ++out_i)
         {
             float best_val = -FLT_MAX;
+            int best_idx = -1;
             int best_thread = -1;
 
             for (int t = 0; t < num_threads; ++t)
@@ -372,9 +397,11 @@ __global__ void cuda_topk_f32_kernel(
                 if (ptrs[t] < k)
                 {
                     float v = s_vals[t * k + ptrs[t]];
-                    if (v > best_val)
+                    const int idx = s_idxs[t * k + ptrs[t]];
+                    if (topkCandidateBetter(v, idx, best_val, best_idx))
                     {
                         best_val = v;
+                        best_idx = idx;
                         best_thread = t;
                     }
                 }
@@ -425,13 +452,14 @@ __global__ void cuda_topk_topp_sample_f32_kernel(
     for (int i = tid; i < n; i += num_threads)
     {
         const float val = data[i];
-        if (local_count >= k && val <= local_vals[k - 1])
+        if (local_count >= k &&
+            !topkCandidateBetter(val, i, local_vals[k - 1], local_idxs[k - 1]))
             continue;
 
         int pos = (local_count < k) ? local_count : k - 1;
         for (int j = pos - 1; j >= 0; --j)
         {
-            if (val > local_vals[j])
+            if (topkCandidateBetter(val, i, local_vals[j], local_idxs[j]))
             {
                 local_vals[j + 1] = local_vals[j];
                 local_idxs[j + 1] = local_idxs[j];
@@ -471,15 +499,18 @@ __global__ void cuda_topk_topp_sample_f32_kernel(
         for (int out_i = 0; out_i < k; ++out_i)
         {
             float best_val = -FLT_MAX;
+            int best_idx = -1;
             int best_thread = -1;
             for (int t = 0; t < num_threads; ++t)
             {
                 if (ptrs[t] < k)
                 {
                     const float v = s_vals[t * k + ptrs[t]];
-                    if (v > best_val)
+                    const int idx = s_idxs[t * k + ptrs[t]];
+                    if (topkCandidateBetter(v, idx, best_val, best_idx))
                     {
                         best_val = v;
+                        best_idx = idx;
                         best_thread = t;
                     }
                 }
@@ -543,13 +574,14 @@ __global__ void cuda_topk_smallk_partials_f32_kernel(
     for (int i = block_start + tid; i < block_end; i += num_threads)
     {
         const float val = data[i];
-        if (local_count >= k && val <= local_vals[k - 1])
+        if (local_count >= k &&
+            !topkCandidateBetter(val, i, local_vals[k - 1], local_idxs[k - 1]))
             continue;
 
         int pos = (local_count < k) ? local_count : k - 1;
         for (int j = pos - 1; j >= 0; --j)
         {
-            if (val > local_vals[j])
+            if (topkCandidateBetter(val, i, local_vals[j], local_idxs[j]))
             {
                 local_vals[j + 1] = local_vals[j];
                 local_idxs[j + 1] = local_idxs[j];
@@ -588,15 +620,18 @@ __global__ void cuda_topk_smallk_partials_f32_kernel(
         for (int out_i = 0; out_i < k; ++out_i)
         {
             float best_val = -FLT_MAX;
+            int best_idx = -1;
             int best_thread = -1;
             for (int t = 0; t < num_threads; ++t)
             {
                 if (ptrs[t] < k)
                 {
                     const float v = s_vals[t * k + ptrs[t]];
-                    if (v > best_val)
+                    const int idx = s_idxs[t * k + ptrs[t]];
+                    if (topkCandidateBetter(v, idx, best_val, best_idx))
                     {
                         best_val = v;
+                        best_idx = idx;
                         best_thread = t;
                     }
                 }
@@ -652,13 +687,14 @@ __global__ void cuda_topk_topp_distribution_from_partials_f32_kernel(
         if (idx < 0)
             continue;
         const float val = partial_values[i];
-        if (local_count >= k && val <= local_vals[k - 1])
+        if (local_count >= k &&
+            !topkCandidateBetter(val, idx, local_vals[k - 1], local_idxs[k - 1]))
             continue;
 
         int pos = (local_count < k) ? local_count : k - 1;
         for (int j = pos - 1; j >= 0; --j)
         {
-            if (val > local_vals[j])
+            if (topkCandidateBetter(val, idx, local_vals[j], local_idxs[j]))
             {
                 local_vals[j + 1] = local_vals[j];
                 local_idxs[j + 1] = local_idxs[j];
@@ -698,15 +734,18 @@ __global__ void cuda_topk_topp_distribution_from_partials_f32_kernel(
         for (int out_i = 0; out_i < k; ++out_i)
         {
             float best_val = -FLT_MAX;
+            int best_idx = -1;
             int best_thread = -1;
             for (int t = 0; t < num_threads; ++t)
             {
                 if (ptrs[t] < k)
                 {
                     const float v = s_vals[t * k + ptrs[t]];
-                    if (v > best_val)
+                    const int idx = s_idxs[t * k + ptrs[t]];
+                    if (topkCandidateBetter(v, idx, best_val, best_idx))
                     {
                         best_val = v;
+                        best_idx = idx;
                         best_thread = t;
                     }
                 }
@@ -763,13 +802,14 @@ __global__ void cuda_topk_topp_distribution_f32_kernel(
     for (int i = tid; i < n; i += num_threads)
     {
         const float val = data[i];
-        if (local_count >= k && val <= local_vals[k - 1])
+        if (local_count >= k &&
+            !topkCandidateBetter(val, i, local_vals[k - 1], local_idxs[k - 1]))
             continue;
 
         int pos = (local_count < k) ? local_count : k - 1;
         for (int j = pos - 1; j >= 0; --j)
         {
-            if (val > local_vals[j])
+            if (topkCandidateBetter(val, i, local_vals[j], local_idxs[j]))
             {
                 local_vals[j + 1] = local_vals[j];
                 local_idxs[j + 1] = local_idxs[j];
@@ -809,15 +849,18 @@ __global__ void cuda_topk_topp_distribution_f32_kernel(
         for (int out_i = 0; out_i < k; ++out_i)
         {
             float best_val = -FLT_MAX;
+            int best_idx = -1;
             int best_thread = -1;
             for (int t = 0; t < num_threads; ++t)
             {
                 if (ptrs[t] < k)
                 {
                     const float v = s_vals[t * k + ptrs[t]];
-                    if (v > best_val)
+                    const int idx = s_idxs[t * k + ptrs[t]];
+                    if (topkCandidateBetter(v, idx, best_val, best_idx))
                     {
                         best_val = v;
+                        best_idx = idx;
                         best_thread = t;
                     }
                 }

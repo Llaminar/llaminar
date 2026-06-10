@@ -107,8 +107,6 @@ namespace llaminar2
         // the final bucket row.
         const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
         setSelectedRowForReplay(real_seq_len - 1);
-        if (params_.device_id.is_gpu() && gpuStream() && bound_workspace_)
-            (void)(ensureGpuParamStateInitialized() && uploadGpuSelectedRow());
     }
 
     void HiddenStateRowSelectStage::setSelectedRowForReplay(int selected_row_idx)
@@ -117,6 +115,22 @@ namespace llaminar2
         refreshPinnedSelectedRow();
         if (gpu_state_)
             gpu_state_->device_value_uploaded = false;
+    }
+
+    bool HiddenStateRowSelectStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
+    {
+        (void)ctx;
+        if (!params_.device_id.is_gpu())
+            return true;
+        if (stream)
+            setGPUStream(stream);
+        if (!gpuStream())
+        {
+            LOG_ERROR("[HiddenStateRowSelectStage] Graph launch preparation requires an explicit non-null stream on "
+                      << params_.device_id.toString());
+            return false;
+        }
+        return uploadGpuSelectedRow();
     }
 
     bool HiddenStateRowSelectStage::validateCommon(TensorBase **input_base, TensorBase **output_base)

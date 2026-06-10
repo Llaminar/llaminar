@@ -2488,6 +2488,24 @@ namespace llaminar2
         return all_success;
     }
 
+    bool RankOrchestrator::commitMTPShiftedRowFromDeviceTargetSample(
+        int target_sample_slot,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (device_runners_.size() != 1 || !device_runners_[0])
+        {
+            LOG_ERROR("[RankOrchestrator] Device-target shifted MTP commit is not enabled for multi-participant TP domains yet");
+            return false;
+        }
+        return device_runners_[0]->commitMTPShiftedRowFromDeviceTargetSample(
+            target_sample_slot,
+            already_appended_tokens,
+            allow_speculative_discard,
+            position_offset_override);
+    }
+
     bool RankOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden(
         int32_t token,
         int already_appended_tokens,

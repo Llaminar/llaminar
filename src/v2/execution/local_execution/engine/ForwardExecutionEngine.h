@@ -200,6 +200,30 @@ namespace llaminar2
             (void)stream;
         }
 
+        /**
+         * @brief Whether the next one-row main decode may defer its final sync.
+         *
+         * MTP condition-forward decode immediately consumes main logits with a
+         * GPU sampler or GPU distribution-builder.  Deferring the replay sync
+         * lets that consumer enqueue on the same stream instead of forcing the
+         * CPU to wait between model forward and sampling.  Hosts should return
+         * true only for one-shot decode paths where a device consumer is
+         * guaranteed to follow.
+         */
+        virtual bool shouldDeferMainDecodeFinalSync() const { return false; }
+
+        /**
+         * @brief Receive the stream whose main-decode logits are pending.
+         *
+         * Called after a successful deferred main-decode replay.  The host must
+         * enqueue the next logits-consuming device operation on this stream, or
+         * clear the pending stream when nullptr is passed.
+         */
+        virtual void setPendingMainDecodeStream(void *stream)
+        {
+            (void)stream;
+        }
+
         /** Domain placement epoch for MoE-sensitive prefill graph-cache keys. */
         virtual uint64_t moePlacementEpoch() const { return 0; }
 
@@ -386,6 +410,23 @@ namespace llaminar2
         };
 
         /**
+         * @brief Counts the replay-state action chosen for a live-state mutation.
+         *
+         * MTP publication is a precise boundary: ordinary decode captures must
+         * be recaptured before correction replay, while all-position verifier
+         * captures may keep their executable and only rebind explicit streams.
+         * Returning this summary makes that split testable and exportable.
+         */
+        struct ReplayStateResetSummary
+        {
+            size_t reset_replay_state = 0;
+            size_t preserved_for_stream_rebind = 0;
+            size_t ordinary_decode_reset = 0;
+            size_t all_position_verifier_preserved = 0;
+            size_t other_preserved = 0;
+        };
+
+        /**
          * @brief Return the cached forward graph used by the most recent
          *        successful cached execution.
          *
@@ -474,7 +515,8 @@ namespace llaminar2
          * KernelFactory dynamic-state reset cannot leave backend kernels with
          * null streams before the next updateDynamicParams() call.
          */
-        void resetCapturedReplayStateForCorrectionReplay();
+        ReplayStateResetSummary resetCapturedReplayStateForCorrectionReplay(
+            uint64_t live_state_epoch = 0);
 
         /**
          * @brief Reset request/replay state without discarding cached forward graphs.

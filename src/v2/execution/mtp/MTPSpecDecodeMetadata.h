@@ -6,6 +6,7 @@
 #include "../../interfaces/IWorkspaceConsumer.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -165,6 +166,29 @@ namespace llaminar2
         std::vector<int32_t> bonus_ready_state_slot_indices;
     };
 
+    /**
+     * @brief Accepted-count view of one completed speculative decode step.
+     *
+     * This is the vLLM-shaped metadata input used when draft tokens stayed in
+     * device slots and the host only knows the verifier outcome.  The
+     * `accepted_verifier_input_prefix` count includes the first main-model
+     * token at verifier row zero; it is therefore one larger than the number of
+     * accepted sidecar draft tokens when at least the first output token was
+     * produced.
+     */
+    struct MTPSpecDecodeAcceptedOutcome
+    {
+        int request_id = 0;
+        int vocab_size = 0;
+        int draft_count = 0;
+        std::vector<int32_t> committed_output_tokens;
+        std::optional<int32_t> bonus_ready_token;
+        int accepted_verifier_input_prefix = 0;
+        int target_verifier_state_commit_count = -1;
+        bool all_drafts_accepted = false;
+        bool stopped_on_output = false;
+    };
+
     WorkspaceRequirements buildMTPSpecDecodeWorkspaceRequirements(
         const MTPSpecDecodeMetadataShape &shape);
 
@@ -199,6 +223,19 @@ namespace llaminar2
         int vocab_size,
         const MTPDecodeCatchupGreedyRequest &request,
         const MTPDecodeCatchupGreedyResult &result);
+
+    /**
+     * @brief Build metadata from accepted counts instead of host draft tokens.
+     *
+     * Use this for device-resident stochastic MTP lanes where rejected draft
+     * token slots intentionally never leave GPU memory.  The resulting metadata
+     * preserves the same state/publication contract as the draft-token helper,
+     * but its accepted prefix is provided by the verifier outcome rather than
+     * reconstructed by comparing host-visible token vectors.
+     */
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchFromAcceptedOutcome(
+        const MTPSpecDecodeMetadataShape &shape,
+        const MTPSpecDecodeAcceptedOutcome &outcome);
 
     MTPSpecDecodeStateCommitPlan buildMTPSpecDecodeStateCommitPlan(
         const MTPSpecDecodeMetadataBatch &batch);

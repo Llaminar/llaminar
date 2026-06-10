@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+import textwrap
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -71,6 +72,66 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("dry-run:", result.stdout)
+
+    def test_baseline_summary_row_matches_header_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dense = tmp_path / "dense.gguf"
+            dense.write_text("dense fixture\n", encoding="utf-8")
+            fake_binary = tmp_path / "fake_llaminar2"
+            fake_binary.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -euo pipefail
+                    out=""
+                    while [[ $# -gt 0 ]]; do
+                      if [[ "$1" == "--benchmark-json-output" ]]; then
+                        out="$2"
+                        shift 2
+                      else
+                        shift
+                      fi
+                    done
+                    cat > "${out}" <<'JSON'
+                    {"success":true,"throughput_tokens_per_sec":{"decode":10.0,"overall":20.0},"tokens":{"prefill":1,"decode":1},"config":{"mtp_depth_policy":"fixed","mtp_draft_tokens":1},"mtp":{}}
+                    JSON
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_binary.chmod(0o755)
+            output_dir = tmp_path / "out"
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--binary",
+                    str(fake_binary),
+                    "--dense-model",
+                    str(dense),
+                    "--devices",
+                    "cpu:0",
+                    "--models",
+                    "dense",
+                    "--modes",
+                    "greedy",
+                    "--variants",
+                    "baseline",
+                    "--output-dir",
+                    str(output_dir),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = (output_dir / "summary.tsv").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(len(lines[0].split("\t")), len(lines[1].split("\t")))
+            self.assertEqual(len(lines[0].split("\t")), 59)
 
 
 if __name__ == "__main__":

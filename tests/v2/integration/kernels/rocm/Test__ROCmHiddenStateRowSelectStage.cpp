@@ -3,7 +3,8 @@
  * @brief ROCm integration tests for graph-capturable hidden-state row selection.
  *
  * Captures one row-select stage into a HIP graph, replays it twice, and verifies
- * that changing PrefillReplayParams changes the selected row without recapture.
+ * that replay metadata can be refreshed on the explicit launch stream without
+ * recapturing the graph.
  */
 
 #include <gtest/gtest.h>
@@ -25,8 +26,9 @@ using namespace llaminar2;
 
 namespace
 {
+#ifdef HAVE_ROCM
     /// @brief Fill hidden rows with deterministic values that identify the row.
-    std::unique_ptr<FP32Tensor> makeHiddenStates(int seq_len, int d_model, DeviceId device)
+    std::unique_ptr<FP32Tensor> makeHiddenStates(int seq_len, int d_model, DeviceId device, hipStream_t stream)
     {
         auto hidden = std::make_unique<FP32Tensor>(
             std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
@@ -40,20 +42,21 @@ namespace
                     20.0f * static_cast<float>(row + 1) + 0.0625f * static_cast<float>(column);
             }
         }
-        hidden->ensureOnDevice(device);
+        hidden->ensureOnDevice(device, stream);
         return hidden;
     }
 
-#ifdef HAVE_ROCM
     /// @brief Copy scratch row from HIP device memory for assertion.
-    std::vector<float> downloadScratchRow(FP32Tensor &scratch, int d_model)
+    std::vector<float> downloadScratchRow(FP32Tensor &scratch, int d_model, hipStream_t stream)
     {
         std::vector<float> row(static_cast<size_t>(d_model), 0.0f);
-        EXPECT_EQ(hipMemcpy(row.data(),
-                            scratch.gpu_data_ptr(),
-                            static_cast<size_t>(d_model) * sizeof(float),
-                            hipMemcpyDeviceToHost),
+        EXPECT_EQ(hipMemcpyAsync(row.data(),
+                                 scratch.gpu_data_ptr(),
+                                 static_cast<size_t>(d_model) * sizeof(float),
+                                 hipMemcpyDeviceToHost,
+                                 stream),
                   hipSuccess);
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
         return row;
     }
 
@@ -116,11 +119,14 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
     const DeviceId device = DeviceId::rocm(0);
     const int bucket_seq_len = 8;
     const int d_model = 32;
-    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device, stream);
     auto scratch = std::make_unique<FP32Tensor>(
         std::vector<size_t>{1, static_cast<size_t>(d_model)},
         DeviceId::cpu());
-    scratch->ensureOnDevice(device);
+    scratch->ensureOnDevice(device, stream);
 
     HiddenStateRowSelectStage::Params params;
     params.device_id = device;
@@ -133,15 +139,13 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
     ASSERT_TRUE(workspace.allocate(stage.getWorkspaceRequirements(bucket_seq_len, d_model, 0)));
     stage.bindWorkspace(&workspace);
 
-    hipStream_t stream = nullptr;
-    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
     stage.setGPUStream(stream);
 
     // Warmup performs scalar allocation before capture and proves the stage path works.
     stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{2, bucket_seq_len, 0});
     ASSERT_TRUE(stage.execute(nullptr));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-    expectRow(downloadScratchRow(*scratch, d_model), *hidden, 1, d_model);
+    expectRow(downloadScratchRow(*scratch, d_model, stream), *hidden, 1, d_model);
 
     hipGraph_t graph = nullptr;
     hipGraphExec_t graph_exec = nullptr;
@@ -156,13 +160,15 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
 
     ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-    expectRow(downloadScratchRow(*scratch, d_model), *hidden, 1, d_model);
+    expectRow(downloadScratchRow(*scratch, d_model, stream), *hidden, 1, d_model);
 
-    // No recapture: update only the pinned scalar and replay the same graph exec.
+    // No recapture: update host intent, then let the graph-launch preparation
+    // hook upload the scalar on the same explicit stream used for graph launch.
     stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{6, bucket_seq_len, 0});
+    ASSERT_TRUE(stage.prepareGraphLaunch(nullptr, stream));
     ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-    expectRow(downloadScratchRow(*scratch, d_model), *hidden, 5, d_model);
+    expectRow(downloadScratchRow(*scratch, d_model, stream), *hidden, 5, d_model);
 
     EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
     EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
@@ -184,11 +190,14 @@ TEST(Test__ROCmHiddenStateRowSelectStage, GpuExecutionRequiresBoundWorkspace)
     const DeviceId device = DeviceId::rocm(0);
     const int bucket_seq_len = 4;
     const int d_model = 16;
-    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device, stream);
     auto scratch = std::make_unique<FP32Tensor>(
         std::vector<size_t>{1, static_cast<size_t>(d_model)},
         DeviceId::cpu());
-    scratch->ensureOnDevice(device);
+    scratch->ensureOnDevice(device, stream);
 
     HiddenStateRowSelectStage::Params params;
     params.device_id = device;
@@ -197,9 +206,12 @@ TEST(Test__ROCmHiddenStateRowSelectStage, GpuExecutionRequiresBoundWorkspace)
     params.seq_len = bucket_seq_len;
     params.d_model = d_model;
     HiddenStateRowSelectStage stage(params);
+    stage.setGPUStream(stream);
 
     stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{2, bucket_seq_len, 0});
     EXPECT_FALSE(stage.execute(nullptr));
+
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
 }
 
@@ -219,11 +231,14 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
     const int d_model = 32;
     const std::vector<int> initial_rows{1, 3, 6};
     const std::vector<int> replay_rows{7, 0, 4};
-    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device, stream);
     auto scratch = std::make_unique<FP32Tensor>(
         std::vector<size_t>{initial_rows.size(), static_cast<size_t>(d_model)},
         DeviceId::cpu());
-    scratch->ensureOnDevice(device);
+    scratch->ensureOnDevice(device, stream);
 
     HiddenStateRowsSelectStage::Params params;
     params.device_id = device;
@@ -238,8 +253,6 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
     ASSERT_TRUE(workspace.allocate(stage.getWorkspaceRequirements(bucket_seq_len, d_model, 0)));
     stage.bindWorkspace(&workspace);
 
-    hipStream_t stream = nullptr;
-    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
     stage.setGPUStream(stream);
 
     ASSERT_TRUE(stage.execute(nullptr));
@@ -266,6 +279,7 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
                d_model);
 
     ASSERT_TRUE(stage.setSelectedRowsForReplay(replay_rows));
+    ASSERT_TRUE(stage.prepareGraphLaunch(nullptr, stream));
     ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
     expectRows(downloadScratchRows(*scratch, static_cast<int>(replay_rows.size()), d_model, stream),
                *hidden,
@@ -299,7 +313,7 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayReadsExternalMetada
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
 
-    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device);
+    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device, stream);
     auto scratch = std::make_unique<FP32Tensor>(
         std::vector<size_t>{initial_rows.size(), static_cast<size_t>(d_model)},
         DeviceId::cpu());

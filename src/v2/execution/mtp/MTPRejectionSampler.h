@@ -11,8 +11,10 @@
 #pragma once
 
 #include "MTPDecodeCatchup.h"
+#include "../../kernels/common/SamplingMath.h"
 #include "../../utils/Sampler.h"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -68,6 +70,36 @@ namespace llaminar2
     };
 
     /**
+     * @brief Fixed-size device summary for a batched stochastic MTP verifier.
+     *
+     * CUDA and ROCm write this logical shape from compact device metadata after
+     * the verifier rows and summary kernel run. Keeping the type in the shared
+     * MTP sampler contract makes the host handoff small and backend-neutral:
+     * device code owns row decisions, while this structure only reports the
+     * already-reduced token stream and publication counters.
+     */
+    struct MTPDeviceRejectionBatchOutcome
+    {
+        bool ok = false;
+        std::array<int32_t, sampling_math::kSpeculativeBatchMaxOutputTokens>
+            output_tokens;
+        int output_token_count = 0;
+        int accepted_speculative_prefix = 0;
+        int target_verifier_state_commit_count = 0;
+        int32_t ready_token = -1;
+        int32_t rejected_verified_token = -1;
+        bool stopped_on_output = false;
+        bool all_speculative_accepted = true;
+        int consumed_verifier_rows = 0;
+        bool sampled_terminal = false;
+
+        MTPDeviceRejectionBatchOutcome()
+        {
+            output_tokens.fill(-1);
+        }
+    };
+
+    /**
      * @brief Sample one stochastic speculative-verifier row from distributions.
      *
      * This is the CPU/reference implementation of the same row-level contract
@@ -118,5 +150,29 @@ namespace llaminar2
         const MTPDecodeCatchupGreedyRequest &request,
         const std::vector<MTPRejectionSampleRowResult> &verified_rows,
         std::optional<int32_t> bonus_ready_token = std::nullopt);
+
+    /**
+     * @brief Convert a compact device outcome into the vector batch contract.
+     *
+     * The device outcome is already reduced: `output_tokens[0]` is the first
+     * target token and the remaining entries are accepted verifier rows or the
+     * residual correction token. This helper performs the same validation for
+     * every backend before the runner publishes or rolls back state.
+     */
+    MTPRejectionBatchOutcome summarizeDeviceMTPRejectionBatchOutcome(
+        const MTPDecodeCatchupGreedyRequest &request,
+        const MTPDeviceRejectionBatchOutcome &device_outcome);
+
+    /**
+     * @brief Build a catch-up result from a compact device verifier summary.
+     *
+     * This is the shared host-side completion path for vLLM-style GPU
+     * stochastic verification. It deliberately mirrors
+     * buildAllPositionMTPDecodeCatchupStochasticResult() so CPU tests, CUDA,
+     * and ROCm all agree on publication counters and emitted tokens.
+     */
+    MTPDecodeCatchupGreedyResult buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+        const MTPDecodeCatchupGreedyRequest &request,
+        const MTPDeviceRejectionBatchOutcome &device_outcome);
 
 } // namespace llaminar2

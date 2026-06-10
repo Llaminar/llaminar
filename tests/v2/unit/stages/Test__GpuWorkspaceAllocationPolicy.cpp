@@ -7,6 +7,8 @@
 
 #include "execution/moe/MoEWorkspaceRequirements.h"
 
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -97,6 +99,20 @@ namespace
                 return true;
         }
         return false;
+    }
+
+    std::string removeAsciiWhitespace(std::string source)
+    {
+        source.erase(
+            std::remove_if(
+                source.begin(),
+                source.end(),
+                [](unsigned char c)
+                {
+                    return std::isspace(c) != 0;
+                }),
+            source.end());
+        return source;
     }
 
     std::string stripCommentsAndStringLiterals(const std::string &source)
@@ -386,6 +402,197 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GraphCaptureControllerChecksStreamSynch
            "GPU failures are attributed to the graph segment that surfaced them.";
     EXPECT_NE(source.find("synchronizeStreamChecked("), std::string::npos);
     EXPECT_NE(source.find("Initial captured launch stream sync failed after segment starting at"), std::string::npos);
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPPendingLogitsStreamsUseOwnershipHelpers)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+
+    /*
+     * Pending logits streams are not general-purpose scratch pointers. They
+     * encode ownership of an asynchronous graph replay stream from a logits
+     * producer to exactly the next consumer. Remove the helper implementation
+     * itself, then require every remaining production use to go through the
+     * explicit publish/consume/peek/clear verbs.
+     */
+    std::string guarded_source = source;
+    const size_t helper_begin = guarded_source.find(
+        "const char *DeviceGraphOrchestrator::pendingLogitsStreamRoleName(");
+    ASSERT_NE(helper_begin, std::string::npos);
+    const size_t helper_end = guarded_source.find(
+        "void DeviceGraphOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled",
+        helper_begin);
+    ASSERT_NE(helper_end, std::string::npos);
+    guarded_source.erase(helper_begin, helper_end - helper_begin);
+
+    const auto executable_source = stripCommentsAndStringLiterals(guarded_source);
+    const std::vector<std::string> legacy_raw_fields = {
+        "pending_mtp_logits_stream_",
+        "pending_main_decode_logits_stream_",
+        "pending_all_position_logits_stream_",
+    };
+    for (const auto &field : legacy_raw_fields)
+    {
+        EXPECT_EQ(executable_source.find(field), std::string::npos)
+            << field << " must not come back as a role-specific raw stream field.";
+        EXPECT_EQ(stripCommentsAndStringLiterals(header).find(field), std::string::npos)
+            << field << " must not come back as a role-specific raw stream field.";
+    }
+
+    const auto executable_header = stripCommentsAndStringLiterals(header);
+    const auto compact_executable_header = removeAsciiWhitespace(executable_header);
+    EXPECT_NE(executable_header.find("struct PendingLogitsStreamHandoff"), std::string::npos)
+        << "Pending stream storage should remain structurally wrapped.";
+    EXPECT_NE(compact_executable_header.find("std::array<PendingLogitsStreamHandoff,3>pending_logits_streams_"),
+              std::string::npos)
+        << "Pending stream storage should stay role-indexed instead of scattered into raw fields.";
+    EXPECT_NE(compact_executable_header.find("void*stream_=nullptr"), std::string::npos)
+        << "The raw stream pointer must stay private to the handoff object.";
+    EXPECT_NE(executable_header.find("bool canPublish(void *candidate) const"), std::string::npos)
+        << "The one-shot overwrite rule should live on the handoff object.";
+    EXPECT_EQ(executable_header.find("void *&pendingLogitsStreamSlot"), std::string::npos)
+        << "Do not expose mutable raw stream references from the orchestrator.";
+    EXPECT_EQ(executable_source.find("pending_logits_streams_"), std::string::npos)
+        << "Production code outside the helper implementation must not touch the slot table directly.";
+    EXPECT_EQ(executable_source.find("pendingLogitsStreamSlot("), std::string::npos)
+        << "Production code must use the handoff object API, not a raw slot helper.";
+
+    EXPECT_NE(source.find("publishPendingLogitsStream("), std::string::npos);
+    EXPECT_NE(source.find("consumePendingLogitsStream("), std::string::npos);
+    EXPECT_NE(source.find("peekPendingLogitsStream("), std::string::npos);
+    EXPECT_NE(source.find("clearPendingLogitsStream("), std::string::npos);
+    EXPECT_NE(source.find("Cannot replace unconsumed pending logits stream"), std::string::npos)
+        << "Publishing a different stream over an unconsumed logits handoff must hard-fail.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBeforeConsumers)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+
+    EXPECT_NE(header.find("struct PendingShiftedMTPKVReadyState"), std::string::npos)
+        << "Deferred shifted MTP KV writes must be represented by an explicit owned state object.";
+    EXPECT_NE(header.find("recordShiftedMTPKVReady"), std::string::npos);
+    EXPECT_NE(header.find("waitForPendingShiftedMTPKVReady"), std::string::npos);
+    EXPECT_NE(source.find("shifted_mtp_kv_ready_events"), std::string::npos);
+    EXPECT_NE(source.find("shifted_mtp_kv_ready_waits"), std::string::npos);
+
+    const auto sidecar_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
+        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+    EXPECT_NE(sidecar_body.find("waitForPendingShiftedMTPKVReady"), std::string::npos)
+        << "A new MTP sidecar run must wait before reading/appending shifted MTP KV.";
+    EXPECT_NE(sidecar_body.find("recordShiftedMTPKVReady"), std::string::npos)
+        << "KV-only sidecar replay must publish an event if it skips CPU stream sync.";
+    EXPECT_NE(sidecar_body.find("shifted_mtp_kv_stream_syncs_deferred"), std::string::npos);
+    const size_t kv_only_guard = sidecar_body.find("if (!kv_cache_only)");
+    const size_t logits_defer = sidecar_body.find("deferredSamplingStream");
+    ASSERT_NE(kv_only_guard, std::string::npos);
+    ASSERT_NE(logits_defer, std::string::npos);
+    EXPECT_LT(kv_only_guard, logits_defer)
+        << "KV-only sidecar replay must not use the pending-logits stream handoff; it owns shifted KV.";
+
+    const auto publish_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(",
+        "std::vector<ForwardExecutionEngine::ReplayCacheObservation>");
+    const size_t publish_wait = publish_body.find("waitForPendingShiftedMTPKVReady");
+    const size_t kv_publish = publish_body.find("publishAcceptedMTPSpecKVState");
+    ASSERT_NE(publish_wait, std::string::npos);
+    ASSERT_NE(kv_publish, std::string::npos);
+    EXPECT_LT(publish_wait, kv_publish)
+        << "Accepted-state publication truncates MTP KV and must wait for deferred shifted appends first.";
+
+    const auto sequential_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden(",
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowFromDeviceTargetSample(");
+    const auto device_target_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowFromDeviceTargetSample(",
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromPartialForward(");
+    const auto partial_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromPartialForward(",
+        "const float *DeviceGraphOrchestrator::mtpLogits() const");
+    EXPECT_NE(sequential_body.find("waitForPendingShiftedMTPKVReady"), std::string::npos);
+    EXPECT_NE(device_target_body.find("waitForPendingShiftedMTPKVReady"), std::string::npos);
+    EXPECT_NE(partial_body.find("waitForPendingShiftedMTPKVReady"), std::string::npos);
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPTargetDistributionBuildPreservesDeferredFirstTokenReadyEvent)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto build_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::buildStochasticDistributionOnDevice(",
+        "bool DeviceGraphOrchestrator::sampleStochasticDistributionOnDeviceImpl(");
+    const auto executable_build_body = stripCommentsAndStringLiterals(build_body);
+
+    /*
+     * The penalty-free vLLM-style stochastic path samples the first generated
+     * token into STOCHASTIC_TARGET_SAMPLE_TOKENS[0], then reuses target
+     * distribution slot 0 for all-position verifier row 0.  Distribution-slot
+     * reuse must not clear the sampled-token ready event; otherwise the batch
+     * summary can read that first token from another stream without waiting for
+     * the sampler kernel.
+     */
+    EXPECT_EQ(
+        executable_build_body.find("clearStochasticTargetSampleReadySlot"),
+        std::string::npos)
+        << "Building a target distribution must preserve deferred first-token readiness.";
+    EXPECT_NE(
+        executable_build_body.find("clearStochasticDraftSampleReadySlot(slot)"),
+        std::string::npos)
+        << "Draft distribution builds still clear draft sample readiness because "
+           "draft distribution slots and draft sampled-token slots share one "
+           "step-local producer/consumer pair.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecStatePublicationPreservesSidecarReplayState)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto publish_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(",
+        "std::vector<ForwardExecutionEngine::ReplayCacheObservation>");
+    const auto mutation_body = sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::handleLivePrefixReplayStateAfterMutation(",
+        "PrefixCacheFingerprintResult DeviceGraphOrchestrator::buildCurrentPrefixFingerprint(");
+
+    /*
+     * MTP spec-state publication replaces live main/MTP KV and recurrent state
+     * with verifier-captured rows. Main/verifier replay caches still need a
+     * correction boundary, but depth-0 sidecar graphs read stable arena buffers
+     * and update dynamic token/position params before every launch. Resetting
+     * sidecar segmented replay on every accepted token keeps ROCm/CUDA stuck in
+     * warmup and destroys the vLLM-style speed path.
+     */
+    const auto executable_publish_body =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(publish_body));
+    EXPECT_NE(executable_publish_body.find(
+                  "handleLivePrefixReplayStateAfterMutation(,false)"),
+              std::string::npos)
+        << "MTP accepted-state publication must keep a main/verifier replay-state "
+           "mutation boundary.";
+
+    const auto executable_mutation_body =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(mutation_body));
+    EXPECT_NE(executable_mutation_body.find("if(!correction_replay_boundary)"),
+              std::string::npos)
+        << "Spec-state publication must not reset sidecar replay caches.";
+    EXPECT_NE(mutation_body.find("preserved_for_spec_publication"),
+              std::string::npos)
+        << "Perf stats must make the sidecar replay preservation explicit.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDARingKVCacheGatherHasNoRawAllocationFallback)

@@ -34,6 +34,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
 
 // =========================================================================
 // Extern "C" declarations for CUDA kernel wrappers
@@ -1696,6 +1697,56 @@ namespace llaminar2
                                                                                     << " local_vocab_size=" << local_vocab_size
                                                                                     << " vocab_offset=" << vocab_offset);
                     return false;
+                }
+            }
+            // Validation readbacks require D2H plus stream synchronization, both
+            // illegal inside CUDA graph capture. The launch itself still consumes
+            // the device token IDs and remains graph-capturable.
+            if (use_device_token_ids &&
+                debugEnv().validation.validate_buffers &&
+                num_tokens > 0 &&
+                !isGraphCaptureActive())
+            {
+                std::vector<int> sampled_tokens(static_cast<size_t>(num_tokens), -1);
+                cudaError_t token_copy_err = cudaMemcpyAsync(
+                    sampled_tokens.data(),
+                    d_token_ids,
+                    static_cast<size_t>(num_tokens) * sizeof(int),
+                    cudaMemcpyDeviceToHost,
+                    static_cast<cudaStream_t>(gpu_stream_));
+                if (token_copy_err != cudaSuccess)
+                {
+                    LOG_ERROR("[CUDAEmbeddingKernelT] Failed to read device token IDs for validation: "
+                              << cudaGetErrorString(token_copy_err));
+                    return false;
+                }
+                token_copy_err = cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                if (token_copy_err != cudaSuccess)
+                {
+                    LOG_ERROR("[CUDAEmbeddingKernelT] Failed to synchronize device token validation: "
+                              << cudaGetErrorString(token_copy_err));
+                    return false;
+                }
+                const bool single_participant =
+                    !mpi_ctx || mpi_ctx->world_size() <= 1;
+                for (int i = 0; i < num_tokens; ++i)
+                {
+                    const int token_id = sampled_tokens[static_cast<size_t>(i)];
+                    const bool in_local_range =
+                        token_id >= vocab_offset &&
+                        token_id < vocab_offset + local_vocab_size;
+                    if (!in_local_range && single_participant)
+                    {
+                        LOG_ERROR("[CUDAEmbeddingKernelT] Device-token embedding would zero single-device token="
+                                  << token_id << " local_vocab_size=" << local_vocab_size
+                                  << " vocab_offset=" << vocab_offset
+                                  << " num_tokens=" << num_tokens);
+                        return false;
+                    }
+                    LOG_DEBUG("[CUDAEmbeddingKernelT] Device-token embedding validation token="
+                              << token_id << " local_vocab_size=" << local_vocab_size
+                              << " vocab_offset=" << vocab_offset
+                              << " in_local_range=" << (in_local_range ? 1 : 0));
                 }
             }
 
