@@ -3083,6 +3083,152 @@ namespace
         PerfStatsCollector::reset();
     }
 
+    TEST_F(Test__PrefillDecodeTransition, AllPositionSpecPublicationForcedRejectReplayCheckDerivesNextToken)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_all_position_reject_replay_check_unit.json";
+        {
+            ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            ScopedEnv enable_replay_check("LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK", "1");
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/false,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cpu(),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true);
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPSpecStatePublication();
+            mock->setVerifierAcceptedPrefixScript({0});
+            mock->setDecodeArgmaxScript({
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+            });
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult rejected = runner->decodeStep();
+            ASSERT_TRUE(rejected.success()) << rejected.error;
+            EXPECT_THAT(rejected.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *derived =
+                findPerfRecordWithTags(
+                    records,
+                    PerfStatRecord::Kind::Counter,
+                    "commit_replay_check_derived_next_tokens",
+                    {{"path", "all_position_state_publication_verifier"},
+                     {"deferred_condition_token",
+                      std::to_string(MockInferenceRunner::VERIFY_REJECT_TOKEN)},
+                     {"next_token",
+                      std::to_string(MockInferenceRunner::DECODE_ARGMAX_TOKEN)}});
+            ASSERT_NE(derived, nullptr)
+                << "forced-reject publication has no ready token, so the "
+                   "debug replay oracle must derive one by forwarding the "
+                   "rejected correction as the next condition token.";
+
+            const PerfStatRecord *match =
+                findPerfRecordWithTags(
+                    records,
+                    PerfStatRecord::Kind::Counter,
+                    "commit_replay_check_matches",
+                    {{"path", "all_position_state_publication_verifier"},
+                     {"accepted_tokens", "7,4"},
+                     {"next_token",
+                      std::to_string(MockInferenceRunner::DECODE_ARGMAX_TOKEN)},
+                     {"derived_next_token", "true"}});
+            ASSERT_NE(match, nullptr);
+
+            runner->setDecodeStepTokenBudget(1);
+            GenerationResult ordinary = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
+            ASSERT_TRUE(ordinary.success()) << ordinary.error;
+            EXPECT_THAT(ordinary.tokens,
+                        ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN))
+                << "after a forced reject, the next one-token decode must "
+                   "consume the rejected correction exactly once and continue "
+                   "from the same token as a full replay.";
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, AllPositionSpecPublicationSynthesizesVerifierBaseAfterConditionForward)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_all_position_synthetic_base_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/false,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cpu(),
+                /*mtp_draft_tokens=*/1,
+                /*chained_mtp_support=*/false);
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPSpecStatePublication();
+            mock->setVerifierAcceptedPrefixScript({0, 1});
+            mock->setDecodeArgmaxScript({MockInferenceRunner::DECODE_ARGMAX_TOKEN});
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult rejected = runner->decodeStep();
+            ASSERT_TRUE(rejected.success()) << rejected.error;
+            EXPECT_THAT(rejected.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
+            const int captures_after_reject = mock->captureCheckpointCount();
+            ASSERT_EQ(captures_after_reject, 1)
+                << "first ready-logits all-position step only needs the entry checkpoint";
+
+            GenerationResult accepted = runner->decodeStep();
+            ASSERT_TRUE(accepted.success()) << accepted.error;
+            EXPECT_THAT(accepted.tokens,
+                        ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+            EXPECT_EQ(mock->restoreCount(), 0)
+                << "main-state-preserving all-position publication must not restore "
+                   "the synthetic verifier base.";
+            EXPECT_EQ(mock->captureCheckpointCount(), captures_after_reject + 1)
+                << "the second step keeps its failure rollback checkpoint but skips "
+                   "the post-condition verifier-base export.";
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *synthetic_base =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "capture_verifier_base_prefix_state_skipped_all_position_publication");
+            ASSERT_NE(synthetic_base, nullptr);
+            EXPECT_DOUBLE_EQ(synthetic_base->value, 1.0);
+            const PerfStatRecord *verifier_base_capture =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Timer,
+                               "capture_verifier_base_prefix_state");
+            EXPECT_EQ(verifier_base_capture, nullptr)
+                << "the all-position state-publication fast path should not export "
+                   "a verifier-base checkpoint after condition forward.";
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
     TEST_F(Test__PrefillDecodeTransition, AllPositionSpecPublicationCommitsAcceptedPrefixWithBonusVerifierRow)
     {
         const std::filesystem::path export_path =

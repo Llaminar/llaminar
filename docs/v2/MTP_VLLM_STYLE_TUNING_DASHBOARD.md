@@ -16,8 +16,14 @@ Latest full dense/MoE matrix:
 `benchmark_results/mtp_vllm_style/20260609T-phase3-row-indexed-accepted-matrix/`
 with `--decode-tokens 16 --perfstats`.
 
-Latest correctness gate: Phase 4 focused units, dense Qwen3.6 stochastic parity
-on CPU/CUDA/ROCm, CUDA/ROCm stochastic graph smokes, and GPU sampling integration.
+Latest correctness gate: Phase 5 focused units
+`V2_Unit_MTPStateTransaction`, `V2_Unit_MTPGraphConstruction`,
+`V2_Unit_PrefillDecodeTransition`, `V2_Unit_GpuWorkspaceAllocationPolicy`,
+plus MTP perfstats/matrix script units.
+
+Latest Phase 5 publication-cost slice:
+`benchmark_results/mtp_vllm_style/20260610T-phase5-publication-cost-dense-stochastic-gpu/`
+and `...-cpu8/`.
 
 ## Matrix
 
@@ -38,16 +44,9 @@ on CPU/CUDA/ROCm, CUDA/ROCm stochastic graph smokes, and GPU sampling integratio
 
 ## Current Read
 
-- Phase 4 dense SingleDevice is accepted. The closeout gate passed
-  `V2_Unit_MTPRejectionSampler`, `V2_Unit_PrefillDecodeTransition`,
-  `V2_Unit_MTPGraphConstruction`, `V2_Unit_DeviceGraphOrchestrator`,
-  `V2_Unit_GpuWorkspaceAllocationPolicy`, `V2_Integration_GPUSamplingKernels`,
-  dense stochastic parity on CPU/CUDA/ROCm, and CUDA/ROCm stochastic graph
-  smokes.
-- Phase 4 fixes: host/device first-sidecar graph caches are split, sidecar
-  replay state survives accepted-state publication, GPU batch outcomes no
-  longer accept host draft shadows, and prefix/parity tests assert the retired
-  decode-equivalent stochastic verifier is not used.
+- Phase 4 dense SingleDevice is accepted. Its closeout gate covered focused
+  units, GPU sampling integration, dense stochastic parity on CPU/CUDA/ROCm,
+  and CUDA/ROCm stochastic graph smokes.
 - Dense stochastic is speed-positive on all backends in useful bounded lanes:
   CUDA d3 1.35x, ROCm d1 1.10x and dynamic 1.07x, CPU d2 1.30x.
 - ROCm d2/d3 stochastic are bad because acceptance collapses to 28.6%/46.2% on
@@ -56,6 +55,19 @@ on CPU/CUDA/ROCm, CUDA/ROCm stochastic graph smokes, and GPU sampling integratio
   forward dominate: CPU d2 reports 22.9s verifier and 6.6s condition time for
   the measured decode section.
 - MoE is functionally alive on all backends but speed-negative everywhere.
+- Phase 5 focused slices are green: live-state mutation reasons are typed,
+  publication distinguishes accepted vs rejected correction, and the
+  post-condition verifier-base stamp is now a tested logical transaction
+  helper instead of a payload checkpoint export. Matrix rows now include
+  `publish_count` and `publish_avg_ms` for depth-stability checks.
+- Phase 5 publication-cost slice: CUDA publish_avg 0.47-0.56ms, ROCm
+  0.29-0.32ms, CPU 3.84-3.86ms. Publication is stable across d1/d2/d3; remaining
+  cost is verifier/condition plus debug/prefix checkpoints, not slot publish.
+- Forced-reject replay parity is now covered in the runner unit: when no ready
+  token exists, the debug oracle derives the next token by forwarding the
+  rejected correction, then checks it against full replay.
+- Phase 5 is accepted on the focused gate; stale all-position checkpoint tags
+  are gone.
 
 ## Target Anchors
 
@@ -69,6 +81,6 @@ llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
 
 ## Next
 
-1. Enter Phase 5: publish from spec slots, not checkpoints.
+1. Enter Phase 6: graph-captured draft/verify/sample/publish stress work.
 2. Keep the dense stochastic closeout matrix as the per-iteration regression.
 3. Move MoE speed work after SingleDevice state publication is cheap.

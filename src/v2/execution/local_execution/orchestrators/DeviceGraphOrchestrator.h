@@ -2044,6 +2044,7 @@ namespace llaminar2
             // the host data is gone and cannot be re-uploaded.
             device_sampling_counter_ = 0;
             ++session_epoch_;
+            recordLivePrefixSessionReset("clear_cache");
         }
 
         /**
@@ -2632,7 +2633,39 @@ namespace llaminar2
         bool isPrefixCacheMoEModel() const;
         bool mtpSpecStatePublicationRequiresCapturedStage() const;
         void *explicitGPUStreamForOperation(const char *operation) const;
+        /**
+         * @brief Typed reasons for live inference-state mutations.
+         *
+         * Phase 5 treats live state as a versioned object.  Each mutation must
+         * say whether it came from accepted speculative publication, a rejected
+         * correction, prefix restore/truncate, or a full session reset.  This
+         * keeps graph replay invalidation and perf diagnostics aligned.
+         */
+        enum class LivePrefixMutationReason
+        {
+            Unknown,
+            AcceptedSpecPublication,
+            RejectedCorrection,
+            PrefixRestore,
+            PrefixTruncate,
+            SessionReset,
+        };
+
+        struct LivePrefixMutationRecord
+        {
+            uint64_t previous_epoch = 0;
+            uint64_t live_state_epoch = 0;
+            const char *reason_name = "unknown";
+        };
+
+        static const char *livePrefixMutationReasonName(
+            LivePrefixMutationReason reason);
+        LivePrefixMutationRecord recordLivePrefixMutation(
+            LivePrefixMutationReason reason,
+            const char *operation);
+        void recordLivePrefixSessionReset(const char *operation);
         void handleLivePrefixReplayStateAfterMutation(
+            LivePrefixMutationReason reason,
             const char *operation,
             bool preserve_gpu_replay_state = false);
         PrefixCacheFingerprintResult buildCurrentPrefixFingerprint(
@@ -3258,6 +3291,15 @@ namespace llaminar2
         /// Used to detect stale kernel state across inference sessions
         uint64_t session_epoch_ = 0;
         uint64_t live_replay_state_epoch_ = 1;
+        uint64_t live_state_mutation_count_ = 0;
+        uint64_t live_state_accepted_publications_ = 0;
+        uint64_t live_state_rejected_corrections_ = 0;
+        uint64_t live_state_prefix_restores_ = 0;
+        uint64_t live_state_prefix_truncates_ = 0;
+        uint64_t live_state_session_resets_ = 0;
+        LivePrefixMutationReason last_live_state_mutation_reason_ =
+            LivePrefixMutationReason::Unknown;
+        std::string last_live_state_mutation_operation_;
         uint64_t device_sampling_counter_ = 0;
 
         bool compute_all_position_logits_ = false;

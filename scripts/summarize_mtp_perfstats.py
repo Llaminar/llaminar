@@ -20,6 +20,8 @@ FIELDS = (
     "deferred_corrections",
     "rejection_no_ready",
     "publish_ms",
+    "publish_count",
+    "publish_avg_ms",
     "sidecar_ms",
     "sidecar_depth0_decode_ms",
     "shifted_initial_ms",
@@ -162,6 +164,18 @@ def _sum_tagged_int(
 
 def summarize(path: Path | None) -> dict[str, float | int]:
     records = _records(path)
+    publish_ms = _sum_total_ms(
+        records,
+        "mtp",
+        "all_position_publish_accepted_state",
+        phase="decode",
+    )
+    publish_count = _sum_count(
+        records,
+        "mtp",
+        "all_position_publish_accepted_state",
+        phase="decode",
+    )
     shifted_row_ms = _sum_total_ms_many(
         records,
         "mtp",
@@ -229,7 +243,9 @@ def summarize(path: Path | None) -> dict[str, float | int]:
             "all_position_rejection_without_ready_token",
             phase="decode",
         ),
-        "publish_ms": _sum_total_ms(records, "mtp", "all_position_publish_accepted_state"),
+        "publish_ms": publish_ms,
+        "publish_count": publish_count,
+        "publish_avg_ms": publish_ms / publish_count if publish_count else 0.0,
         "sidecar_ms": _sum_total_ms(records, "mtp", "sidecar_forward", phase="decode"),
         "sidecar_depth0_decode_ms": _sum_total_ms(
             records,

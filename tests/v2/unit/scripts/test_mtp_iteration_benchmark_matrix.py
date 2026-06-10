@@ -131,7 +131,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             lines = (output_dir / "summary.tsv").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 2)
             self.assertEqual(len(lines[0].split("\t")), len(lines[1].split("\t")))
-            self.assertEqual(len(lines[0].split("\t")), 59)
+            self.assertEqual(len(lines[0].split("\t")), 61)
 
 
 if __name__ == "__main__":

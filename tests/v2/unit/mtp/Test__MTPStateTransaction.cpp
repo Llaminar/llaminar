@@ -76,6 +76,34 @@ TEST(Test__MTPStateTransaction, ExpectedShiftedTokensLagMainByOne)
     EXPECT_EQ(expectedShiftedMTPTokens(9), 8);
 }
 
+TEST(Test__MTPStateTransaction, LogicalVerifierBaseSnapshotCarriesDecodeEquivalentTokenCounts)
+{
+    const PrefixStateSnapshot snapshot =
+        makeLogicalMTPVerifierBaseSnapshot(/*cached_tokens=*/7);
+
+    EXPECT_TRUE(snapshot.valid);
+    EXPECT_TRUE(snapshot.logical_checkpoint);
+    EXPECT_EQ(snapshot.provenance, PrefixStateProvenance::LogicalCheckpoint);
+    EXPECT_EQ(snapshot.cached_tokens, 7);
+    ASSERT_EQ(snapshot.mtp_cached_tokens.size(), 1u);
+    EXPECT_EQ(snapshot.mtp_cached_tokens.front(), 6);
+    EXPECT_TRUE(snapshot.blocks.empty())
+        << "Logical verifier-base snapshots must not smuggle payload blocks "
+           "back into the steady MTP path.";
+    EXPECT_TRUE(snapshot.mtp_blocks.empty());
+    EXPECT_TRUE(isDecodeEquivalent(snapshot.provenance));
+}
+
+TEST(Test__MTPStateTransaction, LogicalVerifierBaseSnapshotRejectsNegativePositions)
+{
+    const PrefixStateSnapshot snapshot =
+        makeLogicalMTPVerifierBaseSnapshot(/*cached_tokens=*/-1);
+
+    EXPECT_FALSE(snapshot.valid);
+    EXPECT_TRUE(snapshot.logical_checkpoint);
+    EXPECT_EQ(snapshot.provenance, PrefixStateProvenance::LogicalCheckpoint);
+}
+
 TEST(Test__MTPStateTransaction, CommittedDecodeStateRequiresConsistentCounts)
 {
     MTPDecodeStateStamp state = makeState(5);

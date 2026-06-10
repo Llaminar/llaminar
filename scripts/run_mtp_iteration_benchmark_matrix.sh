@@ -307,11 +307,11 @@ if [[ ! -x "${perf_summary_script}" ]]; then
   chmod +x "${perf_summary_script}" 2>/dev/null || true
 fi
 
-printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
+printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
 : > "${commands_path}"
 
 zero_perf_summary() {
-  local fields=38
+  local fields=40
   local values=()
   for ((i = 0; i < fields; ++i)); do
     values+=("0")

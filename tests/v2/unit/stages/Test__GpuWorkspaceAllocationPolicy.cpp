@@ -579,8 +579,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecStatePublicationPreservesSidecar
      */
     const auto executable_publish_body =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(publish_body));
+    EXPECT_NE(executable_publish_body.find("plan.requiresCorrectionReplay()?"),
+              std::string::npos)
+        << "Spec-state publication diagnostics must distinguish accepted "
+           "publication from rejected correction.";
     EXPECT_NE(executable_publish_body.find(
-                  "handleLivePrefixReplayStateAfterMutation(,false)"),
+                  "handleLivePrefixReplayStateAfterMutation(mutation_reason,,false)"),
               std::string::npos)
         << "MTP accepted-state publication must keep a main/verifier replay-state "
            "mutation boundary.";

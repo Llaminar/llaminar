@@ -6004,7 +6004,12 @@ namespace llaminar2
          * published state atomic: future graph launches must be captured from
          * the newly published positions, KV/GDN state, and shifted MTP cache.
          */
+        const LivePrefixMutationReason mutation_reason =
+            plan.requiresCorrectionReplay()
+                ? LivePrefixMutationReason::RejectedCorrection
+                : LivePrefixMutationReason::AcceptedSpecPublication;
         handleLivePrefixReplayStateAfterMutation(
+            mutation_reason,
             "mtp_spec_state_publication",
             /*preserve_gpu_replay_state=*/false);
 
@@ -6190,6 +6195,7 @@ namespace llaminar2
             if (workspace_generation_after_commit != workspace_generation_before_commit)
             {
                 handleLivePrefixReplayStateAfterMutation(
+                    LivePrefixMutationReason::Unknown,
                     "mtp_shifted_row_sequential_commit_workspace_rebind");
             }
         }
@@ -6365,6 +6371,7 @@ namespace llaminar2
         if (workspace_generation_after_commit != workspace_generation_before_commit)
         {
             handleLivePrefixReplayStateAfterMutation(
+                LivePrefixMutationReason::Unknown,
                 "mtp_shifted_row_device_target_commit_workspace_rebind");
         }
         return true;
@@ -6571,6 +6578,7 @@ namespace llaminar2
             if (workspace_generation_after_commit != workspace_generation_before_commit)
             {
                 handleLivePrefixReplayStateAfterMutation(
+                    LivePrefixMutationReason::Unknown,
                     "mtp_shifted_row_commit_workspace_rebind");
             }
         }
@@ -7724,6 +7732,19 @@ namespace llaminar2
         snapshot.primary_device = state_.device_id;
         snapshot.current_position = getPosition(0);
         snapshot.session_epoch = session_epoch_;
+        snapshot.live_state_epoch = live_replay_state_epoch_;
+        snapshot.live_state_mutations = live_state_mutation_count_;
+        snapshot.last_live_state_mutation_reason =
+            livePrefixMutationReasonName(last_live_state_mutation_reason_);
+        snapshot.last_live_state_mutation_operation =
+            last_live_state_mutation_operation_;
+        snapshot.live_state_accepted_publications =
+            live_state_accepted_publications_;
+        snapshot.live_state_rejected_corrections =
+            live_state_rejected_corrections_;
+        snapshot.live_state_prefix_restores = live_state_prefix_restores_;
+        snapshot.live_state_prefix_truncates = live_state_prefix_truncates_;
+        snapshot.live_state_session_resets = live_state_session_resets_;
         snapshot.prefix_cache_config_enabled =
             graph_builder_ && graph_builder_->config().prefix_cache.enabled;
         snapshot.prefix_cache_bypassed =
@@ -7885,15 +7906,111 @@ namespace llaminar2
         }
     }
 
+    const char *DeviceGraphOrchestrator::livePrefixMutationReasonName(
+        LivePrefixMutationReason reason)
+    {
+        switch (reason)
+        {
+        case LivePrefixMutationReason::AcceptedSpecPublication:
+            return "accepted_publication";
+        case LivePrefixMutationReason::RejectedCorrection:
+            return "rejected_correction";
+        case LivePrefixMutationReason::PrefixRestore:
+            return "prefix_restore";
+        case LivePrefixMutationReason::PrefixTruncate:
+            return "prefix_truncate";
+        case LivePrefixMutationReason::SessionReset:
+            return "session_reset";
+        case LivePrefixMutationReason::Unknown:
+        default:
+            return "unknown";
+        }
+    }
+
+    DeviceGraphOrchestrator::LivePrefixMutationRecord
+    DeviceGraphOrchestrator::recordLivePrefixMutation(
+        LivePrefixMutationReason reason,
+        const char *operation)
+    {
+        const uint64_t previous_epoch = live_replay_state_epoch_;
+        ++live_replay_state_epoch_;
+        ++live_state_mutation_count_;
+        last_live_state_mutation_reason_ = reason;
+        last_live_state_mutation_operation_ =
+            operation ? operation : "unknown";
+
+        switch (reason)
+        {
+        case LivePrefixMutationReason::AcceptedSpecPublication:
+            ++live_state_accepted_publications_;
+            break;
+        case LivePrefixMutationReason::RejectedCorrection:
+            ++live_state_rejected_corrections_;
+            break;
+        case LivePrefixMutationReason::PrefixRestore:
+            ++live_state_prefix_restores_;
+            break;
+        case LivePrefixMutationReason::PrefixTruncate:
+            ++live_state_prefix_truncates_;
+            break;
+        case LivePrefixMutationReason::SessionReset:
+            ++live_state_session_resets_;
+            break;
+        case LivePrefixMutationReason::Unknown:
+        default:
+            break;
+        }
+
+        return LivePrefixMutationRecord{
+            previous_epoch,
+            live_replay_state_epoch_,
+            livePrefixMutationReasonName(reason)};
+    }
+
+    void DeviceGraphOrchestrator::recordLivePrefixSessionReset(const char *operation)
+    {
+        PerfStatsCollector::Tags tags{{"operation", operation ? operation : "unknown"}};
+        const LivePrefixMutationRecord mutation =
+            recordLivePrefixMutation(
+                LivePrefixMutationReason::SessionReset,
+                operation);
+        tags["mutation_reason"] = mutation.reason_name;
+        tags["previous_live_state_epoch"] =
+            std::to_string(mutation.previous_epoch);
+        tags["live_state_epoch"] = std::to_string(mutation.live_state_epoch);
+        tags["live_state_mutation_count"] =
+            std::to_string(live_state_mutation_count_);
+        if (isPrefixCacheMoEModel())
+        {
+            tags["model"] = "moe";
+            tags["moe_placement_epoch"] = std::to_string(moePlacementEpoch());
+        }
+        tags["forward_replay_reset_scope"] = "session";
+        tags["replay_state"] = "reset";
+        tags["sidecar_replay_state"] = "reset";
+        tags["kernel_dynamic_state"] = "reset";
+        PerfStatsCollector::addCounter("mtp",
+                                       "live_prefix_replay_state_after_mutation",
+                                       1.0,
+                                       "decode",
+                                       state_.device_id.toString(),
+                                       std::move(tags));
+    }
+
     void DeviceGraphOrchestrator::handleLivePrefixReplayStateAfterMutation(
+        LivePrefixMutationReason reason,
         const char *operation,
         bool preserve_gpu_replay_state)
     {
         PerfStatsCollector::Tags tags{{"operation", operation ? operation : "unknown"}};
-        const uint64_t previous_epoch = live_replay_state_epoch_;
-        ++live_replay_state_epoch_;
-        tags["previous_live_state_epoch"] = std::to_string(previous_epoch);
-        tags["live_state_epoch"] = std::to_string(live_replay_state_epoch_);
+        const LivePrefixMutationRecord mutation =
+            recordLivePrefixMutation(reason, operation);
+        tags["mutation_reason"] = mutation.reason_name;
+        tags["previous_live_state_epoch"] =
+            std::to_string(mutation.previous_epoch);
+        tags["live_state_epoch"] = std::to_string(mutation.live_state_epoch);
+        tags["live_state_mutation_count"] =
+            std::to_string(live_state_mutation_count_);
         if (isPrefixCacheMoEModel())
         {
             tags["model"] = "moe";
@@ -7902,7 +8019,8 @@ namespace llaminar2
         if (state_.device_id.is_gpu() && forward_engine_ && !preserve_gpu_replay_state)
         {
             const bool correction_replay_boundary =
-                operation && std::string(operation) == "mtp_spec_state_publication";
+                reason == LivePrefixMutationReason::AcceptedSpecPublication ||
+                reason == LivePrefixMutationReason::RejectedCorrection;
             if (correction_replay_boundary)
             {
                 const ForwardExecutionEngine::ReplayStateResetSummary summary =
@@ -9532,7 +9650,9 @@ namespace llaminar2
 
             state_.positions[seq_idx] = snapshot.cached_tokens;
             state_.sequence_lengths[seq_idx] = snapshot.cached_tokens;
-            handleLivePrefixReplayStateAfterMutation("restore_logical_checkpoint");
+            handleLivePrefixReplayStateAfterMutation(
+                LivePrefixMutationReason::PrefixRestore,
+                "restore_logical_checkpoint");
             return true;
         }
 
@@ -9565,7 +9685,9 @@ namespace llaminar2
             resetHybridPrefixPayloadState(*state_.kv_cache);
             state_.positions[seq_idx] = 0;
             state_.sequence_lengths[seq_idx] = 0;
-            handleLivePrefixReplayStateAfterMutation("restore_payload_checkpoint_zero");
+            handleLivePrefixReplayStateAfterMutation(
+                LivePrefixMutationReason::PrefixRestore,
+                "restore_payload_checkpoint_zero");
             return true;
         }
 
@@ -9732,7 +9854,9 @@ namespace llaminar2
 
         state_.positions[seq_idx] = snapshot.cached_tokens;
         state_.sequence_lengths[seq_idx] = snapshot.cached_tokens;
-        handleLivePrefixReplayStateAfterMutation("restore_payload_checkpoint");
+        handleLivePrefixReplayStateAfterMutation(
+            LivePrefixMutationReason::PrefixRestore,
+            "restore_payload_checkpoint");
         return true;
     }
 
@@ -9769,7 +9893,9 @@ namespace llaminar2
         }
         state_.positions[seq_idx] = cached_tokens;
         state_.sequence_lengths[seq_idx] = cached_tokens;
-        handleLivePrefixReplayStateAfterMutation("truncate_live_prefix");
+        handleLivePrefixReplayStateAfterMutation(
+            LivePrefixMutationReason::PrefixTruncate,
+            "truncate_live_prefix");
         return true;
     }
 
@@ -11388,6 +11514,7 @@ namespace llaminar2
         }
 
         resetKernelDynamicState();
+        recordLivePrefixSessionReset("clearInferenceState");
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared (cached graph topology preserved)");
     }

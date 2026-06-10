@@ -15,6 +15,7 @@
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/moe/MoEExpertParallelPlan.h"
 #include "execution/moe/MoERebalanceController.h"
+#include "execution/mtp/MTPSpecStateContract.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "loaders/PreparedWeightStore.h"
@@ -953,6 +954,7 @@ namespace
             {
                 EXPECT_NE(record.tags.find("previous_live_state_epoch"), record.tags.end());
                 EXPECT_NE(record.tags.find("live_state_epoch"), record.tags.end());
+                EXPECT_NE(record.tags.find("mutation_reason"), record.tags.end());
                 total += record.value;
             }
         }
@@ -3037,6 +3039,146 @@ TEST(Test__MTPGraphConstruction, DynamicDepthFullAcceptCommitDiscardsSpeculative
     PerfStatsCollector::reset();
 }
 
+TEST(Test__MTPGraphConstruction, SpecStatePublicationRecordsAcceptedAndRejectedMutationReasons)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    auto run_case = [](int accepted_count,
+                       bool requires_correction,
+                       const std::string &expected_reason)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_PERF_STATS_JSON", "1"},
+        });
+        PerfStatsCollector::reset();
+
+        TinyQwen35MTPForwardFixture fixture;
+        fixture.config.mtp.draft_tokens = 3;
+        fixture.config.max_seq_len = 16;
+
+        auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+        DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+        ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+            /*batch_size=*/1,
+            fixture.config.max_seq_len,
+            DeviceId::cpu()));
+
+        auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+        orchestrator.setFrozenWeightSet(std::move(frozen));
+        ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+        PreparedWeightStore store;
+        prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+        graph_builder->setPreparedWeightStore(&store);
+
+        const std::vector<int> prefix_tokens = {1, 2, 3, 4};
+        ASSERT_NE(orchestrator.forward(prefix_tokens.data(),
+                                       static_cast<int>(prefix_tokens.size()),
+                                       1),
+                  nullptr);
+
+        ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/5))
+            << "Spec-state publication assumes the first shifted MTP KV row "
+               "belongs to the sidecar; verifier rows only fill the accepted "
+               "prefix after that first row.";
+
+        ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+        const std::vector<int> verifier_tokens = {5, 6, 7};
+        ASSERT_NE(orchestrator.forward(verifier_tokens.data(),
+                                       static_cast<int>(verifier_tokens.size()),
+                                       1),
+                  nullptr);
+        ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
+
+        std::vector<int32_t> accepted_tokens = {5, 6, 7};
+        ASSERT_TRUE(orchestrator.commitMTPShiftedRowsFromPartialForward(
+            accepted_tokens.data(),
+            accepted_count,
+            /*already_appended_tokens=*/1,
+            /*main_forward_token_count=*/static_cast<int>(verifier_tokens.size()),
+            /*allow_speculative_discard=*/true,
+            /*position_offset_override=*/static_cast<int>(prefix_tokens.size())));
+
+        MTPSpecStepPlan plan;
+        plan.request_index = 0;
+        plan.request_id = 17;
+        plan.draft_count = static_cast<int>(verifier_tokens.size());
+        plan.target_rows = plan.draft_count + 1;
+        plan.valid_sampled_count = plan.target_rows;
+        plan.committed_output_count =
+            accepted_count + (requires_correction ? 1 : 0);
+        plan.accepted_count = accepted_count;
+        plan.rejected_count = requires_correction
+                                  ? plan.draft_count - accepted_count
+                                  : 0;
+        plan.base_cached_tokens = static_cast<int>(prefix_tokens.size());
+        plan.target_cached_tokens = plan.base_cached_tokens + accepted_count;
+        plan.accepted_state_slot_index = accepted_count - 1;
+        plan.all_drafts_accepted = !requires_correction;
+        if (requires_correction)
+        {
+            plan.correction_replay_start_index = accepted_count;
+            plan.correction_replay_count = 1;
+            plan.next_condition_token = 8;
+        }
+        else
+        {
+            plan.bonus_ready_token_row = plan.draft_count;
+            plan.bonus_ready_token_index = plan.draft_count;
+            plan.bonus_ready_state_slot_index = plan.draft_count;
+        }
+
+        std::string publication_error;
+        ASSERT_TRUE(orchestrator.publishAcceptedMTPSpecState(
+            plan,
+            &publication_error))
+            << publication_error;
+
+        const auto after_publish = orchestrator.prefixStateProbe();
+        EXPECT_EQ(after_publish.current_position, plan.target_cached_tokens);
+        ASSERT_FALSE(after_publish.positions.empty());
+        ASSERT_FALSE(after_publish.sequence_lengths.empty());
+        EXPECT_EQ(after_publish.positions[0], plan.target_cached_tokens);
+        EXPECT_EQ(after_publish.sequence_lengths[0], plan.target_cached_tokens);
+        EXPECT_EQ(maxCachedTokens(after_publish.kv_caches), plan.target_cached_tokens);
+        EXPECT_EQ(maxCachedTokens(after_publish.mtp_kv_caches),
+                  std::max(0, plan.target_cached_tokens - 1));
+        EXPECT_EQ(after_publish.live_state_mutations, 1u);
+        EXPECT_EQ(after_publish.last_live_state_mutation_reason, expected_reason);
+        EXPECT_EQ(after_publish.last_live_state_mutation_operation,
+                  "mtp_spec_state_publication");
+        EXPECT_EQ(after_publish.live_state_accepted_publications,
+                  requires_correction ? 0u : 1u);
+        EXPECT_EQ(after_publish.live_state_rejected_corrections,
+                  requires_correction ? 1u : 0u);
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        const auto mutation_tags = PerfStatsCollector::Tags{
+            {"operation", "mtp_spec_state_publication"},
+            {"mutation_reason", expected_reason},
+            {"kernel_dynamic_state", "reset"},
+            {"replay_state", "preserved"},
+            {"sidecar_replay_state", "preserved"}};
+        EXPECT_DOUBLE_EQ(
+            sumMTPRecordValuesContaining(
+                records,
+                PerfStatRecord::Kind::Counter,
+                "live_prefix_replay_state_after_mutation",
+                mutation_tags),
+            1.0);
+    };
+
+    run_case(/*accepted_count=*/3,
+             /*requires_correction=*/false,
+             "accepted_publication");
+    run_case(/*accepted_count=*/1,
+             /*requires_correction=*/true,
+             "rejected_correction");
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__MTPGraphConstruction, ChainedSidecarSuffixCommitAllowsCommittedVerifierPrefix)
 {
     DeviceManager::instance().initialize(-1, false);
@@ -3167,6 +3309,10 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
     const auto after_clear = orchestrator.prefixStateProbe();
     EXPECT_EQ(maxCachedTokens(after_clear.kv_caches), 0);
     EXPECT_EQ(maxCachedTokens(after_clear.mtp_kv_caches), 0);
+    EXPECT_EQ(after_clear.live_state_session_resets, 1u);
+    EXPECT_EQ(after_clear.live_state_mutations, 1u);
+    EXPECT_EQ(after_clear.last_live_state_mutation_reason, "session_reset");
+    EXPECT_EQ(after_clear.last_live_state_mutation_operation, "clear_cache");
 
     ASSERT_TRUE(orchestrator.restoreLivePrefixState(snapshot));
     const auto after_restore = orchestrator.prefixStateProbe();
@@ -3176,28 +3322,59 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
     EXPECT_EQ(after_restore.sequence_lengths[0], static_cast<int>(prefix_tokens.size()));
     EXPECT_EQ(maxCachedTokens(after_restore.kv_caches), static_cast<int>(prefix_tokens.size()));
     EXPECT_EQ(maxCachedTokens(after_restore.mtp_kv_caches), static_cast<int>(prefix_tokens.size()) - 1);
+    EXPECT_EQ(after_restore.live_state_session_resets, 1u);
+    EXPECT_EQ(after_restore.live_state_prefix_restores, 1u);
+    EXPECT_EQ(after_restore.live_state_mutations, 2u);
+    EXPECT_EQ(after_restore.last_live_state_mutation_reason, "prefix_restore");
+    EXPECT_EQ(after_restore.last_live_state_mutation_operation, "restore_payload_checkpoint");
 
     ASSERT_TRUE(orchestrator.truncateLivePrefixState(1));
     const auto after_truncate = orchestrator.prefixStateProbe();
     EXPECT_EQ(maxCachedTokens(after_truncate.kv_caches), 1);
     EXPECT_EQ(maxCachedTokens(after_truncate.mtp_kv_caches), 0);
+    EXPECT_EQ(after_truncate.live_state_prefix_restores, 1u);
+    EXPECT_EQ(after_truncate.live_state_prefix_truncates, 1u);
+    EXPECT_EQ(after_truncate.live_state_mutations, 3u);
+    EXPECT_EQ(after_truncate.last_live_state_mutation_reason, "prefix_truncate");
+    EXPECT_EQ(after_truncate.last_live_state_mutation_operation, "truncate_live_prefix");
 
     ASSERT_TRUE(orchestrator.restoreLivePrefixState(snapshot));
     const auto after_second_restore = orchestrator.prefixStateProbe();
     EXPECT_EQ(maxCachedTokens(after_second_restore.kv_caches), static_cast<int>(prefix_tokens.size()));
     EXPECT_EQ(maxCachedTokens(after_second_restore.mtp_kv_caches), static_cast<int>(prefix_tokens.size()) - 1);
+    EXPECT_EQ(after_second_restore.live_state_session_resets, 1u);
+    EXPECT_EQ(after_second_restore.live_state_prefix_restores, 2u);
+    EXPECT_EQ(after_second_restore.live_state_prefix_truncates, 1u);
+    EXPECT_EQ(after_second_restore.live_state_mutations, 4u);
+    EXPECT_EQ(after_second_restore.last_live_state_mutation_reason, "prefix_restore");
+    EXPECT_EQ(after_second_restore.last_live_state_mutation_operation, "restore_payload_checkpoint");
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto session_reset_tags = PerfStatsCollector::Tags{
+        {"operation", "clear_cache"},
+        {"mutation_reason", "session_reset"},
+        {"kernel_dynamic_state", "reset"},
+        {"replay_state", "reset"},
+        {"sidecar_replay_state", "reset"}};
     const auto restore_tags = PerfStatsCollector::Tags{
         {"operation", "restore_payload_checkpoint"},
+        {"mutation_reason", "prefix_restore"},
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
     const auto truncate_tags = PerfStatsCollector::Tags{
         {"operation", "truncate_live_prefix"},
+        {"mutation_reason", "prefix_truncate"},
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
+    EXPECT_DOUBLE_EQ(
+        sumMTPRecordValuesContaining(
+            records,
+            PerfStatRecord::Kind::Counter,
+            "live_prefix_replay_state_after_mutation",
+            session_reset_tags),
+        1.0);
     EXPECT_DOUBLE_EQ(
         sumMTPRecordValuesContaining(
             records,
@@ -3274,10 +3451,15 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
     EXPECT_EQ(maxCachedTokens(after_restore.mtp_kv_caches), static_cast<int>(prefix_tokens.size()) - 1);
     ASSERT_FALSE(after_restore.positions.empty());
     EXPECT_EQ(after_restore.positions[0], static_cast<int>(prefix_tokens.size()));
+    EXPECT_EQ(after_restore.live_state_prefix_restores, 1u);
+    EXPECT_EQ(after_restore.live_state_mutations, 1u);
+    EXPECT_EQ(after_restore.last_live_state_mutation_reason, "prefix_restore");
+    EXPECT_EQ(after_restore.last_live_state_mutation_operation, "restore_logical_checkpoint");
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto restore_tags = PerfStatsCollector::Tags{
         {"operation", "restore_logical_checkpoint"},
+        {"mutation_reason", "prefix_restore"},
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
@@ -3384,12 +3566,17 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEReplayState
     checkpoint.logical_checkpoint = true;
     checkpoint.cached_tokens = 0;
     ASSERT_TRUE(orchestrator.restoreLivePrefixState(checkpoint));
+    const auto after_restore = orchestrator.prefixStateProbe();
+    EXPECT_EQ(after_restore.live_state_prefix_restores, 1u);
+    EXPECT_EQ(after_restore.last_live_state_mutation_reason, "prefix_restore");
+    EXPECT_EQ(after_restore.last_live_state_mutation_operation, "restore_logical_checkpoint");
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto preserve_tags = PerfStatsCollector::Tags{
         {"model", "moe"},
         {"moe_placement_epoch", "0"},
         {"operation", "restore_logical_checkpoint"},
+        {"mutation_reason", "prefix_restore"},
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
@@ -3486,6 +3673,10 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsMatchFullRowsOnCPU)
     ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
 
     orchestrator.clearInferenceState();
+    const auto after_clear_state = orchestrator.prefixStateProbe();
+    EXPECT_EQ(after_clear_state.live_state_session_resets, 1u);
+    EXPECT_EQ(after_clear_state.last_live_state_mutation_reason, "session_reset");
+    EXPECT_EQ(after_clear_state.last_live_state_mutation_operation, "clearInferenceState");
 
     // The compact verifier mode keeps the forward sequence length at three
     // tokens, but asks the graph to run LM-head GEMM over only rows 0 and 1.

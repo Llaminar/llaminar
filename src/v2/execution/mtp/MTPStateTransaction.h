@@ -51,6 +51,19 @@ namespace llaminar2
 
     int expectedShiftedMTPTokens(int logical_tokens);
 
+    /**
+     * @brief Create a payload-free verifier-base snapshot for the MTP fast path.
+     *
+     * The all-position publication verifier can skip exporting a second
+     * prefix-cache payload when the condition forward has already advanced live
+     * state to the verifier base and the sidecar is guaranteed not to mutate
+     * main state. This helper creates the narrow logical snapshot used by the
+     * transaction validator in that case. It records only token-count
+     * invariants; callers must still keep a real rollback checkpoint for
+     * failure paths until verifier state is fully isolated in speculative slots.
+     */
+    PrefixStateSnapshot makeLogicalMTPVerifierBaseSnapshot(int cached_tokens);
+
     MTPStateValidationResult validateCommittedMTPDecodeState(
         const MTPDecodeStateStamp &state,
         const MTPCommitValidationOptions &options = {});

@@ -60,6 +60,15 @@ namespace llaminar2
         DeviceId primary_device = DeviceId::cpu();
         int current_position = 0;
         uint64_t session_epoch = 0;
+        uint64_t live_state_epoch = 0;
+        uint64_t live_state_mutations = 0;
+        std::string last_live_state_mutation_reason;
+        std::string last_live_state_mutation_operation;
+        uint64_t live_state_accepted_publications = 0;
+        uint64_t live_state_rejected_corrections = 0;
+        uint64_t live_state_prefix_restores = 0;
+        uint64_t live_state_prefix_truncates = 0;
+        uint64_t live_state_session_resets = 0;
         bool prefix_cache_config_enabled = false;
         bool prefix_cache_ready = false;
         bool prefix_cache_bypassed = false;

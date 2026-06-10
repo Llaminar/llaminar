@@ -1384,6 +1384,53 @@ namespace llaminar2
             return result;
         };
 
+        const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        const bool stochastic_verify =
+            mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
+            !active_sampling_params_.is_greedy();
+        const bool stochastic_device_verify =
+            stochastic_verify &&
+            runner_->primaryDeviceId().is_gpu() &&
+            runner_->supportsDeviceStochasticMTPVerification();
+        const bool stochastic_host_verify =
+            stochastic_verify &&
+            !runner_->primaryDeviceId().is_gpu();
+        const bool use_sampling_penalties =
+            active_sampling_params_.has_penalties() && !stochastic_verify;
+        const bool supports_all_position_state_publication =
+            runner_->supportsMTPSpecStatePublication() &&
+            (!stochastic_verify || stochastic_device_verify || stochastic_host_verify);
+        const MTPVerifierPolicyDecision verifier_policy =
+            chooseMTPVerifierPolicy(
+                MTPVerifierPolicyInput{
+                    .greedy_sampling = active_sampling_params_.is_greedy(),
+                    .stochastic_verify = stochastic_verify,
+                    .uses_sampling_penalties = use_sampling_penalties,
+                    .supports_spec_state_publication =
+                        supports_all_position_state_publication,
+                });
+        if (verifier_policy.path == MTPVerifierExecutionPath::Unsupported)
+        {
+            return fail_after_checkpoint(
+                std::string("MTP verifier policy selected unsupported path: ") +
+                verifier_policy.reason);
+        }
+        const bool use_all_position_state_publication_verifier =
+            verifier_policy.path ==
+            MTPVerifierExecutionPath::AllPositionStatePublication;
+        const bool verify_sidecar_preserves_main_state =
+            DebugEnv::isTruthyEnv("LLAMINAR_MTP_VERIFY_SIDECAR_PRESERVES_MAIN_STATE");
+        const bool verify_commit_replay_check =
+            DebugEnv::isTruthyEnv("LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK") &&
+            !stochastic_verify &&
+            !use_sampling_penalties &&
+            active_sampling_params_.is_greedy();
+        const bool can_synthesize_verifier_base_checkpoint =
+            use_all_position_state_publication_verifier &&
+            runner_->supportsMTPSidecarPreservesMainState() &&
+            !verify_sidecar_preserves_main_state &&
+            !verify_commit_replay_check;
+
         auto join_tokens = [](const std::vector<int32_t> &tokens) -> std::string
         {
             std::ostringstream oss;
@@ -1846,20 +1893,6 @@ namespace llaminar2
             return std::nullopt;
         };
 
-        const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
-        const bool stochastic_verify =
-            mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
-            !active_sampling_params_.is_greedy();
-        const bool stochastic_device_verify =
-            stochastic_verify &&
-            runner_->primaryDeviceId().is_gpu() &&
-            runner_->supportsDeviceStochasticMTPVerification();
-        const bool stochastic_host_verify =
-            stochastic_verify &&
-            !runner_->primaryDeviceId().is_gpu();
-        const bool use_sampling_penalties =
-            active_sampling_params_.has_penalties() && !stochastic_verify;
-
         const bool can_defer_main_decode_sync =
             runner_->primaryDeviceId().is_gpu() &&
             !active_sampling_params_.has_penalties() &&
@@ -1886,6 +1919,19 @@ namespace llaminar2
             }
             if (!ok)
                 return fail_after_checkpoint("Forward pass failed during MTP condition decode");
+            if (can_synthesize_verifier_base_checkpoint)
+            {
+                verifier_base_checkpoint =
+                    makeLogicalMTPVerifierBaseSnapshot(runner_->get_position());
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "capture_verifier_base_prefix_state_skipped_all_position_publication",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)}});
+            }
+            else
             {
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
@@ -1903,28 +1949,6 @@ namespace llaminar2
         {
             PerfStatsCollector::addCounter("mtp", "condition_forward_skipped_ready_logits", 1.0, "decode");
         }
-
-        const bool supports_all_position_state_publication =
-            runner_->supportsMTPSpecStatePublication() &&
-            (!stochastic_verify || stochastic_device_verify || stochastic_host_verify);
-        const MTPVerifierPolicyDecision verifier_policy =
-            chooseMTPVerifierPolicy(
-                MTPVerifierPolicyInput{
-                    .greedy_sampling = active_sampling_params_.is_greedy(),
-                    .stochastic_verify = stochastic_verify,
-                    .uses_sampling_penalties = use_sampling_penalties,
-                    .supports_spec_state_publication =
-                        supports_all_position_state_publication,
-                });
-        if (verifier_policy.path == MTPVerifierExecutionPath::Unsupported)
-        {
-            return fail_after_checkpoint(
-                std::string("MTP verifier policy selected unsupported path: ") +
-                verifier_policy.reason);
-        }
-        const bool use_all_position_state_publication_verifier =
-            verifier_policy.path ==
-            MTPVerifierExecutionPath::AllPositionStatePublication;
 
         const int requested_speculative_draft_count = currentMTPDraftDepth(mtp);
         const int pre_sample_effective_draft_count =
@@ -2228,11 +2252,6 @@ namespace llaminar2
             return result;
         }
 
-        const bool verify_commit_replay_check =
-            DebugEnv::isTruthyEnv("LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK") &&
-            !stochastic_verify &&
-            !use_sampling_penalties &&
-            active_sampling_params_.is_greedy();
         std::optional<PrefixStateSnapshot> verifier_replay_base_checkpoint;
         if (verify_commit_replay_check)
         {
@@ -2713,7 +2732,7 @@ namespace llaminar2
             {
                 return std::nullopt;
             }
-            if (expected_next_token < 0 || tokens_to_replay.empty() ||
+            if (tokens_to_replay.empty() ||
                 !verifier_replay_base_checkpoint.has_value())
             {
                 return std::nullopt;
@@ -2827,6 +2846,50 @@ namespace llaminar2
                 return tokens;
             };
 
+            const bool derived_next_token_from_deferred_condition =
+                expected_next_token < 0;
+            auto prepare_committed_ready_state = [&]()
+                -> std::optional<int32_t>
+            {
+                if (!derived_next_token_from_deferred_condition)
+                    return expected_next_token;
+
+                /*
+                 * A forced reject has no ready token yet: publication advances
+                 * only the accepted verifier prefix, while the rejected
+                 * correction is the next ordinary condition token.  The debug
+                 * oracle therefore has to run that one condition forward before
+                 * comparing the committed state against a full replay.
+                 */
+                const int32_t deferred_condition_token = tokens_to_replay.back();
+                if (!runner_->forward(&deferred_condition_token, 1))
+                    return std::nullopt;
+                const int32_t sampled = runner_->sampleGreedyOnDevice();
+                if (sampled < 0)
+                    return std::nullopt;
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "commit_replay_check_derived_next_tokens",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"path", path},
+                     {"deferred_condition_token",
+                      std::to_string(deferred_condition_token)},
+                     {"next_token", std::to_string(sampled)}});
+                return sampled;
+            };
+
+            std::optional<int32_t> prepared_next_token =
+                prepare_committed_ready_state();
+            if (!prepared_next_token)
+            {
+                return derived_next_token_from_deferred_condition
+                           ? std::string("MTP commit replay check deferred condition forward failed")
+                           : std::string("MTP commit replay check missing expected next token");
+            }
+            expected_next_token = *prepared_next_token;
+
             std::optional<std::vector<int32_t>> live_committed_continuation =
                 sample_continuation(expected_next_token);
             if (!live_committed_continuation)
@@ -2877,6 +2940,13 @@ namespace llaminar2
                        (debug_context.empty() ? std::string{} : " " + debug_context);
             }
 
+            std::optional<int32_t> committed_ready_token =
+                prepare_committed_ready_state();
+            if (!committed_ready_token ||
+                *committed_ready_token != expected_next_token)
+            {
+                return std::string("MTP commit replay check committed ready-token derivation mismatch");
+            }
             std::optional<std::vector<int32_t>> committed_continuation =
                 sample_continuation(expected_next_token);
             if (!committed_continuation)
@@ -2997,6 +3067,8 @@ namespace llaminar2
                  {"accepted_tokens", join_tokens(tokens_to_replay)},
                  {"next_token", std::to_string(expected_next_token)},
                  {"continuation_depth", std::to_string(continuation_check_depth)},
+                 {"derived_next_token",
+                  derived_next_token_from_deferred_condition ? "true" : "false"},
                  {"used_ready_logits", use_ready_logits ? "true" : "false"}});
             return std::nullopt;
         };
@@ -3006,8 +3078,6 @@ namespace llaminar2
             const bool sidecar_preserves_main_state =
                 runner_->supportsMTPSidecarPreservesMainState();
             bool restored_verifier_base = sidecar_preserves_main_state;
-            const bool captured_post_sidecar_checkpoint =
-                !sidecar_checkpoints.empty() && sidecar_checkpoints.front().valid;
             if (sidecar_preserves_main_state)
             {
                 PerfStatsCollector::addCounter(
@@ -3017,9 +3087,7 @@ namespace llaminar2
                     "decode",
                     {},
                     {{"draft_tokens", std::to_string(draft_tokens.size())},
-                     {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)},
-                     {"discarded_sidecar_checkpoint",
-                      captured_post_sidecar_checkpoint ? "true" : "false"}});
+                     {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)}});
             }
             else
             {
@@ -3038,9 +3106,7 @@ namespace llaminar2
                         "decode",
                         {},
                         {{"draft_tokens", std::to_string(draft_tokens.size())},
-                         {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)},
-                         {"discarded_sidecar_checkpoint",
-                          captured_post_sidecar_checkpoint ? "true" : "false"}});
+                         {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)}});
                 }
             }
             if (!restored_verifier_base)
@@ -4089,7 +4155,8 @@ namespace llaminar2
                  {"ready_token", std::to_string(ready_token)},
                  {"used_ready_logits", use_ready_logits ? "true" : "false"}});
 
-            if (!stopped_on_output && ready_token >= 0)
+            if (!stopped_on_output &&
+                (ready_token >= 0 || verify_commit_replay_check))
             {
                 std::ostringstream replay_context;
                 replay_context

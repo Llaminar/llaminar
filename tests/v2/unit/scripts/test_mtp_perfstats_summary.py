@@ -326,6 +326,8 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["deferred_corrections"], 3)
         self.assertEqual(summary["rejection_no_ready"], 4)
         self.assertEqual(summary["publish_ms"], 1.25)
+        self.assertEqual(summary["publish_count"], 3)
+        self.assertAlmostEqual(summary["publish_avg_ms"], 1.25 / 3.0)
         self.assertEqual(summary["sidecar_ms"], 2.5)
         self.assertEqual(summary["sidecar_depth0_decode_ms"], 3.5)
         self.assertEqual(summary["shifted_initial_ms"], 4.0)
@@ -363,7 +365,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
             capture_output=True,
         )
         values = result.stdout.strip().split("\t")
-        self.assertEqual(len(values), 38)
+        self.assertEqual(len(values), 40)
         self.assertTrue(all(value in ("0", "0.0") for value in values))
 
     def test_multiple_paths_emit_table_for_matrix_comparison(self) -> None:

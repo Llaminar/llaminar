@@ -711,6 +711,41 @@ Open gaps:
   59.44 vs 43.88 tok/s, ROCm fixed d1 33.48 and dynamic 32.57 vs 30.33 tok/s,
   and CPU fixed d2 5.78 vs 4.46 tok/s. ROCm fixed d2/d3 are documented
   acceptance-limited, not contract failures.
+- Phase 5 has started with a typed live-state mutation ledger. Runtime probes
+  and perf tags now distinguish accepted publication, rejected correction,
+  prefix restore, prefix truncate, and session reset; `clear_cache()` and
+  `clearInferenceState()` both advance the live-state epoch. The runner also
+  skips the post-condition verifier-base checkpoint export on the all-position
+  publication path when the sidecar is main-state preserving and debug replay
+  checks are off. The second focused slice moved that synthetic verifier-base
+  stamp into `makeLogicalMTPVerifierBaseSnapshot()`, making the checkpoint-free
+  path a tested MTP transaction primitive instead of an inline runner detail.
+  `V2_Unit_MTPStateTransaction` now proves the logical stamp carries
+  decode-equivalent main/shifted-KV token counts and no payload blocks.
+  `V2_Unit_MTPGraphConstruction` also proves accepted publication and rejected
+  correction update distinct live-state mutation reasons while preserving the
+  sidecar-owned first shifted-KV row contract. The benchmark summary pipeline
+  now reports `publish_count` and `publish_avg_ms` beside `publish_ms`, so the
+  Phase 5 closeout matrix can judge publication stability across d1/d2/d3
+  instead of comparing only total wall time. A bounded dense stochastic
+  publication-cost slice is green on CUDA/ROCm with 16 decode tokens and CPU
+  with 8 decode tokens:
+  `benchmark_results/mtp_vllm_style/20260610T-phase5-publication-cost-dense-stochastic-gpu/`
+  and `...-cpu8/`. Publish cost is stable across d1/d2/d3: CUDA
+  0.47-0.56 ms/publish, ROCm 0.29-0.32 ms/publish, and CPU
+  3.84-3.86 ms/publish. Checkpoint export still appears as debug/prefix
+  anchoring cost, but the steady slot-publication path is no longer scaling
+  with depth. The next slice added a forced-reject replay oracle for the no
+  ready-token case: under `LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK`, the
+  all-position publication path now derives the next token by forwarding the
+  rejected correction from the committed state, then compares that token and
+  continuation against a full replay from the verifier base. The
+  `AllPositionSpecPublicationForcedRejectReplayCheckDerivesNextToken` unit
+  proves the next one-token decode consumes the rejected correction exactly
+  once. The final cleanup slice removed the stale all-position
+  `discarded_sidecar_checkpoint` tag; that tag remains only on the sequential
+  verifier path where a post-sidecar checkpoint is still a real object.
+  Phase 5 is accepted on the focused gate.
 - TP/PP/ExpertParallel MTP is out of scope until SingleDevice is green.
 
 ## Implementation Phases
@@ -864,6 +899,19 @@ Exit gate:
 ### Phase 5: Publish From Spec Slots, Not Checkpoints
 
 Goal: make accepted-state publication cheap, atomic, and backend-neutral.
+
+Status:
+
+- Accepted. Focused slices added typed state-version diagnostics and moved
+  the all-position verifier-base checkpoint skip behind the tested
+  `makeLogicalMTPVerifierBaseSnapshot()` transaction helper. Guarded by
+  `V2_Unit_MTPStateTransaction`, `V2_Unit_MTPGraphConstruction`,
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, and the MTP perfstats/matrix script
+  unit regressions. The first publication-cost slice shows stable per-publish
+  cost across fixed d1/d2/d3 on CUDA, ROCm, and CPU; forced-reject replay is
+  covered by a no-ready-token oracle and the stale all-position checkpoint tag
+  was removed.
 
 Work:
 
@@ -1058,7 +1106,7 @@ diagnostic until it is proven faster than d1 on a matching benchmark. The
 generated `summary.tsv` includes
 `speedup_vs_baseline` for every MTP row plus perfstats-derived verifier health:
 `verifier_ms`, `condition_ms/count/skipped_ready`, `rejection_no_ready`,
-`correction_ms`,
+`correction_ms`, `publish_ms/count/avg_ms`,
 `sidecar_ms`, `sidecar_depth0_decode_ms`, `shifted_*_ms`, `sampling_ms`,
 `shifted_kv_ready_events/waits/syncs_deferred`, `checkpoint_ms`,
 `sidecar_graph_hits/misses`,

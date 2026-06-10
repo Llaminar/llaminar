@@ -22,6 +22,25 @@ namespace llaminar2
         return std::max(0, logical_tokens - 1);
     }
 
+    PrefixStateSnapshot makeLogicalMTPVerifierBaseSnapshot(int cached_tokens)
+    {
+        PrefixStateSnapshot snapshot;
+        if (cached_tokens < 0)
+        {
+            snapshot.valid = false;
+            snapshot.logical_checkpoint = true;
+            snapshot.provenance = PrefixStateProvenance::LogicalCheckpoint;
+            return snapshot;
+        }
+
+        snapshot.valid = true;
+        snapshot.logical_checkpoint = true;
+        snapshot.provenance = PrefixStateProvenance::LogicalCheckpoint;
+        snapshot.cached_tokens = cached_tokens;
+        snapshot.mtp_cached_tokens = {expectedShiftedMTPTokens(cached_tokens)};
+        return snapshot;
+    }
+
     MTPStateValidationResult validateCommittedMTPDecodeState(
         const MTPDecodeStateStamp &state,
         const MTPCommitValidationOptions &options)
