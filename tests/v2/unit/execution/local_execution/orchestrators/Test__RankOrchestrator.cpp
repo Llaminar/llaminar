@@ -226,6 +226,61 @@ public:
         return mtp_logits_.empty() ? logits_.data() : mtp_logits_.data();
     }
 
+    int sampleGreedyFromMTPLogitsOnDevice() override
+    {
+        ++sample_mtp_logits_calls_;
+        const float *values = mtpLogits();
+        if (!values || config_.vocab_size <= 0)
+            return -1;
+
+        int best = 0;
+        float best_value = values[0];
+        for (int i = 1; i < config_.vocab_size; ++i)
+        {
+            if (values[i] > best_value)
+            {
+                best = i;
+                best_value = values[i];
+            }
+        }
+        return best;
+    }
+
+    bool commitMTPShiftedRowsFromPartialForward(
+        const int32_t *tokens,
+        int token_count,
+        int already_appended_tokens,
+        int main_forward_token_count,
+        bool allow_speculative_discard = false,
+        int position_offset_override = -1) override
+    {
+        ++commit_mtp_shifted_rows_calls_;
+        last_commit_mtp_already_appended_ = already_appended_tokens;
+        last_commit_mtp_main_forward_token_count_ = main_forward_token_count;
+        last_commit_mtp_allow_speculative_discard_ = allow_speculative_discard;
+        last_commit_mtp_position_offset_override_ = position_offset_override;
+        last_commit_mtp_tokens_.clear();
+        if (tokens && token_count > 0)
+            last_commit_mtp_tokens_.assign(tokens, tokens + token_count);
+        return commit_mtp_shifted_rows_ok_;
+    }
+
+    bool commitMTPShiftedRowFromCurrentTerminalHidden(
+        int32_t token,
+        int already_appended_tokens,
+        bool allow_speculative_discard = false,
+        int position_offset_override = -1) override
+    {
+        const int32_t one_token = token;
+        return commitMTPShiftedRowsFromPartialForward(
+            &one_token,
+            1,
+            already_appended_tokens,
+            /*main_forward_token_count=*/0,
+            allow_speculative_discard,
+            position_offset_override);
+    }
+
     bool hasMTPLogitsLocal() const override
     {
         return mtp_logits_local_ != nullptr;
@@ -495,6 +550,7 @@ public:
     void set_forward_mtp_ok(bool ok) { forward_mtp_ok_ = ok; }
     void set_supports_chained_mtp_drafts(bool supported) { supports_chained_mtp_drafts_ = supported; }
     void set_forward_mtp_from_last_draft_ok(bool ok) { forward_mtp_from_last_draft_ok_ = ok; }
+    void set_commit_mtp_shifted_rows_ok(bool ok) { commit_mtp_shifted_rows_ok_ = ok; }
     void set_supports_mtp_spec_state_publication(bool supported) { supports_mtp_spec_state_publication_ = supported; }
     void set_publish_mtp_spec_state_ok(bool ok) { publish_mtp_spec_state_ok_ = ok; }
     void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
@@ -531,10 +587,17 @@ public:
     int harvested_prompt_token_count() const { return harvested_prompt_token_count_; }
     size_t forward_mtp_call_count() const { return forward_mtp_calls_.load(std::memory_order_relaxed); }
     size_t forward_mtp_from_last_draft_call_count() const { return forward_mtp_from_last_draft_calls_.load(std::memory_order_relaxed); }
+    size_t sample_mtp_logits_call_count() const { return sample_mtp_logits_calls_; }
+    size_t commit_mtp_shifted_rows_call_count() const { return commit_mtp_shifted_rows_calls_; }
     size_t publish_mtp_spec_state_call_count() const { return publish_mtp_spec_state_calls_.load(std::memory_order_relaxed); }
     int32_t last_mtp_condition_token() const { return last_mtp_condition_token_; }
     int32_t last_chained_mtp_condition_token() const { return last_chained_mtp_condition_token_; }
     int last_chained_mtp_position_id() const { return last_chained_mtp_position_id_; }
+    int last_commit_mtp_already_appended() const { return last_commit_mtp_already_appended_; }
+    int last_commit_mtp_main_forward_token_count() const { return last_commit_mtp_main_forward_token_count_; }
+    bool last_commit_mtp_allow_speculative_discard() const { return last_commit_mtp_allow_speculative_discard_; }
+    int last_commit_mtp_position_offset_override() const { return last_commit_mtp_position_offset_override_; }
+    const std::vector<int32_t> &last_commit_mtp_tokens() const { return last_commit_mtp_tokens_; }
     const MTPSpecStepPlan &last_mtp_spec_state_plan() const { return last_mtp_spec_state_plan_; }
     size_t set_all_position_logits_call_count() const { return set_all_position_logits_calls_.load(std::memory_order_relaxed); }
     size_t get_all_position_logits_local_info_call_count() const { return get_all_position_logits_local_info_calls_.load(std::memory_order_relaxed); }
@@ -550,6 +613,8 @@ public:
         clear_cache_calls_.store(0, std::memory_order_relaxed);
         forward_mtp_calls_.store(0, std::memory_order_relaxed);
         forward_mtp_from_last_draft_calls_.store(0, std::memory_order_relaxed);
+        sample_mtp_logits_calls_ = 0;
+        commit_mtp_shifted_rows_calls_ = 0;
         publish_mtp_spec_state_calls_.store(0, std::memory_order_relaxed);
         set_all_position_logits_calls_.store(0, std::memory_order_relaxed);
         get_all_position_logits_local_info_calls_.store(0, std::memory_order_relaxed);
@@ -578,6 +643,7 @@ private:
     bool forward_mtp_ok_ = true;
     bool supports_chained_mtp_drafts_ = false;
     bool forward_mtp_from_last_draft_ok_ = true;
+    bool commit_mtp_shifted_rows_ok_ = true;
     bool supports_mtp_spec_state_publication_ = false;
     bool publish_mtp_spec_state_ok_ = true;
     bool set_all_position_logits_ok_ = true;
@@ -591,7 +657,13 @@ private:
     int32_t last_mtp_condition_token_ = -1;
     int32_t last_chained_mtp_condition_token_ = -1;
     int last_chained_mtp_position_id_ = -1;
+    int last_commit_mtp_already_appended_ = 0;
+    int last_commit_mtp_main_forward_token_count_ = 0;
+    int last_commit_mtp_position_offset_override_ = -1;
+    bool last_commit_mtp_allow_speculative_discard_ = false;
     MTPSpecStepPlan last_mtp_spec_state_plan_;
+    size_t sample_mtp_logits_calls_ = 0;
+    size_t commit_mtp_shifted_rows_calls_ = 0;
     size_t prefix_lookup_calls_ = 0;
     size_t prefix_populate_calls_ = 0;
     size_t prefix_harvest_calls_ = 0;
@@ -601,6 +673,7 @@ private:
     std::vector<int> terminal_restored_tokens_;
     std::vector<int32_t> prefix_lookup_tokens_;
     std::vector<int32_t> harvested_prefix_tokens_;
+    std::vector<int32_t> last_commit_mtp_tokens_;
     mutable std::atomic<size_t> forward_calls_{0};
     mutable std::atomic<size_t> clear_cache_calls_{0};
     mutable std::atomic<size_t> forward_mtp_calls_{0};
@@ -1801,6 +1874,75 @@ TEST_F(Test__RankOrchestrator, PrefixLookupPipelineStageMissClampsWholePipeline)
     ASSERT_TRUE(orchestrator->populatePrefix(hit));
     EXPECT_EQ(stage0_ptr->populated_prefix_tokens(), std::vector<int>({2}));
     EXPECT_EQ(stage1_ptr->populated_prefix_tokens(), std::vector<int>({2}));
+}
+
+TEST_F(Test__RankOrchestrator, LocalPPSidecarMethodsDelegateOnlyToFinalStage)
+{
+    auto stage0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage0_ptr = stage0.get();
+    stage0_ptr->set_forward_mtp_ok(false);
+    stage0_ptr->set_mock_mtp_logits({10.0f, 0.0f, 0.0f});
+
+    auto stage1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage1_ptr = stage1.get();
+    stage1_ptr->set_vocab_size(3);
+    stage1_ptr->set_mock_mtp_logits({0.0f, 1.0f, 9.0f});
+    stage1_ptr->set_supports_chained_mtp_drafts(true);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    stages.push_back(std::move(stage0));
+    stages.push_back(std::move(stage1));
+
+    auto orchestrator = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(stages),
+        makeRankConfigForRunnerCount(2));
+
+    /*
+     * LocalPP MTP does not treat stages as TP participants.  The normal
+     * verifier still runs through forwardPP(), but sidecar-only operations are
+     * owned by the pipeline tail because that is where terminal hidden, final
+     * norm, LM head, and MTP logits live.
+     */
+    EXPECT_TRUE(orchestrator->mtpDecodeUnsupportedReason().empty());
+    EXPECT_TRUE(orchestrator->forwardMTP(42));
+    EXPECT_EQ(stage0_ptr->forward_mtp_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->forward_mtp_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->last_mtp_condition_token(), 42);
+
+    EXPECT_TRUE(orchestrator->supportsChainedMTPDrafts());
+    EXPECT_TRUE(orchestrator->forwardMTPFromLastDraft(77, 13));
+    EXPECT_EQ(stage0_ptr->forward_mtp_from_last_draft_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->forward_mtp_from_last_draft_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->last_chained_mtp_condition_token(), 77);
+    EXPECT_EQ(stage1_ptr->last_chained_mtp_position_id(), 13);
+
+    ASSERT_NE(orchestrator->mtpLogits(), nullptr);
+    EXPECT_FLOAT_EQ(orchestrator->mtpLogits()[2], 9.0f);
+    EXPECT_EQ(orchestrator->sampleGreedyFromMTPLogitsOnDevice(), 2);
+    EXPECT_EQ(stage0_ptr->sample_mtp_logits_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->sample_mtp_logits_call_count(), 1u);
+
+    const int32_t accepted_tokens[] = {5, 6};
+    EXPECT_TRUE(orchestrator->commitMTPShiftedRowsFromPartialForward(
+        accepted_tokens,
+        2,
+        1,
+        2,
+        /*allow_speculative_discard=*/true,
+        /*position_offset_override=*/99));
+    EXPECT_EQ(stage0_ptr->commit_mtp_shifted_rows_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->commit_mtp_shifted_rows_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->last_commit_mtp_already_appended(), 1);
+    EXPECT_EQ(stage1_ptr->last_commit_mtp_main_forward_token_count(), 2);
+    EXPECT_TRUE(stage1_ptr->last_commit_mtp_allow_speculative_discard());
+    EXPECT_EQ(stage1_ptr->last_commit_mtp_position_offset_override(), 99);
+    EXPECT_EQ(stage1_ptr->last_commit_mtp_tokens(),
+              std::vector<int32_t>({5, 6}));
+
+    EXPECT_FALSE(orchestrator->supportsMTPSpecStatePublication())
+        << "PP all-position publication must remain disabled until every "
+           "stage can publish its own accepted verifier row state.";
 }
 
 TEST_F(Test__RankOrchestrator, ForwardMTPRunsOnEveryLocalTPChild)

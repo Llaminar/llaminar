@@ -895,11 +895,10 @@ namespace llaminar2
                 return setError(
                     "MTP decode with --mtp-draft-tokens > 1 requires runner support for chained MTP sidecars");
             }
-            const std::string unsupported_reason = runner_->mtpDecodeUnsupportedReason();
-            if (unsupported_reason == "MTP decode is not enabled for PP topologies")
+            if (active_mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic &&
+                plan_.usesLocalPP())
             {
-                return setError(
-                    "MTP is not enabled for PP topologies; disable MTP or use a supported SingleDevice/TP topology");
+                return setError("MTP dynamic depth policy is not enabled for PP topologies");
             }
         }
         else

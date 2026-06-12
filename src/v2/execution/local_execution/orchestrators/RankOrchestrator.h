@@ -882,6 +882,22 @@ namespace llaminar2
         bool forwardPP(const int *tokens, int seq_len);
 
         /**
+         * @brief Return the PP stage that owns MTP sidecar execution.
+         *
+         * In pipeline-parallel decode the normal verifier/replay path still
+         * runs through every PP stage via forwardPP().  The Qwen3.6 MTP
+         * sidecar, however, consumes the terminal hidden row and produces
+         * sidecar logits, so it belongs to the final PP stage: the same stage
+         * that owns output norm and the LM head.  Keeping this helper explicit
+         * avoids accidentally treating PP stages like TP participants.
+         */
+        IInferenceRunner *finalPPSidecarRunner();
+
+        /**
+         * @brief Const overload of finalPPSidecarRunner().
+         */
+        const IInferenceRunner *finalPPSidecarRunner() const;
+
         /**
          * @brief Aggregate stats from all device runners
          */

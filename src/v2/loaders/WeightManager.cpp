@@ -6633,9 +6633,10 @@ namespace llaminar2
             if (loader_.hasTensor(sidecar_prefix + "nextn.eh_proj.weight"))
             {
                 // Qwen3.6 encodes MTP as a trailing blk.N sidecar. The main graph
-                // layer range intentionally excludes that block, but the MTP
-                // manifest may still request its attention/FFN tensors.
-                return true;
+                // layer range intentionally excludes that block. Pipeline stages
+                // treat the sidecar like final norm and LM head: only the stage
+                // that can produce terminal hidden/logits should load and bind it.
+                return has_lm_head;
             }
             // Layer range is [first, last) - first inclusive, last exclusive
             return layer_idx >= first_layer && layer_idx < last_layer;

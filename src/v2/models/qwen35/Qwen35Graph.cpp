@@ -552,7 +552,8 @@ namespace llaminar2
                 input.kv_cache,
                 input.position_ids,
                 device,
-                sidecar_stage_prefix);
+                sidecar_stage_prefix,
+                /*layer_idx_is_cache_local=*/true);
             if (kv_append.size() == 0)
                 return ComputeGraph{};
 
@@ -574,7 +575,8 @@ namespace llaminar2
             input.position_ids,
             device,
             input.sequence_lengths,
-            sidecar_stage_prefix);
+            sidecar_stage_prefix,
+            /*layer_idx_is_cache_local=*/true);
         if (attention.size() == 0)
             return ComputeGraph{};
 
@@ -967,7 +969,8 @@ namespace llaminar2
         IKVCache *kv_cache,
         const int *position_ids,
         DeviceId device,
-        const std::string &stage_prefix_override)
+        const std::string &stage_prefix_override,
+        bool layer_idx_is_cache_local)
     {
         ComputeGraph graph;
         if (!kv_cache)
@@ -1079,7 +1082,8 @@ namespace llaminar2
             batch_size,
             kv_cache,
             device,
-            rope_node);
+            rope_node,
+            layer_idx_is_cache_local);
         graph.setTerminalNode(kv_append);
         return graph;
     }
@@ -1094,7 +1098,8 @@ namespace llaminar2
         const int *position_ids,
         DeviceId device,
         const std::vector<int> *sequence_lengths,
-        const std::string &stage_prefix_override)
+        const std::string &stage_prefix_override,
+        bool layer_idx_is_cache_local)
     {
         ComputeGraph graph;
         std::string prefix = stage_prefix_override.empty()
@@ -1235,7 +1240,8 @@ namespace llaminar2
         std::string attn_node = addKVCacheAndAttention(
             graph, prefix, buffers, layer_idx,
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
-            kv_cache, position_ids, device, has_qkv_proj, rope_node);
+            kv_cache, position_ids, device, has_qkv_proj, rope_node,
+            layer_idx_is_cache_local);
 
         // =================================================================
         // Stage 4.5: Sigmoid output gate — attn_output *= sigmoid(fa_gate)

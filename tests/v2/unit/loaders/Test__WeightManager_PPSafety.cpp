@@ -183,31 +183,39 @@ TEST_F(Test__WeightManager_PPSafety, LMHeadStage_LoadsLayerWeightsInRange)
 }
 
 /**
- * @test Qwen3.6 trailing nextn sidecar weights remain loadable outside the main layer range.
+ * @test Qwen3.6 trailing nextn sidecar weights load only on the terminal PP stage.
  *
  * The main graph excludes the trailing nextn/MTP block from ordinary decoder
- * execution, but MTP sidecar initialization still needs that block's local
- * attention/FFN tensors.
+ * execution. MTP sidecar initialization still needs that block's local
+ * attention/FFN tensors, but only on the stage that owns terminal hidden,
+ * final norm, and LM head.
  */
-TEST_F(Test__WeightManager_PPSafety, LayerRange_AllowsTrailingNextNSidecarWeights)
+TEST_F(Test__WeightManager_PPSafety, LayerRange_AllowsTrailingNextNSidecarWeightsOnlyOnTerminalStage)
 {
     mock_loader_ = MockModelLoader::createMinimal();
     mock_loader_->addFP32RandomTensor("blk.64.nextn.eh_proj.weight", {8, 8});
     mock_loader_->addFP32RandomTensor("blk.64.attn_k.weight", {8, 8});
     mock_loader_->addFP32RandomTensor("blk.65.attn_k.weight", {8, 8});
 
-    PPSafetyTestableWeightManager wm(*mock_loader_);
-    wm.setLayerRange(0, 64, true, true);
+    PPSafetyTestableWeightManager non_terminal(*mock_loader_);
+    non_terminal.setLayerRange(0, 32, true, false);
+    EXPECT_EQ(non_terminal.getWeightForDevice("blk.64.nextn.eh_proj.weight", DeviceId::cpu(), 0), nullptr)
+        << "Non-terminal PP stages must not load the MTP sidecar projection";
+    EXPECT_EQ(non_terminal.getWeightForDevice("blk.64.attn_k.weight", DeviceId::cpu(), 0), nullptr)
+        << "Non-terminal PP stages must not load MTP sidecar attention weights";
 
-    auto sidecar_fc = wm.getWeightForDevice("blk.64.nextn.eh_proj.weight", DeviceId::cpu(), 0);
+    PPSafetyTestableWeightManager terminal(*mock_loader_);
+    terminal.setLayerRange(32, 64, false, true);
+
+    auto sidecar_fc = terminal.getWeightForDevice("blk.64.nextn.eh_proj.weight", DeviceId::cpu(), 0);
     EXPECT_NE(sidecar_fc, nullptr)
-        << "MTP nextn projection should be loadable outside the main graph range";
+        << "Terminal PP stage should load the MTP nextn projection outside the main graph range";
 
-    auto sidecar_attn = wm.getWeightForDevice("blk.64.attn_k.weight", DeviceId::cpu(), 0);
+    auto sidecar_attn = terminal.getWeightForDevice("blk.64.attn_k.weight", DeviceId::cpu(), 0);
     EXPECT_NE(sidecar_attn, nullptr)
-        << "MTP sidecar attention weights should be loadable outside the main graph range";
+        << "Terminal PP stage should load MTP sidecar attention weights outside the main graph range";
 
-    auto unrelated_out_of_range = wm.getWeightForDevice("blk.65.attn_k.weight", DeviceId::cpu(), 0);
+    auto unrelated_out_of_range = terminal.getWeightForDevice("blk.65.attn_k.weight", DeviceId::cpu(), 0);
     EXPECT_EQ(unrelated_out_of_range, nullptr)
         << "Non-sidecar out-of-range layers must remain filtered";
 }

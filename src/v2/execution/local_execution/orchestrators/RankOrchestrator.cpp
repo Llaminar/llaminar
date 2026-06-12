@@ -2015,9 +2015,17 @@ namespace llaminar2
 
             LOG_DEBUG("RankOrchestrator::forwardPP: Executing stage " << stage_idx);
 
-            // Call forward with nullptr tokens - the stage will use setHiddenState input
-            // and skip embedding since has_embedding=false for non-first stages
-            if (!curr_runner->forward(nullptr, seq_len))
+            /*
+             * Non-head PP stages consume transferred hidden activations rather
+             * than embedding token ids. The final stage still needs the raw
+             * token ids when MTP is enabled so its shifted prefill cache can be
+             * populated for the sidecar. Passing tokens here does not make the
+             * stage re-run embedding; has_embedding=false keeps the graph on
+             * the hidden-state input path.
+             */
+            const int *stage_tokens =
+                curr_runner.get() == finalPPSidecarRunner() ? tokens : nullptr;
+            if (!curr_runner->forward(stage_tokens, seq_len))
             {
                 LOG_ERROR("RankOrchestrator::forwardPP: Stage " << stage_idx << " forward failed");
                 return false;
@@ -2052,6 +2060,20 @@ namespace llaminar2
         LOG_DEBUG("RankOrchestrator::forwardPP: Complete, all " << num_stages << " stages executed"
                                                                 << ", position now " << current_position_);
         return true;
+    }
+
+    IInferenceRunner *RankOrchestrator::finalPPSidecarRunner()
+    {
+        if (pp_stage_runners_.empty())
+            return nullptr;
+        return pp_stage_runners_.back().get();
+    }
+
+    const IInferenceRunner *RankOrchestrator::finalPPSidecarRunner() const
+    {
+        if (pp_stage_runners_.empty())
+            return nullptr;
+        return pp_stage_runners_.back().get();
     }
 
     int RankOrchestrator::sampleGreedyOnDevice()
@@ -2110,6 +2132,23 @@ namespace llaminar2
             "decode",
             "rank",
             {{"participants", std::to_string(device_runners_.size())}});
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            /*
+             * PP verifier replay stays pipeline-wide through forwardPP(), but
+             * the MTP sidecar consumes the terminal hidden row and produces MTP
+             * logits on the final stage.  Running it on earlier stages would be
+             * nonsensical: they do not own final norm, LM head, or sidecar
+             * logits.  This is intentionally not TP fan-out.
+             */
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_forward_mtp_pp_final_stage_calls",
+                1.0,
+                "decode",
+                "rank");
+            return pp_sidecar->forwardMTP(draft_condition_token);
+        }
         if (device_runners_.empty())
         {
             return false;
@@ -2263,7 +2302,12 @@ namespace llaminar2
 
     bool RankOrchestrator::supportsChainedMTPDrafts() const
     {
-        if (!pp_stage_runners_.empty() || device_runners_.empty())
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->supportsChainedMTPDrafts();
+        }
+
+        if (device_runners_.empty())
         {
             return false;
         }
@@ -2286,10 +2330,16 @@ namespace llaminar2
             "decode",
             "rank",
             {{"participants", std::to_string(device_runners_.size())}});
-        if (!pp_stage_runners_.empty())
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
-            LOG_ERROR("[RankOrchestrator] Chained MTP drafts are not enabled for PP topologies yet");
-            return false;
+            if (!pp_sidecar->supportsChainedMTPDrafts())
+            {
+                LOG_ERROR("[RankOrchestrator] Final PP stage does not support chained MTP sidecar execution");
+                return false;
+            }
+            return pp_sidecar->forwardMTPFromLastDraft(
+                draft_condition_token,
+                position_id);
         }
         if (device_runners_.empty())
         {
@@ -2502,6 +2552,22 @@ namespace llaminar2
                       << " hidden_source_row_end=" << hidden_source_row_end);
             return false;
         }
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            /*
+             * PP replay has already produced the accepted hidden rows on the
+             * final stage.  Only that stage owns the shifted MTP KV cache, so
+             * commit the accepted sidecar rows there instead of iterating every
+             * pipeline participant.
+             */
+            return pp_sidecar->commitMTPShiftedRowsFromPartialForward(
+                tokens,
+                token_count,
+                already_appended_tokens,
+                main_forward_token_count,
+                allow_speculative_discard,
+                position_offset_override);
+        }
         if (device_runners_.empty())
             return false;
 
@@ -2672,6 +2738,14 @@ namespace llaminar2
         bool allow_speculative_discard,
         int position_offset_override)
     {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->commitMTPShiftedRowFromDeviceTargetSample(
+                target_sample_slot,
+                already_appended_tokens,
+                allow_speculative_discard,
+                position_offset_override);
+        }
         if (device_runners_.size() != 1 || !device_runners_[0])
         {
             LOG_ERROR("[RankOrchestrator] Device-target shifted MTP commit is not enabled for multi-participant TP domains yet");
@@ -2696,6 +2770,16 @@ namespace llaminar2
             "decode",
             "rank",
             {{"participants", std::to_string(device_runners_.size())}});
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            if (already_appended_tokens < 0)
+                return false;
+            return pp_sidecar->commitMTPShiftedRowFromCurrentTerminalHidden(
+                token,
+                already_appended_tokens,
+                allow_speculative_discard,
+                position_offset_override);
+        }
         if (already_appended_tokens < 0 || device_runners_.empty())
             return false;
 
@@ -2855,6 +2939,16 @@ namespace llaminar2
 
     bool RankOrchestrator::flushPendingMTPWork()
     {
+        if (!pp_stage_runners_.empty())
+        {
+            bool ok = true;
+            for (const auto &runner : pp_stage_runners_)
+            {
+                ok = runner && runner->flushPendingMTPWork() && ok;
+            }
+            return ok;
+        }
+
         bool ok = true;
         for (const auto &runner : device_runners_)
         {
@@ -2865,6 +2959,11 @@ namespace llaminar2
 
     const float *RankOrchestrator::mtpLogits() const
     {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->mtpLogits();
+        }
+
         if (device_runners_.empty())
         {
             return nullptr;
@@ -2949,6 +3048,11 @@ namespace llaminar2
 
     int RankOrchestrator::sampleGreedyFromMTPLogitsOnDevice()
     {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleGreedyFromMTPLogitsOnDevice();
+        }
+
         if (device_runners_.empty())
         {
             return -1;
@@ -3534,9 +3638,13 @@ namespace llaminar2
 
     std::string RankOrchestrator::mtpDecodeUnsupportedReason() const
     {
-        if (!pp_stage_runners_.empty())
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
-            return "MTP decode is not enabled for PP topologies";
+            const std::string child_reason =
+                pp_sidecar->mtpDecodeUnsupportedReason();
+            if (!child_reason.empty())
+                return child_reason;
+            return {};
         }
         if (device_runners_.size() > 1)
         {

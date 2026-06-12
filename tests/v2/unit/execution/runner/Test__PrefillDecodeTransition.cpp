@@ -2192,7 +2192,8 @@ namespace
                                                                              bool chained_mtp_support = false,
                                                                              bool sidecar_sample_fusion = false,
                                                                              MTPDepthPolicyConfig depth_policy = {},
-                                                                             MTPVerifyMode verify_mode = MTPVerifyMode::Greedy)
+                                                                             MTPVerifyMode verify_mode = MTPVerifyMode::Greedy,
+                                                                             bool local_pp_topology = false)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
@@ -2227,16 +2228,29 @@ namespace
             config.mtp.verify_mode = verify_mode;
             config.mtp.depth_policy = depth_policy;
 
+            RankExecutionPlan runner_plan = plan_;
+            if (local_pp_topology)
+            {
+                /*
+                 * Only the topology shape is needed for these runner-level
+                 * guard tests. Real PP execution is covered by RankOrchestrator
+                 * and parity integration tests.
+                 */
+                runner_plan.local_pp_devices = {GlobalDeviceAddress::cpu(),
+                                                GlobalDeviceAddress::cpu()};
+                runner_plan.local_pp_layer_boundaries = {0, 12, 24};
+            }
+
             std::unique_ptr<OrchestrationRunner> runner;
             if (mpi_ctx)
             {
                 runner = std::make_unique<OrchestrationRunner>(
-                    std::move(config), plan_, std::move(mock), std::move(mpi_ctx));
+                    std::move(config), runner_plan, std::move(mock), std::move(mpi_ctx));
             }
             else
             {
                 runner = std::make_unique<OrchestrationRunner>(
-                    std::move(config), plan_, std::move(mock));
+                    std::move(config), runner_plan, std::move(mock));
             }
 
             // Set greedy sampling (temperature=0)
@@ -5332,19 +5346,35 @@ namespace
         EXPECT_EQ(probe.mtp_transaction_rollbacks, 1u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPPPTopologyFailsBeforePrefillForward)
+    TEST_F(Test__PrefillDecodeTransition, MTPDynamicPPTopologyFailsBeforePrefillForward)
     {
+        MTPDepthPolicyConfig dynamic_depth;
+        dynamic_depth.mode = MTPDepthPolicyMode::Dynamic;
+        dynamic_depth.min_depth = 1;
+        dynamic_depth.max_depth = 3;
+        dynamic_depth.initial_depth = 3;
+
         auto [runner, mock] = createRunner(
             /*mtp_enabled=*/true,
             /*mtp_accept=*/true,
-            "MTP decode is not enabled for PP topologies");
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            /*primary_device=*/DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true,
+            /*sidecar_sample_fusion=*/false,
+            dynamic_depth,
+            MTPVerifyMode::Greedy,
+            /*local_pp_topology=*/true);
 
         std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
         EXPECT_FALSE(runner->prefill(prompt));
-        EXPECT_NE(runner->lastError().find("MTP is not enabled for PP topologies"),
+        EXPECT_NE(runner->lastError().find("MTP dynamic depth policy is not enabled for PP topologies"),
                   std::string::npos);
         EXPECT_EQ(mock->forwardCallCount(), 0)
-            << "Unsupported PP MTP must fail before shifted-prefill sidecar state is populated";
+            << "Dynamic PP MTP must fail before shifted-prefill sidecar state is populated";
         EXPECT_EQ(mock->forwardMTPCount(), 0);
 
         auto probe = runner->prefixStateProbe();

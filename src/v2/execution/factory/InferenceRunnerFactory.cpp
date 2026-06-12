@@ -966,6 +966,7 @@ namespace llaminar2
         DeviceId device,
         const TensorParallelConfig *tp_config = nullptr,
         const FactoryPPStageConfig *pp_config = nullptr,
+        bool include_terminal_mtp_embedding = false,
         int tp_rank_override = -1)
     {
         InferenceStrategy strategy;
@@ -1006,8 +1007,14 @@ namespace llaminar2
         const WeightSliceSpec vocab_slice = vocabSliceSpecForAssignment(tp_config, device, tp_rank_override);
         const int pp_stage = pp_config ? pp_config->first_layer : -1;
 
-        if (!pp_config || pp_config->has_embedding)
+        if (!pp_config || pp_config->has_embedding || include_terminal_mtp_embedding)
         {
+            /**
+             * Terminal PP stages normally do not own the main embedding stage,
+             * but the MTP sidecar still embeds shifted draft token ids. Binding
+             * token_embd.weight here gives the sidecar a graph-local embedding
+             * table without changing the main PP stage execution path.
+             */
             plan.add(makeSingleDeviceRequirement(
                 weight_mgr,
                 "token_embd.weight",
@@ -2529,6 +2536,7 @@ namespace llaminar2
             device,
             graph_config.tp_config.get(),
             nullptr,
+            false,
             graph_config.tp_config ? graph_config.local_rank : -1);
         if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[InferenceRunner]"))
             return false;
@@ -2684,6 +2692,31 @@ namespace llaminar2
             LOG_ERROR("[PPStageRunner] " << pp_validation.error_message());
             return false;
         }
+        /**
+         * MTP sidecar weights belong to the terminal PP stage only.
+         *
+         * RankOrchestrator passes a full-model ModelContext into every PP
+         * stage, so relying on WeightManager's global layer-range state is not
+         * enough here. Appending sidecar names to a non-terminal stage's local
+         * validation list would let that stage materialize and prepare the same
+         * trailing nextn block, then release its host upload clone before the
+         * real terminal sidecar owner can upload it. Keep the ownership rule
+         * explicit at the factory boundary where PP stage responsibilities are
+         * known.
+         */
+        if (pp_config.has_lm_head && !appendMTPWeightsIfRequested(
+                                         config,
+                                         *model_ctx,
+                                         arch,
+                                         pp_validation,
+                                         "[PPStageRunner]"))
+        {
+            return false;
+        }
+        else if (config.mtp.enabled && !pp_config.has_lm_head)
+        {
+            LOG_DEBUG("[PPStageRunner] MTP enabled, but this non-terminal PP stage does not own sidecar weights");
+        }
 
         // Load global weights this stage owns.
         // IMPORTANT: Pass the target device so first_device_ is set to the GPU
@@ -2746,7 +2779,8 @@ namespace llaminar2
             pp_validation,
             device,
             nullptr,
-            &pp_config);
+            &pp_config,
+            config.mtp.enabled && pp_config.has_lm_head);
         if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[PPStageRunner]"))
             return false;
         FrozenModelWeightSet frozen_weights = weight_mgr->materialize(weight_plan);
@@ -3463,6 +3497,20 @@ namespace llaminar2
                 return nullptr;
             }
 
+            if (pp_cfg.has_lm_head && !appendMTPWeightsIfRequested(
+                                          config,
+                                          *concrete_model_ctx,
+                                          architecture,
+                                          validation,
+                                          "[InferenceRunner] PP stage"))
+            {
+                return nullptr;
+            }
+            else if (config.mtp.enabled && !pp_cfg.has_lm_head)
+            {
+                LOG_DEBUG("[InferenceRunner] PP stage skips MTP sidecar weights because it is non-terminal");
+            }
+
             auto weight_plan = buildSingleDeviceWeightPlan(
                 *concrete_weight_mgr,
                 *concrete_model_ctx,
@@ -3470,6 +3518,7 @@ namespace llaminar2
                 device,
                 graph_config.tp_config.get(),
                 &pp_cfg,
+                config.mtp.enabled && pp_cfg.has_lm_head,
                 graph_config.tp_config ? graph_config.local_rank : -1);
             if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] PP stage"))
                 return nullptr;
@@ -3556,6 +3605,7 @@ namespace llaminar2
                         device,
                         graph_config.tp_config.get(),
                         nullptr,
+                        false,
                         graph_config.tp_config ? graph_config.local_rank : -1);
                     if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] LocalTP"))
                         return nullptr;

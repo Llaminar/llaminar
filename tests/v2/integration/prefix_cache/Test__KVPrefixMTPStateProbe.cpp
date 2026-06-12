@@ -2806,7 +2806,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPSegmentedCollectiveHardFai
     EXPECT_EQ(snapshot.mtp_rollbacks, 0u);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalPPMTPHardFailsBeforePrefill)
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalPPMTPDynamicHardFailsBeforePrefill)
 {
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -2828,7 +2828,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalPPMTPHardFailsBeforePrefill)
     dm.initialize(-1, false);
     if (dm.rocm_device_count() < 2)
     {
-        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 LocalPP MTP hard-fail smoke";
+        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 LocalPP dynamic MTP hard-fail smoke";
     }
 
     OrchestrationConfig config = OrchestrationConfig::defaults();
@@ -2840,7 +2840,11 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalPPMTPHardFailsBeforePrefill)
     config.pp_split = PPSplitMode::MANUAL;
     config.kv_cache_precision = "auto";
     config.mtp.enabled = true;
-    config.mtp.draft_tokens = 1;
+    config.mtp.draft_tokens = 3;
+    config.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    config.mtp.depth_policy.min_depth = 1;
+    config.mtp.depth_policy.max_depth = 3;
+    config.mtp.depth_policy.initial_depth = 3;
 
     config.domain_definitions.clear();
     config.pp_stage_definitions = {
@@ -2883,9 +2887,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalPPMTPHardFailsBeforePrefill)
 
     ASSERT_FALSE(result.error.empty());
     EXPECT_TRUE(result.tokens.empty());
-    EXPECT_NE(result.error.find("MTP is not enabled for PP topologies"), std::string::npos)
-        << result.error;
-    EXPECT_NE(result.error.find("disable MTP or use a supported SingleDevice/TP topology"), std::string::npos)
+    EXPECT_NE(result.error.find("MTP dynamic depth policy is not enabled for PP topologies"), std::string::npos)
         << result.error;
     EXPECT_EQ(snapshot.mtp_draft_steps, 0u);
     EXPECT_EQ(snapshot.mtp_verifier_runs, 0u);

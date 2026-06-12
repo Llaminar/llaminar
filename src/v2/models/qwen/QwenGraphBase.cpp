@@ -2588,10 +2588,13 @@ namespace llaminar2
         int batch_size,
         IKVCache *kv_cache,
         DeviceId device,
-        const std::string &rope_dependency)
+        const std::string &rope_dependency,
+        bool layer_idx_is_cache_local)
     {
         int total_tokens = batch_size * seq_len;
-        int kv_local_layer = layer_idx - config_.pp_layer_offset;
+        int kv_local_layer = layer_idx_is_cache_local
+                                 ? layer_idx
+                                 : layer_idx - config_.pp_layer_offset;
 
         if (kv_cache)
         {
@@ -2639,10 +2642,13 @@ namespace llaminar2
         const int *position_ids,
         DeviceId device,
         bool has_qkv_proj,
-        const std::string &rope_dependency)
+        const std::string &rope_dependency,
+        bool layer_idx_is_cache_local)
     {
         int total_tokens = batch_size * seq_len;
-        int kv_local_layer = layer_idx - config_.pp_layer_offset;
+        int kv_local_layer = layer_idx_is_cache_local
+                                 ? layer_idx
+                                 : layer_idx - config_.pp_layer_offset;
 
         const std::string kv_append_dependency =
             addKVCacheAppend(
@@ -2654,7 +2660,8 @@ namespace llaminar2
                 batch_size,
                 kv_cache,
                 device,
-                rope_dependency);
+                rope_dependency,
+                layer_idx_is_cache_local);
 
         // --- Determine K/V source for attention ---
         ITensor *K_for_attn = buffers.K;

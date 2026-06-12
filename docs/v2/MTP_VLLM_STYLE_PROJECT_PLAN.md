@@ -1849,9 +1849,18 @@ Status:
   `^V2_Integration_Parity_Qwen36MoE_ExpertOverlay_`.
 - The tuning dashboard now tracks SingleDevice, LocalTP, LocalPP, NodeLocalTP,
   and ExpertOverlay separately for implementation, parity, and benchmark state.
-  LocalPP is intentionally recorded as prefix-only plus MTP hard-fail until the
-  sidecar can be split across PP stage runners instead of using the TP fan-out
-  path.
+  LocalPP fixed-depth dense MTP is now implemented through a final-stage
+  sidecar delegation path: the terminal PP stage receives shifted-prefill
+  tokens, owns the MTP sidecar weights plus embedding table, and builds MTP KV
+  append/attention with cache-local sidecar layer ids instead of subtracting
+  the main PP offset. Non-terminal PP stages reject sidecar weights. Dynamic
+  depth, stochastic, and all-position publication remain hard-gated until they
+  have explicit PP scalar/outcome coordination. Focused gates:
+  `V2_Unit_WeightManagerPPSafety`, `V2_Unit_RankOrchestrator`,
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalPPDynamicHardFail`, and full
+  `^V2_Integration_Parity_Qwen36_LocalPP_`, which is green for prefix restore,
+  fixed d1/d3 MTP, and prefix+MTP restore.
 
 Exit gate:
 

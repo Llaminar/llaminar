@@ -418,7 +418,16 @@ namespace llaminar2
             DeviceId device);
 
         /**
-         * Add KV cache append stage.
+         * @brief Add a KV cache append stage.
+         *
+         * Normal transformer graphs pass a global model layer id and the helper
+         * translates it to the PP-stage-local KV cache layer. Sidecar graphs,
+         * such as MTP, own a separate cache whose layer ids are already local.
+         *
+         * @param layer_idx Global model layer id by default, or cache-local id
+         *                  when @p layer_idx_is_cache_local is true.
+         * @param layer_idx_is_cache_local Treat @p layer_idx as an already-local
+         *                                 KV cache layer id.
          * @return KV append node name, or rope_dependency when no KV cache is present.
          */
         std::string addKVCacheAppend(
@@ -430,10 +439,16 @@ namespace llaminar2
             int batch_size,
             IKVCache *kv_cache,
             DeviceId device,
-            const std::string &rope_dependency);
+            const std::string &rope_dependency,
+            bool layer_idx_is_cache_local = false);
 
         /**
-         * Add KV cache append, attention compute, and optional gather stages.
+         * @brief Add KV cache append, attention compute, and optional gather stages.
+         *
+         * @param layer_idx Global model layer id by default, or cache-local id
+         *                  when @p layer_idx_is_cache_local is true.
+         * @param layer_idx_is_cache_local Treat @p layer_idx as an already-local
+         *                                 KV cache layer id.
          * @return Terminal attention node name
          */
         std::string addKVCacheAndAttention(
@@ -449,7 +464,8 @@ namespace llaminar2
             const int *position_ids,
             DeviceId device,
             bool has_qkv_proj,
-            const std::string &rope_dependency);
+            const std::string &rope_dependency,
+            bool layer_idx_is_cache_local = false);
 
         /**
          * Add Wo GEMM projection + optional TP allreduce.
