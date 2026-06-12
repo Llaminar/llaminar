@@ -1855,13 +1855,17 @@ Status:
   append/attention with cache-local sidecar layer ids instead of subtracting
   the main PP offset. Non-terminal PP stages reject sidecar weights. Dynamic
   depth is enabled through the same central `OrchestrationRunner` controller as
-  SingleDevice/LocalTP, so PP stages do not adapt independently. Stochastic and
-  all-position publication remain hard-gated until they have explicit PP
-  outcome coordination. Focused gates:
+  SingleDevice/LocalTP, so PP stages do not adapt independently. LocalPP
+  all-position publication is now implemented as an all-stage contract:
+  non-final stages publish verifier main KV/GDN state only, while the final
+  stage owns logits, stochastic device outcome verification, terminal-hidden
+  row selection, and shifted sidecar KV publication. Device-token handoff
+  remains gated for PP because verifier token input starts at stage 0 while
+  final-stage sampler slots live on the pipeline tail. Focused gates:
   `V2_Unit_WeightManagerPPSafety`, `V2_Unit_RankOrchestrator`,
   `V2_Unit_PrefillDecodeTransition`, and full
   `^V2_Integration_Parity_Qwen36_LocalPP_`, which is green for prefix restore,
-  fixed d1/d3 MTP, dynamic MTP, and prefix+MTP restore.
+  fixed d1/d3 MTP, dynamic MTP, stochastic MTP, and prefix+MTP restore.
 
 Exit gate:
 

@@ -414,6 +414,7 @@ namespace llaminar2
          * @return true if forward pass succeeded on all devices
          */
         bool forward(const int *tokens, int seq_len) override;
+        DeviceId primaryDeviceId() const override;
 
         /**
          * @brief Get combined logits from last forward pass
@@ -424,6 +425,7 @@ namespace llaminar2
          */
         const float *logits() const override;
         bool forwardMTP(int32_t draft_condition_token) override;
+        bool forwardMTPForDeviceSampling(int32_t draft_condition_token) override;
         /**
          * @brief True when every LocalTP participant can consume a previous
          *        MTP sidecar hidden row as the next draft input.
@@ -442,6 +444,15 @@ namespace llaminar2
          * participant-symmetric graph sequence.
          */
         bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
+        bool forwardMTPFromLastDraftForDeviceSampling(
+            int32_t draft_condition_token,
+            int position_id) override;
+        bool forwardMTPFromDeviceDraftForDeviceSampling(
+            int draft_sample_slot,
+            int position_id) override;
+        bool forwardMTPFromDeviceTargetForDeviceSampling(
+            int target_sample_slot,
+            int position_id) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -494,12 +505,134 @@ namespace llaminar2
             std::string *error = nullptr) override;
         const float *getAllPositionLogits() const override;
         std::string mtpDecodeUnsupportedReason() const override;
+        bool supportsMTPSidecarLogitsStreamHandoff() const override;
+        bool supportsMTPDeviceDraftTokenInput() const override;
+        bool supportsMTPSidecarPreservesMainState() const override;
+        bool applyPenaltiesOnDevice(
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size) override;
+        bool applyPenaltiesToMTPLogitsOnDevice(
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size) override;
+        bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
+            int row,
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size) override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
         int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
         bool sampleGreedyFromAllPositionLogitsOnDeviceRows(
             int start_row,
             int row_count,
             int32_t *out_tokens) override;
+        bool verifyGreedyAllPositionBatchOutcomeOnDevice(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeVerifyBatchOutcome *out) override;
+        bool supportsDeviceStochasticMTPVerification() const override;
+        bool buildStochasticDistributionOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            DeviceDistributionBuffer buffer,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size) override;
+        bool buildStochasticDistributionsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        bool buildStochasticProcessedLogitRowsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        int sampleStochasticDraftProposalOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold) override;
+        bool sampleStochasticDraftProposalOnDeviceDeferred(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold) override;
+        int sampleStochasticDistributionOnDevice(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override;
+        bool sampleStochasticDistributionOnDeviceDeferred(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override;
+        const void *prepareMTPVerifierInputTokensOnDevice(
+            int32_t first_token,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override;
+        const void *prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+            int first_target_sample_slot,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override;
+        bool verifyStochasticDistributionsOnDevice(
+            int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            float residual_threshold,
+            DeviceSpeculativeVerifyResult *out) override;
+        bool verifyStochasticDistributionsBatchOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            DeviceSpeculativeVerifyResult *out) override;
+        bool verifyStochasticDistributionsBatchOutcomeOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
+        bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
 
         /**
          * @brief GPU-side greedy sampling for decode

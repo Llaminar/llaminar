@@ -309,6 +309,33 @@ public:
         return set_all_position_logits_ok_;
     }
 
+    bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override
+    {
+        set_row_indexed_all_position_logits_calls_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        compute_row_indexed_all_position_logits_ = enabled;
+        row_indexed_all_position_logit_rows_ = enabled ? row_count : 0;
+        return set_row_indexed_all_position_logits_ok_;
+    }
+
+    bool setMTPSpecVerifierInputPlan(
+        const MTPSpecDecodeVerifierInputPlan &plan) override
+    {
+        set_mtp_spec_verifier_input_plan_calls_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        last_mtp_spec_verifier_input_plan_ = plan;
+        return set_mtp_spec_verifier_input_plan_ok_;
+    }
+
+    void clearMTPSpecVerifierInputPlan() override
+    {
+        clear_mtp_spec_verifier_input_plan_calls_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+    }
+
     const float *getAllPositionLogits() const override
     {
         return all_position_logits_.empty() ? logits_.data() : all_position_logits_.data();
@@ -358,9 +385,241 @@ public:
         return mtp_unsupported_reason_;
     }
 
+    DeviceId primaryDeviceId() const override
+    {
+        return device_id_;
+    }
+
     int vocab_size() const override
     {
         return config_.vocab_size;
+    }
+
+    bool supportsMTPSidecarLogitsStreamHandoff() const override
+    {
+        return supports_mtp_sidecar_logits_stream_handoff_;
+    }
+
+    bool supportsMTPDeviceDraftTokenInput() const override
+    {
+        return supports_mtp_device_draft_token_input_;
+    }
+
+    bool supportsMTPSidecarPreservesMainState() const override
+    {
+        return supports_mtp_sidecar_preserves_main_state_;
+    }
+
+    bool applyPenaltiesOnDevice(
+        const std::vector<LogitPenalty> &penalties,
+        int vocab_size) override
+    {
+        ++apply_penalties_on_device_calls_;
+        last_penalty_count_ = penalties.size();
+        last_penalty_vocab_size_ = vocab_size;
+        return apply_penalties_on_device_ok_;
+    }
+
+    bool applyPenaltiesToMTPLogitsOnDevice(
+        const std::vector<LogitPenalty> &penalties,
+        int vocab_size) override
+    {
+        ++apply_penalties_to_mtp_logits_calls_;
+        last_penalty_count_ = penalties.size();
+        last_penalty_vocab_size_ = vocab_size;
+        return apply_penalties_to_mtp_logits_ok_;
+    }
+
+    bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
+        int row,
+        const std::vector<LogitPenalty> &penalties,
+        int vocab_size) override
+    {
+        ++apply_penalties_to_all_position_row_calls_;
+        last_all_position_penalty_row_ = row;
+        last_penalty_count_ = penalties.size();
+        last_penalty_vocab_size_ = vocab_size;
+        return apply_penalties_to_all_position_row_ok_;
+    }
+
+    bool verifyGreedyAllPositionBatchOutcomeOnDevice(
+        const int32_t *draft_tokens,
+        int draft_token_count,
+        const int32_t *stop_tokens,
+        int stop_token_count,
+        DeviceSpeculativeVerifyBatchOutcome *out) override
+    {
+        (void)draft_tokens;
+        (void)stop_tokens;
+        ++verify_greedy_all_position_batch_outcome_calls_;
+        last_stochastic_row_count_ = draft_token_count;
+        last_stop_token_count_ = stop_token_count;
+        if (out)
+        {
+            *out = DeviceSpeculativeVerifyBatchOutcome{};
+            out->accepted_speculative_prefix = draft_token_count;
+            out->consumed_verifier_rows = draft_token_count;
+        }
+        return verify_greedy_all_position_batch_outcome_ok_;
+    }
+
+    bool supportsDeviceStochasticMTPVerification() const override
+    {
+        return supports_device_stochastic_mtp_verification_;
+    }
+
+    bool buildStochasticDistributionOnDevice(
+        DeviceLogitsSource source,
+        int row,
+        DeviceDistributionBuffer buffer,
+        int slot,
+        const SamplingParams &params,
+        int vocab_size) override
+    {
+        (void)source;
+        (void)buffer;
+        (void)params;
+        ++build_stochastic_distribution_calls_;
+        last_stochastic_row_ = row;
+        last_stochastic_slot_ = slot;
+        last_stochastic_vocab_size_ = vocab_size;
+        return stochastic_device_ops_ok_;
+    }
+
+    bool buildStochasticDistributionsOnDevice(
+        DeviceLogitsSource source,
+        int first_row,
+        DeviceDistributionBuffer buffer,
+        int first_slot,
+        int row_count,
+        const SamplingParams &params,
+        int vocab_size) override
+    {
+        (void)source;
+        (void)buffer;
+        (void)params;
+        ++build_stochastic_distributions_calls_;
+        last_stochastic_row_ = first_row;
+        last_stochastic_slot_ = first_slot;
+        last_stochastic_row_count_ = row_count;
+        last_stochastic_vocab_size_ = vocab_size;
+        return stochastic_device_ops_ok_;
+    }
+
+    bool buildStochasticProcessedLogitRowsOnDevice(
+        DeviceLogitsSource source,
+        int first_row,
+        DeviceDistributionBuffer buffer,
+        int first_slot,
+        int row_count,
+        const SamplingParams &params,
+        int vocab_size) override
+    {
+        (void)source;
+        (void)buffer;
+        (void)params;
+        ++build_stochastic_processed_rows_calls_;
+        last_stochastic_row_ = first_row;
+        last_stochastic_slot_ = first_slot;
+        last_stochastic_row_count_ = row_count;
+        last_stochastic_vocab_size_ = vocab_size;
+        return stochastic_device_ops_ok_;
+    }
+
+    int sampleStochasticDraftProposalOnDevice(
+        DeviceLogitsSource source,
+        int row,
+        int slot,
+        const SamplingParams &params,
+        int vocab_size,
+        float threshold) override
+    {
+        (void)source;
+        (void)params;
+        ++sample_stochastic_draft_proposal_calls_;
+        last_stochastic_row_ = row;
+        last_stochastic_slot_ = slot;
+        last_stochastic_vocab_size_ = vocab_size;
+        last_stochastic_threshold_ = threshold;
+        return stochastic_sample_token_;
+    }
+
+    bool sampleStochasticDraftProposalOnDeviceDeferred(
+        DeviceLogitsSource source,
+        int row,
+        int slot,
+        const SamplingParams &params,
+        int vocab_size,
+        float threshold) override
+    {
+        return sampleStochasticDraftProposalOnDevice(
+                   source,
+                   row,
+                   slot,
+                   params,
+                   vocab_size,
+                   threshold) >= 0;
+    }
+
+    int sampleStochasticDistributionOnDevice(
+        DeviceDistributionBuffer buffer,
+        int slot,
+        float threshold) override
+    {
+        (void)buffer;
+        ++sample_stochastic_distribution_calls_;
+        last_stochastic_slot_ = slot;
+        last_stochastic_threshold_ = threshold;
+        return stochastic_sample_token_;
+    }
+
+    bool sampleStochasticDistributionOnDeviceDeferred(
+        DeviceDistributionBuffer buffer,
+        int slot,
+        float threshold) override
+    {
+        return sampleStochasticDistributionOnDevice(buffer, slot, threshold) >= 0;
+    }
+
+    bool verifyStochasticDistributionsBatchOutcomeOnDevice(
+        int first_target_slot,
+        int first_draft_slot,
+        const int32_t *draft_tokens,
+        const float *accept_thresholds,
+        const float *residual_thresholds,
+        int row_count,
+        int32_t first_token,
+        const int32_t *stop_tokens,
+        int stop_token_count,
+        int bonus_target_slot,
+        float bonus_threshold,
+        DeviceSpeculativeVerifyBatchOutcome *out,
+        uint64_t inverse_sample_seed = 0,
+        int inverse_sample_first_logical_position = 0,
+        bool use_vllm_probability_rejection = false) override
+    {
+        (void)first_target_slot;
+        (void)first_draft_slot;
+        (void)draft_tokens;
+        (void)accept_thresholds;
+        (void)residual_thresholds;
+        (void)first_token;
+        (void)stop_tokens;
+        (void)bonus_target_slot;
+        (void)bonus_threshold;
+        (void)inverse_sample_seed;
+        (void)inverse_sample_first_logical_position;
+        ++verify_stochastic_batch_outcome_calls_;
+        last_stochastic_row_count_ = row_count;
+        last_stop_token_count_ = stop_token_count;
+        last_use_vllm_probability_rejection_ = use_vllm_probability_rejection;
+        if (out)
+        {
+            *out = DeviceSpeculativeVerifyBatchOutcome{};
+            out->accepted_speculative_prefix = row_count;
+            out->consumed_verifier_rows = row_count;
+        }
+        return stochastic_device_ops_ok_;
     }
 
     void clear_cache() override
@@ -555,6 +814,10 @@ public:
     void set_publish_mtp_spec_state_ok(bool ok) { publish_mtp_spec_state_ok_ = ok; }
     void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
     void set_mtp_unsupported_reason(std::string reason) { mtp_unsupported_reason_ = std::move(reason); }
+    void set_primary_device_id(DeviceId device_id) { device_id_ = device_id; }
+    void set_supports_mtp_sidecar_preserves_main_state(bool supported) { supports_mtp_sidecar_preserves_main_state_ = supported; }
+    void set_supports_device_stochastic_mtp_verification(bool supported) { supports_device_stochastic_mtp_verification_ = supported; }
+    void set_stochastic_sample_token(int token) { stochastic_sample_token_ = token; }
     void set_prefix_live_capture_ok(bool ok) { prefix_live_capture_ok_ = ok; }
     void set_prefix_live_restore_ok(bool ok) { prefix_live_restore_ok_ = ok; }
     void set_prefix_live_truncate_ok(bool ok) { prefix_live_truncate_ok_ = ok; }
@@ -600,9 +863,22 @@ public:
     const std::vector<int32_t> &last_commit_mtp_tokens() const { return last_commit_mtp_tokens_; }
     const MTPSpecStepPlan &last_mtp_spec_state_plan() const { return last_mtp_spec_state_plan_; }
     size_t set_all_position_logits_call_count() const { return set_all_position_logits_calls_.load(std::memory_order_relaxed); }
+    size_t set_row_indexed_all_position_logits_call_count() const { return set_row_indexed_all_position_logits_calls_.load(std::memory_order_relaxed); }
+    size_t set_mtp_spec_verifier_input_plan_call_count() const { return set_mtp_spec_verifier_input_plan_calls_.load(std::memory_order_relaxed); }
+    size_t clear_mtp_spec_verifier_input_plan_call_count() const { return clear_mtp_spec_verifier_input_plan_calls_.load(std::memory_order_relaxed); }
     size_t get_all_position_logits_local_info_call_count() const { return get_all_position_logits_local_info_calls_.load(std::memory_order_relaxed); }
     size_t consume_all_position_logits_local_info_call_count() const { return consume_all_position_logits_local_info_calls_.load(std::memory_order_relaxed); }
     bool compute_all_position_logits() const { return compute_all_position_logits_; }
+    bool compute_row_indexed_all_position_logits() const { return compute_row_indexed_all_position_logits_; }
+    int row_indexed_all_position_logit_rows() const { return row_indexed_all_position_logit_rows_; }
+    size_t apply_penalties_to_all_position_row_call_count() const { return apply_penalties_to_all_position_row_calls_; }
+    size_t build_stochastic_processed_rows_call_count() const { return build_stochastic_processed_rows_calls_; }
+    size_t sample_stochastic_draft_proposal_call_count() const { return sample_stochastic_draft_proposal_calls_; }
+    size_t sample_stochastic_distribution_call_count() const { return sample_stochastic_distribution_calls_; }
+    size_t verify_stochastic_batch_outcome_call_count() const { return verify_stochastic_batch_outcome_calls_; }
+    size_t verify_greedy_all_position_batch_outcome_call_count() const { return verify_greedy_all_position_batch_outcome_calls_; }
+    int last_stochastic_row_count() const { return last_stochastic_row_count_; }
+    bool last_use_vllm_probability_rejection() const { return last_use_vllm_probability_rejection_; }
     size_t prefix_live_capture_call_count() const { return prefix_live_capture_calls_.load(std::memory_order_relaxed); }
     size_t prefix_live_restore_call_count() const { return prefix_live_restore_calls_.load(std::memory_order_relaxed); }
     size_t prefix_live_truncate_call_count() const { return prefix_live_truncate_calls_.load(std::memory_order_relaxed); }
@@ -617,6 +893,9 @@ public:
         commit_mtp_shifted_rows_calls_ = 0;
         publish_mtp_spec_state_calls_.store(0, std::memory_order_relaxed);
         set_all_position_logits_calls_.store(0, std::memory_order_relaxed);
+        set_row_indexed_all_position_logits_calls_.store(0, std::memory_order_relaxed);
+        set_mtp_spec_verifier_input_plan_calls_.store(0, std::memory_order_relaxed);
+        clear_mtp_spec_verifier_input_plan_calls_.store(0, std::memory_order_relaxed);
         get_all_position_logits_local_info_calls_.store(0, std::memory_order_relaxed);
         consume_all_position_logits_local_info_calls_.store(0, std::memory_order_relaxed);
         prefix_live_capture_calls_.store(0, std::memory_order_relaxed);
@@ -636,6 +915,7 @@ private:
     std::shared_ptr<MTPPublicationRendezvous> mtp_publication_rendezvous_;
     std::shared_ptr<ChainedMTPRendezvous> chained_mtp_rendezvous_;
     PrefixLookupResult prefix_lookup_result_;
+    DeviceId device_id_ = DeviceId::cpu();
     bool prefix_populate_ok_ = true;
     bool prefix_harvest_ok_ = true;
     bool prefix_terminal_restore_ok_ = true;
@@ -647,9 +927,23 @@ private:
     bool supports_mtp_spec_state_publication_ = false;
     bool publish_mtp_spec_state_ok_ = true;
     bool set_all_position_logits_ok_ = true;
+    bool set_row_indexed_all_position_logits_ok_ = true;
+    bool set_mtp_spec_verifier_input_plan_ok_ = true;
     bool compute_all_position_logits_ = false;
+    bool compute_row_indexed_all_position_logits_ = false;
+    int row_indexed_all_position_logit_rows_ = 0;
     std::string mtp_unsupported_reason_;
     std::unique_ptr<MoERebalanceController> moe_rebalance_controller_;
+    bool supports_mtp_sidecar_logits_stream_handoff_ = false;
+    bool supports_mtp_device_draft_token_input_ = false;
+    bool supports_mtp_sidecar_preserves_main_state_ = false;
+    bool supports_device_stochastic_mtp_verification_ = false;
+    bool apply_penalties_on_device_ok_ = true;
+    bool apply_penalties_to_mtp_logits_ok_ = true;
+    bool apply_penalties_to_all_position_row_ok_ = true;
+    bool verify_greedy_all_position_batch_outcome_ok_ = true;
+    bool stochastic_device_ops_ok_ = true;
+    int stochastic_sample_token_ = 17;
     bool prefix_live_capture_ok_ = true;
     bool prefix_live_restore_ok_ = true;
     bool prefix_live_truncate_ok_ = true;
@@ -662,8 +956,29 @@ private:
     int last_commit_mtp_position_offset_override_ = -1;
     bool last_commit_mtp_allow_speculative_discard_ = false;
     MTPSpecStepPlan last_mtp_spec_state_plan_;
+    MTPSpecDecodeVerifierInputPlan last_mtp_spec_verifier_input_plan_;
     size_t sample_mtp_logits_calls_ = 0;
     size_t commit_mtp_shifted_rows_calls_ = 0;
+    size_t apply_penalties_on_device_calls_ = 0;
+    size_t apply_penalties_to_mtp_logits_calls_ = 0;
+    size_t apply_penalties_to_all_position_row_calls_ = 0;
+    size_t build_stochastic_distribution_calls_ = 0;
+    size_t build_stochastic_distributions_calls_ = 0;
+    size_t build_stochastic_processed_rows_calls_ = 0;
+    size_t sample_stochastic_draft_proposal_calls_ = 0;
+    size_t sample_stochastic_distribution_calls_ = 0;
+    size_t verify_stochastic_batch_outcome_calls_ = 0;
+    size_t verify_greedy_all_position_batch_outcome_calls_ = 0;
+    size_t last_penalty_count_ = 0;
+    int last_penalty_vocab_size_ = 0;
+    int last_all_position_penalty_row_ = -1;
+    int last_stochastic_row_ = -1;
+    int last_stochastic_slot_ = -1;
+    int last_stochastic_row_count_ = 0;
+    int last_stochastic_vocab_size_ = 0;
+    int last_stop_token_count_ = 0;
+    float last_stochastic_threshold_ = 0.0f;
+    bool last_use_vllm_probability_rejection_ = false;
     size_t prefix_lookup_calls_ = 0;
     size_t prefix_populate_calls_ = 0;
     size_t prefix_harvest_calls_ = 0;
@@ -680,6 +995,9 @@ private:
     mutable std::atomic<size_t> forward_mtp_from_last_draft_calls_{0};
     mutable std::atomic<size_t> publish_mtp_spec_state_calls_{0};
     mutable std::atomic<size_t> set_all_position_logits_calls_{0};
+    mutable std::atomic<size_t> set_row_indexed_all_position_logits_calls_{0};
+    mutable std::atomic<size_t> set_mtp_spec_verifier_input_plan_calls_{0};
+    mutable std::atomic<size_t> clear_mtp_spec_verifier_input_plan_calls_{0};
     mutable std::atomic<size_t> get_all_position_logits_local_info_calls_{0};
     mutable std::atomic<size_t> consume_all_position_logits_local_info_calls_{0};
     mutable std::atomic<size_t> prefix_live_capture_calls_{0};
@@ -1943,6 +2261,153 @@ TEST_F(Test__RankOrchestrator, LocalPPSidecarMethodsDelegateOnlyToFinalStage)
     EXPECT_FALSE(orchestrator->supportsMTPSpecStatePublication())
         << "PP all-position publication must remain disabled until every "
            "stage can publish its own accepted verifier row state.";
+}
+
+TEST_F(Test__RankOrchestrator, LocalPPAllPositionPublicationRunsOnEveryStage)
+{
+    auto stage0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage0_ptr = stage0.get();
+    stage0_ptr->set_supports_mtp_spec_state_publication(true);
+
+    auto stage1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage1_ptr = stage1.get();
+    stage1_ptr->set_supports_mtp_spec_state_publication(true);
+    stage1_ptr->set_mock_all_position_logits({1.0f, 3.0f, 2.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    stages.push_back(std::move(stage0));
+    stages.push_back(std::move(stage1));
+
+    auto orchestrator = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(stages),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_TRUE(orchestrator->supportsMTPSpecStatePublication());
+    EXPECT_TRUE(orchestrator->setComputeAllPositionLogits(true));
+    EXPECT_TRUE(orchestrator->setComputeRowIndexedAllPositionLogits(true, 2));
+
+    MTPSpecDecodeVerifierInputPlan verifier_plan;
+    verifier_plan.ok = true;
+    verifier_plan.compact_logit_row_count = 2;
+    verifier_plan.verifier_logit_rows = {0, 1};
+    EXPECT_TRUE(orchestrator->setMTPSpecVerifierInputPlan(verifier_plan));
+    orchestrator->clearMTPSpecVerifierInputPlan();
+
+    EXPECT_EQ(stage0_ptr->set_all_position_logits_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->set_all_position_logits_call_count(), 1u);
+    EXPECT_EQ(stage0_ptr->set_row_indexed_all_position_logits_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->set_row_indexed_all_position_logits_call_count(), 1u);
+    EXPECT_TRUE(stage0_ptr->compute_row_indexed_all_position_logits());
+    EXPECT_TRUE(stage1_ptr->compute_row_indexed_all_position_logits());
+    EXPECT_EQ(stage0_ptr->row_indexed_all_position_logit_rows(), 2);
+    EXPECT_EQ(stage1_ptr->row_indexed_all_position_logit_rows(), 2);
+    EXPECT_EQ(stage0_ptr->set_mtp_spec_verifier_input_plan_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->set_mtp_spec_verifier_input_plan_call_count(), 1u);
+    EXPECT_EQ(stage0_ptr->clear_mtp_spec_verifier_input_plan_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->clear_mtp_spec_verifier_input_plan_call_count(), 1u);
+
+    std::string error;
+    EXPECT_TRUE(orchestrator->publishAcceptedMTPSpecState(
+        makeMTPSpecPublicationPlan(/*accepted_count=*/2),
+        &error))
+        << error;
+    EXPECT_EQ(stage0_ptr->publish_mtp_spec_state_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->publish_mtp_spec_state_call_count(), 1u);
+    EXPECT_EQ(stage0_ptr->last_mtp_spec_state_plan().accepted_count, 2);
+    EXPECT_EQ(stage1_ptr->last_mtp_spec_state_plan().accepted_count, 2);
+    EXPECT_FALSE(stage0_ptr->last_mtp_spec_state_plan().publish_mtp_shifted_kv);
+    EXPECT_TRUE(stage1_ptr->last_mtp_spec_state_plan().publish_mtp_shifted_kv);
+    ASSERT_NE(orchestrator->getAllPositionLogits(), nullptr);
+    EXPECT_FLOAT_EQ(orchestrator->getAllPositionLogits()[1], 3.0f);
+}
+
+TEST_F(Test__RankOrchestrator, LocalPPStochasticDeviceHooksDelegateOnlyToFinalStage)
+{
+    auto stage0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage0_ptr = stage0.get();
+    stage0_ptr->set_primary_device_id(DeviceId::rocm(0));
+
+    auto stage1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage1_ptr = stage1.get();
+    stage1_ptr->set_primary_device_id(DeviceId::rocm(1));
+    stage1_ptr->set_supports_device_stochastic_mtp_verification(true);
+    stage1_ptr->set_supports_mtp_sidecar_preserves_main_state(true);
+    stage1_ptr->set_stochastic_sample_token(23);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    stages.push_back(std::move(stage0));
+    stages.push_back(std::move(stage1));
+
+    auto orchestrator = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(stages),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_EQ(orchestrator->primaryDeviceId(), DeviceId::rocm(1))
+        << "LocalPP MTP device policy follows the logits-owning final stage";
+    EXPECT_TRUE(orchestrator->supportsDeviceStochasticMTPVerification());
+    EXPECT_TRUE(orchestrator->supportsMTPSidecarPreservesMainState());
+    EXPECT_FALSE(orchestrator->supportsMTPSidecarLogitsStreamHandoff())
+        << "PP device-token handoff remains gated until token slots have an "
+           "explicit pipeline-head ownership contract";
+    EXPECT_FALSE(orchestrator->supportsMTPDeviceDraftTokenInput());
+
+    std::vector<LogitPenalty> penalties;
+    penalties.push_back(LogitPenalty{7, -1.0f});
+    EXPECT_TRUE(orchestrator->applyPenaltiesToAllPositionLogitsOnDeviceRow(
+        /*row=*/1,
+        penalties,
+        /*vocab_size=*/32));
+    EXPECT_EQ(stage0_ptr->apply_penalties_to_all_position_row_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->apply_penalties_to_all_position_row_call_count(), 1u);
+
+    SamplingParams params;
+    params.temperature = 0.7f;
+    params.top_k = 8;
+    EXPECT_TRUE(orchestrator->buildStochasticProcessedLogitRowsOnDevice(
+        DeviceLogitsSource::AllPosition,
+        /*first_row=*/0,
+        DeviceDistributionBuffer::Target,
+        /*first_slot=*/0,
+        /*row_count=*/2,
+        params,
+        /*vocab_size=*/32));
+    EXPECT_EQ(stage0_ptr->build_stochastic_processed_rows_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->build_stochastic_processed_rows_call_count(), 1u);
+
+    EXPECT_EQ(orchestrator->sampleStochasticDraftProposalOnDevice(
+                  DeviceLogitsSource::MTP,
+                  /*row=*/0,
+                  /*slot=*/1,
+                  params,
+                  /*vocab_size=*/32,
+                  /*threshold=*/0.25f),
+              23);
+    EXPECT_EQ(stage0_ptr->sample_stochastic_draft_proposal_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->sample_stochastic_draft_proposal_call_count(), 1u);
+
+    DeviceSpeculativeVerifyBatchOutcome outcome;
+    EXPECT_TRUE(orchestrator->verifyStochasticDistributionsBatchOutcomeOnDevice(
+        /*first_target_slot=*/0,
+        /*first_draft_slot=*/0,
+        /*draft_tokens=*/nullptr,
+        /*accept_thresholds=*/nullptr,
+        /*residual_thresholds=*/nullptr,
+        /*row_count=*/2,
+        /*first_token=*/11,
+        /*stop_tokens=*/nullptr,
+        /*stop_token_count=*/0,
+        /*bonus_target_slot=*/2,
+        /*bonus_threshold=*/0.5f,
+        &outcome,
+        /*inverse_sample_seed=*/123,
+        /*inverse_sample_first_logical_position=*/9,
+        /*use_vllm_probability_rejection=*/true));
+    EXPECT_EQ(stage0_ptr->verify_stochastic_batch_outcome_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->verify_stochastic_batch_outcome_call_count(), 1u);
+    EXPECT_TRUE(stage1_ptr->last_use_vllm_probability_rejection());
+    EXPECT_EQ(stage1_ptr->last_stochastic_row_count(), 2);
 }
 
 TEST_F(Test__RankOrchestrator, ForwardMTPRunsOnEveryLocalTPChild)

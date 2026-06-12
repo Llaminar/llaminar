@@ -38,6 +38,11 @@ TEST(Qwen36LocalPPPrefixParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
     runDenseDynamicMTPParity(localPPCase(), false);
 }
 
+TEST(Qwen36LocalPPPrefixParity, StochasticMTPVerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(localPPCase());
+}
+
 TEST(Qwen36LocalPPPrefixParity, PrefixCacheMTPRestore)
 {
     runDenseMTPParity(localPPCase(), true);

@@ -1122,11 +1122,10 @@ namespace llaminar2
         if (mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
             !active_sampling_params_.is_greedy() &&
             (plan_.usesLocalTP() ||
-             plan_.usesLocalPP() ||
              plan_.usesGlobalTP() ||
              (mpi_ctx_ && mpi_ctx_->world_size() > 1)))
         {
-            return "MTP speculative sampling verification is currently implemented only for SingleDevice full-logit execution";
+            return "MTP speculative sampling verification is currently implemented only for SingleDevice and LocalPP full-logit execution";
         }
         if (runner_->primaryDeviceId().is_rocm() && debugEnv().rocm.concurrent_decode)
         {

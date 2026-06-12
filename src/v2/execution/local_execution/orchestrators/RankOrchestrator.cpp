@@ -2078,6 +2078,10 @@ namespace llaminar2
 
     int RankOrchestrator::sampleGreedyOnDevice()
     {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleGreedyOnDevice();
+        }
         if (mode_ != ParallelismMode::TP || device_runners_.size() < 2)
             return -1;
         return DeviceSampler::sampleGreedy(device_runners_);
@@ -2085,6 +2089,10 @@ namespace llaminar2
 
     int RankOrchestrator::sampleOnDevice(const SamplingParams &params)
     {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleOnDevice(params);
+        }
         if (params.is_greedy())
             return sampleGreedyOnDevice();
         if (mode_ != ParallelismMode::TP || device_runners_.size() < 2)
@@ -2122,6 +2130,19 @@ namespace llaminar2
         }
 
         return nullptr;
+    }
+
+    DeviceId RankOrchestrator::primaryDeviceId() const
+    {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->primaryDeviceId();
+        }
+        if (!device_runners_.empty() && device_runners_[0])
+        {
+            return device_runners_[0]->primaryDeviceId();
+        }
+        return DeviceId::cpu();
     }
 
     bool RankOrchestrator::forwardMTP(int32_t draft_condition_token)
@@ -2298,6 +2319,20 @@ namespace llaminar2
         }
 
         return all_success;
+    }
+
+    bool RankOrchestrator::forwardMTPForDeviceSampling(int32_t draft_condition_token)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->forwardMTPForDeviceSampling(draft_condition_token);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->forwardMTPForDeviceSampling(
+                draft_condition_token);
+        }
+        return false;
     }
 
     bool RankOrchestrator::supportsChainedMTPDrafts() const
@@ -2505,6 +2540,65 @@ namespace llaminar2
         }
 
         return all_success;
+    }
+
+    bool RankOrchestrator::forwardMTPFromLastDraftForDeviceSampling(
+        int32_t draft_condition_token,
+        int position_id)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->forwardMTPFromLastDraftForDeviceSampling(
+                draft_condition_token,
+                position_id);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->forwardMTPFromLastDraftForDeviceSampling(
+                draft_condition_token,
+                position_id);
+        }
+        return false;
+    }
+
+    bool RankOrchestrator::forwardMTPFromDeviceDraftForDeviceSampling(
+        int draft_sample_slot,
+        int position_id)
+    {
+        /*
+         * LocalPP samples draft tokens in final-stage device memory, while the
+         * next verifier input starts at pipeline stage 0.  Until the pipeline
+         * has a first-stage-owned token slot or an explicit transfer contract,
+         * rank-level PP must not advertise device-token sidecar chaining.
+         */
+        if (finalPPSidecarRunner())
+        {
+            return false;
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->forwardMTPFromDeviceDraftForDeviceSampling(
+                draft_sample_slot,
+                position_id);
+        }
+        return false;
+    }
+
+    bool RankOrchestrator::forwardMTPFromDeviceTargetForDeviceSampling(
+        int target_sample_slot,
+        int position_id)
+    {
+        if (finalPPSidecarRunner())
+        {
+            return false;
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->forwardMTPFromDeviceTargetForDeviceSampling(
+                target_sample_slot,
+                position_id);
+        }
+        return false;
     }
 
     bool RankOrchestrator::commitMTPShiftedRowsFromLastForward(
@@ -3084,6 +3178,11 @@ namespace llaminar2
 
     int RankOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(int row)
     {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleGreedyFromAllPositionLogitsOnDevice(row);
+        }
+
         if (device_runners_.empty() || row < 0)
         {
             return -1;
@@ -3120,6 +3219,14 @@ namespace llaminar2
         int row_count,
         int32_t *out_tokens)
     {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                start_row,
+                row_count,
+                out_tokens);
+        }
+
         if (device_runners_.empty() ||
             start_row < 0 ||
             row_count <= 0 ||
@@ -3204,15 +3311,469 @@ namespace llaminar2
         return true;
     }
 
+    bool RankOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDevice(
+        const int32_t *draft_tokens,
+        int draft_token_count,
+        const int32_t *stop_tokens,
+        int stop_token_count,
+        DeviceSpeculativeVerifyBatchOutcome *out)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->verifyGreedyAllPositionBatchOutcomeOnDevice(
+                draft_tokens,
+                draft_token_count,
+                stop_tokens,
+                stop_token_count,
+                out);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->verifyGreedyAllPositionBatchOutcomeOnDevice(
+                draft_tokens,
+                draft_token_count,
+                stop_tokens,
+                stop_token_count,
+                out);
+        }
+        return false;
+    }
+
+    bool RankOrchestrator::supportsDeviceStochasticMTPVerification() const
+    {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->supportsDeviceStochasticMTPVerification();
+        }
+        return device_runners_.size() == 1 &&
+               device_runners_[0] &&
+               device_runners_[0]->supportsDeviceStochasticMTPVerification();
+    }
+
+    bool RankOrchestrator::buildStochasticDistributionOnDevice(
+        DeviceLogitsSource source,
+        int row,
+        DeviceDistributionBuffer buffer,
+        int slot,
+        const SamplingParams &params,
+        int vocab_size)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->buildStochasticDistributionOnDevice(
+                source,
+                row,
+                buffer,
+                slot,
+                params,
+                vocab_size);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->buildStochasticDistributionOnDevice(
+                source,
+                row,
+                buffer,
+                slot,
+                params,
+                vocab_size);
+        }
+        return false;
+    }
+
+    bool RankOrchestrator::buildStochasticDistributionsOnDevice(
+        DeviceLogitsSource source,
+        int first_row,
+        DeviceDistributionBuffer buffer,
+        int first_slot,
+        int row_count,
+        const SamplingParams &params,
+        int vocab_size)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->buildStochasticDistributionsOnDevice(
+                source,
+                first_row,
+                buffer,
+                first_slot,
+                row_count,
+                params,
+                vocab_size);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->buildStochasticDistributionsOnDevice(
+                source,
+                first_row,
+                buffer,
+                first_slot,
+                row_count,
+                params,
+                vocab_size);
+        }
+        return false;
+    }
+
+    bool RankOrchestrator::buildStochasticProcessedLogitRowsOnDevice(
+        DeviceLogitsSource source,
+        int first_row,
+        DeviceDistributionBuffer buffer,
+        int first_slot,
+        int row_count,
+        const SamplingParams &params,
+        int vocab_size)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->buildStochasticProcessedLogitRowsOnDevice(
+                source,
+                first_row,
+                buffer,
+                first_slot,
+                row_count,
+                params,
+                vocab_size);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->buildStochasticProcessedLogitRowsOnDevice(
+                source,
+                first_row,
+                buffer,
+                first_slot,
+                row_count,
+                params,
+                vocab_size);
+        }
+        return false;
+    }
+
+    int RankOrchestrator::sampleStochasticDraftProposalOnDevice(
+        DeviceLogitsSource source,
+        int row,
+        int slot,
+        const SamplingParams &params,
+        int vocab_size,
+        float threshold)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleStochasticDraftProposalOnDevice(
+                source,
+                row,
+                slot,
+                params,
+                vocab_size,
+                threshold);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->sampleStochasticDraftProposalOnDevice(
+                source,
+                row,
+                slot,
+                params,
+                vocab_size,
+                threshold);
+        }
+        return -1;
+    }
+
+    bool RankOrchestrator::sampleStochasticDraftProposalOnDeviceDeferred(
+        DeviceLogitsSource source,
+        int row,
+        int slot,
+        const SamplingParams &params,
+        int vocab_size,
+        float threshold)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleStochasticDraftProposalOnDeviceDeferred(
+                source,
+                row,
+                slot,
+                params,
+                vocab_size,
+                threshold);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->sampleStochasticDraftProposalOnDeviceDeferred(
+                source,
+                row,
+                slot,
+                params,
+                vocab_size,
+                threshold);
+        }
+        return false;
+    }
+
+    int RankOrchestrator::sampleStochasticDistributionOnDevice(
+        DeviceDistributionBuffer buffer,
+        int slot,
+        float threshold)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleStochasticDistributionOnDevice(
+                buffer,
+                slot,
+                threshold);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->sampleStochasticDistributionOnDevice(
+                buffer,
+                slot,
+                threshold);
+        }
+        return -1;
+    }
+
+    bool RankOrchestrator::sampleStochasticDistributionOnDeviceDeferred(
+        DeviceDistributionBuffer buffer,
+        int slot,
+        float threshold)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleStochasticDistributionOnDeviceDeferred(
+                buffer,
+                slot,
+                threshold);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->sampleStochasticDistributionOnDeviceDeferred(
+                buffer,
+                slot,
+                threshold);
+        }
+        return false;
+    }
+
+    const void *RankOrchestrator::prepareMTPVerifierInputTokensOnDevice(
+        int32_t first_token,
+        int first_draft_slot,
+        int draft_token_count,
+        int total_verifier_input_tokens)
+    {
+        if (finalPPSidecarRunner())
+        {
+            return nullptr;
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->prepareMTPVerifierInputTokensOnDevice(
+                first_token,
+                first_draft_slot,
+                draft_token_count,
+                total_verifier_input_tokens);
+        }
+        return nullptr;
+    }
+
+    const void *RankOrchestrator::prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+        int first_target_sample_slot,
+        int first_draft_slot,
+        int draft_token_count,
+        int total_verifier_input_tokens)
+    {
+        if (finalPPSidecarRunner())
+        {
+            return nullptr;
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+                first_target_sample_slot,
+                first_draft_slot,
+                draft_token_count,
+                total_verifier_input_tokens);
+        }
+        return nullptr;
+    }
+
+    bool RankOrchestrator::verifyStochasticDistributionsOnDevice(
+        int target_slot,
+        int draft_slot,
+        int draft_token,
+        float accept_threshold,
+        float residual_threshold,
+        DeviceSpeculativeVerifyResult *out)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->verifyStochasticDistributionsOnDevice(
+                target_slot,
+                draft_slot,
+                draft_token,
+                accept_threshold,
+                residual_threshold,
+                out);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->verifyStochasticDistributionsOnDevice(
+                target_slot,
+                draft_slot,
+                draft_token,
+                accept_threshold,
+                residual_threshold,
+                out);
+        }
+        return false;
+    }
+
+    bool RankOrchestrator::verifyStochasticDistributionsBatchOnDevice(
+        int first_target_slot,
+        int first_draft_slot,
+        const int32_t *draft_tokens,
+        const float *accept_thresholds,
+        const float *residual_thresholds,
+        int row_count,
+        DeviceSpeculativeVerifyResult *out)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->verifyStochasticDistributionsBatchOnDevice(
+                first_target_slot,
+                first_draft_slot,
+                draft_tokens,
+                accept_thresholds,
+                residual_thresholds,
+                row_count,
+                out);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->verifyStochasticDistributionsBatchOnDevice(
+                first_target_slot,
+                first_draft_slot,
+                draft_tokens,
+                accept_thresholds,
+                residual_thresholds,
+                row_count,
+                out);
+        }
+        return false;
+    }
+
+    bool RankOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDevice(
+        int first_target_slot,
+        int first_draft_slot,
+        const int32_t *draft_tokens,
+        const float *accept_thresholds,
+        const float *residual_thresholds,
+        int row_count,
+        int32_t first_token,
+        const int32_t *stop_tokens,
+        int stop_token_count,
+        int bonus_target_slot,
+        float bonus_threshold,
+        DeviceSpeculativeVerifyBatchOutcome *out,
+        uint64_t inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        bool use_vllm_probability_rejection)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->verifyStochasticDistributionsBatchOutcomeOnDevice(
+                first_target_slot,
+                first_draft_slot,
+                draft_tokens,
+                accept_thresholds,
+                residual_thresholds,
+                row_count,
+                first_token,
+                stop_tokens,
+                stop_token_count,
+                bonus_target_slot,
+                bonus_threshold,
+                out,
+                inverse_sample_seed,
+                inverse_sample_first_logical_position,
+                use_vllm_probability_rejection);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->verifyStochasticDistributionsBatchOutcomeOnDevice(
+                first_target_slot,
+                first_draft_slot,
+                draft_tokens,
+                accept_thresholds,
+                residual_thresholds,
+                row_count,
+                first_token,
+                stop_tokens,
+                stop_token_count,
+                bonus_target_slot,
+                bonus_threshold,
+                out,
+                inverse_sample_seed,
+                inverse_sample_first_logical_position,
+                use_vllm_probability_rejection);
+        }
+        return false;
+    }
+
+    bool RankOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
+        int first_target_slot,
+        int first_draft_slot,
+        const int32_t *draft_tokens,
+        const float *accept_thresholds,
+        const float *residual_thresholds,
+        int row_count,
+        int first_target_sample_slot,
+        const int32_t *stop_tokens,
+        int stop_token_count,
+        int bonus_target_slot,
+        float bonus_threshold,
+        DeviceSpeculativeVerifyBatchOutcome *out,
+        uint64_t inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        bool use_vllm_probability_rejection)
+    {
+        if (finalPPSidecarRunner())
+        {
+            return false;
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
+                first_target_slot,
+                first_draft_slot,
+                draft_tokens,
+                accept_thresholds,
+                residual_thresholds,
+                row_count,
+                first_target_sample_slot,
+                stop_tokens,
+                stop_token_count,
+                bonus_target_slot,
+                bonus_threshold,
+                out,
+                inverse_sample_seed,
+                inverse_sample_first_logical_position,
+                use_vllm_probability_rejection);
+        }
+        return false;
+    }
+
     bool RankOrchestrator::setComputeAllPositionLogits(bool enabled)
     {
-        if (device_runners_.empty())
+        auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
         {
             return false;
         }
 
         bool all_success = true;
-        for (auto &runner : device_runners_)
+        for (auto &runner : participants)
         {
             if (!runner || !runner->setComputeAllPositionLogits(enabled))
             {
@@ -3231,13 +3792,15 @@ namespace llaminar2
 
     bool RankOrchestrator::setComputeRowIndexedAllPositionLogits(bool enabled, int row_count)
     {
-        if (device_runners_.empty())
+        auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
         {
             return false;
         }
 
         bool all_success = true;
-        for (auto &runner : device_runners_)
+        for (auto &runner : participants)
         {
             if (!runner || !runner->setComputeRowIndexedAllPositionLogits(enabled, row_count))
             {
@@ -3254,13 +3817,15 @@ namespace llaminar2
     bool RankOrchestrator::setMTPSpecVerifierInputPlan(
         const MTPSpecDecodeVerifierInputPlan &plan)
     {
-        if (device_runners_.empty())
+        auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
         {
             return false;
         }
 
         bool all_success = true;
-        for (auto &runner : device_runners_)
+        for (auto &runner : participants)
         {
             if (!runner || !runner->setMTPSpecVerifierInputPlan(plan))
             {
@@ -3272,7 +3837,9 @@ namespace llaminar2
 
     void RankOrchestrator::clearMTPSpecVerifierInputPlan()
     {
-        for (auto &runner : device_runners_)
+        auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        for (auto &runner : participants)
         {
             if (runner)
                 runner->clearMTPSpecVerifierInputPlan();
@@ -3281,12 +3848,14 @@ namespace llaminar2
 
     bool RankOrchestrator::supportsMTPSpecStatePublication() const
     {
-        if (!pp_stage_runners_.empty() || device_runners_.empty())
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
         {
             return false;
         }
 
-        for (const auto &runner : device_runners_)
+        for (const auto &runner : participants)
         {
             if (!runner || !runner->supportsMTPSpecStatePublication())
             {
@@ -3313,11 +3882,92 @@ namespace llaminar2
             "rank_mtp_spec_state_publication_total",
             "decode",
             "rank",
-            {{"participants", std::to_string(device_runners_.size())}});
+            {{"participants",
+              std::to_string(!pp_stage_runners_.empty()
+                                 ? pp_stage_runners_.size()
+                                 : device_runners_.size())}});
 
         if (!pp_stage_runners_.empty())
         {
-            return fail("MTP spec-state publication is not enabled for PP topologies yet");
+            /*
+             * Pipeline publication is an all-stage local-state mutation:
+             * earlier stages own their KV/GDN rows, while the final stage also
+             * owns logits and terminal hidden.  Publish every stage to the same
+             * common accepted count before the request continues.
+             */
+            std::vector<MTPSpecStepPlan> participant_plans(
+                pp_stage_runners_.size(),
+                plan);
+            MTPSpecCommonStepPlan common_plan =
+                coordinateMTPSpecCommonAcceptedPrefix(participant_plans);
+            if (!common_plan.ok ||
+                common_plan.clamped_steps.size() != pp_stage_runners_.size())
+            {
+                return fail(
+                    std::string("PP MTP spec-state common-prefix coordination failed: ") +
+                    (common_plan.ok
+                         ? std::string("missing clamped stage plans")
+                         : common_plan.error));
+            }
+            if (common_plan.requires_common_fallback_replay)
+            {
+                return fail("PP MTP spec-state publication cannot publish divergent stages directly");
+            }
+
+            bool all_success = true;
+            std::vector<std::string> child_errors(pp_stage_runners_.size());
+            for (size_t i = 0; i < pp_stage_runners_.size(); ++i)
+            {
+                if (!pp_stage_runners_[i])
+                {
+                    child_errors[i] = "stage runner is unavailable";
+                    all_success = false;
+                    continue;
+                }
+                if (!pp_stage_runners_[i]->supportsMTPSpecStatePublication())
+                {
+                    child_errors[i] =
+                        "stage does not support verifier-state publication";
+                    all_success = false;
+                    continue;
+                }
+                MTPSpecStepPlan stage_plan = common_plan.clamped_steps[i];
+                stage_plan.publish_mtp_shifted_kv =
+                    i + 1 == pp_stage_runners_.size();
+                if (!pp_stage_runners_[i]->publishAcceptedMTPSpecState(
+                        stage_plan,
+                        &child_errors[i]))
+                {
+                    all_success = false;
+                }
+            }
+
+            if (!all_success)
+            {
+                for (size_t i = 0; i < child_errors.size(); ++i)
+                {
+                    if (!child_errors[i].empty())
+                    {
+                        std::ostringstream msg;
+                        msg << "PP MTP spec-state publication failed on stage "
+                            << i << ": " << child_errors[i];
+                        return fail(msg.str());
+                    }
+                }
+                return fail("PP MTP spec-state publication failed on at least one stage");
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mtp_spec_state_publications",
+                1.0,
+                "decode",
+                "rank",
+                {{"topology", "local_pp"},
+                 {"participants", std::to_string(pp_stage_runners_.size())},
+                 {"accepted_count",
+                  std::to_string(common_plan.common_accepted_count)}});
+            return true;
         }
         if (device_runners_.empty())
         {
@@ -3543,6 +4193,11 @@ namespace llaminar2
 
     const float *RankOrchestrator::getAllPositionLogits() const
     {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->getAllPositionLogits();
+        }
+
         if (device_runners_.empty())
         {
             return nullptr;
@@ -3659,6 +4314,104 @@ namespace llaminar2
             }
         }
         return {};
+    }
+
+    bool RankOrchestrator::supportsMTPSidecarLogitsStreamHandoff() const
+    {
+        /*
+         * LocalPP is intentionally false for now: the sidecar logits are
+         * produced on the pipeline tail, but verifier token input belongs to
+         * the pipeline head.  Keeping this false prevents the vLLM-style
+         * stochastic path from assuming one stage's device token slot can be
+         * consumed by another stage without an explicit handoff contract.
+         */
+        if (finalPPSidecarRunner())
+        {
+            return false;
+        }
+        return device_runners_.size() == 1 &&
+               device_runners_[0] &&
+               device_runners_[0]->supportsMTPSidecarLogitsStreamHandoff();
+    }
+
+    bool RankOrchestrator::supportsMTPDeviceDraftTokenInput() const
+    {
+        if (finalPPSidecarRunner())
+        {
+            return false;
+        }
+        return device_runners_.size() == 1 &&
+               device_runners_[0] &&
+               device_runners_[0]->supportsMTPDeviceDraftTokenInput();
+    }
+
+    bool RankOrchestrator::supportsMTPSidecarPreservesMainState() const
+    {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->supportsMTPSidecarPreservesMainState();
+        }
+        return device_runners_.size() == 1 &&
+               device_runners_[0] &&
+               device_runners_[0]->supportsMTPSidecarPreservesMainState();
+    }
+
+    bool RankOrchestrator::applyPenaltiesOnDevice(
+        const std::vector<LogitPenalty> &penalties,
+        int vocab_size)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->applyPenaltiesOnDevice(penalties, vocab_size);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->applyPenaltiesOnDevice(
+                penalties,
+                vocab_size);
+        }
+        return penalties.empty();
+    }
+
+    bool RankOrchestrator::applyPenaltiesToMTPLogitsOnDevice(
+        const std::vector<LogitPenalty> &penalties,
+        int vocab_size)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->applyPenaltiesToMTPLogitsOnDevice(
+                penalties,
+                vocab_size);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->applyPenaltiesToMTPLogitsOnDevice(
+                penalties,
+                vocab_size);
+        }
+        return penalties.empty();
+    }
+
+    bool RankOrchestrator::applyPenaltiesToAllPositionLogitsOnDeviceRow(
+        int row,
+        const std::vector<LogitPenalty> &penalties,
+        int vocab_size)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->applyPenaltiesToAllPositionLogitsOnDeviceRow(
+                row,
+                penalties,
+                vocab_size);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->applyPenaltiesToAllPositionLogitsOnDeviceRow(
+                row,
+                penalties,
+                vocab_size);
+        }
+        return penalties.empty();
     }
 
     void RankOrchestrator::setSkipLogitsGatherDecode(bool skip)

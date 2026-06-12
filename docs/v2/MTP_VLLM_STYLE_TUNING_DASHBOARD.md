@@ -35,9 +35,11 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
 - NodeLocalTP dynamic-depth scalar coordination is green in the dense parity
   lane: full `^V2_Integration_Parity_Qwen36_NodeLocalTP_` passed 5/5
   real-model tests plus fixture.
-- LocalPP dense MTP is green on ROCm for fixed d1/d3, dynamic depth, prefix
-  restore, and prefix+MTP restore. Stochastic and all-position publication
-  remain gated.
+- LocalPP dense MTP is green on ROCm for prefix restore, prefix+MTP restore,
+  fixed d1/d3, dynamic depth, and stochastic all-position publication. PP
+  non-final stages publish main verifier state only; the final stage owns
+  logits, sampling, terminal hidden, and shifted sidecar KV. Gate:
+  full `^V2_Integration_Parity_Qwen36_LocalPP_` passed 7/7.
 - Stage-owned CUDA side-stream workspace declarations still hold the dense VRAM
   win: one-token d3 stochastic graph workspace is about 784 MB instead of the
   stale LM-head-sized 1827 MB plan.
@@ -48,7 +50,7 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
 |---|---|---|---|
 | SingleDevice | Green dense/MoE greedy+stochastic on CPU/CUDA/ROCm | Green broad device matrix | Dense accepted; MoE speed weak |
 | LocalTP | Green dense fixed d1/d2/d3 + dynamic; rank-wide depth and stream handoff wired | Green Qwen3.6 dense parity | MoE bench sparse; keep in matrix |
-| LocalPP | Amber: final-stage sidecar; stochastic gated | Green dense prefix+d1/d3/dyn+prefix-MTP restore | Bench/all-position pending |
+| LocalPP | Green dense final-stage sidecar + all-stage publication; PP device-token handoff gated | Green dense prefix+d1/d3/dyn/stoch+prefix-MTP restore | Bench pending |
 | NodeLocalTP | Green dense fixed d1/d2/d3 + dynamic scalar broadcast | Green full dense NodeLocalTP parity | MoE still unproven |
 | ExpertOverlay | Green MoE hot/mixed correctness path; dense not a separate target | Green ROCm2TP-hot + CPU2LocalTP-cold parity | Speed Amber/Red until MoE economics improve |
 

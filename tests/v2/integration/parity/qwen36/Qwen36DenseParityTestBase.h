@@ -3568,8 +3568,10 @@ namespace llaminar2::test::parity::qwen36
     {
         ScopedDenseParityDeterministicMode deterministic_mode(
             shouldUseDenseParityDeterministicMode(test_case));
-        ASSERT_EQ(test_case.topology, DensePrefixParityTopology::SingleDevice)
-            << "Phase 13.7 stochastic MTP verifier parity is currently single-device only";
+        ASSERT_TRUE(test_case.topology == DensePrefixParityTopology::SingleDevice ||
+                    test_case.topology == DensePrefixParityTopology::LocalPP)
+            << "Stochastic MTP verifier parity currently requires a full-logit "
+               "SingleDevice or LocalPP final-stage owner";
 
         ScopedEnvironmentValues graph_env({
             {"LLAMINAR_GPU_GRAPHS", "1"},

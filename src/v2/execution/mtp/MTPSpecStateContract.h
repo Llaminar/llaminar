@@ -36,6 +36,16 @@ namespace llaminar2
 
         bool all_drafts_accepted = false;
         bool stopped = false;
+        /**
+         * @brief Whether this participant owns shifted MTP sidecar KV rows.
+         *
+         * SingleDevice and TP participants publish both main verifier state and
+         * shifted MTP KV.  In LocalPP, non-final stages own main KV/GDN state
+         * but do not own the sidecar cache; the final stage owns sidecar KV and
+         * leaves this true.  This keeps publication explicit instead of making
+         * non-final PP stages truncate sidecar state they never produced.
+         */
+        bool publish_mtp_shifted_kv = true;
 
         bool publishesAcceptedState() const { return accepted_count > 0; }
         bool requiresCorrectionReplay() const { return correction_replay_count > 0; }

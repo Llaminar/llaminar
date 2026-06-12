@@ -6377,7 +6377,8 @@ namespace llaminar2
         {
             return fail("MTP spec-state publication could not resolve an explicit GPU stream");
         }
-        if (state_.device_id.is_gpu() &&
+        if (plan.publish_mtp_shifted_kv &&
+            state_.device_id.is_gpu() &&
             !waitForPendingShiftedMTPKVReady(
                 stream,
                 "mtp_spec_state_publication"))
@@ -6390,14 +6391,17 @@ namespace llaminar2
             return fail("MTP spec-state publication requires an initialized main KV cache");
         }
         std::vector<IKVCache *> mtp_caches;
-        mtp_caches.reserve(state_.mtp_kv_caches.size());
-        for (const auto &cache : state_.mtp_kv_caches)
+        if (plan.publish_mtp_shifted_kv)
         {
-            if (!cache)
+            mtp_caches.reserve(state_.mtp_kv_caches.size());
+            for (const auto &cache : state_.mtp_kv_caches)
             {
-                return fail("MTP spec-state publication requires initialized MTP KV caches");
+                if (!cache)
+                {
+                    return fail("MTP spec-state publication requires initialized MTP KV caches");
+                }
+                mtp_caches.push_back(cache.get());
             }
-            mtp_caches.push_back(cache.get());
         }
 
         MTPSpecKVPublicationResult kv_result =
@@ -6433,7 +6437,7 @@ namespace llaminar2
          * for publication so the readiness event below covers every live-state
          * component the next sidecar will read.
          */
-        if (result.accepted_count > 0)
+        if (plan.publish_mtp_shifted_kv && result.accepted_count > 0)
         {
             const int accepted_hidden_row = result.accepted_count - 1;
             if (!selectMTPTerminalHiddenRow(
@@ -6492,6 +6496,7 @@ namespace llaminar2
             state_.device_id.toString(),
             {{"accepted_count", std::to_string(result.accepted_count)},
              {"main_kv_tokens", std::to_string(kv_result.main_truncated_tokens)},
+             {"publishes_mtp_shifted_kv", plan.publish_mtp_shifted_kv ? "true" : "false"},
              {"restored_stages", std::to_string(result.restored_stage_count)},
              {"skipped_stages", std::to_string(result.skipped_stage_count)},
              {"target_rows", std::to_string(plan.target_rows)}});
