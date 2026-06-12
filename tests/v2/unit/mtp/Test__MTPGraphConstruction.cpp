@@ -424,6 +424,7 @@ namespace
             buffers.extensions[BufferId::MOE_UP_SCRATCH] = moe_up_scratch.get();
             return buffers;
         }
+
     };
 
     struct TinyQwenForwardFixture
@@ -1952,6 +1953,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
     ASSERT_NE(terminal_hidden, nullptr);
     for (int i = 0; i < fixture.config.d_model; ++i)
         terminal_hidden[i] = 0.01f * static_cast<float>((i % 19) + 1);
+    orchestrator.markMainForwardHiddenProducedForTesting(/*seq_len=*/1, /*batch_size=*/1);
 
     auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
     orchestrator.setFrozenWeightSet(std::move(frozen));
@@ -2060,6 +2062,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
     ASSERT_NE(terminal_hidden, nullptr);
     for (int i = 0; i < fixture.config.d_model; ++i)
         terminal_hidden[i] = 0.01f * static_cast<float>((i % 19) + 1);
+    orchestrator.markMainForwardHiddenProducedForTesting(/*seq_len=*/1, /*batch_size=*/1);
 
     auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
     orchestrator.setFrozenWeightSet(std::move(frozen));
@@ -2072,6 +2075,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
     ASSERT_EQ(orchestrator.moePlacementEpoch(), 0u);
     ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/3));
     orchestrator.clear_cache();
+    orchestrator.markMainForwardHiddenProducedForTesting(/*seq_len=*/1, /*batch_size=*/1);
     ASSERT_EQ(orchestrator.moePlacementEpoch(), 0u);
     ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/4));
 
@@ -2161,6 +2165,7 @@ TEST(Test__MTPGraphConstruction, DenseSidecarGraphCacheIgnoresMoEPlacementEpochC
     ASSERT_NE(terminal_hidden, nullptr);
     for (int i = 0; i < fixture.config.d_model; ++i)
         terminal_hidden[i] = 0.01f * static_cast<float>((i % 19) + 1);
+    orchestrator.markMainForwardHiddenProducedForTesting(/*seq_len=*/1, /*batch_size=*/1);
 
     auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
     orchestrator.setFrozenWeightSet(std::move(frozen));
@@ -2254,6 +2259,7 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
     ASSERT_NE(terminal_hidden, nullptr);
     for (int i = 0; i < fixture.config.d_model; ++i)
         terminal_hidden[i] = 0.01f * static_cast<float>((i % 19) + 1);
+    orchestrator.markMainForwardHiddenProducedForTesting(/*seq_len=*/1, /*batch_size=*/1);
 
     auto frozen = makeMoEMTPFrozenWeightSet(fixture);
     orchestrator.setFrozenWeightSet(std::move(frozen));
@@ -2580,6 +2586,50 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
     ASSERT_NE(device_misses, nullptr);
     EXPECT_DOUBLE_EQ(device_misses->value, 1.0);
 
+    auto plain_handoff_tags = [](const char *context)
+    {
+        return PerfStatsCollector::Tags{
+            {"context", context},
+            {"seq_len", "1"}};
+    };
+    auto explicit_completion_tags = [](const char *context)
+    {
+        return PerfStatsCollector::Tags{
+            {"context", context},
+            {"kv_cache_only", "false"},
+            {"path", "plain"},
+            {"seq_len", "1"}};
+    };
+
+    const PerfStatRecord *host_plain_handoff = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_plain_stream_handoffs",
+        plain_handoff_tags("mtp_decode_sidecar"));
+    ASSERT_NE(host_plain_handoff, nullptr);
+    EXPECT_DOUBLE_EQ(host_plain_handoff->value, 1.0);
+
+    const PerfStatRecord *device_plain_handoff = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_plain_stream_handoffs",
+        plain_handoff_tags("mtp_decode_sidecar_device_target_token"));
+    ASSERT_NE(device_plain_handoff, nullptr);
+    EXPECT_DOUBLE_EQ(device_plain_handoff->value, 1.0);
+
+    EXPECT_EQ(findMTPRecord(
+                  records,
+                  PerfStatRecord::Kind::Counter,
+                  "sidecar_explicit_stream_completions",
+                  explicit_completion_tags("mtp_decode_sidecar")),
+              nullptr);
+    EXPECT_EQ(findMTPRecord(
+                  records,
+                  PerfStatRecord::Kind::Counter,
+                  "sidecar_explicit_stream_completions",
+                  explicit_completion_tags("mtp_decode_sidecar_device_target_token")),
+              nullptr);
+
     PerfStatsCollector::reset();
 }
 
@@ -2746,6 +2796,7 @@ TEST(Test__MTPGraphConstruction, GlobalTPMTPSamplingAllgathersShardCandidates)
         terminal_hidden_elements *= dim;
     for (size_t i = 0; i < terminal_hidden_elements; ++i)
         terminal_hidden[i] = 0.01f * static_cast<float>((i % 17) + 1);
+    orchestrator.markMainForwardHiddenProducedForTesting(/*seq_len=*/1, /*batch_size=*/1);
 
     auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
     orchestrator.setFrozenWeightSet(std::move(frozen));

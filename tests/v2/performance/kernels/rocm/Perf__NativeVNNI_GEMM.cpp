@@ -1298,6 +1298,14 @@ namespace
             }
             (void)hipStreamSynchronize(stream.stream);
 
+            // Candidate variants are timed above under their explicit KB/TW
+            // override. Correctness must be judged against the canonical
+            // single-projection path, not against a reference polluted by the
+            // same override. Otherwise the trainer can learn a fast variant
+            // that is self-consistent but not verifier-equivalent to the model
+            // path used outside the sweep.
+            rocmGemv_native_vnni_reset_tuning_overrides();
+
             float min_cosine = 1.0f;
             for (size_t i = 0; i < projection_Ns.size(); ++i)
             {

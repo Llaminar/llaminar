@@ -892,64 +892,79 @@ namespace llaminar2
         {
             errors.push_back("Prefix cache block size must be > 0");
         }
-        if (mtp.draft_tokens <= 0)
+        if (mtp.enabled)
         {
-            errors.push_back("MTP draft tokens must be > 0");
-        }
-        if (mtp.depth_policy.min_depth < 0)
-        {
-            errors.push_back("MTP depth policy min depth must be >= 0");
-        }
-        if (mtp.depth_policy.max_depth < 0)
-        {
-            errors.push_back("MTP depth policy max depth must be >= 0");
-        }
-        if (mtp.depth_policy.initial_depth < 0)
-        {
-            errors.push_back("MTP depth policy initial depth must be >= 0");
-        }
-        const int effective_max_depth =
-            mtp.depth_policy.max_depth > 0 ? mtp.depth_policy.max_depth : mtp.draft_tokens;
-        const int effective_initial_depth =
-            mtp.depth_policy.initial_depth > 0
-                ? mtp.depth_policy.initial_depth
-                : (mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic
-                       ? mtp.depth_policy.min_depth
-                       : effective_max_depth);
-        if (effective_max_depth < mtp.depth_policy.min_depth)
-        {
-            errors.push_back("MTP depth policy max depth must be >= min depth");
-        }
-        if (effective_initial_depth < mtp.depth_policy.min_depth ||
-            effective_initial_depth > effective_max_depth)
-        {
-            errors.push_back("MTP depth policy initial depth must be within [min depth, max depth]");
-        }
-        if (mtp.depth_policy.window_size <= 0)
-        {
-            errors.push_back("MTP depth policy window size must be > 0");
-        }
-        if (mtp.depth_policy.min_samples <= 0)
-        {
-            errors.push_back("MTP depth policy min samples must be > 0");
-        }
-        if (mtp.depth_policy.cooldown_steps < 0)
-        {
-            errors.push_back("MTP depth policy cooldown steps must be >= 0");
-        }
-        if (mtp.depth_policy.promote_consecutive_windows <= 0)
-        {
-            errors.push_back("MTP depth policy promote consecutive windows must be > 0");
-        }
-        auto valid_rate = [](double value)
-        {
-            return value >= 0.0 && value <= 1.0;
-        };
-        if (!valid_rate(mtp.depth_policy.promote_full_accept_rate) ||
-            !valid_rate(mtp.depth_policy.demote_zero_accept_rate) ||
-            !valid_rate(mtp.depth_policy.demote_acceptance_rate))
-        {
-            errors.push_back("MTP depth policy thresholds must be in [0, 1]");
+            if (mtp.draft_tokens <= 0)
+            {
+                errors.push_back("MTP draft tokens must be > 0");
+            }
+
+            const auto &depth_policy = mtp.depth_policy;
+            if (depth_policy.min_depth < 0)
+            {
+                errors.push_back("MTP depth policy min depth must be >= 0");
+            }
+            if (depth_policy.max_depth < 0)
+            {
+                errors.push_back("MTP depth policy max depth must be >= 0");
+            }
+            if (depth_policy.initial_depth < 0)
+            {
+                errors.push_back("MTP depth policy initial depth must be >= 0");
+            }
+
+            if (depth_policy.mode != MTPDepthPolicyMode::Fixed)
+            {
+                /*
+                 * Fixed-depth MTP is normalized by MTPDepthController to
+                 * min=max=initial=draft_tokens and ignores dynamic hysteresis
+                 * fields. Validate the rolling-window knobs only for observe
+                 * and dynamic modes so hard-pinned benchmark lanes are not
+                 * coupled to adaptive-policy defaults.
+                 */
+                const int effective_max_depth =
+                    depth_policy.max_depth > 0 ? depth_policy.max_depth : mtp.draft_tokens;
+                const int effective_initial_depth =
+                    resolveMTPDepthPolicyInitialDepth(
+                        depth_policy,
+                        mtp.draft_tokens,
+                        mtp.verify_mode);
+                if (effective_max_depth < depth_policy.min_depth)
+                {
+                    errors.push_back("MTP depth policy max depth must be >= min depth");
+                }
+                if (effective_initial_depth < depth_policy.min_depth ||
+                    effective_initial_depth > effective_max_depth)
+                {
+                    errors.push_back("MTP depth policy initial depth must be within [min depth, max depth]");
+                }
+                if (depth_policy.window_size <= 0)
+                {
+                    errors.push_back("MTP depth policy window size must be > 0");
+                }
+                if (depth_policy.min_samples <= 0)
+                {
+                    errors.push_back("MTP depth policy min samples must be > 0");
+                }
+                if (depth_policy.cooldown_steps < 0)
+                {
+                    errors.push_back("MTP depth policy cooldown steps must be >= 0");
+                }
+                if (depth_policy.promote_consecutive_windows <= 0)
+                {
+                    errors.push_back("MTP depth policy promote consecutive windows must be > 0");
+                }
+                auto valid_rate = [](double value)
+                {
+                    return value >= 0.0 && value <= 1.0;
+                };
+                if (!valid_rate(depth_policy.promote_full_accept_rate) ||
+                    !valid_rate(depth_policy.demote_zero_accept_rate) ||
+                    !valid_rate(depth_policy.demote_acceptance_rate))
+                {
+                    errors.push_back("MTP depth policy thresholds must be in [0, 1]");
+                }
+            }
         }
 
         return errors;
@@ -1060,6 +1075,8 @@ namespace llaminar2
         oss << "    depth_cooldown: " << mtp.depth_policy.cooldown_steps << "\n";
         oss << "    depth_promote_windows: "
             << mtp.depth_policy.promote_consecutive_windows << "\n";
+        oss << "    depth_generated_policy: "
+            << (mtp.depth_policy.use_generated_policy ? "true" : "false") << "\n";
         oss << "    depth_promote_full_accept: " << mtp.depth_policy.promote_full_accept_rate << "\n";
         oss << "    depth_demote_zero_accept: " << mtp.depth_policy.demote_zero_accept_rate << "\n";
         oss << "    depth_demote_acceptance: " << mtp.depth_policy.demote_acceptance_rate << "\n";

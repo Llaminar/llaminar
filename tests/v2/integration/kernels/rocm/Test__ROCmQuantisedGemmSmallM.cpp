@@ -1451,10 +1451,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
         }
     }
 
-    EXPECT_GE(graph_atomic_launches, 1.0)
-        << "GPU-graph Qwen3.6 small-M FFN down must use graph-capturable atomic K-partitioning";
-    EXPECT_EQ(graph_split_reduce_launches, 0.0)
-        << "GPU-graph small-M split/reduce is graph-safe in focused tests but slower on real Qwen3.6";
+    EXPECT_EQ(graph_atomic_launches, 0.0)
+        << "GPU-graph Qwen3.6 small-M FFN down should not silently force atomic K-partitioning";
+    EXPECT_GE(graph_split_reduce_launches, 1.0)
+        << "GPU-graph Qwen3.6 small-M FFN down should use declared workspace split/reduce by default";
 
     PerfStatsCollector::reset();
 }
@@ -2472,10 +2472,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
         << "The batched qkv/z subgroup should quantize activations once";
     EXPECT_GE(batched_projection_calls, 2.0)
         << "The batched qkv/z subgroup should cover both heterogeneous-N projection payloads";
-    EXPECT_GE(graph_atomic_launches, 1.0)
-        << "GPU-graph Qwen3.6 batched GDN qkv/z small-M route must use graph-capturable atomic K-partitioning";
-    EXPECT_EQ(graph_split_reduce_launches, 0.0)
-        << "GPU-graph batched small-M split/reduce is graph-safe in focused tests but slower on real Qwen3.6";
+    EXPECT_EQ(graph_atomic_launches, 0.0)
+        << "GPU-graph Qwen3.6 batched GDN qkv/z should not silently force atomic K-partitioning";
+    EXPECT_GE(graph_split_reduce_launches, 1.0)
+        << "GPU-graph Qwen3.6 batched GDN qkv/z should use declared workspace split/reduce by default";
 
     PerfStatsCollector::reset();
 }
@@ -2703,6 +2703,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedSingleProjectionQ4KFFNDownM2Hon
 
     ScopedEnv force_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB", "2");
     ScopedEnv force_graphs("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnv force_atomic("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "1");
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
 
@@ -2726,7 +2727,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedSingleProjectionQ4KFFNDownM2Hon
     ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
 
     EXPECT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K))
-        << "Graph-captured forced KB=2 should use atomic K-partitioning, not split/reduce replay";
+        << "Explicit ROCm atomic-reduce with forced KB=2 should use atomic K-partitioning";
 
 #ifdef HAVE_ROCM
     EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
@@ -2764,9 +2765,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedSingleProjectionQ4KFFNDownM2Hon
     }
 
     EXPECT_GE(atomic_launches, 1.0)
-        << "Graph-captured KB override should be honored by the atomic route";
+        << "Explicit ROCm atomic-reduce KB override should be honored by the atomic route";
     EXPECT_EQ(split_reduce_launches, 0.0)
-        << "Graph-captured KB override must not re-enable split/reduce replay";
+        << "Explicit ROCm atomic-reduce KB override must not re-enable split/reduce replay";
 
     PerfStatsCollector::reset();
     kernel.unbindWorkspace();

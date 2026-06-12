@@ -73,6 +73,18 @@ namespace llaminar2
             prepared_embedding_handle_ = handle;
         }
 
+        void setVocabRange(int vocab_offset, int local_vocab_size) override
+        {
+            explicit_vocab_range_ = true;
+            vocab_offset_ = vocab_offset;
+            local_vocab_size_ = local_vocab_size;
+        }
+
+        void setAllowOutOfRangeTokenIds(bool allow) override
+        {
+            allow_out_of_range_token_ids_ = allow;
+        }
+
         bool supports_device(int device_idx) const override
         {
             return device_idx >= 0; // GPU only
@@ -263,6 +275,11 @@ namespace llaminar2
         int device_token_count_ = 0;
         bool device_token_ids_active_ = false;
         void *preload_stream_ = nullptr; ///< Stream used for the last setDynamicTokenIds H2D copy
+
+        int vocab_offset_ = 0;
+        int local_vocab_size_ = 0;
+        bool explicit_vocab_range_ = false;
+        bool allow_out_of_range_token_ids_ = false;
     };
 
     // Convenience alias

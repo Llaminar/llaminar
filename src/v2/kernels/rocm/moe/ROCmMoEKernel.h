@@ -137,6 +137,11 @@ namespace llaminar2
             ITensor *input, ITensor *gate_inp, ITensor *shared_output,
             int seq_len, int d_model) override;
 
+        void sharedExpertGateAddFromTensors(
+            ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+            ITensor *routed_residual, ITensor *combined_output,
+            int seq_len, int d_model) override;
+
         void swiGLUFromTensors(ITensor *gate, ITensor *up, int count) override;
 
         void weightedAddFromTensors(
@@ -303,6 +308,25 @@ namespace llaminar2
 
         bool prepareSharedExpertPrefillGroup(int seq_len) override;
 
+        /**
+         * @brief Build verifier-prefill groups with the Qwen shared expert appended.
+         *
+         * The grouped-prefill pipeline treats the shared expert as logical
+         * expert `num_experts`.  Its per-row route weight is the device-side
+         * sigmoid gate `sigmoid(dot(hidden[row], shared_gate_inp))`, which lets
+         * ROCm run the same combined routed+shared verifier path as CUDA
+         * without a host synchronization point.
+         */
+        bool prepareExpertGroupsWithSharedGateAsync(
+            ITensor *routing_indices,
+            ITensor *routing_weights,
+            ITensor *hidden,
+            ITensor *shared_gate_inp,
+            int seq_len,
+            int d_model,
+            int num_experts,
+            int top_k) override;
+
         bool executeGroupedPrefillPipeline(
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,
@@ -349,6 +373,7 @@ namespace llaminar2
 
     private:
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
+        static constexpr std::size_t kRuntimePointerArrayWorkspaceEntries = 1024;
 
         void syncBlasStream();
         void allocateHistogramBuffers(int num_layers, int num_experts);
@@ -356,6 +381,10 @@ namespace llaminar2
         bool ensureGroupedDecodeCapacity(int num_active, int intermediate);
         bool ensureGroupedGateUpCapacity(int num_active, int d_model);
         bool ensureGroupedGateUpKPartScratchCapacity(int num_active, int k_partitions, int intermediate);
+        bool ensureGroupedGateUpDecodeMetadata(const int *expert_ids, int num_active);
+        bool ensureGroupedDownDecodeMetadata(const int *expert_ids, const float *expert_weights, int num_active);
+        bool isDecodeGraphCaptureActive() const;
+        bool rejectDecodeStagingDuringCapture(const char *context) const;
         bool stageRuntimeGateUpPointerArrays(
             int descriptor_table_id,
             int top_k,
@@ -410,6 +439,7 @@ namespace llaminar2
             int d_model = 0;
             int intermediate = 0;
             uint8_t codebook_id = 0;
+            uint32_t codebook_mask = 0;
             bool valid = false;
         };
 
@@ -423,6 +453,7 @@ namespace llaminar2
             int d_model = 0;
             int intermediate = 0;
             uint8_t codebook_id = 0;
+            uint32_t codebook_mask = 0;
             bool valid = false;
         };
 
@@ -448,6 +479,19 @@ namespace llaminar2
             int8_t *d_gate_weights_q8 = nullptr;
             float *d_gate_scales = nullptr;
         };
+
+        /**
+         * @brief Warmup readiness for graph-owned grouped-decode pointer slots.
+         *
+         * HIP graph replay captures the device address of the pointer-array slot,
+         * not the host pointer values.  ROCm therefore uses a deterministic slot
+         * per prepared descriptor table and refuses capture until warmup has
+         * staged that slot through the declared MoE workspace.  The booleans are
+         * intentionally just readiness markers; pointer values are not cached on
+         * the kernel object.
+         */
+        std::array<bool, kRuntimePointerArrayWorkspaceEntries> gateup_pointer_slot_ready_{};
+        std::array<bool, kRuntimePointerArrayWorkspaceEntries> down_pointer_slot_ready_{};
 
         int device_ordinal_;
         std::unique_ptr<rocm::HipBLASGemmKernel> blas_gemm_;
@@ -478,6 +522,8 @@ namespace llaminar2
         int grouped_decode_active_cap_ = 0;
         int grouped_decode_intermediate_cap_ = 0;
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
+        std::vector<int> grouped_down_cached_expert_ids_;
+        std::vector<float> grouped_down_cached_weights_;
 
         // Grouped decode staging for ROCm native-VNNI MoE gate/up path.
         float **d_grouped_gate_output_ptrs_ = nullptr;
@@ -496,6 +542,7 @@ namespace llaminar2
         std::vector<float *> host_grouped_gate_output_ptrs_;
         std::vector<float *> host_grouped_up_output_ptrs_;
         std::vector<int> host_grouped_gateup_expert_ids_;
+        std::vector<int> grouped_gateup_cached_expert_ids_;
 
         // Reusable scratch for sharedExpertGate() gate values.
         float *d_shared_gate_scratch_ = nullptr; ///< [shared_gate_scratch_capacity_] floats on device
@@ -522,19 +569,28 @@ namespace llaminar2
         int *d_group_counts_ = nullptr;        ///< [num_experts] per-expert token counts
         int *d_group_max_tokens_ = nullptr;    ///< [1] device-side max(d_group_counts_) (async reduction)
         int *d_group_token_indices_ = nullptr; ///< [total_slots] grouped token indices
+        int *d_group_original_to_grouped_ = nullptr; ///< [total_slots] original route slot to grouped slot
+        int *d_group_single_expert_ids_ = nullptr; ///< [1] singleton active expert list for mixed verifier tables
         float *d_group_weights_ = nullptr;     ///< [total_slots] grouped routing weights
         int *d_group_active_expert_ids_ = nullptr; ///< [min(total_slots,num_experts)] compact active expert ids
         int group_active_expert_slots_ = 0;    ///< Fixed active-expert launch slots from the last small grouping pass
+        bool group_has_appended_single_expert_ = false; ///< Last grouping appended a singleton shared expert
         int group_slots_cap_ = 0;              ///< capacity for total_slots buffers
         int group_experts_cap_ = 0;            ///< capacity for num_experts buffers
 
         // Phase 5: Grouped prefill pipeline scratch buffers.
-        // The kernels execute sequentially on one stream, so A/scales are reused
-        // for SwiGLU quantization and gate is reused for down-projection output.
-        int8_t *d_prefill_A_int8_ = nullptr;  ///< [prefill_slots_cap_, max(d_model,intermediate)]
-        float *d_prefill_A_scales_ = nullptr; ///< [prefill_slots_cap_, max_blocks_per_row]
-        float *d_prefill_gate_ = nullptr;     ///< [prefill_slots_cap_, max(d_model,intermediate)]
-        float *d_prefill_up_ = nullptr;       ///< [prefill_slots_cap_, intermediate]
+        //
+        // The fused ROCm verifier path must not write SwiGLU activations into
+        // the same buffers that hold gathered hidden activations: independent
+        // output-column blocks can finish the fused gate/up epilogue while
+        // other blocks are still reading A/scales.  Keep the handoff explicit
+        // and workspace-owned so graph replay cannot observe an in-place race.
+        int8_t *d_prefill_A_int8_ = nullptr;       ///< [prefill_slots_cap_, max(d_model,intermediate)]
+        float *d_prefill_A_scales_ = nullptr;      ///< [prefill_slots_cap_, max_blocks_per_row]
+        int8_t *d_prefill_swiglu_int8_ = nullptr;  ///< [prefill_slots_cap_, intermediate]
+        float *d_prefill_swiglu_scales_ = nullptr; ///< [prefill_slots_cap_, intermediate / 32]
+        float *d_prefill_gate_ = nullptr;          ///< [prefill_slots_cap_, max(d_model,intermediate)]
+        float *d_prefill_up_ = nullptr;            ///< [prefill_slots_cap_, intermediate]
         int prefill_slots_cap_ = 0;           ///< Current capacity (total_slots)
         int prefill_d_model_cap_ = 0;         ///< Current d_model capacity
         int prefill_intermediate_cap_ = 0;    ///< Current intermediate capacity

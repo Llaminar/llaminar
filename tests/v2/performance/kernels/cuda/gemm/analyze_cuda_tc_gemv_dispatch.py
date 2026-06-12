@@ -18,7 +18,7 @@ ASPECT_BUCKETS = (
 )
 
 ASPECT_ORDER = ["very_wide", "wide", "balanced", "tall"]
-FAMILY_ORDER = ["wide", "kpar", "direct"]
+FAMILY_ORDER = ["wide", "kpar", "rowpar", "direct"]
 ASPECT_CONDITIONS = {
     "very_wide": "aspect_ratio >= 16.0f",
     "wide": "aspect_ratio >= 2.0f",
@@ -58,7 +58,7 @@ def aspect_bucket(ratio: float) -> str:
     return "tall"
 
 
-def load_rows(path: Path):
+def load_rows(path: Path, winners_only: bool = True):
     rows = []
     with path.open("r", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -67,7 +67,7 @@ def load_rows(path: Path):
                 is_best = int(raw["is_best"])
             except (KeyError, ValueError):
                 continue
-            if is_best != 1:
+            if winners_only and is_best != 1:
                 continue
 
             format_name = raw["format"]
@@ -80,6 +80,7 @@ def load_rows(path: Path):
                     raise SystemExit(
                         f"codebook mismatch in CSV: format {format_name} maps to {codebook}, row has {csv_codebook}")
 
+            m = int(raw.get("m", "1"))
             n = int(raw["n"])
             k = int(raw["k"])
             ratio = float(n) / float(k) if k else 0.0
@@ -88,6 +89,7 @@ def load_rows(path: Path):
                 "format": format_name,
                 "codebook": codebook,
                 "shape": raw["shape"],
+                "m": m,
                 "n": n,
                 "k": k,
                 "ratio": ratio,
@@ -102,8 +104,98 @@ def load_rows(path: Path):
                     int(raw["max_kb"]),
                     int(raw["force_two_phase"]),
                 ),
+                "bw": float(raw["eff_bw_gbs"]),
+                "is_best": is_best == 1,
             })
     return rows
+
+
+def select_runtime_rows(all_rows):
+    """Collapse source-format rows to the dispatch surface used at runtime.
+
+    CUDA NativeVNNI GEMV dispatch is keyed by ``(codebook, M, N, K)``. Some GGUF
+    formats are aliases of the same native codebook (for example Q4_1/Q4_K), so
+    the runtime cannot choose two different tunings for the same key. Pick one
+    aggregate winner per key by maximizing the worst alias-relative bandwidth,
+    then the mean alias-relative bandwidth. This keeps validation honest: exact
+    hit rates measure what the generated table can actually express.
+    """
+
+    grouped = defaultdict(list)
+    for row in all_rows:
+        grouped[(row["codebook"], row["m"], row["n"], row["k"])].append(row)
+
+    runtime_rows = []
+    alias_groups = 0
+    conflict_groups = 0
+
+    for key, bucket in grouped.items():
+        formats = sorted({row["format"] for row in bucket})
+        if len(formats) > 1:
+            alias_groups += 1
+
+        oracle_by_format = {}
+        for row in bucket:
+            oracle_by_format[row["format"]] = max(oracle_by_format.get(row["format"], 0.0), row["bw"])
+
+        candidates = sorted({(row["family"], row["candidate"]) for row in bucket})
+        scored = []
+        for family, candidate in candidates:
+            ratios = []
+            total_bw = 0.0
+            for fmt in formats:
+                fmt_rows = [
+                    row for row in bucket
+                    if row["format"] == fmt and row["family"] == family and row["candidate"] == candidate
+                ]
+                best_bw = max((row["bw"] for row in fmt_rows), default=0.0)
+                oracle = oracle_by_format.get(fmt, 0.0)
+                ratios.append((best_bw / oracle) if oracle > 0.0 else 0.0)
+                total_bw += best_bw
+            scored.append({
+                "family": family,
+                "candidate": candidate,
+                "min_ratio": min(ratios) if ratios else 0.0,
+                "mean_ratio": sum(ratios) / len(ratios) if ratios else 0.0,
+                "total_bw": total_bw,
+            })
+
+        best = max(
+            scored,
+            key=lambda item: (
+                item["min_ratio"],
+                item["mean_ratio"],
+                item["total_bw"],
+                item["family"],
+                item["candidate"],
+            ),
+        )
+
+        source_winners = {
+            (row["family"], row["candidate"])
+            for row in bucket
+            if row["is_best"]
+        }
+        if len(source_winners) > 1:
+            conflict_groups += 1
+
+        template = max(bucket, key=lambda row: row["bw"]).copy()
+        template["format"] = CODEBOOK_TO_FORMAT.get(key[0], template["format"])
+        template["family"] = best["family"]
+        template["candidate"] = best["candidate"]
+        template["alias_formats"] = "/".join(formats)
+        template["alias_count"] = len(formats)
+        template["alias_min_ratio"] = best["min_ratio"]
+        template["alias_mean_ratio"] = best["mean_ratio"]
+        runtime_rows.append(template)
+
+    runtime_rows.sort(key=lambda row: (row["codebook"], row["m"], row["k"], row["n"]))
+    return runtime_rows, {
+        "source_rows": sum(1 for row in all_rows if row["is_best"]),
+        "runtime_rows": len(runtime_rows),
+        "alias_groups": alias_groups,
+        "conflict_groups": conflict_groups,
+    }
 
 
 def modal_value(rows, key_name):
@@ -191,13 +283,14 @@ def best_segments(rows, key_name, max_segments=3, min_size=4):
 def build_exact_rules(rows):
     grouped = defaultdict(list)
     for row in rows:
-        grouped[(row["codebook"], row["n"], row["k"])].append(row)
+        grouped[(row["codebook"], row["m"], row["n"], row["k"])].append(row)
 
     exact_rules = defaultdict(list)
-    for (codebook, n, k), bucket in grouped.items():
+    for (codebook, m, n, k), bucket in grouped.items():
         family, family_support = modal_value(bucket, "family")
         candidate, candidate_support = modal_candidate([row for row in bucket if row["family"] == family])
         exact_rules[codebook].append({
+            "m": m,
             "n": n,
             "k": k,
             "family": family,
@@ -208,24 +301,28 @@ def build_exact_rules(rows):
         })
 
     for codebook in exact_rules:
-        exact_rules[codebook].sort(key=lambda rule: (rule["k"], rule["n"]))
+        exact_rules[codebook].sort(key=lambda rule: (rule["m"], rule["k"], rule["n"]))
     return exact_rules
 
 
 def build_family_fallback_rules(rows):
     rules = {}
     for codebook in sorted({row["codebook"] for row in rows}):
-        for aspect in ASPECT_ORDER:
-            bucket = [row for row in rows if row["codebook"] == codebook and row["aspect"] == aspect]
-            if bucket:
-                rules[(codebook, aspect)] = best_segments(bucket, "family")
+        for m in sorted({row["m"] for row in rows if row["codebook"] == codebook}):
+            for aspect in ASPECT_ORDER:
+                bucket = [
+                    row for row in rows
+                    if row["codebook"] == codebook and row["m"] == m and row["aspect"] == aspect
+                ]
+                if bucket:
+                    rules[(codebook, m, aspect)] = best_segments(bucket, "family")
     return rules
 
 
 def build_tuning_fallback_rules(rows):
     grouped = defaultdict(list)
     for row in rows:
-        grouped[(row["codebook"], row["aspect"], row["family"])].append(row)
+        grouped[(row["codebook"], row["m"], row["aspect"], row["family"])].append(row)
 
     rules = {}
     for key, bucket in grouped.items():
@@ -235,13 +332,13 @@ def build_tuning_fallback_rules(rows):
 
 def pick_exact_rule(exact_rules, row):
     for rule in exact_rules.get(row["codebook"], []):
-        if rule["n"] == row["n"] and rule["k"] == row["k"]:
+        if rule["m"] == row["m"] and rule["n"] == row["n"] and rule["k"] == row["k"]:
             return rule
     return None
 
 
 def pick_family_fallback(family_rules, row):
-    rules = family_rules.get((row["codebook"], row["aspect"]))
+    rules = family_rules.get((row["codebook"], row["m"], row["aspect"]))
     if not rules:
         return "kpar"
     for rule in rules:
@@ -251,7 +348,7 @@ def pick_family_fallback(family_rules, row):
 
 
 def pick_candidate_fallback(tuning_rules, row, family):
-    rules = tuning_rules.get((row["codebook"], row["aspect"], family))
+    rules = tuning_rules.get((row["codebook"], row["m"], row["aspect"], family))
     if not rules:
         return None
     for rule in rules:
@@ -297,8 +394,8 @@ def format_candidate(candidate):
     return f"{{ {tile_n}, {cpt}, {target_waves}, {mkg}, {max_kb}, {force_two_phase} }}"
 
 
-def format_packed_key(n, k):
-    return f"0x{(((k & 0xFFFFFFFF) << 32) | (n & 0xFFFFFFFF)):016x}ULL"
+def format_packed_key(m, n, k):
+    return f"0x{(((m & 0xFF) << 56) | ((k & 0xFFFFFF) << 28) | (n & 0x0FFFFFFF)):016x}ULL"
 
 
 def write_exact_override_function(lines, exact_rules):
@@ -309,10 +406,11 @@ def write_exact_override_function(lines, exact_rules):
     lines.append("    GeneratedDispatchTuning tuning;")
     lines.append("};")
     lines.append("")
-    lines.append("inline constexpr uint64_t packGeneratedDispatchKey(int N, int K)")
+    lines.append("inline constexpr uint64_t packGeneratedDispatchKey(int M, int N, int K)")
     lines.append("{")
-    lines.append("    return (static_cast<uint64_t>(static_cast<uint32_t>(K)) << 32) |")
-    lines.append("           static_cast<uint32_t>(N);")
+    lines.append("    return (static_cast<uint64_t>(M & 0xFF) << 56) |")
+    lines.append("           (static_cast<uint64_t>(K & 0xFFFFFF) << 28) |")
+    lines.append("           static_cast<uint64_t>(N & 0x0FFFFFFF);")
     lines.append("}")
     lines.append("")
     lines.append("template <size_t Count>")
@@ -339,9 +437,9 @@ def write_exact_override_function(lines, exact_rules):
     lines.append("}")
     lines.append("")
     lines.append("template <uint8_t CB>")
-    lines.append("inline bool selectKnownShapeGenerated(int N, int K, NativeGemvShape &out_shape, GeneratedDispatchTuning &out_tuning)")
+    lines.append("inline bool selectKnownShapeGenerated(int M, int N, int K, NativeGemvShape &out_shape, GeneratedDispatchTuning &out_tuning)")
     lines.append("{")
-    lines.append("    const uint64_t packed_key = packGeneratedDispatchKey(N, K);")
+    lines.append("    const uint64_t packed_key = packGeneratedDispatchKey(M, N, K);")
     first_codebook = True
     for codebook in sorted(exact_rules):
         prefix = "if constexpr" if first_codebook else "else if constexpr"
@@ -351,7 +449,7 @@ def write_exact_override_function(lines, exact_rules):
         lines.append("        static constexpr GeneratedKnownShapeEntry kTable[] = {")
         for rule in exact_rules[codebook]:
             lines.append(
-                f"            {{ {format_packed_key(rule['n'], rule['k'])}, NativeGemvShape::{rule['family'].upper()}, {format_candidate(rule['candidate'])} }}, // {rule['n']}x{rule['k']} {rule['family_support']}/{rule['total']}")
+                f"            {{ {format_packed_key(rule['m'], rule['n'], rule['k'])}, NativeGemvShape::{rule['family'].upper()}, {format_candidate(rule['candidate'])} }}, // M={rule['m']} {rule['n']}x{rule['k']} {rule['family_support']}/{rule['total']}")
         lines.append("        };")
         lines.append("        return findGeneratedKnownShape(kTable, packed_key, out_shape, out_tuning);")
         lines.append("    }")
@@ -362,7 +460,7 @@ def write_exact_override_function(lines, exact_rules):
 
 def write_family_fallback(lines, family_rules):
     lines.append("template <uint8_t CB>")
-    lines.append("inline NativeGemvShape classifyShapeGeneratedFallback(int N, int K)")
+    lines.append("inline NativeGemvShape classifyShapeGeneratedFallback(int M, int N, int K)")
     lines.append("{")
     lines.append("    const float aspect_ratio = (K > 0) ? (static_cast<float>(N) / static_cast<float>(K)) : 0.0f;")
     lines.append("    const long long work_items = static_cast<long long>(N) * static_cast<long long>(K);")
@@ -370,22 +468,28 @@ def write_family_fallback(lines, family_rules):
     for codebook in sorted({key[0] for key in family_rules}):
         prefix = "    if constexpr" if first_codebook else "    else if constexpr"
         first_codebook = False
-        lines.append(f"    {prefix} (CB == {codebook}) {{ // {CODEBOOK_TO_FORMAT[codebook]}")
-        first_aspect = True
-        for aspect in ASPECT_ORDER:
-            rules = family_rules.get((codebook, aspect))
-            if not rules:
-                continue
-            aspect_prefix = "        if" if first_aspect else "        else if"
-            first_aspect = False
-            lines.append(f"        {aspect_prefix} ({ASPECT_CONDITIONS[aspect]}) {{")
-            for index, rule in enumerate(rules):
-                choice = f"NativeGemvShape::{rule['choice'].upper()}"
-                if index == len(rules) - 1:
-                    lines.append(f"            return {choice}; // {rule['support']}/{rule['total']}")
-                else:
-                    keyword = "if" if index == 0 else "else if"
-                    lines.append(f"            {keyword} (work_items <= {rule['max_work']}LL) return {choice}; // {rule['support']}/{rule['total']}")
+        lines.append(f"    {prefix} (CB == {codebook}) {{ // {canonical_branch_label(codebook)}")
+        first_m = True
+        for m in sorted({key[1] for key in family_rules if key[0] == codebook}):
+            m_prefix = "        if" if first_m else "        else if"
+            first_m = False
+            lines.append(f"        {m_prefix} (M == {m}) {{")
+            first_aspect = True
+            for aspect in ASPECT_ORDER:
+                rules = family_rules.get((codebook, m, aspect))
+                if not rules:
+                    continue
+                aspect_prefix = "            if" if first_aspect else "            else if"
+                first_aspect = False
+                lines.append(f"            {aspect_prefix} ({ASPECT_CONDITIONS[aspect]}) {{")
+                for index, rule in enumerate(rules):
+                    choice = f"NativeGemvShape::{rule['choice'].upper()}"
+                    if index == len(rules) - 1:
+                        lines.append(f"                return {choice}; // {rule['support']}/{rule['total']}")
+                    else:
+                        keyword = "if" if index == 0 else "else if"
+                        lines.append(f"                {keyword} (work_items <= {rule['max_work']}LL) return {choice}; // {rule['support']}/{rule['total']}")
+                lines.append("            }")
             lines.append("        }")
         lines.append("        return NativeGemvShape::KPAR;")
         lines.append("    }")
@@ -396,7 +500,7 @@ def write_family_fallback(lines, family_rules):
 
 def write_tuning_fallback(lines, tuning_rules):
     lines.append("template <uint8_t CB>")
-    lines.append("inline GeneratedDispatchTuning selectGeneratedTuningFallback(NativeGemvShape shape, int N, int K)")
+    lines.append("inline GeneratedDispatchTuning selectGeneratedTuningFallback(NativeGemvShape shape, int M, int N, int K)")
     lines.append("{")
     lines.append("    const float aspect_ratio = (K > 0) ? (static_cast<float>(N) / static_cast<float>(K)) : 0.0f;")
     lines.append("    const long long work_items = static_cast<long long>(N) * static_cast<long long>(K);")
@@ -404,29 +508,35 @@ def write_tuning_fallback(lines, tuning_rules):
     for codebook in sorted({key[0] for key in tuning_rules}):
         prefix = "    if constexpr" if first_codebook else "    else if constexpr"
         first_codebook = False
-        lines.append(f"    {prefix} (CB == {codebook}) {{ // {CODEBOOK_TO_FORMAT[codebook]}")
-        lines.append("        switch (shape)")
-        lines.append("        {")
-        for family in FAMILY_ORDER:
-            lines.append(f"        case NativeGemvShape::{family.upper()}:")
-            first_aspect = True
-            for aspect in ASPECT_ORDER:
-                rules = tuning_rules.get((codebook, aspect, family))
-                if not rules:
-                    continue
-                aspect_prefix = "            if" if first_aspect else "            else if"
-                first_aspect = False
-                lines.append(f"            {aspect_prefix} ({ASPECT_CONDITIONS[aspect]}) {{")
-                for index, rule in enumerate(rules):
-                    candidate = format_candidate(rule['choice'])
-                    if index == len(rules) - 1:
-                        lines.append(f"                return {candidate}; // {rule['support']}/{rule['total']}")
-                    else:
-                        keyword = "if" if index == 0 else "else if"
-                        lines.append(f"                {keyword} (work_items <= {rule['max_work']}LL) return {candidate}; // {rule['support']}/{rule['total']}")
-                lines.append("            }")
-            lines.append("            break;")
-        lines.append("        }")
+        lines.append(f"    {prefix} (CB == {codebook}) {{ // {canonical_branch_label(codebook)}")
+        first_m = True
+        for m in sorted({key[1] for key in tuning_rules if key[0] == codebook}):
+            m_prefix = "        if" if first_m else "        else if"
+            first_m = False
+            lines.append(f"        {m_prefix} (M == {m}) {{")
+            lines.append("            switch (shape)")
+            lines.append("            {")
+            for family in FAMILY_ORDER:
+                lines.append(f"            case NativeGemvShape::{family.upper()}:")
+                first_aspect = True
+                for aspect in ASPECT_ORDER:
+                    rules = tuning_rules.get((codebook, m, aspect, family))
+                    if not rules:
+                        continue
+                    aspect_prefix = "                if" if first_aspect else "                else if"
+                    first_aspect = False
+                    lines.append(f"                {aspect_prefix} ({ASPECT_CONDITIONS[aspect]}) {{")
+                    for index, rule in enumerate(rules):
+                        candidate = format_candidate(rule['choice'])
+                        if index == len(rules) - 1:
+                            lines.append(f"                    return {candidate}; // {rule['support']}/{rule['total']}")
+                        else:
+                            keyword = "if" if index == 0 else "else if"
+                            lines.append(f"                    {keyword} (work_items <= {rule['max_work']}LL) return {candidate}; // {rule['support']}/{rule['total']}")
+                    lines.append("                }")
+                lines.append("                break;")
+            lines.append("            }")
+            lines.append("        }")
         lines.append("    }")
     lines.append("    return { 128, 1, 0, 0, 0, 0 };")
     lines.append("}")
@@ -456,30 +566,42 @@ def write_output(path: Path, input_path: Path, exact_rules, family_rules, tuning
     lines.append("// Known-shape overrides for the swept decode shapes.")
     write_exact_override_function(lines, exact_rules)
     lines.append("template <uint8_t CB>")
-    lines.append("inline NativeGemvShape classifyShapeGeneratedFallback(int N, int K);")
+    lines.append("inline NativeGemvShape classifyShapeGeneratedFallback(int M, int N, int K);")
     lines.append("")
     lines.append("template <uint8_t CB>")
-    lines.append("inline GeneratedDispatchTuning selectGeneratedTuningFallback(NativeGemvShape shape, int N, int K);")
+    lines.append("inline GeneratedDispatchTuning selectGeneratedTuningFallback(NativeGemvShape shape, int M, int N, int K);")
+    lines.append("")
+    lines.append("template <uint8_t CB>")
+    lines.append("inline NativeGemvShape classifyShapeGenerated(int M, int N, int K)")
+    lines.append("{")
+    lines.append("    GeneratedDispatchTuning tuning{};")
+    lines.append("    NativeGemvShape shape = NativeGemvShape::KPAR;")
+    lines.append("    if (selectKnownShapeGenerated<CB>(M, N, K, shape, tuning))")
+    lines.append("        return shape;")
+    lines.append("    return classifyShapeGeneratedFallback<CB>(M, N, K);")
+    lines.append("}")
     lines.append("")
     lines.append("template <uint8_t CB>")
     lines.append("inline NativeGemvShape classifyShapeGenerated(int N, int K)")
     lines.append("{")
-    lines.append("    GeneratedDispatchTuning tuning{};")
-    lines.append("    NativeGemvShape shape = NativeGemvShape::KPAR;")
-    lines.append("    if (selectKnownShapeGenerated<CB>(N, K, shape, tuning))")
-    lines.append("        return shape;")
-    lines.append("    return classifyShapeGeneratedFallback<CB>(N, K);")
+    lines.append("    return classifyShapeGenerated<CB>(1, N, K);")
     lines.append("}")
     lines.append("")
     write_family_fallback(lines, family_rules)
     lines.append("template <uint8_t CB>")
-    lines.append("inline GeneratedDispatchTuning selectGeneratedTuning(int N, int K)")
+    lines.append("inline GeneratedDispatchTuning selectGeneratedTuning(int M, int N, int K)")
     lines.append("{")
     lines.append("    GeneratedDispatchTuning tuning{};")
     lines.append("    NativeGemvShape shape = NativeGemvShape::KPAR;")
-    lines.append("    if (selectKnownShapeGenerated<CB>(N, K, shape, tuning))")
+    lines.append("    if (selectKnownShapeGenerated<CB>(M, N, K, shape, tuning))")
     lines.append("        return tuning;")
-    lines.append("    return selectGeneratedTuningFallback<CB>(classifyShapeGeneratedFallback<CB>(N, K), N, K);")
+    lines.append("    return selectGeneratedTuningFallback<CB>(classifyShapeGeneratedFallback<CB>(M, N, K), M, N, K);")
+    lines.append("}")
+    lines.append("")
+    lines.append("template <uint8_t CB>")
+    lines.append("inline GeneratedDispatchTuning selectGeneratedTuning(int N, int K)")
+    lines.append("{")
+    lines.append("    return selectGeneratedTuning<CB>(1, N, K);")
     lines.append("}")
     lines.append("")
     write_tuning_fallback(lines, tuning_rules)
@@ -492,7 +614,7 @@ def render_known_shape_override_block(input_path: Path, exact_rules, overall_met
     lines.append(KNOWN_OVERRIDE_BEGIN)
     lines.append(f"// Source CSV: {input_path}")
     lines.append(f"// Known-shape override coverage: {overall_metrics['exact_override_hits']}/{overall_metrics['total']} ({overall_metrics['exact_override_pct']:.2f}%)")
-    lines.append("// These exact (N,K) winners are layered over the existing broad fallback table.")
+    lines.append("// These exact (M,N,K) winners are layered over the existing broad fallback table.")
     lines.append("")
     write_exact_override_function(lines, exact_rules)
     lines.append(KNOWN_OVERRIDE_END)
@@ -503,25 +625,37 @@ def render_known_shape_public_api() -> str:
     return "\n".join([
         PUBLIC_API_MARKER,
         "template <uint8_t CB>",
-        "inline NativeGemvShape classifyShapeGenerated(int N, int K)",
+        "inline NativeGemvShape classifyShapeGenerated(int M, int N, int K)",
         "{",
         "    NativeGemvShape shape = NativeGemvShape::KPAR;",
         "    GeneratedDispatchTuning tuning{};",
-        "    if (selectKnownShapeGenerated<CB>(N, K, shape, tuning))",
+        "    if (selectKnownShapeGenerated<CB>(M, N, K, shape, tuning))",
         "        return shape;",
-        "    selectGeneratedDispatch_<CB>(N, K, shape, tuning);",
+        "    selectGeneratedDispatch_<CB>(M, N, K, shape, tuning);",
         "    return shape;",
+        "}",
+        "",
+        "template <uint8_t CB>",
+        "inline NativeGemvShape classifyShapeGenerated(int N, int K)",
+        "{",
+        "    return classifyShapeGenerated<CB>(1, N, K);",
+        "}",
+        "",
+        "template <uint8_t CB>",
+        "inline GeneratedDispatchTuning selectGeneratedTuning(int M, int N, int K)",
+        "{",
+        "    NativeGemvShape shape = NativeGemvShape::KPAR;",
+        "    GeneratedDispatchTuning tuning{};",
+        "    if (selectKnownShapeGenerated<CB>(M, N, K, shape, tuning))",
+        "        return tuning;",
+        "    selectGeneratedDispatch_<CB>(M, N, K, shape, tuning);",
+        "    return tuning;",
         "}",
         "",
         "template <uint8_t CB>",
         "inline GeneratedDispatchTuning selectGeneratedTuning(int N, int K)",
         "{",
-        "    NativeGemvShape shape = NativeGemvShape::KPAR;",
-        "    GeneratedDispatchTuning tuning{};",
-        "    if (selectKnownShapeGenerated<CB>(N, K, shape, tuning))",
-        "        return tuning;",
-        "    selectGeneratedDispatch_<CB>(N, K, shape, tuning);",
-        "    return tuning;",
+        "    return selectGeneratedTuning<CB>(1, N, K);",
         "}",
     ])
 
@@ -539,24 +673,7 @@ def replace_public_api(text: str) -> str:
     if marker_index < 0:
         raise SystemExit("base include does not contain the GEMV generated public API marker")
 
-    pattern = re.compile(
-        rf"{re.escape(PUBLIC_API_MARKER)}\n"
-        r"template <uint8_t CB>\n"
-        r"inline NativeGemvShape classifyShapeGenerated\(int N, int K\)\n"
-        r"\{\n"
-        r".*?"
-        r"\n\}\n\n"
-        r"template <uint8_t CB>\n"
-        r"inline GeneratedDispatchTuning selectGeneratedTuning\(int N, int K\)\n"
-        r"\{\n"
-        r".*?"
-        r"\n\}",
-        re.DOTALL,
-    )
-    replaced, count = re.subn(pattern, render_known_shape_public_api(), text, count=1)
-    if count != 1:
-        raise SystemExit("failed to replace generated GEMV dispatch public API in base include")
-    return replaced
+    return text[:marker_index].rstrip() + "\n" + render_known_shape_public_api()
 
 
 def write_output_with_base(path: Path, input_path: Path, base_include: Path, exact_rules, overall_metrics):
@@ -576,11 +693,23 @@ def write_output_with_base(path: Path, input_path: Path, base_include: Path, exa
     path.write_text(text.rstrip() + "\n")
 
 
-def write_summary(path: Path, input_path: Path, exact_rules, family_rules, tuning_rules, overall_metrics, fallback_metrics):
+def write_summary(
+    path: Path,
+    input_path: Path,
+    exact_rules,
+    family_rules,
+    tuning_rules,
+    overall_metrics,
+    fallback_metrics,
+    runtime_stats,
+):
     lines = []
     lines.append("CUDA Native-Payload GEMV Dispatch Heuristic Summary")
     lines.append(f"Input CSV: {input_path}")
-    lines.append(f"Winner rows: {overall_metrics['total']}")
+    lines.append(f"Source winner rows: {runtime_stats['source_rows']}")
+    lines.append(f"Runtime dispatch rows: {runtime_stats['runtime_rows']}")
+    lines.append(f"Alias runtime keys: {runtime_stats['alias_groups']}")
+    lines.append(f"Alias winner-conflict keys: {runtime_stats['conflict_groups']}")
     lines.append(f"Overall family hit rate: {overall_metrics['family_hits']}/{overall_metrics['total']} ({overall_metrics['family_pct']:.2f}%)")
     lines.append(f"Overall exact hit rate: {overall_metrics['exact_hits']}/{overall_metrics['total']} ({overall_metrics['exact_pct']:.2f}%)")
     lines.append(f"Known-shape override coverage: {overall_metrics['exact_override_hits']}/{overall_metrics['total']} ({overall_metrics['exact_override_pct']:.2f}%)")
@@ -589,32 +718,36 @@ def write_summary(path: Path, input_path: Path, exact_rules, family_rules, tunin
     lines.append("")
     lines.append("Known-shape override counts by codebook:")
     for codebook in sorted(exact_rules):
-        lines.append(f"  CB {codebook:2d} ({CODEBOOK_TO_FORMAT[codebook]}): {len(exact_rules[codebook])} exact (N,K) overrides")
+        lines.append(f"  CB {codebook:2d} ({CODEBOOK_TO_FORMAT[codebook]}): {len(exact_rules[codebook])} exact (M,N,K) overrides")
     lines.append("")
     lines.append("Fallback family routing rules by codebook:")
     for codebook in sorted({key[0] for key in family_rules}):
         lines.append(f"  CB {codebook:2d} ({CODEBOOK_TO_FORMAT[codebook]}):")
-        for aspect in ASPECT_ORDER:
-            rules = family_rules.get((codebook, aspect))
-            if not rules:
-                continue
-            lines.append(f"    {aspect}:")
-            for rule in rules:
-                lines.append(f"      work<= {rule['max_work']}: {rule['choice']} ({rule['support']}/{rule['total']})")
+        for m in sorted({key[1] for key in family_rules if key[0] == codebook}):
+            lines.append(f"    M={m}:")
+            for aspect in ASPECT_ORDER:
+                rules = family_rules.get((codebook, m, aspect))
+                if not rules:
+                    continue
+                lines.append(f"      {aspect}:")
+                for rule in rules:
+                    lines.append(f"        work<= {rule['max_work']}: {rule['choice']} ({rule['support']}/{rule['total']})")
     lines.append("")
     lines.append("Fallback tuning rules by codebook:")
     for codebook in sorted({key[0] for key in tuning_rules}):
         lines.append(f"  CB {codebook:2d} ({CODEBOOK_TO_FORMAT[codebook]}):")
         saw_codebook = False
-        for family in FAMILY_ORDER:
-            for aspect in ASPECT_ORDER:
-                rules = tuning_rules.get((codebook, aspect, family))
-                if not rules:
-                    continue
-                saw_codebook = True
-                lines.append(f"    {family}/{aspect}:")
-                for rule in rules:
-                    lines.append(f"      work<= {rule['max_work']}: {rule['choice']} ({rule['support']}/{rule['total']})")
+        for m in sorted({key[1] for key in tuning_rules if key[0] == codebook}):
+            lines.append(f"    M={m}:")
+            for family in FAMILY_ORDER:
+                for aspect in ASPECT_ORDER:
+                    rules = tuning_rules.get((codebook, m, aspect, family))
+                    if not rules:
+                        continue
+                    saw_codebook = True
+                    lines.append(f"      {family}/{aspect}:")
+                    for rule in rules:
+                        lines.append(f"        work<= {rule['max_work']}: {rule['choice']} ({rule['support']}/{rule['total']})")
         if not saw_codebook:
             lines.append("    no fallback tuning rules generated")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -646,9 +779,10 @@ def main():
     if not input_path.is_file():
         raise SystemExit(f"input CSV not found: {input_path}")
 
-    rows = load_rows(input_path)
+    all_rows = load_rows(input_path, winners_only=False)
+    rows, runtime_stats = select_runtime_rows(all_rows)
     if not rows:
-        raise SystemExit(f"no winner rows found in: {input_path}")
+        raise SystemExit(f"no runtime winner rows found in: {input_path}")
 
     exact_rules = build_exact_rules(rows)
     family_rules = build_family_fallback_rules(rows)
@@ -661,10 +795,23 @@ def main():
         write_output_with_base(output_path, input_path, Path(args.base_include), exact_rules, overall_metrics)
     else:
         write_output(output_path, input_path, exact_rules, family_rules, tuning_rules, overall_metrics, fallback_metrics)
-    write_summary(summary_path, input_path, exact_rules, family_rules, tuning_rules, overall_metrics, fallback_metrics)
+    write_summary(
+        summary_path,
+        input_path,
+        exact_rules,
+        family_rules,
+        tuning_rules,
+        overall_metrics,
+        fallback_metrics,
+        runtime_stats,
+    )
 
     print(f"generated heuristic include: {output_path}")
     print(f"generated heuristic summary: {summary_path}")
+    print(f"source winner rows: {runtime_stats['source_rows']}")
+    print(f"runtime dispatch rows: {runtime_stats['runtime_rows']}")
+    print(f"alias runtime keys: {runtime_stats['alias_groups']}")
+    print(f"alias winner-conflict keys: {runtime_stats['conflict_groups']}")
     print(f"overall family hit rate: {overall_metrics['family_hits']}/{overall_metrics['total']} ({overall_metrics['family_pct']:.2f}%)")
     print(f"overall exact hit rate: {overall_metrics['exact_hits']}/{overall_metrics['total']} ({overall_metrics['exact_pct']:.2f}%)")
     print(f"known-shape override coverage: {overall_metrics['exact_override_hits']}/{overall_metrics['total']} ({overall_metrics['exact_override_pct']:.2f}%)")

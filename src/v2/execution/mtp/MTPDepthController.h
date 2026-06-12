@@ -9,6 +9,13 @@
 namespace llaminar2
 {
 
+    /**
+     * @brief Human-readable reason for the last adaptive depth decision.
+     *
+     * These values are exported through request summaries and benchmark JSON.
+     * Keep them stable enough that tuning scripts can group by the string form
+     * returned by @ref toString.
+     */
     enum class MTPDepthDecisionReason
     {
         FixedMode,
@@ -19,6 +26,10 @@ namespace llaminar2
         PromoteFullAcceptRate,
         DemoteZeroAcceptRate,
         DemoteLowAcceptanceRate,
+        GeneratedPolicyPromote,
+        GeneratedPolicyDemote,
+        GeneratedPolicyHold,
+        GeneratedBestDepthGraceWindow,
         ProbeHigherBeforeDemote,
         DepthZeroBypass,
         Hold,
@@ -26,6 +37,14 @@ namespace llaminar2
 
     const char *toString(MTPDepthDecisionReason reason);
 
+    /**
+     * @brief Rolling observation window used by dynamic MTP depth selection.
+     *
+     * The controller intentionally records only cheap counters from completed
+     * verifier steps.  It does not read clocks or backend-specific timing; the
+     * offline trainer learns timing-sensitive policies from benchmark TSVs and
+     * emits simple acceptance-window predicates.
+     */
     struct MTPDepthWindow
     {
         uint64_t verifier_runs = 0;
@@ -38,6 +57,13 @@ namespace llaminar2
         uint64_t accepted_prefix_sum = 0;
     };
 
+    /**
+     * @brief Per-step signal recorded after a speculative verifier step.
+     *
+     * @c requested_depth is what the controller asked for, @c effective_depth is
+     * the number of draft rows actually attempted after budget clamping, and
+     * @c accepted_speculative_prefix is the contiguous accepted prefix.
+     */
     struct MTPDepthObservation
     {
         int requested_depth = 1;
@@ -47,6 +73,13 @@ namespace llaminar2
         bool rollback = false;
     };
 
+    /**
+     * @brief Result of evaluating one rolling window.
+     *
+     * Most decode steps return @c evaluated=false because the window is still
+     * accumulating evidence.  When evaluated, @c changed tells callers whether
+     * the live request depth moved and @c reason explains why.
+     */
     struct MTPDepthDecision
     {
         bool evaluated = false;
@@ -62,6 +95,9 @@ namespace llaminar2
         double full_accept_rate = 0.0;
     };
 
+    /**
+     * @brief Aggregate adaptive-depth counters emitted into request stats.
+     */
     struct MTPDepthControllerStats
     {
         uint64_t windows = 0;
@@ -71,13 +107,28 @@ namespace llaminar2
         uint64_t observe_recommendations = 0;
     };
 
+    /**
+     * @brief Deterministic online controller for fixed, observe, and dynamic
+     * MTP draft depth.
+     *
+     * Dynamic mode combines hand-written safety hysteresis with an optional
+     * generated policy table.  The generated policy can only promote/demote
+     * inside the configured min/max bounds and is disabled automatically for
+     * fixed mode, so fixed-depth benchmark lanes remain hard pinned.
+     */
     class MTPDepthController
     {
     public:
         MTPDepthController() = default;
-        MTPDepthController(MTPDepthPolicyConfig config, int configured_draft_tokens);
+        MTPDepthController(
+            MTPDepthPolicyConfig config,
+            int configured_draft_tokens,
+            MTPVerifyMode verify_mode = MTPVerifyMode::Greedy);
 
-        void configure(MTPDepthPolicyConfig config, int configured_draft_tokens);
+        void configure(
+            MTPDepthPolicyConfig config,
+            int configured_draft_tokens,
+            MTPVerifyMode verify_mode = MTPVerifyMode::Greedy);
         void reset();
 
         int currentDepth() const { return current_depth_; }
@@ -121,9 +172,22 @@ namespace llaminar2
         bool depthZeroProbeReady() const;
 
         MTPDepthPolicyConfig config_;
+        /** @brief Active verifier mode used to select generated policy rows. */
+        MTPVerifyMode verify_mode_ = MTPVerifyMode::Greedy;
         int current_depth_ = 1;
         int steps_since_change_ = 0;
         int promotion_streak_ = 0;
+        /**
+         * @brief Consecutive non-catastrophic bad windows at the learned best
+         * fixed-depth lane.
+         *
+         * Benchmark-trained hold rows can identify a depth that wins over a
+         * whole request even though individual 16-step windows are noisy.  One
+         * bad window gets grace; a second consecutive bad window is treated as
+         * request-local evidence that this prompt differs from the trained
+         * fixed-depth lane.
+         */
+        int generated_best_bad_streak_ = 0;
         MTPDepthWindow window_;
         MTPDepthDecision last_decision_;
         MTPDepthControllerStats stats_;

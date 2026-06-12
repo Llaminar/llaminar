@@ -57,6 +57,18 @@ def main() -> int:
         if found != expected:
             raise SystemExit(f"expected helpers {sorted(expected)}, found {sorted(found)}")
 
+        required_fragments = (
+            "int M, int N, int K",
+            "const float log2_m",
+            "classifyShapeGenerated(int M, int N, int K)",
+            "selectGeneratedTuning(int M, int N, int K)",
+            "return classifyShapeGenerated<CB>(1, N, K);",
+            "return selectGeneratedTuning<CB>(1, N, K);",
+        )
+        for fragment in required_fragments:
+            if fragment not in text:
+                raise SystemExit(f"generated CUDA GEMV dispatch is missing M-aware fragment: {fragment}")
+
         if not summary.read_text().strip():
             raise SystemExit("generator summary was empty")
 

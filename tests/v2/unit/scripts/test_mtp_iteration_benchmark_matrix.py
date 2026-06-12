@@ -72,6 +72,9 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("dry-run:", result.stdout)
+        self.assertIn("--mtp-depth-policy dynamic", result.stdout)
+        self.assertIn("--mtp-min-draft-tokens 1", result.stdout)
+        self.assertNotIn("--mtp-initial-draft-tokens", result.stdout)
 
     def test_baseline_summary_row_matches_header_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -130,8 +133,24 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = (output_dir / "summary.tsv").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 2)
-            self.assertEqual(len(lines[0].split("\t")), len(lines[1].split("\t")))
-            self.assertEqual(len(lines[0].split("\t")), 61)
+            header = lines[0].split("\t")
+            row = lines[1].split("\t")
+            self.assertEqual(len(header), len(row))
+            self.assertEqual(len(header), 73)
+            for required_column in (
+                "generated_policy",
+                "min_depth",
+                "max_depth",
+                "depth_updates",
+                "depth_promotions",
+                "depth_demotions",
+                "depth_windows",
+                "last_depth_reason",
+            ):
+                self.assertIn(required_column, header)
+            self.assertEqual(row[header.index("depth_updates")], "0")
+            self.assertEqual(row[header.index("last_depth_reason")], "")
+            self.assertEqual(row[header.index("generated_policy")], "false")
 
 
 if __name__ == "__main__":

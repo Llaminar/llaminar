@@ -421,6 +421,8 @@ namespace llaminar2
                 workspace_m,
                 params_.n_v > 0 ? params_.n_v : n,
                 workspace_k));
+        addCudaConcurrentDecodeGemvSideStreamWorkspace(
+            combined, params_.device_id, workspace_m, /*projection_count=*/3);
         return combined;
     }
 

@@ -100,6 +100,26 @@ namespace llaminar2
     };
 
     /**
+     * @brief Row-local softmax statistics for processed full-vocab logits.
+     *
+     * vLLM-style stochastic verification avoids materializing compact target
+     * distributions for every verifier row. Instead, each row can be reduced to
+     * a few full-vocab softmax statistics, and individual token probabilities
+     * are recovered by reading that token's logit. `processed logits` means the
+     * caller has already applied temperature, penalties, and any top-k/top-p
+     * masks; masked tokens should be represented by non-finite logits.
+     */
+    struct MTPFullLogitRowStats
+    {
+        bool ok = false;
+        std::string error;
+
+        int32_t argmax_token = -1;
+        float max_logit = 0.0f;
+        double exp_sum = 0.0;
+    };
+
+    /**
      * @brief Sample one stochastic speculative-verifier row from distributions.
      *
      * This is the CPU/reference implementation of the same row-level contract
@@ -110,6 +130,86 @@ namespace llaminar2
     MTPRejectionSampleRowResult sampleMTPRejectionRowFromDistributions(
         const std::vector<SamplingDistributionEntry> &target_distribution,
         const std::vector<SamplingDistributionEntry> &draft_distribution,
+        int32_t draft_token,
+        float accept_threshold,
+        float residual_threshold);
+
+    /**
+     * @brief Sample vLLM-style recovered token from full probability rows.
+     *
+     * vLLM samples the rejection recovery token with a Gumbel-max equivalent:
+     * choose the token with maximal `max(p - q, 0) * inv_q[token]`, where
+     * `inv_q` is generated from exponential random draws. `no_draft_probs`
+     * matches vLLM's n-gram/speculator mode: the draft token itself is removed
+     * from the target probability row and all other target probabilities are
+     * eligible.
+     */
+    int32_t sampleMTPRecoveredTokenFromProbabilities(
+        const float *target_probabilities,
+        const float *draft_probabilities,
+        const float *inverse_rejection_samples,
+        int vocab_size,
+        int32_t draft_token,
+        bool no_draft_probabilities = false);
+
+    /**
+     * @brief Sample one vLLM-style stochastic verifier row from full probabilities.
+     *
+     * This is the direct CPU/reference mirror of vLLM's random rejection path:
+     * accept the sampled draft token when `p(draft) / q(draft)` beats the
+     * caller-provided uniform threshold, otherwise use
+     * sampleMTPRecoveredTokenFromProbabilities() for the recovered token.
+     */
+    MTPRejectionSampleRowResult sampleMTPRejectionRowFromProbabilities(
+        const float *target_probabilities,
+        const float *draft_probabilities,
+        const float *inverse_rejection_samples,
+        int vocab_size,
+        int32_t draft_token,
+        float accept_threshold,
+        bool no_draft_probabilities = false);
+
+    /**
+     * @brief Compute vLLM-style softmax stats for one processed full-logit row.
+     *
+     * This is the CPU/reference contract that CUDA and ROCm block reducers must
+     * match. Ties use lower token id to make backend parity deterministic.
+     */
+    MTPFullLogitRowStats computeMTPFullLogitRowStats(
+        const float *logits,
+        int vocab_size);
+
+    /**
+     * @brief Return a token probability from processed full logits and stats.
+     */
+    float probabilityFromMTPFullLogits(
+        const float *logits,
+        int vocab_size,
+        const MTPFullLogitRowStats &stats,
+        int32_t token);
+
+    /**
+     * @brief Sample one token from processed full logits using a threshold.
+     *
+     * The cumulative walk is in token-id order so CPU/CUDA/ROCm can share a
+     * stable deterministic reference even when logits are not compacted.
+     */
+    int32_t sampleMTPTokenFromProcessedLogits(
+        const float *logits,
+        int vocab_size,
+        float threshold);
+
+    /**
+     * @brief Sample one stochastic verifier row from processed full logits.
+     *
+     * This is the vLLM-shaped reference path for the next GPU sampler: accept
+     * by looking up the sampled draft token's target/draft probabilities, and
+     * only build a residual sample when that draft token is rejected.
+     */
+    MTPRejectionSampleRowResult sampleMTPRejectionRowFromProcessedLogits(
+        const float *target_logits,
+        const float *draft_logits,
+        int vocab_size,
         int32_t draft_token,
         float accept_threshold,
         float residual_threshold);
@@ -139,6 +239,26 @@ namespace llaminar2
         std::optional<int32_t> bonus_ready_token = std::nullopt);
 
     /**
+     * @brief Build the stochastic batch outcome directly from processed logits.
+     *
+     * `target_logits` and `draft_logits` contain verifier rows for
+     * `request.draft_tokens[1:]`. `bonus_target_logits` is sampled only when all
+     * verifier rows accept and no output stop token was seen.
+     */
+    MTPRejectionBatchOutcome summarizeAllPositionMTPRejectionBatchFromProcessedLogits(
+        const MTPDecodeCatchupGreedyRequest &request,
+        const float *target_logits,
+        const float *draft_logits,
+        int verifier_row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const std::vector<float> &accept_thresholds,
+        const std::vector<float> &residual_thresholds,
+        const float *bonus_target_logits = nullptr,
+        float bonus_threshold = 0.0f);
+
+    /**
      * @brief Convert stochastic verifier row decisions into the catch-up result.
      *
      * `request.draft_tokens[0]` is the already-accepted first target token.
@@ -150,6 +270,22 @@ namespace llaminar2
         const MTPDecodeCatchupGreedyRequest &request,
         const std::vector<MTPRejectionSampleRowResult> &verified_rows,
         std::optional<int32_t> bonus_ready_token = std::nullopt);
+
+    /**
+     * @brief Convert processed full-logit verifier rows into catch-up state.
+     */
+    MTPDecodeCatchupGreedyResult buildAllPositionMTPDecodeCatchupFromProcessedLogits(
+        const MTPDecodeCatchupGreedyRequest &request,
+        const float *target_logits,
+        const float *draft_logits,
+        int verifier_row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const std::vector<float> &accept_thresholds,
+        const std::vector<float> &residual_thresholds,
+        const float *bonus_target_logits = nullptr,
+        float bonus_threshold = 0.0f);
 
     /**
      * @brief Convert a compact device outcome into the vector batch contract.

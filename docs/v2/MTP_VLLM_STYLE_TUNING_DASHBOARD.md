@@ -1,91 +1,85 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Scope: SingleDevice Qwen3.6 dense/MoE MTP on CUDA/ROCm/CPU. Keep under 5KB and update every iteration.
+Scope: Qwen3.6 dense/MoE MTP on CUDA/ROCm/CPU across SingleDevice, LocalTP,
+LocalPP, NodeLocalTP, and ExpertOverlay. Keep this file under 6KB.
 
-Contract: refresh CUDA/ROCm/CPU with no-MTP, fixed d1/d2/d3, and dynamic. Dynamic must be reported beside same-run fixed rows. Before commit, run broad units plus relevant parity.
+RAG: Green = correct and speed-positive near target. Amber = correct but slow,
+partial, or policy-sensitive. Red = failing, speed-negative, or unproven.
 
-RAG: Green = correct and speed-positive near target. Amber = correct but slow, partial, or policy-sensitive. Red = failing or unproven.
+Iteration contract: refresh no-MTP, fixed d1/d2/d3, and dynamic for the active
+device/model/mode. Before a WiP commit, broad units plus touched parity must pass.
 
-## Evidence
+## Latest Evidence
 
-Latest dense stochastic closeout:
-`benchmark_results/mtp_vllm_style/20260610T-phase4-dense-stochastic-closeout-matrix-v2/`
-with `--decode-tokens 64 --perfstats`.
+- GPU stochastic matrix:
+  `benchmark_results/mtp_vllm_style/20260612T170149Z-gpu-stochastic-vllm-greedyq-c4096-post-moe-workspace/`.
+  CUDA/ROCm dense+MoE rows ran with zero rollbacks.
+- Dense stochastic remains speed-positive in the short `-c 4096` lane: CUDA best
+  d2 52.6 vs 44.7 tok/s (1.18x), ROCm best d1 37.0 vs 31.3 tok/s (1.18x).
+  Dynamic starts at d3 on CUDA and d1 on ROCm; `n=16` is too short for
+  hysteresis updates.
+- MoE stochastic is functionally green but speed-red on both GPUs. Same-run
+  baselines beat every MTP depth: CUDA best d3 79.0 vs 115.3 tok/s; ROCm best
+  d1 51.8 vs 69.1 tok/s.
+- `rocprof` on ROCm MoE d1 shows true GPU time dominated by GDN, routed/shared
+  MoE GEMMs, native GEMM, and LM head. Sampling kernels are secondary.
+- Phase 9 ExpertOverlay mixed parity is now green for ROCm2TP-hot plus
+  CPU2LocalTP-cold. Fixes: ROCm MoE local-expert nested workspace declarations,
+  LocalTP all-position verifier stream consumption, and deterministic ROCm MoE
+  parity mode. Guards: `V2_Unit_RankOrchestrator`,
+  `V2_Unit_MoELocalExpertStage_PreparedWeights`, and full
+  `^V2_Integration_Parity_Qwen36MoE_ExpertOverlay_`.
+- Fresh gate: full `^V2_Unit_` passed 502/502 after rebuilding, then
+  `^V2_Integration_ROCmMoEKernel$|^V2_Integration_Parity_Qwen36MoE_ExpertOverlay_`
+  passed 6/6.
+- Stage-owned CUDA side-stream workspace declarations still hold the dense VRAM
+  win: one-token d3 stochastic graph workspace is about 784 MB instead of the
+  stale LM-head-sized 1827 MB plan.
 
-Latest full dense/MoE matrix:
-`benchmark_results/mtp_vllm_style/20260609T-phase3-row-indexed-accepted-matrix/`
-with `--decode-tokens 16 --perfstats`.
+## Topology Matrix
 
-Latest correctness gate: Phase 6 accepted. CUDA/ROCm greedy graph smokes,
-768-token stochastic clear-cache replay, graph-stream d3 parity, broad
-`V2_Unit_`, and integration/release builds are green.
+| Topology | Dense MTP | MoE MTP | Benchmark/Tuning Status |
+|---|---|---|---|
+| SingleDevice | Green CPU/CUDA/ROCm greedy+stochastic | Amber/Red by mode; correct, MoE speed weak | full device matrix active |
+| LocalTP | Green for dense fixed d3 + dynamic | Amber; rank stream handoff fixed, MoE needs more benches | touched units + Qwen3.6 parity |
+| LocalPP | Amber; contract planned, less benchmark evidence | Red/Unproven | next PP parity expansion |
+| NodeLocalTP | Green dense fixed d2/d3 | Amber/Unproven for MoE | scalar dynamic depth still gated |
+| ExpertOverlay | Amber dense, Green MoE parity for hot/mixed lanes | Amber; correct, speed not accepted | full ExpertOverlay parity green |
 
-Latest Phase 5 publication-cost slice:
-`benchmark_results/mtp_vllm_style/20260610T-phase5-publication-cost-dense-stochastic-gpu/`
-and `...-cpu8/`.
-
-Latest Phase 6 graph slice: CUDA/ROCm greedy and long stochastic graph lifecycle pass.
-
-## Matrix
+## Device Matrix
 
 | Backend | Model | Sampling | RAG | Latest decode tok/s | Main blocker |
 |---|---|---|---|---|---|
-| CUDA | Dense 27B | greedy | Green | base 44.6; d1/d2/d3/dyn 60.9/55.7/60.0/49.3 | dynamic short-run lag |
-| CUDA | Dense 27B | stochastic | Green | base 43.88; d1/d2/d3/dyn 37.25/58.09/59.44/53.43 | d1 low acceptance |
-| ROCm | Dense 27B | greedy | Green | base 31.3; d1/d2/d3/dyn 45.7/33.4/41.9/40.7 | d2 weak |
-| ROCm | Dense 27B | stochastic | Green | base 30.33; d1/d2/d3/dyn 33.48/23.71/24.52/32.57 | d2/d3 acceptance-limited |
-| CPU | Dense 27B | greedy | Green | base 4.7; d1/d2/d3/dyn 5.9/6.0/9.3/6.1 | dynamic shallow |
-| CPU | Dense 27B | stochastic | Green | base 4.46; d1/d2/d3/dyn 5.06/5.78/4.85/5.41 | verifier/condition cost |
-| CUDA | MoE 35B | greedy | Amber | base 112.9; d1/d2/d3/dyn 62.8/66.8/69.6/57.9 | verifier dominates |
-| CUDA | MoE 35B | stochastic | Amber | base 114.5; d1/d2/d3/dyn 49.8/45.0/42.5/53.6 | low/zero acceptance |
-| ROCm | MoE 35B | greedy | Amber | base 64.7; d1/d2/d3/dyn 38.2/35.7/40.3/35.9 | verifier dominates |
-| ROCm | MoE 35B | stochastic | Amber | base 64.8; d1/d2/d3/dyn 29.7/25.8/23.1/30.5 | verifier dominates |
-| CPU | MoE 35B | greedy | Amber | base 17.7; d1/d2/d3/dyn 13.5/13.9/12.4/13.3 | host verifier cost |
-| CPU | MoE 35B | stochastic | Amber | base 17.6; d1/d2/d3/dyn 14.5/13.3/14.1/14.0 | host verifier cost |
+| CUDA | Dense 27B | greedy | Green | base 44.0; d1/d2/d3/dyn 63.9/76.1/91.4/87.8 | dynamic lag |
+| CUDA | Dense 27B | stochastic | Green | base 44.7; 52.6/52.6/47.7/47.7 | short-lane d3 regress |
+| ROCm | Dense 27B | greedy | Green | base 30.3; 42.3/48.1/65.0/52.9 | absolute CUDA gap |
+| ROCm | Dense 27B | stochastic | Green | base 31.3; 37.0/28.7/27.0/36.9 | d2/d3 acceptance/cost |
+| CPU | Dense 27B | greedy | Green | base 4.7; 5.9/6.0/9.3/6.1 | dynamic shallow |
+| CPU | Dense 27B | stochastic | Green | base 4.46; 5.06/5.78/4.85/5.41 | verifier/condition |
+| CUDA | MoE 35B | greedy | Amber | base 139.2; d1/d2/d3/dyn 129.6/136.6/139.1/146.1 | weak win |
+| CUDA | MoE 35B | stochastic | Red | base 115.3; 78.5/76.0/79.0/78.3 | verifier+condition cost |
+| ROCm | MoE 35B | greedy | Amber | base 77.0; 79.0/91.5/90.3/86.1 | below dense-class win |
+| ROCm | MoE 35B | stochastic | Red | base 69.1; 51.8/48.5/40.7/51.6 | verifier/model drain |
+| CPU | MoE 35B | greedy | Amber | base 17.7; 13.5/13.9/12.4/13.3 | host verifier cost |
+| CPU | MoE 35B | stochastic | Amber | base 17.6; 14.5/13.3/14.1/14.0 | host verifier cost |
 
 ## Current Read
 
-- Phase 4 dense SingleDevice is accepted. Its closeout gate covered focused
-  units, GPU sampling integration, dense stochastic parity on CPU/CUDA/ROCm,
-  and CUDA/ROCm stochastic graph smokes.
-- Dense stochastic is speed-positive on all backends in useful bounded lanes:
-  CUDA d3 1.35x, ROCm d1 1.10x and dynamic 1.07x, CPU d2 1.30x.
-- ROCm d2/d3 stochastic are bad because acceptance collapses to 28.6%/46.2% on
-  this prompt, not because of rollbacks or transaction failures.
-- CPU stochastic is correct and speed-positive, but verifier and condition
-  forward dominate: CPU d2 reports 22.9s verifier and 6.6s condition time for
-  the measured decode section.
-- MoE is functionally alive on all backends but speed-negative everywhere.
-- Phase 5 focused slices are green: live-state mutation reasons are typed,
-  publication distinguishes accepted vs rejected correction, and the
-  post-condition verifier-base stamp is now a tested logical transaction
-  helper instead of a payload checkpoint export. Matrix rows now include
-  `publish_count` and `publish_avg_ms` for depth-stability checks.
-- Phase 5 publication-cost slice: CUDA publish_avg 0.47-0.56ms, ROCm
-  0.29-0.32ms, CPU 3.84-3.86ms. Publication is stable across d1/d2/d3; remaining
-  cost is verifier/condition plus debug/prefix checkpoints, not slot publish.
-- Phase 5 is accepted: forced-reject replay parity is unit-covered and stale
-  all-position checkpoint tags are gone.
-- Phase 6 accepted: CUDA/ROCm greedy and 768-token stochastic graph tests require
-  `main_verifier`, `mtp_decode_sidecar`, and `mtp_decode_catchup`
-  warm/capture/replay. ROCm d3 stays on the M=4 decode-continuation attention
-  path; CUDA catch-up now uses one canonical lifecycle context. Penalty-free
-  stochastic defers final sync; penalty-bearing long runs sync verifier rows by
-  policy. Release CMake now skips graph-stream parity test properties in
-  perf-only builds.
+Dense relative speedup is accepted on CUDA/ROCm. GPU MoE greedy is correct and
+sometimes positive but still below the dense-class win. GPU MoE stochastic is
+not benchmark-accepted: the vLLM-shaped path is correct, but verifier,
+condition, and sidecar transaction work overwhelm recovered tokens.
 
 ## Target Anchors
 
-llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`:
-
-| Lane | Dense 27B decode | MoE 35B decode |
-|---|---:|---:|
-| no-MTP | 41.83 tok/s | 118.26 tok/s |
-| MTP d1 | 54.9 tok/s | 142.0 tok/s |
-| MTP d3 | 52.5 tok/s | 132.8 tok/s |
+llama.cpp CUDA anchors from `ggml-org/llama.cpp@6ddc943`: dense no-MTP 41.83,
+d1 54.9, d3 52.5 tok/s; MoE no-MTP 118.26, d1 142.0, d3 132.8 tok/s.
 
 ## Next
 
-1. Commit the accepted Phase 6 slice.
-2. Keep the dense stochastic closeout matrix as the per-iteration regression.
-3. Start Phase 7 MoE speed work.
+1. Continue Phase 9 multi-device hardening, keeping LocalTP, LocalPP,
+   ExpertOverlay, and NodeLocalTP status updated beside SingleDevice.
+2. Continue Phase 8 transaction-level vLLM alignment for MoE; reduce verifier,
+   condition, and sidecar graph economics before deeper sampler/kernel tuning.
+3. Re-run the bounded GPU MoE stochastic matrix after the next verifier/condition
+   tuning slice, then refresh this table from same-run baselines.

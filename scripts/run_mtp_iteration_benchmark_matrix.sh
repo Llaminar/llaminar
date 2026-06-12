@@ -248,7 +248,6 @@ describe_variant() {
         --mtp-draft-tokens 3
         --mtp-depth-policy dynamic
         --mtp-min-draft-tokens 1
-        --mtp-initial-draft-tokens 1
       )
       ;;
     *)
@@ -307,11 +306,11 @@ if [[ ! -x "${perf_summary_script}" ]]; then
   chmod +x "${perf_summary_script}" 2>/dev/null || true
 fi
 
-printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
+printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\tdepth_updates\tdepth_promotions\tdepth_demotions\tdepth_windows\tlast_depth_reason\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tsampling_enqueue_ms\tstochastic_batch_outcome_ms\tstochastic_batch_d2h_sync_ms\tgreedy_summary_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
 : > "${commands_path}"
 
 zero_perf_summary() {
-  local fields=40
+  local fields=44
   local values=()
   for ((i = 0; i < fields; ++i)); do
     values+=("0")
@@ -348,8 +347,16 @@ append_summary() {
       (.tokens.prefill // 0),
       (.tokens.decode // 0),
       (.config.mtp_depth_policy // "none"),
+      (.config.mtp_depth_generated_policy // false),
       (.config.mtp_draft_tokens // 0),
       (.mtp.current_depth // 0),
+      (.mtp.min_depth // 0),
+      (.mtp.max_depth // 0),
+      (.mtp.depth_policy_updates // 0),
+      (.mtp.depth_policy_promotions // 0),
+      (.mtp.depth_policy_demotions // 0),
+      (.mtp.depth_policy_windows // 0),
+      (.mtp.request.last_depth_policy_reason // ""),
       (.mtp.accepted_tokens // 0),
       (.mtp.rejected_tokens // 0),
       (.mtp.rollbacks // 0),

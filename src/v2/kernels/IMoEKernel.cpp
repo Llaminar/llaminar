@@ -11,6 +11,7 @@
 #include "../tensors/ITensor.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace llaminar2
@@ -68,6 +69,32 @@ namespace llaminar2
     {
         sharedExpertGate(input->data(), gate_inp->data(),
                          shared_output->mutable_data(), seq_len, d_model);
+    }
+
+    void IMoEKernel::sharedExpertGateAddFromTensors(
+        ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+        ITensor *routed_residual, ITensor *combined_output,
+        int seq_len, int d_model)
+    {
+        const float *input_data = input->data();
+        const float *gate_data = gate_inp->data();
+        const float *shared_data = shared_output->data();
+        const float *residual_data = routed_residual->data();
+        float *combined_data = combined_output->mutable_data();
+
+        for (int t = 0; t < seq_len; ++t)
+        {
+            const float *row = input_data + static_cast<size_t>(t) * d_model;
+            float dot = 0.0f;
+            for (int j = 0; j < d_model; ++j)
+                dot += gate_data[j] * row[j];
+
+            const float gate = 1.0f / (1.0f + std::exp(-dot));
+            const size_t row_offset = static_cast<size_t>(t) * d_model;
+            for (int j = 0; j < d_model; ++j)
+                combined_data[row_offset + j] = residual_data[row_offset + j] +
+                                                gate * shared_data[row_offset + j];
+        }
     }
 
     void IMoEKernel::swiGLUFromTensors(ITensor *gate, ITensor *up, int count)

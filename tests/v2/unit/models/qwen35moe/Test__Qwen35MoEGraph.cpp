@@ -32,6 +32,20 @@ namespace
         return std::find(node->dependencies.begin(), node->dependencies.end(), dependency) != node->dependencies.end();
     }
 
+    bool contractReads(const StageBufferContract &contract, BufferId id)
+    {
+        const auto reads = contract.allArenaReads();
+        return std::any_of(reads.begin(), reads.end(),
+                           [id](const BufferBinding &binding) { return binding.id == id; });
+    }
+
+    bool contractWrites(const StageBufferContract &contract, BufferId id)
+    {
+        const auto writes = contract.allWrites();
+        return std::any_of(writes.begin(), writes.end(),
+                           [id](const BufferBinding &binding) { return binding.id == id; });
+    }
+
     bool hasFingerprintField(
         const PrefixFingerprintMaterial &material,
         const std::string &name,
@@ -277,6 +291,35 @@ TEST(Test__Qwen35MoEGraph, ReplicatedRoutedExpertOutputFeedsCombineDirectlyUnder
     ASSERT_NE(graph.getNode("layer0_moe_combine"), nullptr);
 
     EXPECT_TRUE(hasDependency(graph, "layer0_moe_combine", "layer0_moe_expert_ffn"));
+}
+
+TEST(Test__Qwen35MoEGraph, SingleDeviceSharedGateFusesMoECombine)
+{
+    GraphConfig config = makeMoEConfig();
+    Qwen35MoEGraph graph_builder(config, nullptr);
+
+    TensorArena arena;
+    auto layer = makeMoELayerWeights(arena);
+    layer.shared_expert_gate_inp = arena.fp32({static_cast<size_t>(config.d_model)});
+    auto buffers = makeActivationBuffers(arena, /*tokens=*/2, config.d_model,
+                                         config.moe.num_experts, config.moe.top_k);
+
+    ComputeGraph graph = graph_builder.buildFFNGraph(
+        layer, buffers, /*layer_idx=*/0, /*seq_len=*/2,
+        /*batch_size=*/1, DeviceId::cpu());
+
+    ASSERT_NE(graph.getNode("layer0_moe_expert_ffn"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_shared_expert_gate"), nullptr);
+    EXPECT_EQ(graph.getNode("layer0_moe_combine"), nullptr)
+        << "Single-device MoE should fuse shared-expert gating and routed-output combine";
+
+    EXPECT_TRUE(hasDependency(graph, "layer0_shared_expert_gate", "layer0_moe_expert_ffn"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_shared_expert_gate", "layer0_shared_expert_ffn"));
+
+    const auto contract = graph.getNode("layer0_shared_expert_gate")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(contract, BufferId::MOE_SHARED_EXPERT_OUTPUT));
+    EXPECT_TRUE(contractReads(contract, BufferId::MOE_COMBINED_OUTPUT));
+    EXPECT_TRUE(contractWrites(contract, BufferId::ATTN_PROJ));
 }
 
 TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputAllreducesUnderTP)

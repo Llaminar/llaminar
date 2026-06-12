@@ -1274,9 +1274,13 @@ namespace llaminar2
         }
 
         CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::EMBEDDING_LOOKUP, gpu_stream_);
+        const int launch_vocab_size = explicit_vocab_range_ && local_vocab_size_ > 0
+                                          ? local_vocab_size_
+                                          : INT_MAX;
+        const int launch_vocab_offset = explicit_vocab_range_ ? vocab_offset_ : 0;
         cudaError_t err = launch_embedding_lookup(embed_data, token_ids, output,
                                                   num_tokens, d_model,
-                                                  INT_MAX, 0,
+                                                  launch_vocab_size, launch_vocab_offset,
                                                   static_cast<cudaStream_t>(gpu_stream_));
         if (err != cudaSuccess)
         {
@@ -1594,7 +1598,22 @@ namespace llaminar2
             {
                 return false;
             }
-            return apply(d_embed, d_token_ids, num_tokens, d_model, d_output, mpi_ctx, device_idx);
+            const int launch_vocab_size = explicit_vocab_range_ && local_vocab_size_ > 0
+                                              ? local_vocab_size_
+                                              : static_cast<int>(embed_fp32->rows());
+            const int launch_vocab_offset = explicit_vocab_range_ ? vocab_offset_ : 0;
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::EMBEDDING_LOOKUP, gpu_stream_);
+            err = launch_embedding_lookup(d_embed, d_token_ids, d_output,
+                                          num_tokens, d_model,
+                                          launch_vocab_size, launch_vocab_offset,
+                                          static_cast<cudaStream_t>(gpu_stream_));
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "[CUDAEmbeddingKernelT] FP32 kernel launch failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
+            return true;
         }
 
         // --- Quantized path: repack to EmbedQ8 via IINT8Unpackable ---
@@ -1727,15 +1746,16 @@ namespace llaminar2
                               << cudaGetErrorString(token_copy_err));
                     return false;
                 }
-                const bool single_participant =
-                    !mpi_ctx || mpi_ctx->world_size() <= 1;
+                const bool zero_token_rows_allowed =
+                    allow_out_of_range_token_ids_ ||
+                    (mpi_ctx && mpi_ctx->world_size() > 1);
                 for (int i = 0; i < num_tokens; ++i)
                 {
                     const int token_id = sampled_tokens[static_cast<size_t>(i)];
                     const bool in_local_range =
                         token_id >= vocab_offset &&
                         token_id < vocab_offset + local_vocab_size;
-                    if (!in_local_range && single_participant)
+                    if (!in_local_range && !zero_token_rows_allowed)
                     {
                         LOG_ERROR("[CUDAEmbeddingKernelT] Device-token embedding would zero single-device token="
                                   << token_id << " local_vocab_size=" << local_vocab_size

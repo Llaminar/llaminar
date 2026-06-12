@@ -63,6 +63,7 @@ struct NativeVNNIDecodeGeneratedRuntimeConfig
 
 static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRuntimeConfig(
     uint8_t codebook_id,
+    int m,
     int n,
     int k)
 {
@@ -81,7 +82,7 @@ static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRu
 
     llaminar2::rocm::generated::ROCmNativeVNNIDecodeDispatchConfig generated_cfg{};
     if (!llaminar2::rocm::generated::selectROCmNativeVNNIDecodeGenerated(
-            codebook_id, n, k, generated_cfg))
+            codebook_id, m, n, k, generated_cfg))
     {
         return resolved;
     }
@@ -3632,7 +3633,7 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     const int explicit_kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
     const int explicit_waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
     const auto generated_cfg =
-        resolveNativeVNNIDecodeGeneratedRuntimeConfig(static_cast<uint8_t>(FMT), N, K);
+        resolveNativeVNNIDecodeGeneratedRuntimeConfig(static_cast<uint8_t>(FMT), SMALL_M, N, K);
     const int kb_override =
         (explicit_kb_override > 0)
             ? explicit_kb_override
@@ -3641,9 +3642,12 @@ bool rocmLaunch_native_vnni_small_m_fp32(
         (explicit_waves_override > 0)
             ? explicit_waves_override
             : (generated_cfg.has_generated ? generated_cfg.target_waves_per_cu : -1);
-    const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
     const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
-    const bool use_atomic_reduce = !deterministic && (graph_capture_enabled || rocm_env.nvnni_atomic_reduce);
+    // Split-reduce is graph-capturable here: the partial buffer is declared by
+    // the GEMM workspace contract before capture, so replay only launches
+    // kernels over stable device pointers. Atomic reduction remains an explicit
+    // tuning mode rather than something GPU graphs silently force on.
+    const bool use_atomic_reduce = !deterministic && rocm_env.nvnni_atomic_reduce;
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
@@ -3811,7 +3815,7 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     const int explicit_waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
     const auto generated_cfg =
         num_projections == 1
-            ? resolveNativeVNNIDecodeGeneratedRuntimeConfig(static_cast<uint8_t>(FMT), Ns[0], K)
+            ? resolveNativeVNNIDecodeGeneratedRuntimeConfig(static_cast<uint8_t>(FMT), SMALL_M, Ns[0], K)
             : NativeVNNIDecodeGeneratedRuntimeConfig{};
     const int kb_override =
         (explicit_kb_override > 0)
@@ -3821,9 +3825,11 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
         (explicit_waves_override > 0)
             ? explicit_waves_override
             : (generated_cfg.has_generated ? generated_cfg.target_waves_per_cu : -1);
-    const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
     const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
-    const bool use_atomic_reduce = !deterministic && (graph_capture_enabled || rocm_env.nvnni_atomic_reduce);
+    // Batched split-reduce uses per-projection workspace partials. That keeps
+    // graph replay deterministic and avoids the hidden sync cost of atomics
+    // unless the ROCm atomic-reduce tuning knob is explicitly enabled.
+    const bool use_atomic_reduce = !deterministic && rocm_env.nvnni_atomic_reduce;
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
@@ -4089,7 +4095,7 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     const int explicit_waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
     const auto generated_cfg =
         num_projections == 1
-            ? resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_ids[0], Ns[0], K)
+            ? resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_ids[0], SMALL_M, Ns[0], K)
             : NativeVNNIDecodeGeneratedRuntimeConfig{};
     const int kb_override =
         (explicit_kb_override > 0)
@@ -4099,9 +4105,10 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
         (explicit_waves_override > 0)
             ? explicit_waves_override
             : (generated_cfg.has_generated ? generated_cfg.target_waves_per_cu : -1);
-    const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
     const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
-    const bool use_atomic_reduce = !deterministic && (graph_capture_enabled || rocm_env.nvnni_atomic_reduce);
+    // Mixed-codebook batches follow the same ownership rule as homogeneous
+    // batches: graph capture is safe with declared split-reduce workspace.
+    const bool use_atomic_reduce = !deterministic && rocm_env.nvnni_atomic_reduce;
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
@@ -4709,7 +4716,7 @@ bool rocmGemv_native_vnni_fp32(
     const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
     const bool use_atomic_reduce = !deterministic && rocm_env.nvnni_atomic_reduce;
     const NativeVNNIDecodeGeneratedRuntimeConfig generated_cfg =
-        resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_id, N, K);
+        resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_id, 1, N, K);
 
     // =========================================================================
     // IQ grid formats: LDS-cached grid kernel with 256-thread workgroups

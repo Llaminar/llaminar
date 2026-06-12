@@ -567,6 +567,54 @@ TEST_F(MoEExpertComputeStageTest, SharedGate_MaterializesBF16GateInputAsFP32ForT
         EXPECT_NEAR(out[i], 2.0f * expected_gate, 1e-5f) << "Gate mismatch at dim " << i;
 }
 
+TEST_F(MoEExpertComputeStageTest, SharedGate_FusedCombineAddsRoutedResidualWithoutMutatingSharedOutput)
+{
+    const int seq = 2;
+    const int d = 4;
+
+    auto input = TestTensorFactory::createFP32({seq, d});
+    auto gate_inp = TestTensorFactory::createFP32({1, d});
+    auto shared_output = TestTensorFactory::createFP32({seq, d});
+    auto routed_residual = TestTensorFactory::createFP32({seq, d});
+    auto combined_output = TestTensorFactory::createFP32({seq, d});
+
+    for (int i = 0; i < seq * d; ++i)
+    {
+        input->mutable_data()[i] = static_cast<float>((i % d) + 1);
+        shared_output->mutable_data()[i] = 2.0f + static_cast<float>(i);
+        routed_residual->mutable_data()[i] = -1.0f + 0.25f * static_cast<float>(i);
+        combined_output->mutable_data()[i] = -99.0f;
+    }
+    for (int i = 0; i < d; ++i)
+        gate_inp->mutable_data()[i] = 0.0f; // sigmoid(0) = 0.5 for every row.
+
+    const std::vector<float> original_shared(
+        shared_output->data(), shared_output->data() + shared_output->numel());
+
+    SharedExpertGateStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input = input.get();
+    params.gate_inp = gate_inp.get();
+    params.shared_output = shared_output.get();
+    params.routed_residual = routed_residual.get();
+    params.combined_output = combined_output.get();
+    params.seq_len = seq;
+    params.d_model = d;
+
+    SharedExpertGateStage stage(params);
+    ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+
+    for (int i = 0; i < seq * d; ++i)
+    {
+        EXPECT_FLOAT_EQ(shared_output->data()[i], original_shared[i])
+            << "Fused combine must treat shared_output as read-only";
+        EXPECT_NEAR(combined_output->data()[i],
+                    routed_residual->data()[i] + 0.5f * original_shared[i],
+                    1e-5f)
+            << "Fused combine mismatch at element " << i;
+    }
+}
+
 TEST_F(MoEExpertComputeStageTest, SharedGate_LargePositiveDotSaturates)
 {
     const int seq = 1;

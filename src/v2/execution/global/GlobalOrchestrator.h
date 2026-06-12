@@ -139,7 +139,9 @@ namespace llaminar2
         void setSuppressTimelineAll(bool suppress);
         void setAccumulatePrefillAll(bool accumulate);
         void flushStageTimelineAll();
+        bool supportsChainedMTPDraftsAll() const;
         bool forwardMTPAll(int32_t draft_condition_token);
+        bool forwardMTPFromLastDraftAll(int32_t draft_condition_token, int position_id);
         bool commitMTPShiftedRowsFromLastForwardAll(
             const int32_t *tokens,
             int token_count,
@@ -270,6 +272,16 @@ namespace llaminar2
         ExecutionPath executionPath() const override;
         const char *architecture() const override;
         bool forwardMTP(int32_t draft_condition_token) override;
+        /**
+         * @brief True when every local participant can execute chained MTP drafts.
+         *
+         * NodeLocalTP/GlobalTP uses one rank-wide draft token broadcast.  Chained
+         * depth-2/3 drafts are safe only when each rank-local participant can
+         * consume the previous sidecar hidden state at the same logical shifted
+         * MTP position.
+         */
+        bool supportsChainedMTPDrafts() const override;
+        bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,

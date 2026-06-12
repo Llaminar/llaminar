@@ -640,6 +640,7 @@ namespace llaminar2
             else
             {
                 cache.markGPUStreamBindingsDirty();
+                cache.markReplayStateSafeForLiveEpoch(live_state_epoch);
                 ++summary.preserved_for_stream_rebind;
                 if (cache_class == ForwardReplayStateCacheClass::AllPositionVerifier)
                     ++summary.all_position_verifier_preserved;
@@ -1539,9 +1540,12 @@ namespace llaminar2
 
             const bool main_decode_replay =
                 !host.computeAllPositionLogitsEnabled();
+            const bool multi_token_ordinary_decode_replay =
+                main_decode_replay &&
+                input.seq_len > 1;
             const uint64_t live_state_epoch = host.liveReplayStateEpoch();
             if (forward_cache.requiresLiveStateEpochRecapture(
-                    main_decode_replay,
+                    multi_token_ordinary_decode_replay,
                     capture_policy.allow_segmented_capture,
                     live_state_epoch))
             {
@@ -2288,6 +2292,39 @@ namespace llaminar2
                 }
             }
 
+            /*
+             * Cache-hit replay runs a stream/dynamic-parameter prelude before
+             * launching the cached graph. Cache misses need the same contract
+             * for their first execution: graph capture may start inside
+             * DeviceGraphExecutor, so stages such as EmbeddingStage must upload
+             * token IDs to their workspace before executor-side capture begins.
+             *
+             * The stream is Llaminar's owned worker stream, never the legacy
+             * CUDA/HIP null stream. Stages that do not override
+             * updateDynamicParams() simply ignore this setup.
+             */
+            std::vector<IComputeStage *> cache_miss_dynamic_param_stages;
+            if (ctx->deviceId().is_gpu())
+            {
+                if (!execution_stream)
+                {
+                    LOG_ERROR("[ForwardExecutionEngine] GPU cache-miss graph execution requires an explicit stream for "
+                              << ctx->deviceId().toString());
+                    return false;
+                }
+
+                const auto &order = graph.getExecutionOrder();
+                for (const auto &node_name : order)
+                {
+                    ComputeNode *node = graph.getNode(node_name);
+                    if (!node || !node->stage)
+                        continue;
+                    node->stage->setGPUStream(execution_stream);
+                    if (node->stage->hasDynamicParams())
+                        cache_miss_dynamic_param_stages.push_back(node->stage.get());
+                }
+            }
+
             if (!host.prepareLiveStateForForwardGraphExecution(
                     effective_input,
                     execution_stream,
@@ -2308,6 +2345,13 @@ namespace llaminar2
                     LOG_ERROR("[ForwardExecutionEngine] Failed to prepare all-position verifier graph metadata");
                     return false;
                 }
+            }
+
+            for (auto *stage : cache_miss_dynamic_param_stages)
+            {
+                stage->updateDynamicParams(
+                    effective_input.position_offset,
+                    effective_input.seq_len);
             }
 
             success = executor_.execute(graph, ctx);

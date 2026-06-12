@@ -57,6 +57,23 @@ namespace llaminar2::sampling_math
         return fminf(fmaxf(threshold, 0.0f), kMaxUnitThreshold);
     }
 
+    /**
+     * @brief Convert a uniform draw into vLLM-style inverse exponential noise.
+     *
+     * vLLM's stochastic rejection sampler picks recovered tokens by maximizing
+     * `probability * inv_q[token]`, where `inv_q` is the reciprocal of an
+     * exponential random variable. Keeping this tiny transform shared prevents
+     * CPU, CUDA, and ROCm from drifting on clamp behavior near zero.
+     */
+    LLAMINAR_SAMPLING_HD float inverse_exponential_from_uniform(float uniform)
+    {
+        constexpr float kMinUniform = 1.0f / 16777216.0f;
+        constexpr float kMinExponential = 1.0e-20f;
+        const float u = fminf(fmaxf(uniform, kMinUniform), kMaxUnitThreshold);
+        const float exponential = fmaxf(-logf(u), kMinExponential);
+        return 1.0f / exponential;
+    }
+
     LLAMINAR_SAMPLING_HD float speculative_accept_probability(
         float target_probability,
         float draft_probability)
@@ -80,12 +97,24 @@ namespace llaminar2::sampling_math
         return 0.0f;
     }
 
-    LLAMINAR_SAMPLING_HD int sample_distribution_with_threshold(
+    /**
+     * @brief Sample a compact probability table and optionally return p(token).
+     *
+     * The selected probability is the stored compact-table probability for the
+     * token that won the threshold scan. Keeping this helper shared prevents
+     * CUDA, ROCm, and CPU-side verifier plumbing from drifting on edge cases
+     * such as inactive token slots or clamped thresholds.
+     */
+    LLAMINAR_SAMPLING_HD int sample_distribution_with_threshold_and_probability(
         const int *token_ids,
         const float *probs,
         int k,
-        float threshold)
+        float threshold,
+        float *out_probability)
     {
+        if (out_probability)
+            *out_probability = 0.0f;
+
         float total = 0.0f;
         for (int i = 0; i < k; ++i)
         {
@@ -108,9 +137,13 @@ namespace llaminar2::sampling_math
             if (r <= cumulative)
             {
                 selected = token_ids[i];
+                if (out_probability)
+                    *out_probability = probs[i];
                 break;
             }
         }
+        if (out_probability && selected >= 0 && *out_probability == 0.0f)
+            *out_probability = distribution_probability(token_ids, probs, k, selected);
         return selected;
     }
 
@@ -239,13 +272,29 @@ namespace llaminar2::sampling_math
         return selected;
     }
 
-    LLAMINAR_SAMPLING_HD void speculative_verify_with_thresholds(
+    LLAMINAR_SAMPLING_HD int sample_distribution_with_threshold(
+        const int *token_ids,
+        const float *probs,
+        int k,
+        float threshold)
+    {
+        return sample_distribution_with_threshold_and_probability(
+            token_ids,
+            probs,
+            k,
+            threshold,
+            nullptr);
+    }
+
+    LLAMINAR_SAMPLING_HD void speculative_verify_with_thresholds_and_draft_probability(
         const int *target_token_ids,
         const float *target_probs,
         const int *draft_token_ids,
         const float *draft_probs,
         int k,
         int draft_token,
+        float sampled_draft_probability,
+        bool has_sampled_draft_probability,
         float accept_threshold,
         float residual_threshold,
         int *out_token,
@@ -255,8 +304,10 @@ namespace llaminar2::sampling_math
     {
         const float p = distribution_probability(
             target_token_ids, target_probs, k, draft_token);
-        const float q = distribution_probability(
-            draft_token_ids, draft_probs, k, draft_token);
+        const float q =
+            has_sampled_draft_probability && sampled_draft_probability > 0.0f
+                ? sampled_draft_probability
+                : distribution_probability(draft_token_ids, draft_probs, k, draft_token);
         const float accept_probability = speculative_accept_probability(p, q);
         const float threshold = clamp_unit_threshold(accept_threshold);
 
@@ -316,6 +367,37 @@ namespace llaminar2::sampling_math
 
         *out_token = selected;
         *out_accepted = 0;
+    }
+
+    LLAMINAR_SAMPLING_HD void speculative_verify_with_thresholds(
+        const int *target_token_ids,
+        const float *target_probs,
+        const int *draft_token_ids,
+        const float *draft_probs,
+        int k,
+        int draft_token,
+        float accept_threshold,
+        float residual_threshold,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold)
+    {
+        speculative_verify_with_thresholds_and_draft_probability(
+            target_token_ids,
+            target_probs,
+            draft_token_ids,
+            draft_probs,
+            k,
+            draft_token,
+            0.0f,
+            false,
+            accept_threshold,
+            residual_threshold,
+            out_token,
+            out_accepted,
+            out_accept_probability,
+            out_accept_threshold);
     }
 
     /**
@@ -441,6 +523,106 @@ namespace llaminar2::sampling_math
         out_meta[kSpecBatchMetaAllSpeculativeAccepted] = all_accepted ? 1 : 0;
         out_meta[kSpecBatchMetaConsumedVerifierRows] = consumed_rows;
         out_meta[kSpecBatchMetaSampledTerminal] = sampled_terminal;
+    }
+
+    /**
+     * @brief Decide whether a speculative batch needs a bonus ready token.
+     *
+     * GPU lazy verifier kernels use this before sampling the bonus distribution:
+     * if the first token stops, any verifier row stops, or any verifier row
+     * rejects, the bonus token is not semantically consumed and should not burn
+     * a stochastic sample.  The full reducer still owns the final metadata; this
+     * helper only answers the cheap "is bonus needed?" question from the same
+     * shared semantics.
+     */
+    LLAMINAR_SAMPLING_HD bool speculative_batch_needs_bonus_ready_token(
+        int first_token,
+        const int *row_tokens,
+        const int *row_accepted,
+        int row_count,
+        const int *stop_tokens,
+        int stop_token_count)
+    {
+        if (first_token < 0 ||
+            row_count < 0 ||
+            row_count > kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < stop_token_count; ++i)
+        {
+            if (stop_tokens && stop_tokens[i] == first_token)
+                return false;
+        }
+
+        for (int row = 0; row < row_count; ++row)
+        {
+            if (!row_tokens || !row_accepted || row_tokens[row] < 0)
+                return false;
+
+            const int token = row_tokens[row];
+            if (row_accepted[row] == 0)
+                return false;
+
+            for (int i = 0; i < stop_token_count; ++i)
+            {
+                if (stop_tokens && stop_tokens[i] == token)
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Summarize greedy speculative verifier rows from device tokens.
+     *
+     * `verifier_tokens[row]` is the target-model greedy token for verifier row
+     * `row`. `draft_tokens[0]` is the first already-sampled target token and
+     * `draft_tokens[row + 1]` is the speculative draft token checked by
+     * `verifier_tokens[row]`. `verifier_tokens[compare_row_count]` is the bonus
+     * ready token consumed only when every speculative row accepts.
+     */
+    LLAMINAR_SAMPLING_HD void summarize_greedy_speculative_verify_batch(
+        int first_token,
+        const int *verifier_tokens,
+        const int *draft_tokens,
+        int compare_row_count,
+        const int *stop_tokens,
+        int stop_token_count,
+        int *out_tokens,
+        int *out_meta)
+    {
+        if (!verifier_tokens || !draft_tokens || compare_row_count < 0 ||
+            compare_row_count > kSpeculativeBatchMaxRows)
+        {
+            if (out_meta)
+                out_meta[kSpecBatchMetaOk] = 0;
+            return;
+        }
+
+        int row_accepted[kSpeculativeBatchMaxRows] = {0, 0, 0, 0};
+        for (int row = 0; row < compare_row_count; ++row)
+        {
+            row_accepted[row] =
+                verifier_tokens[row] == draft_tokens[row + 1] ? 1 : 0;
+        }
+
+        const int bonus_ready_token = verifier_tokens[compare_row_count];
+        summarize_speculative_verify_batch(
+            first_token,
+            verifier_tokens,
+            row_accepted,
+            compare_row_count,
+            stop_tokens,
+            stop_token_count,
+            bonus_ready_token,
+            /*has_bonus_ready_token=*/1,
+            out_tokens,
+            out_meta);
     }
 
 } // namespace llaminar2::sampling_math

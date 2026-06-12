@@ -18,6 +18,7 @@
 #include <memory>
 
 #include "config/TensorParallelConfig.h"
+#include "execution/compute_stages/stages/EmbeddingStage.h"
 #include "execution/local_execution/graph/GraphSchema.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
@@ -393,6 +394,52 @@ TEST_F(Test__VocabParallelEmbeddingSharding, CPUEmbeddingKernel_ZeroesTokensOuts
     EXPECT_FLOAT_EQ(out[6], 31.0f);
     EXPECT_FLOAT_EQ(out[7], 32.0f);
     EXPECT_FLOAT_EQ(out[8], 33.0f);
+}
+
+TEST_F(Test__VocabParallelEmbeddingSharding, EmbeddingStage_AllowsZeroOutputForLocalTPVocabShard)
+{
+    FP32Tensor local_embed_table({TEST_VOCAB / 2, TEST_D_MODEL});
+    FP32Tensor output({1, TEST_D_MODEL});
+    const int token_id = 7;
+
+    EmbeddingStage::Params params{};
+    params.embed_table = &local_embed_table;
+    params.token_ids = &token_id;
+    params.output = &output;
+    params.num_tokens = 1;
+    params.d_model = TEST_D_MODEL;
+    params.vocab_size = TEST_VOCAB;
+    params.vocab_offset = TEST_VOCAB / 2;
+    params.local_vocab_size = TEST_VOCAB / 2;
+    params.device_id = DeviceId::rocm(1);
+
+    EmbeddingStage stage(params);
+
+    EXPECT_TRUE(stage.allowsZeroOutput())
+        << "LocalTP vocab shards must permit zero rows for tokens owned by another participant";
+}
+
+TEST_F(Test__VocabParallelEmbeddingSharding, EmbeddingStage_DoesNotAllowZeroOutputForFullVocabSingleDevice)
+{
+    FP32Tensor full_embed_table({TEST_VOCAB, TEST_D_MODEL});
+    FP32Tensor output({1, TEST_D_MODEL});
+    const int token_id = 7;
+
+    EmbeddingStage::Params params{};
+    params.embed_table = &full_embed_table;
+    params.token_ids = &token_id;
+    params.output = &output;
+    params.num_tokens = 1;
+    params.d_model = TEST_D_MODEL;
+    params.vocab_size = TEST_VOCAB;
+    params.vocab_offset = 0;
+    params.local_vocab_size = TEST_VOCAB;
+    params.device_id = DeviceId::cpu();
+
+    EmbeddingStage stage(params);
+
+    EXPECT_FALSE(stage.allowsZeroOutput())
+        << "A full-vocab single-device embedding should still fail on accidental all-zero output";
 }
 
 // ============================================================================

@@ -11,6 +11,8 @@
  */
 
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/ExpertSlabTypes.h"
@@ -22,6 +24,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -38,7 +41,7 @@ namespace
         return reinterpret_cast<ITensorGemm *>(static_cast<uintptr_t>(n) * 0x1000u);
     }
 
-    class FakePreparedGemm final : public ITensorGemm
+    class FakePreparedGemm final : public ITensorGemm, public IWorkspaceConsumer
     {
     public:
         explicit FakePreparedGemm(DeviceNativeVNNIMatrixDesc desc)
@@ -86,8 +89,26 @@ namespace
             return out.valid();
         }
 
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+        {
+            WorkspaceRequirements reqs;
+            reqs.buffers.push_back({
+                "fake_prepared_gemm_workspace",
+                static_cast<size_t>(std::max(1, m)) *
+                    static_cast<size_t>(std::max(1, n)) *
+                    static_cast<size_t>(std::max(1, k)),
+                256,
+                true});
+            return reqs;
+        }
+
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+        bool hasWorkspace() const override { return workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
+
     private:
         DeviceNativeVNNIMatrixDesc desc_;
+        DeviceWorkspaceManager *workspace_ = nullptr;
     };
 
     DeviceNativeVNNIMatrixDesc nativeDesc(int expert_id, int role, int n, int k)
@@ -556,6 +577,63 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     MoELocalExpertStage stage(p);
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
     EXPECT_FALSE(stage.execute(&ctx));
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     ROCmWorkspaceRequirementsDeclareNestedMoEAndProjectedGemmScratch)
+{
+    constexpr int kNumExperts = 4;
+    constexpr int kRows = 4;
+    constexpr int kTopK = 3;
+    constexpr int kDModel = 32;
+    constexpr int kIntermediate = 64;
+
+    MoEOverlayCollectiveWorkspace overlay_workspace;
+    overlay_workspace.ensureCapacity(
+        /*max_rows=*/kRows,
+        /*max_entries=*/kRows * kTopK,
+        kDModel,
+        kTopK,
+        DeviceId::cpu());
+
+    auto input = overlay_workspace.localExpertInput(0, 0);
+    auto output = overlay_workspace.localExpertOutput(0, 0);
+
+    MoELocalExpertStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.input_rows = &input;
+    p.output_rows = &output;
+    p.num_experts = kNumExperts;
+    p.top_k = kTopK;
+    p.d_model = kDModel;
+    p.expert_intermediate = kIntermediate;
+    p.layer_idx = 0;
+
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned;
+    attachFakePreparedEngines(p, owned);
+
+    MoELocalExpertStage stage(p);
+    const WorkspaceRequirements reqs = stage.getWorkspaceRequirements(kRows, 0, 0);
+
+    const auto *group_indices = reqs.find(MoEWorkspaceBuffers::GROUP_INT_INDICES);
+    ASSERT_NE(group_indices, nullptr)
+        << "ROCm graph-native local experts delegate to MoEExpertComputeStage at "
+           "execute time, so they must declare grouped-MoE scratch during graph "
+           "workspace allocation.";
+    EXPECT_GE(group_indices->size_bytes,
+              static_cast<size_t>(kRows * kTopK) * sizeof(int));
+
+    const auto *shared_gate = reqs.find(MoEWorkspaceBuffers::ROCM_SHARED_GATE);
+    ASSERT_NE(shared_gate, nullptr);
+    EXPECT_GE(shared_gate->size_bytes,
+              static_cast<size_t>(kRows * kTopK) * sizeof(float));
+
+    const auto *gemm_workspace = reqs.find("fake_prepared_gemm_workspace");
+    ASSERT_NE(gemm_workspace, nullptr);
+    EXPECT_GE(gemm_workspace->size_bytes,
+              static_cast<size_t>(kRows * kTopK) *
+                  static_cast<size_t>(kDModel) *
+                  static_cast<size_t>(kIntermediate));
 }
 
 TEST(Test__MoELocalExpertStage_PreparedWeights,

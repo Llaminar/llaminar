@@ -659,6 +659,20 @@ namespace llaminar2
          */
         virtual LogitsLocalInfo getAllPositionLogitsLocalInfo() const { return {}; }
 
+        /**
+         * @brief Get local all-position verifier logits info for a sampling consumer.
+         *
+         * Graph-captured verifier replay can hand off a producer stream that
+         * owns the freshly-written all-position logits.  Rank-level TP sampling
+         * must consume that stream once and reuse it for every sampled row in
+         * the verifier batch; otherwise child shards can be read on an
+         * unrelated stream before replay has completed.
+         */
+        virtual LogitsLocalInfo consumeAllPositionLogitsLocalInfoForSampling()
+        {
+            return getAllPositionLogitsLocalInfo();
+        }
+
         virtual std::string mtpDecodeUnsupportedReason() const
         {
             return {};
@@ -738,6 +752,32 @@ namespace llaminar2
                 out_tokens[i] = static_cast<int32_t>(token);
             }
             return true;
+        }
+
+        /**
+         * @brief Summarize greedy all-position MTP verifier rows on device.
+         *
+         * This is the greedy counterpart to
+         * verifyStochasticDistributionsBatchOutcomeOnDevice(): implementations
+         * should sample verifier logits on the graph replay stream, compare the
+         * device-resident verifier tokens with the device-resident compact
+         * verifier input row, and return only the already-reduced vLLM-style
+         * commit outcome. The default returns false so unsupported topologies
+         * keep using the older host-row path.
+         */
+        virtual bool verifyGreedyAllPositionBatchOutcomeOnDevice(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeVerifyBatchOutcome *out)
+        {
+            (void)draft_tokens;
+            (void)draft_token_count;
+            (void)stop_tokens;
+            (void)stop_token_count;
+            (void)out;
+            return false;
         }
 
         /**
@@ -937,6 +977,137 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Build compact top-k/top-p tables for contiguous verifier rows.
+         *
+         * The default implementation is unsupported. Device graph runners use
+         * this to queue all all-position target/bonus verifier rows on the
+         * verifier replay stream, avoiding one scalar distribution launch pair
+         * per row. Implementations must require an explicit stream and must not
+         * synchronize.
+         */
+        virtual bool buildStochasticDistributionsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size)
+        {
+            (void)source;
+            (void)first_row;
+            (void)buffer;
+            (void)first_slot;
+            (void)row_count;
+            (void)params;
+            (void)vocab_size;
+            return false;
+        }
+
+        /**
+         * @brief Legacy full-vocab stochastic probability row builder.
+         *
+         * Current vLLM-style MTP verification uses
+         * buildStochasticProcessedLogitRowsOnDevice() plus the batched outcome
+         * verifier. Full target/draft probability rows are intentionally not part
+         * of the production GPU runner contract because they allocate extra
+         * vocab-sized scratch and recreate the removed scalar verifier path. This
+         * default remains unsupported for older tests and non-production runners.
+         */
+        virtual bool buildStochasticProbabilityRowsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size)
+        {
+            (void)source;
+            (void)first_row;
+            (void)buffer;
+            (void)first_slot;
+            (void)row_count;
+            (void)params;
+            (void)vocab_size;
+            return false;
+        }
+
+        /**
+         * @brief Build processed full-logit rows without softmax materialization.
+         *
+         * The rows are in sampling space after temperature, top-k/top-p masks,
+         * and penalties. GPU stochastic MTP verifiers consume these rows
+         * directly to avoid writing full target probability matrices.
+         */
+        virtual bool buildStochasticProcessedLogitRowsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size)
+        {
+            (void)source;
+            (void)first_row;
+            (void)buffer;
+            (void)first_slot;
+            (void)row_count;
+            (void)params;
+            (void)vocab_size;
+            return false;
+        }
+
+        /**
+         * @brief Build and sample a vLLM-style MTP draft proposal on device.
+         *
+         * Draft proposal follows vLLM's default greedy draft branch: the
+         * runner stores the sampled draft token and q(sampled_token) in
+         * runner-owned device slots, and later verifier work treats q as
+         * one-hot at that draft token.
+         */
+        virtual int sampleStochasticDraftProposalOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold)
+        {
+            (void)source;
+            (void)row;
+            (void)slot;
+            (void)params;
+            (void)vocab_size;
+            (void)threshold;
+            return -1;
+        }
+
+        /**
+         * @brief Deferred-host-read variant of sampleStochasticDraftProposalOnDevice().
+         *
+         * The sampled token stays in the runner-owned device draft sample slot,
+         * with an explicit readiness event recorded for the verifier stream.
+         */
+        virtual bool sampleStochasticDraftProposalOnDeviceDeferred(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold)
+        {
+            (void)source;
+            (void)row;
+            (void)slot;
+            (void)params;
+            (void)vocab_size;
+            (void)threshold;
+            return false;
+        }
+
         virtual int sampleStochasticDistributionOnDevice(
             DeviceDistributionBuffer buffer,
             int slot,
@@ -1010,6 +1181,42 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Verify one stochastic MTP row using full probability rows.
+         *
+         * This is the row-level vLLM-style path for history-dependent sampling
+         * where penalties require target rows to be processed sequentially.  The
+         * sampled draft token must already live in the runner's draft device
+         * slot; `draft_token` remains a host-side metadata shadow for tests and
+         * diagnostics.
+         */
+        /**
+         * @brief Legacy scalar full-probability stochastic verifier.
+         *
+         * Production GPU runners should prefer
+         * verifyStochasticDistributionsBatchOutcomeOnDevice() with
+         * use_vllm_probability_rejection=true. The default false implementation
+         * prevents silent fallback to an unowned full-probability arena path.
+         */
+        virtual bool verifyStochasticProbabilityRowOnDevice(
+            int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_logical_position,
+            DeviceSpeculativeVerifyResult *out)
+        {
+            (void)target_slot;
+            (void)draft_slot;
+            (void)draft_token;
+            (void)accept_threshold;
+            (void)inverse_sample_seed;
+            (void)inverse_sample_logical_position;
+            (void)out;
+            return false;
+        }
+
         virtual bool verifyStochasticDistributionsBatchOnDevice(
             int first_target_slot,
             int first_draft_slot,
@@ -1052,7 +1259,10 @@ namespace llaminar2
             int stop_token_count,
             int bonus_target_slot,
             float bonus_threshold,
-            DeviceSpeculativeVerifyBatchOutcome *out)
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false)
         {
             (void)first_target_slot;
             (void)first_draft_slot;
@@ -1066,6 +1276,9 @@ namespace llaminar2
             (void)bonus_target_slot;
             (void)bonus_threshold;
             (void)out;
+            (void)inverse_sample_seed;
+            (void)inverse_sample_first_logical_position;
+            (void)use_vllm_probability_rejection;
             return false;
         }
 
@@ -1090,7 +1303,10 @@ namespace llaminar2
             int stop_token_count,
             int bonus_target_slot,
             float bonus_threshold,
-            DeviceSpeculativeVerifyBatchOutcome *out)
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false)
         {
             (void)first_target_slot;
             (void)first_draft_slot;
@@ -1104,6 +1320,9 @@ namespace llaminar2
             (void)bonus_target_slot;
             (void)bonus_threshold;
             (void)out;
+            (void)inverse_sample_seed;
+            (void)inverse_sample_first_logical_position;
+            (void)use_vllm_probability_rejection;
             return false;
         }
 
@@ -1311,6 +1530,22 @@ namespace llaminar2
          * @return LogitsLocalInfo (empty by default)
          */
         virtual LogitsLocalInfo getLogitsLocalInfo() const { return {}; }
+
+        /**
+         * @brief Get local logits info for a sampling consumer.
+         *
+         * GPU decode graph replay can publish a one-shot producer stream for
+         * the logits row.  Sampling must consume that stream so the argmax or
+         * stochastic sampler is ordered after the graph replay that wrote the
+         * row.  Plain gather/snapshot paths should continue to use
+         * getLogitsLocalInfo(), which is a non-consuming view.
+         *
+         * @return LogitsLocalInfo with the correct consumer stream, or empty.
+         */
+        virtual LogitsLocalInfo consumeLogitsLocalInfoForSampling()
+        {
+            return getLogitsLocalInfo();
+        }
 
         /**
          * @brief Check if this runner has column-parallel local MTP logits

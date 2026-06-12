@@ -91,6 +91,11 @@ QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, NoMTPBenchmarkStyleF
         /*reused_cycle_count=*/4);
 }
 
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, NoMTPBenchmarkPromptKnownWindowPyTorchTokenParity)
+{
+    runDenseBenchmarkPromptKnownWindowPyTorchTokenParity(QWEN36_DENSE_PREFIX_MTP_CASE());
+}
+
 QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, OneRowRestoreLongPrefixMatchesSequential)
 {
     runDenseOneRowRestoreLongPrefixMatchesSequential(QWEN36_DENSE_PREFIX_MTP_CASE());

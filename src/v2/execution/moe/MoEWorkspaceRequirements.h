@@ -43,6 +43,10 @@ namespace llaminar2
         constexpr const char *DECODE_SWIGLU_SCALES = "moe_decode_swiglu_scales";
         constexpr const char *DECODE_EXPERT_IDS = "moe_grouped_decode_expert_ids";
         constexpr const char *DECODE_WEIGHTS = "moe_grouped_decode_weights";
+        constexpr const char *CUDA_DECODE_GATEUP_GATE_PTRS = "cuda_moe_decode_gateup_gate_ptrs";
+        constexpr const char *CUDA_DECODE_GATEUP_UP_PTRS = "cuda_moe_decode_gateup_up_ptrs";
+        constexpr const char *CUDA_DECODE_DOWN_GATE_PTRS = "cuda_moe_decode_down_gate_ptrs";
+        constexpr const char *CUDA_DECODE_DOWN_UP_PTRS = "cuda_moe_decode_down_up_ptrs";
 
         constexpr const char *ROCM_SHARED_GATE = "rocm_moe_shared_gate";
         constexpr const char *ROCM_ROUTE_LOGITS_PARTIALS = "rocm_moe_route_logits_partials";
@@ -54,6 +58,9 @@ namespace llaminar2
         constexpr const char *ROCM_DECODE_GATE_OUTPUT_PTRS = "rocm_moe_decode_gate_output_ptrs";
         constexpr const char *ROCM_DECODE_UP_OUTPUT_PTRS = "rocm_moe_decode_up_output_ptrs";
         constexpr const char *ROCM_DECODE_DOWN_DESCS = "rocm_moe_decode_down_descs";
+
+        constexpr int kRuntimePointerWorkspaceEntries = 1024;
+        constexpr int kRuntimePointerArrayMaxTopK = 16;
 
         inline int ceilDiv(int value, int divisor)
         {
@@ -128,14 +135,20 @@ namespace llaminar2
 
             constexpr int kMaxGateUpPartitions = 32;
             constexpr int kMaxDownPartitions = 16;
+            constexpr int kMaxVerifierRows = 4;
             const std::size_t decode_slots = static_cast<std::size_t>(top_k);
+            const std::size_t verifier_splitk_slots =
+                static_cast<std::size_t>(std::min(max_seq_len, kMaxVerifierRows)) *
+                static_cast<std::size_t>(top_k);
+            const std::size_t gateup_partial_slots =
+                std::max(decode_slots, verifier_splitk_slots);
 
             add(reqs, DECODE_HIDDEN_INT8, static_cast<std::size_t>(d_model) * sizeof(int8_t));
             add(reqs, DECODE_HIDDEN_SCALES, static_cast<std::size_t>(d_model_blocks) * sizeof(float));
             add(reqs, GATEUP_GATE_PARTIALS,
-                decode_slots * kMaxGateUpPartitions * static_cast<std::size_t>(intermediate) * sizeof(float));
+                gateup_partial_slots * kMaxGateUpPartitions * static_cast<std::size_t>(intermediate) * sizeof(float));
             add(reqs, GATEUP_UP_PARTIALS,
-                decode_slots * kMaxGateUpPartitions * static_cast<std::size_t>(intermediate) * sizeof(float));
+                gateup_partial_slots * kMaxGateUpPartitions * static_cast<std::size_t>(intermediate) * sizeof(float));
             add(reqs, DOWN_PARTIALS,
                 kMaxDownPartitions * static_cast<std::size_t>(d_model) * sizeof(float));
             add(reqs, DECODE_SWIGLU_INT8,
@@ -144,6 +157,18 @@ namespace llaminar2
                 decode_slots * static_cast<std::size_t>(intermediate_blocks) * sizeof(float));
             add(reqs, DECODE_EXPERT_IDS, decode_slots * sizeof(int));
             add(reqs, DECODE_WEIGHTS, decode_slots * sizeof(float));
+            add(reqs, CUDA_DECODE_GATEUP_GATE_PTRS,
+                static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
+                    kRuntimePointerArrayMaxTopK * sizeof(float *));
+            add(reqs, CUDA_DECODE_GATEUP_UP_PTRS,
+                static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
+                    kRuntimePointerArrayMaxTopK * sizeof(float *));
+            add(reqs, CUDA_DECODE_DOWN_GATE_PTRS,
+                static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
+                    kRuntimePointerArrayMaxTopK * sizeof(const float *));
+            add(reqs, CUDA_DECODE_DOWN_UP_PTRS,
+                static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
+                    kRuntimePointerArrayMaxTopK * sizeof(const float *));
             return reqs;
         }
 
@@ -197,10 +222,25 @@ namespace llaminar2
 
             add(reqs, ROCM_SHARED_GATE, static_cast<std::size_t>(max_seq_len) * sizeof(float));
             add(reqs, ROCM_GROUP_MAX_TOKENS, sizeof(int));
-            add(reqs, ROCM_DECODE_GATE_PTRS, decode_slots * sizeof(const float *));
-            add(reqs, ROCM_DECODE_UP_PTRS, decode_slots * sizeof(const float *));
-            add(reqs, ROCM_DECODE_GATE_OUTPUT_PTRS, decode_slots * sizeof(float *));
-            add(reqs, ROCM_DECODE_UP_OUTPUT_PTRS, decode_slots * sizeof(float *));
+            /*
+             * Grouped decode pointer arrays are captured by value as device
+             * addresses. A full decode graph contains many MoE stages, so ROCm
+             * reserves deterministic graph-owned pointer slots; one mutable slot
+             * would make all captured stages replay the last staged scratch
+             * pointer set.
+             */
+            add(reqs, ROCM_DECODE_GATE_PTRS,
+                static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
+                    kRuntimePointerArrayMaxTopK * sizeof(const float *));
+            add(reqs, ROCM_DECODE_UP_PTRS,
+                static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
+                    kRuntimePointerArrayMaxTopK * sizeof(const float *));
+            add(reqs, ROCM_DECODE_GATE_OUTPUT_PTRS,
+                static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
+                    kRuntimePointerArrayMaxTopK * sizeof(float *));
+            add(reqs, ROCM_DECODE_UP_OUTPUT_PTRS,
+                static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
+                    kRuntimePointerArrayMaxTopK * sizeof(float *));
             add(reqs, ROCM_DECODE_DOWN_DESCS,
                 decode_slots * sizeof(DeviceNativeVNNIMatrixDesc));
             return reqs;

@@ -12,6 +12,7 @@
 #include "../GPUDeviceContextPool.h"
 #include "NvidiaDeviceContext.h"
 #include "../../utils/Logger.h"
+#include "../../utils/PerfStatsCollector.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
 #include <cuda_runtime.h>
@@ -804,6 +805,18 @@ namespace llaminar2
         int *out_token_ids, float *out_probs,
         float *scratch_values, int *scratch_indices, int scratch_capacity,
         int device_idx, void *stream);
+    extern "C" bool cudaOps_topk_topp_distributions_f32(
+        const float *data, int row_count, int n, int row_stride, int k,
+        float top_p, float temperature,
+        int *out_token_ids, int out_stride, float *out_probs,
+        float *scratch_values, int *scratch_indices, int scratch_capacity,
+        int device_idx, void *stream);
+    extern "C" bool cudaOps_topk_topp_processed_logits_f32(
+        const float *data, int row_count, int n, int row_stride, int k,
+        float top_p, float temperature,
+        float *out_logits, int out_row_stride,
+        float *scratch_values, int *scratch_indices, int scratch_capacity,
+        int device_idx, void *stream);
     extern "C" bool cudaOps_speculative_verify_distribution_f32(
         const int *target_token_ids, const float *target_probs,
         const int *draft_token_ids, const float *draft_probs,
@@ -816,7 +829,58 @@ namespace llaminar2
     extern "C" bool cudaOps_sample_distribution_f32(
         const int *token_ids, const float *probs,
         int k, float threshold,
-        int *out_token, int device_idx, void *stream);
+        int *out_token, float *out_probability, int device_idx, void *stream);
+    extern "C" bool cudaOps_sample_processed_logits_f32(
+        const float *logits,
+        int vocab_size,
+        int row_stride,
+        float threshold,
+        int *out_token,
+        float *out_probability,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_softmax_processed_logits_f32(
+        const float *logits,
+        int row_count,
+        int vocab_size,
+        int row_stride,
+        float *out_probabilities,
+        int out_row_stride,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_softmax_sample_temperature_logits_f32(
+        const float *logits,
+        int vocab_size,
+        int row_stride,
+        float temperature,
+        float threshold,
+        float *out_probabilities,
+        int out_row_stride,
+        int *out_token,
+        float *out_probability,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_scale_sample_temperature_logits_f32(
+        const float *logits,
+        int vocab_size,
+        int row_stride,
+        float temperature,
+        float threshold,
+        float *out_logits,
+        int out_row_stride,
+        int *out_token,
+        float *out_probability,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_fill_inverse_exponential_samples_f32(
+        float *out_samples,
+        int row_count,
+        int vocab_size,
+        int row_stride,
+        unsigned long long seed,
+        int first_logical_position,
+        int device_idx,
+        void *stream);
     extern "C" bool cudaOps_speculative_verify_distribution_threshold_f32(
         const int *target_token_ids, const float *target_probs,
         const int *draft_token_ids, const float *draft_probs,
@@ -845,6 +909,7 @@ namespace llaminar2
         const int *draft_token_ids, const float *draft_probs,
         int k, int distribution_stride,
         const int *sampled_draft_tokens,
+        const float *sampled_draft_probabilities,
         float accept_threshold0, float accept_threshold1,
         float accept_threshold2, float accept_threshold3,
         float residual_threshold0, float residual_threshold1,
@@ -855,6 +920,87 @@ namespace llaminar2
         float *out_accept_probability,
         float *out_accept_threshold,
         int device_idx, void *stream);
+    extern "C" bool cudaOps_speculative_verify_processed_logits_thresholds_batch_device_tokens_f32(
+        const float *target_logits,
+        const float *draft_logits,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const int *sampled_draft_tokens,
+        float accept_threshold0, float accept_threshold1,
+        float accept_threshold2, float accept_threshold3,
+        float residual_threshold0, float residual_threshold1,
+        float residual_threshold2, float residual_threshold3,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        const float *draft_token_probabilities,
+        int device_idx, void *stream);
+    extern "C" bool cudaOps_speculative_verify_processed_target_draft_probabilities_thresholds_batch_device_tokens_f32(
+        const float *target_logits,
+        const float *draft_probabilities,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const int *sampled_draft_tokens,
+        float accept_threshold0,
+        float accept_threshold1,
+        float accept_threshold2,
+        float accept_threshold3,
+        unsigned long long inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int no_draft_probabilities,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_speculative_verify_processed_target_draft_logits_thresholds_batch_device_tokens_f32(
+        const float *target_logits,
+        const float *draft_logits,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const int *sampled_draft_tokens,
+        const float *sampled_draft_probabilities,
+        float accept_threshold0,
+        float accept_threshold1,
+        float accept_threshold2,
+        float accept_threshold3,
+        unsigned long long inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_speculative_verify_probabilities_thresholds_batch_device_tokens_f32(
+        const float *target_probabilities,
+        const float *draft_probabilities,
+        const float *inverse_rejection_samples,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        int inverse_sample_row_stride,
+        const int *sampled_draft_tokens,
+        float accept_threshold0,
+        float accept_threshold1,
+        float accept_threshold2,
+        float accept_threshold3,
+        int no_draft_probabilities,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int device_idx,
+        void *stream);
     extern "C" bool cudaOps_summarize_speculative_verify_batch(
         const int *verify_tokens,
         const int *verify_accepted,
@@ -879,6 +1025,18 @@ namespace llaminar2
         int stop_token_count,
         const int *bonus_token,
         int has_bonus_token,
+        int *out_tokens,
+        int *out_meta,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_summarize_greedy_speculative_verify_batch(
+        const int *verify_tokens,
+        const int *draft_tokens,
+        int compare_row_count,
+        int first_token,
+        int stop_token0, int stop_token1, int stop_token2, int stop_token3,
+        int stop_token4, int stop_token5, int stop_token6, int stop_token7,
+        int stop_token_count,
         int *out_tokens,
         int *out_meta,
         int device_idx,
@@ -992,34 +1150,83 @@ namespace llaminar2
 
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
         cudaStream_t s = resolveStream(device_id, stream);
-        if (!cudaOps_argmax_f32_batched_rows(
-                static_cast<const float *>(data_device),
-                rows,
-                cols,
-                cols,
-                static_cast<float *>(bufs.value_ptr),
-                static_cast<int *>(bufs.index_ptr),
-                static_cast<float *>(partial_vals),
-                static_cast<int *>(partial_idxs),
-                partial_capacity,
-                device_id,
-                s))
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "backend", "cuda_argmax_f32_batched_rows_launch", "decode");
+            if (!cudaOps_argmax_f32_batched_rows(
+                    static_cast<const float *>(data_device),
+                    rows,
+                    cols,
+                    cols,
+                    static_cast<float *>(bufs.value_ptr),
+                    static_cast<int *>(bufs.index_ptr),
+                    static_cast<float *>(partial_vals),
+                    static_cast<int *>(partial_idxs),
+                    partial_capacity,
+                    device_id,
+                    s))
+            {
+                return false;
+            }
+        }
+
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "backend", "cuda_argmax_f32_batched_rows_d2h_enqueue", "decode");
+            CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_values,
+                                                bufs.value_ptr,
+                                                static_cast<size_t>(rows) * sizeof(float),
+                                                cudaMemcpyDeviceToHost,
+                                                s));
+            CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_indices,
+                                                bufs.index_ptr,
+                                                static_cast<size_t>(rows) * sizeof(int),
+                                                cudaMemcpyDeviceToHost,
+                                                s));
+        }
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "backend", "cuda_argmax_f32_batched_rows_sync", "decode");
+            CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
+        }
+        return true;
+    }
+
+    bool CUDABackend::enqueueArgmaxF32BatchedRowsDevice(
+        const void *data_device,
+        int rows,
+        int cols,
+        int device_id,
+        void *stream,
+        void *out_values_device,
+        void *out_indices_device,
+        void *partial_vals,
+        void *partial_idxs,
+        int partial_capacity)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            rows <= 0 || cols <= 0 || !stream ||
+            !out_values_device || !out_indices_device ||
+            !partial_vals || !partial_idxs || partial_capacity < rows)
         {
             return false;
         }
 
-        CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_values,
-                                            bufs.value_ptr,
-                                            static_cast<size_t>(rows) * sizeof(float),
-                                            cudaMemcpyDeviceToHost,
-                                            s));
-        CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_indices,
-                                            bufs.index_ptr,
-                                            static_cast<size_t>(rows) * sizeof(int),
-                                            cudaMemcpyDeviceToHost,
-                                            s));
-        CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
-        return true;
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        PerfStatsCollector::ScopedTimer timer(
+            "backend", "cuda_argmax_f32_batched_rows_device_launch", "decode");
+        return cudaOps_argmax_f32_batched_rows(
+            static_cast<const float *>(data_device),
+            rows,
+            cols,
+            cols,
+            static_cast<float *>(out_values_device),
+            static_cast<int *>(out_indices_device),
+            static_cast<float *>(partial_vals),
+            static_cast<int *>(partial_idxs),
+            partial_capacity,
+            device_id,
+            static_cast<cudaStream_t>(stream));
     }
 
     bool CUDABackend::topKF32(const void *data_device, int n, int k, int device_id,
@@ -1204,6 +1411,102 @@ namespace llaminar2
             stream);
     }
 
+    bool CUDABackend::enqueueBuildTopKTopPDistributionsF32Device(
+        const void *data_device,
+        int row_count,
+        int n,
+        int row_stride,
+        int top_k,
+        float top_p,
+        float temperature,
+        int device_id,
+        void *stream,
+        void *out_token_ids_device,
+        int out_stride,
+        void *out_probs_device,
+        void *scratch_values_device,
+        void *scratch_indices_device,
+        int scratch_capacity)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !data_device || row_count <= 0 || n <= 0 || row_stride < n ||
+            top_k <= 0 || out_stride <= 0 || out_stride < top_k ||
+            !stream || !out_token_ids_device || !out_probs_device)
+        {
+            return false;
+        }
+
+        if (top_k > 256)
+            top_k = 256;
+        if (top_k > n)
+            top_k = n;
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_topk_topp_distributions_f32(
+            static_cast<const float *>(data_device),
+            row_count,
+            n,
+            row_stride,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<int *>(out_token_ids_device),
+            out_stride,
+            static_cast<float *>(out_probs_device),
+            static_cast<float *>(scratch_values_device),
+            static_cast<int *>(scratch_indices_device),
+            scratch_capacity,
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueBuildTopKTopPProcessedLogitsF32Device(
+        const void *data_device,
+        int row_count,
+        int n,
+        int row_stride,
+        int top_k,
+        float top_p,
+        float temperature,
+        int device_id,
+        void *stream,
+        void *out_logits_device,
+        int out_row_stride,
+        void *scratch_values_device,
+        void *scratch_indices_device,
+        int scratch_capacity)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !data_device || row_count <= 0 || n <= 0 ||
+            row_stride < n || out_row_stride < n ||
+            top_k <= 0 || !stream || !out_logits_device)
+        {
+            return false;
+        }
+
+        if (top_k > 256)
+            top_k = 256;
+        if (top_k > n)
+            top_k = n;
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_topk_topp_processed_logits_f32(
+            static_cast<const float *>(data_device),
+            row_count,
+            n,
+            row_stride,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<float *>(out_logits_device),
+            out_row_stride,
+            static_cast<float *>(scratch_values_device),
+            static_cast<int *>(scratch_indices_device),
+            scratch_capacity,
+            device_id,
+            stream);
+    }
+
     bool CUDABackend::enqueueSpeculativeVerifyDistributionsF32Device(
         const void *target_token_ids_device,
         const void *target_probs_device,
@@ -1257,7 +1560,8 @@ namespace llaminar2
         float threshold,
         int device_id,
         void *stream,
-        void *out_token_device)
+        void *out_token_device,
+        void *out_probability_device)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !token_ids_device || !probs_device ||
@@ -1273,6 +1577,167 @@ namespace llaminar2
             top_k,
             threshold,
             static_cast<int *>(out_token_device),
+            static_cast<float *>(out_probability_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueSampleProcessedLogitsF32Device(
+        const void *logits_device,
+        int vocab_size,
+        int row_stride,
+        float threshold,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_probability_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !logits_device || vocab_size <= 0 || row_stride < vocab_size ||
+            !stream || !out_token_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_sample_processed_logits_f32(
+            static_cast<const float *>(logits_device),
+            vocab_size,
+            row_stride,
+            threshold,
+            static_cast<int *>(out_token_device),
+            static_cast<float *>(out_probability_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueSoftmaxAndSampleTemperatureLogitsF32Device(
+        const void *logits_device,
+        int vocab_size,
+        int row_stride,
+        float temperature,
+        float threshold,
+        int device_id,
+        void *stream,
+        void *out_probabilities_device,
+        int out_row_stride,
+        void *out_token_device,
+        void *out_probability_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !logits_device || vocab_size <= 0 || row_stride < vocab_size ||
+            out_row_stride < vocab_size || !stream ||
+            !out_probabilities_device || !out_token_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_softmax_sample_temperature_logits_f32(
+            static_cast<const float *>(logits_device),
+            vocab_size,
+            row_stride,
+            temperature,
+            threshold,
+            static_cast<float *>(out_probabilities_device),
+            out_row_stride,
+            static_cast<int *>(out_token_device),
+            static_cast<float *>(out_probability_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueScaleAndSampleTemperatureLogitsF32Device(
+        const void *logits_device,
+        int vocab_size,
+        int row_stride,
+        float temperature,
+        float threshold,
+        int device_id,
+        void *stream,
+        void *out_logits_device,
+        int out_row_stride,
+        void *out_token_device,
+        void *out_probability_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !logits_device || vocab_size <= 0 || row_stride < vocab_size ||
+            out_row_stride < vocab_size || !stream ||
+            !out_logits_device || !out_token_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_scale_sample_temperature_logits_f32(
+            static_cast<const float *>(logits_device),
+            vocab_size,
+            row_stride,
+            temperature,
+            threshold,
+            static_cast<float *>(out_logits_device),
+            out_row_stride,
+            static_cast<int *>(out_token_device),
+            static_cast<float *>(out_probability_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueSoftmaxProcessedLogitsF32Device(
+        const void *logits_device,
+        int row_count,
+        int vocab_size,
+        int row_stride,
+        int device_id,
+        void *stream,
+        void *out_probabilities_device,
+        int out_row_stride)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !logits_device || row_count <= 0 || vocab_size <= 0 ||
+            row_stride < vocab_size || out_row_stride < vocab_size ||
+            !stream || !out_probabilities_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_softmax_processed_logits_f32(
+            static_cast<const float *>(logits_device),
+            row_count,
+            vocab_size,
+            row_stride,
+            static_cast<float *>(out_probabilities_device),
+            out_row_stride,
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueFillInverseExponentialSamplesF32Device(
+        void *out_samples_device,
+        int row_count,
+        int vocab_size,
+        int row_stride,
+        uint64_t seed,
+        int first_logical_position,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !out_samples_device || row_count <= 0 || row_count > 4 ||
+            vocab_size <= 0 || row_stride < vocab_size || !stream)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_fill_inverse_exponential_samples_f32(
+            static_cast<float *>(out_samples_device),
+            row_count,
+            vocab_size,
+            row_stride,
+            static_cast<unsigned long long>(seed),
+            first_logical_position,
             device_id,
             stream);
     }
@@ -1405,7 +1870,8 @@ namespace llaminar2
         void *out_token_device,
         void *out_accepted_device,
         void *out_accept_probability_device,
-        void *out_accept_threshold_device)
+        void *out_accept_threshold_device,
+        const void *draft_token_probabilities_device)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !target_token_ids_device || !target_probs_device ||
@@ -1437,6 +1903,7 @@ namespace llaminar2
             top_k,
             distribution_stride,
             static_cast<const int *>(draft_tokens_device),
+            static_cast<const float *>(draft_token_probabilities_device),
             accept_thresholds[0],
             accept_thresholds[1],
             accept_thresholds[2],
@@ -1446,6 +1913,254 @@ namespace llaminar2
             residual_thresholds[2],
             residual_thresholds[3],
             row_count,
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueSpeculativeVerifyProcessedLogitsF32DeviceThresholdsBatchDeviceTokens(
+        const void *target_logits_device,
+        const void *draft_logits_device,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const void *draft_tokens_device,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device,
+        const void *draft_token_probabilities_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_logits_device || !draft_logits_device ||
+            !draft_tokens_device ||
+            row_count <= 0 || row_count > 4 ||
+            vocab_size <= 0 ||
+            target_row_stride < vocab_size ||
+            draft_row_stride < vocab_size ||
+            !accept_thresholds_host || !residual_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float residual_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+        {
+            accept_thresholds[i] = accept_thresholds_host[i];
+            residual_thresholds[i] = residual_thresholds_host[i];
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_speculative_verify_processed_logits_thresholds_batch_device_tokens_f32(
+            static_cast<const float *>(target_logits_device),
+            static_cast<const float *>(draft_logits_device),
+            row_count,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            static_cast<const int *>(draft_tokens_device),
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            residual_thresholds[0],
+            residual_thresholds[1],
+            residual_thresholds[2],
+            residual_thresholds[3],
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            static_cast<const float *>(draft_token_probabilities_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueSpeculativeVerifyProcessedTargetDraftProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
+        const void *target_logits_device,
+        const void *draft_probabilities_device,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const void *draft_tokens_device,
+        const float *accept_thresholds_host,
+        uint64_t inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device,
+        bool no_draft_probabilities)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_logits_device ||
+            (!no_draft_probabilities && !draft_probabilities_device) ||
+            !draft_tokens_device ||
+            row_count <= 0 || row_count > 4 ||
+            vocab_size <= 0 ||
+            target_row_stride < vocab_size ||
+            (!no_draft_probabilities && draft_row_stride < vocab_size) ||
+            !accept_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+            accept_thresholds[i] = accept_thresholds_host[i];
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_speculative_verify_processed_target_draft_probabilities_thresholds_batch_device_tokens_f32(
+            static_cast<const float *>(target_logits_device),
+            static_cast<const float *>(draft_probabilities_device),
+            row_count,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            static_cast<const int *>(draft_tokens_device),
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            static_cast<unsigned long long>(inverse_sample_seed),
+            inverse_sample_first_logical_position,
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            no_draft_probabilities ? 1 : 0,
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueSpeculativeVerifyProcessedTargetDraftLogitsF32DeviceThresholdsBatchDeviceTokens(
+        const void *target_logits_device,
+        const void *draft_logits_device,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const void *draft_tokens_device,
+        const float *accept_thresholds_host,
+        uint64_t inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device,
+        const void *draft_token_probabilities_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_logits_device || !draft_logits_device ||
+            !draft_tokens_device ||
+            row_count <= 0 || row_count > 4 ||
+            vocab_size <= 0 ||
+            target_row_stride < vocab_size ||
+            draft_row_stride < vocab_size ||
+            !accept_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+            accept_thresholds[i] = accept_thresholds_host[i];
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_speculative_verify_processed_target_draft_logits_thresholds_batch_device_tokens_f32(
+            static_cast<const float *>(target_logits_device),
+            static_cast<const float *>(draft_logits_device),
+            row_count,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            static_cast<const int *>(draft_tokens_device),
+            static_cast<const float *>(draft_token_probabilities_device),
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            static_cast<unsigned long long>(inverse_sample_seed),
+            inverse_sample_first_logical_position,
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueSpeculativeVerifyProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
+        const void *target_probabilities_device,
+        const void *draft_probabilities_device,
+        const void *inverse_rejection_samples_device,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        int inverse_sample_row_stride,
+        const void *draft_tokens_device,
+        const float *accept_thresholds_host,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device,
+        bool no_draft_probabilities)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_probabilities_device || !inverse_rejection_samples_device ||
+            (!no_draft_probabilities && !draft_probabilities_device) ||
+            !draft_tokens_device ||
+            row_count <= 0 || row_count > 4 ||
+            vocab_size <= 0 ||
+            target_row_stride < vocab_size ||
+            (!no_draft_probabilities && draft_row_stride < vocab_size) ||
+            inverse_sample_row_stride < vocab_size ||
+            !accept_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+            accept_thresholds[i] = accept_thresholds_host[i];
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_speculative_verify_probabilities_thresholds_batch_device_tokens_f32(
+            static_cast<const float *>(target_probabilities_device),
+            static_cast<const float *>(draft_probabilities_device),
+            static_cast<const float *>(inverse_rejection_samples_device),
+            row_count,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            inverse_sample_row_stride,
+            static_cast<const int *>(draft_tokens_device),
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            no_draft_probabilities ? 1 : 0,
             static_cast<int *>(out_token_device),
             static_cast<int *>(out_accepted_device),
             static_cast<float *>(out_accept_probability_device),
@@ -1559,6 +2274,57 @@ namespace llaminar2
             stop_token_count,
             static_cast<const int *>(bonus_token_device),
             has_bonus_token ? 1 : 0,
+            static_cast<int *>(out_tokens_device),
+            static_cast<int *>(out_meta_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueSummarizeGreedySpeculativeVerifyBatch(
+        const void *verify_tokens_device,
+        const void *draft_tokens_device,
+        int compare_row_count,
+        int first_token,
+        const int *stop_tokens_host,
+        int stop_token_count,
+        int device_id,
+        void *stream,
+        void *out_tokens_device,
+        void *out_meta_device)
+    {
+        using namespace sampling_math;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !verify_tokens_device || !draft_tokens_device ||
+            compare_row_count < 0 ||
+            compare_row_count > kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens_host) ||
+            !stream || !out_tokens_device || !out_meta_device)
+        {
+            return false;
+        }
+
+        int stop_tokens[kSpeculativeBatchMaxStopTokens] =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            stop_tokens[i] = stop_tokens_host[i];
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_summarize_greedy_speculative_verify_batch(
+            static_cast<const int *>(verify_tokens_device),
+            static_cast<const int *>(draft_tokens_device),
+            compare_row_count,
+            first_token,
+            stop_tokens[0],
+            stop_tokens[1],
+            stop_tokens[2],
+            stop_tokens[3],
+            stop_tokens[4],
+            stop_tokens[5],
+            stop_tokens[6],
+            stop_tokens[7],
+            stop_token_count,
             static_cast<int *>(out_tokens_device),
             static_cast<int *>(out_meta_device),
             device_id,

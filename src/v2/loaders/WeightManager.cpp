@@ -4563,7 +4563,14 @@ namespace llaminar2
         // Step 4: Allocate VRAM pool + pinned ring buffer
         // ------------------------------------------------------------------
         const auto &rocm_cfg = debugEnv().rocm;
-        const int repack_streams = rocm_cfg.repack_streams;
+        /**
+         * The upload pipeline is a ring of pinned host slots paired with H2D
+         * streams. A zero stream count is never meaningful once there are raw
+         * weights to stage; clamp here before both budgeting and allocation so
+         * the VRAM preflight describes the exact resources the orchestrator will
+         * bind.
+         */
+        const int repack_streams = std::clamp(rocm_cfg.repack_streams, 1, 8);
         const auto *planned_pool = orchestrator->getPool(target_device.ordinal);
         const size_t planned_weight_bytes = planned_pool ? planned_pool->totalPlannedBytes() : 0;
         const size_t staging_bytes = max_raw_bytes * static_cast<size_t>(std::max(0, repack_streams));
@@ -4599,7 +4606,7 @@ namespace llaminar2
                                                                      << " free=" << formatMiB(free_vram_bytes)
                                                                      << " safety_margin=" << formatMiB(safety_margin_bytes));
 
-        orchestrator->allocate(max_raw_bytes, rocm_cfg.repack_streams);
+        orchestrator->allocate(max_raw_bytes, repack_streams);
 
         // ------------------------------------------------------------------
         // Step 5: Create weight jobs

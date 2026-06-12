@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -8,6 +10,7 @@
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "models/GraphTypes.h"
+#include "utils/DebugEnv.h"
 
 using namespace llaminar2;
 
@@ -30,6 +33,42 @@ namespace
     private:
         std::vector<std::string> strings_;
         std::vector<char *> argv_;
+    };
+
+    class ScopedEnvVar
+    {
+    public:
+        explicit ScopedEnvVar(const char *name)
+            : name_(name)
+        {
+            if (const char *current = std::getenv(name_.c_str()))
+                previous_ = current;
+        }
+
+        ~ScopedEnvVar()
+        {
+            if (previous_)
+                ::setenv(name_.c_str(), previous_->c_str(), 1);
+            else
+                ::unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        void set(const char *value)
+        {
+            ::setenv(name_.c_str(), value, 1);
+            mutableDebugEnv().reload();
+        }
+
+        void unset()
+        {
+            ::unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+    private:
+        std::string name_;
+        std::optional<std::string> previous_;
     };
 } // namespace
 
@@ -61,6 +100,63 @@ TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 1.0);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.30);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);
+}
+
+TEST(Test__PrefixMTPConfig, ROCmTopKSmallKPartialBlockOverrideIsValidated)
+{
+    ScopedEnvVar override_env("LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS");
+
+    override_env.unset();
+    EXPECT_EQ(debugEnv().rocm.topk_smallk_partial_blocks, 0)
+        << "Unset ROCm sampler cap should keep the production auto policy.";
+
+    override_env.set("64");
+    EXPECT_EQ(debugEnv().rocm.topk_smallk_partial_blocks, 64);
+
+    override_env.set("33");
+    EXPECT_EQ(debugEnv().rocm.topk_smallk_partial_blocks, 0)
+        << "Unsupported caps should not silently enter the launch policy.";
+
+    override_env.set("128");
+    EXPECT_EQ(debugEnv().rocm.topk_smallk_partial_blocks, 128);
+}
+
+TEST(Test__PrefixMTPConfig, ValidateIgnoresDepthPolicyWhenMTPDisabled)
+{
+    OrchestrationConfig config;
+    config.mtp.enabled = false;
+    config.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    config.mtp.depth_policy.min_depth = 3;
+    config.mtp.depth_policy.max_depth = 1;
+    config.mtp.depth_policy.initial_depth = 9;
+    config.mtp.depth_policy.promote_consecutive_windows = 0;
+
+    const auto errors = config.validate();
+
+    EXPECT_TRUE(errors.empty())
+        << "Disabled MTP must not make no-MTP baselines depend on adaptive-depth knobs";
+}
+
+TEST(Test__PrefixMTPConfig, ValidateFixedDepthIgnoresAdaptiveOnlyKnobs)
+{
+    OrchestrationConfig config;
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 3;
+    config.mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    config.mtp.depth_policy.min_depth = 1;
+    config.mtp.depth_policy.max_depth = 0;
+    config.mtp.depth_policy.initial_depth = 0;
+    config.mtp.depth_policy.promote_consecutive_windows = 0;
+    config.mtp.depth_policy.window_size = 0;
+    config.mtp.depth_policy.min_samples = 0;
+
+    EXPECT_TRUE(config.validate().empty())
+        << "Fixed-depth lanes are normalized to min=max=initial=draft_tokens at controller setup.";
+
+    config.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    const auto errors = config.validate();
+    EXPECT_FALSE(errors.empty())
+        << "Dynamic depth must still reject the same invalid adaptive knobs.";
 }
 
 TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)

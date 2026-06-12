@@ -808,7 +808,8 @@ namespace
             GTEST_SKIP() << "No ROCm device available";
         }
 
-        const int M = 1;
+        constexpr std::array<int, 2> kVerifierRows = {1, 3};
+        const int max_M = 3;
         const int N = 1024;
         const int K = 5120;
         const int blocks_per_row = K / 32;
@@ -836,72 +837,87 @@ namespace
         ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
         ASSERT_NE(stream, nullptr);
         kernel.setGPUStream(stream);
-        ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+        ASSERT_TRUE(setupWorkspace(kernel, max_M, N, K));
 
-        auto input = TestTensorFactory::createFP32Random(
-            {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 3605);
-        auto output_gpu = TestTensorFactory::createFP32(
-            {static_cast<size_t>(M), static_cast<size_t>(N)});
+        for (const int M : kVerifierRows)
+        {
+            auto input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 3605 + M);
+            auto output_gpu = TestTensorFactory::createFP32(
+                {static_cast<size_t>(M), static_cast<size_t>(N)});
 
-        ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K));
-        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K))
+                << "Q4_K packed-contract run M=" << M;
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        const void *d_quant_a = workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A);
-        const void *d_scales_a = workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE);
-        ASSERT_NE(d_quant_a, nullptr);
-        ASSERT_NE(d_scales_a, nullptr);
+            const void *d_quant_a = workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A);
+            const void *d_scales_a = workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE);
+            ASSERT_NE(d_quant_a, nullptr);
+            ASSERT_NE(d_scales_a, nullptr);
 
-        std::vector<int8_t> quant_a(static_cast<size_t>(K));
-        std::vector<float> scales_a(static_cast<size_t>(blocks_per_row));
-        ASSERT_EQ(hipMemcpyAsync(quant_a.data(), d_quant_a,
-                                 quant_a.size() * sizeof(int8_t),
-                                 hipMemcpyDeviceToHost, stream),
-                  hipSuccess);
-        ASSERT_EQ(hipMemcpyAsync(scales_a.data(), d_scales_a,
-                                 scales_a.size() * sizeof(float),
-                                 hipMemcpyDeviceToHost, stream),
-                  hipSuccess);
+            std::vector<int8_t> quant_a(static_cast<size_t>(M) * static_cast<size_t>(K));
+            std::vector<float> scales_a(static_cast<size_t>(M) * static_cast<size_t>(blocks_per_row));
+            ASSERT_EQ(hipMemcpyAsync(quant_a.data(), d_quant_a,
+                                     quant_a.size() * sizeof(int8_t),
+                                     hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(scales_a.data(), d_scales_a,
+                                     scales_a.size() * sizeof(float),
+                                     hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
 
-        auto *output_fp32 = dynamic_cast<FP32Tensor *>(output_gpu.get());
-        ASSERT_NE(output_fp32, nullptr);
-        const void *d_output = output_fp32->gpu_data_ptr();
-        ASSERT_NE(d_output, nullptr);
-        std::vector<float> gpu_output(static_cast<size_t>(N));
-        ASSERT_EQ(hipMemcpyAsync(gpu_output.data(), d_output,
-                                 gpu_output.size() * sizeof(float),
-                                 hipMemcpyDeviceToHost, stream),
-                  hipSuccess);
-        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            auto *output_fp32 = dynamic_cast<FP32Tensor *>(output_gpu.get());
+            ASSERT_NE(output_fp32, nullptr);
+            const void *d_output = output_fp32->gpu_data_ptr();
+            ASSERT_NE(d_output, nullptr);
+            std::vector<float> gpu_output(static_cast<size_t>(M) * static_cast<size_t>(N));
+            ASSERT_EQ(hipMemcpyAsync(gpu_output.data(), d_output,
+                                     gpu_output.size() * sizeof(float),
+                                     hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        std::vector<float> native_contract_ref(static_cast<size_t>(N));
-        cpuQ4LikeNativeVNNIGemvFromPacked(
-            quant_a.data(), scales_a.data(), host_payload, host_scales, host_mins,
-            native_contract_ref.data(), N, K);
+            std::vector<float> native_contract_ref(static_cast<size_t>(M) * static_cast<size_t>(N));
+            std::vector<float> fp32_ref(static_cast<size_t>(M) * static_cast<size_t>(N));
+            for (int row = 0; row < M; ++row)
+            {
+                cpuQ4LikeNativeVNNIGemvFromPacked(
+                    quant_a.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                    scales_a.data() + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row),
+                    host_payload, host_scales, host_mins,
+                    native_contract_ref.data() + static_cast<size_t>(row) * static_cast<size_t>(N),
+                    N, K);
+                cpuFP32Gemv(
+                    input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                    W_fp32.data(),
+                    fp32_ref.data() + static_cast<size_t>(row) * static_cast<size_t>(N),
+                    N, K);
+            }
 
-        const float native_cos = cosineSimilarity(
-            gpu_output.data(), native_contract_ref.data(), static_cast<size_t>(N));
-        const float native_rel_l2 = relativeL2Error(
-            gpu_output.data(), native_contract_ref.data(), static_cast<size_t>(N));
-        const float native_max_abs = maxAbsError(
-            gpu_output.data(), native_contract_ref.data(), static_cast<size_t>(N));
+            const size_t out_count = static_cast<size_t>(M) * static_cast<size_t>(N);
+            const float native_cos = cosineSimilarity(
+                gpu_output.data(), native_contract_ref.data(), out_count);
+            const float native_rel_l2 = relativeL2Error(
+                gpu_output.data(), native_contract_ref.data(), out_count);
+            const float native_max_abs = maxAbsError(
+                gpu_output.data(), native_contract_ref.data(), out_count);
+            const float fp32_cos = cosineSimilarity(
+                gpu_output.data(), fp32_ref.data(), out_count);
 
-        std::vector<float> fp32_ref(static_cast<size_t>(N));
-        cpuFP32Gemv(input->data(), W_fp32.data(), fp32_ref.data(), N, K);
-        const float fp32_cos = cosineSimilarity(
-            gpu_output.data(), fp32_ref.data(), static_cast<size_t>(N));
+            LOG_INFO("[NativeVNNI_GEMV] Q4_K Qwen3.6 GDN time exact-contract"
+                     << " M=" << M
+                     << " native_cos=" << native_cos
+                     << " native_rel_l2=" << native_rel_l2
+                     << " native_max_abs=" << native_max_abs
+                     << " fp32_cos=" << fp32_cos);
 
-        LOG_INFO("[NativeVNNI_GEMV] Q4_K Qwen3.6 GDN time exact-contract"
-                 << " native_cos=" << native_cos
-                 << " native_rel_l2=" << native_rel_l2
-                 << " native_max_abs=" << native_max_abs
-                 << " fp32_cos=" << fp32_cos);
-
-        EXPECT_GT(native_cos, 0.999999f);
-        EXPECT_LT(native_rel_l2, 2e-5f);
-        EXPECT_LT(native_max_abs, 2e-3f);
-        EXPECT_GT(fp32_cos, 0.9998f)
-            << "The full-FP32 reference may be lower than the packed native "
-               "contract because this path intentionally quantizes activations.";
+            EXPECT_GT(native_cos, 0.999999f) << "M=" << M;
+            EXPECT_LT(native_rel_l2, 2e-5f) << "M=" << M;
+            EXPECT_LT(native_max_abs, 2e-3f) << "M=" << M;
+            EXPECT_GT(fp32_cos, 0.9997f)
+                << "The full-FP32 reference may be lower than the packed native "
+                   "contract because this path intentionally quantizes activations. M=" << M;
+        }
 
         cleanupWorkspace(kernel);
         ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
@@ -1035,6 +1051,77 @@ namespace
             << PerfStatsCollector::summaryString({"kernel"}, 0);
         EXPECT_FALSE(found_atomic_reduce)
             << "LLAMINAR_DETERMINISTIC must beat both GPU-graph and env-requested atomic reduce";
+
+        cleanupWorkspace(kernel);
+        PerfStatsCollector::reset();
+#endif
+    }
+
+    TEST_F(NativeVNNIGEMVTest, GpuGraphsUseWorkspaceSplitReduceUnlessAtomicExplicitlyRequested)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_rocm_device_)
+        {
+            GTEST_SKIP() << "No ROCm device available";
+        }
+
+        ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
+        ScopedDebugEnvOverride graphs_env("LLAMINAR_GPU_GRAPHS", "1");
+        ScopedDebugEnvOverride atomic_env("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "0");
+        ScopedDebugEnvOverride perf_env("LLAMINAR_PERF_STATS_JSON", "1");
+        NativeVNNITuningOverrideGuard force_kb(/*kb=*/4);
+        PerfStatsCollector::reset();
+        ASSERT_TRUE(PerfStatsCollector::isEnabled());
+        EXPECT_TRUE(debugEnv().execution.gpu_graphs);
+        EXPECT_FALSE(debugEnv().gemm.deterministic);
+        EXPECT_FALSE(debugEnv().rocm.nvnni_atomic_reduce);
+
+        constexpr int M = 2;
+        constexpr int N = 512;
+        constexpr int K = 2048;
+
+        auto weights = TestTensorFactory::createQ4_0Random({N, K}, 95001u);
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+        ASSERT_FALSE(packed.native_vnni_payload.empty());
+
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+        auto input = TestTensorFactory::createFP32Random({M, K}, -1.0f, 1.0f, 95002u);
+        auto output_gpu = TestTensorFactory::createFP32({M, N});
+        ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K));
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+        const auto records = PerfStatsCollector::snapshot({"kernel"});
+        bool found_split_reduce = false;
+        bool found_atomic_reduce = false;
+        for (const auto &record : records)
+        {
+            if (record.name != "rocm_native_vnni_small_m_launch")
+                continue;
+            auto tag = [&](const char *key) -> std::string
+            {
+                const auto it = record.tags.find(key);
+                return it == record.tags.end() ? std::string{} : it->second;
+            };
+            if (tag("m") != "2" || tag("n") != std::to_string(N) ||
+                tag("k") != std::to_string(K) || tag("codebook") != "0")
+            {
+                continue;
+            }
+            found_split_reduce = found_split_reduce || tag("path") == "split_reduce";
+            found_atomic_reduce = found_atomic_reduce || tag("path") == "atomic_reduce";
+        }
+
+        EXPECT_TRUE(found_split_reduce)
+            << "ROCm GPU-graph small-M GEMV should use declared workspace split-reduce by default"
+            << "\n"
+            << PerfStatsCollector::summaryString({"kernel"}, 0);
+        EXPECT_FALSE(found_atomic_reduce)
+            << "Atomic small-M GEMV is an explicit ROCm tuning mode, not a graph-capture default";
 
         cleanupWorkspace(kernel);
         PerfStatsCollector::reset();

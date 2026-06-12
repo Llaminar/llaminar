@@ -28,6 +28,16 @@ TEST(Qwen36LocalTPPrefixMTPParity, MTPGreedyMatchesPyTorchDecodeTokens)
     runDenseMTPParity(localTPCase(), false);
 }
 
+TEST(Qwen36LocalTPPrefixMTPParity, MTPGreedyDepth3MatchesPyTorchDecodeTokens)
+{
+    runDenseMTPParity(localTPCase(), false, 3);
+}
+
+TEST(Qwen36LocalTPPrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
+{
+    runDenseDynamicMTPParity(localTPCase(), false);
+}
+
 TEST(Qwen36LocalTPPrefixMTPParity, PrefixCacheMTPRestore)
 {
     runDenseMTPParity(localTPCase(), true);

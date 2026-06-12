@@ -366,6 +366,8 @@ namespace llaminar2
 
         mergeFrom(params_.prepared_ref_gate.value(), params_.n_gate);
         mergeFrom(params_.prepared_ref_up.value(), params_.n_up);
+        addCudaConcurrentDecodeGemvSideStreamWorkspace(
+            combined, params_.device_id, workspace_m, /*projection_count=*/2);
         return combined;
     }
 

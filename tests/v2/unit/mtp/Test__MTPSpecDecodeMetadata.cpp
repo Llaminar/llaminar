@@ -159,6 +159,43 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingBindsEveryDeclaredBuffer)
     EXPECT_FALSE(binding.devicePointers().complete());
 }
 
+TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingShapeGrowthRequiresRebind)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    MTPSpecDecodeMetadataShape small_shape;
+    small_shape.max_requests = 1;
+    small_shape.max_draft_tokens = 1;
+
+    MTPSpecDecodeMetadataShape large_shape;
+    large_shape.max_requests = 1;
+    large_shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(small_shape);
+    DeviceWorkspaceManager small_workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(small_workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&small_workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+
+    // A deeper verifier plan can arrive before WorkspaceAllocator has grown the
+    // persistent metadata buffers. The binding must report an undersized
+    // workspace and clear device pointers rather than continuing with stale
+    // pointers from the previous shape.
+    binding.setShape(large_shape);
+    EXPECT_FALSE(binding.hasWorkspace());
+    EXPECT_THAT(binding.bindingError(), HasSubstr("too small"));
+    EXPECT_FALSE(binding.devicePointers().complete());
+
+    DeviceWorkspaceManager large_workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(large_workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&large_workspace);
+    EXPECT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+    EXPECT_TRUE(binding.devicePointers().complete());
+}
+
 TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingDoesNotRequireCommittedRowCompatibilityBuffers)
 {
     if (!hasCPUBackend())

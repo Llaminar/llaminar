@@ -145,6 +145,8 @@ namespace llaminar2
 
             bool cudaNativeVNNIInitIQGridTables_tuned();
 
+            bool cudaNativeVNNIGemvSweep_isActive();
+
             bool cudaNativeVNNIGemvTuned_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
@@ -270,6 +272,11 @@ namespace llaminar2
         constexpr int kCudaConcurrentPrefillWorkspaceSlots = 3;
         constexpr int kCudaConcurrentPrefillExtraAccumulatorSlots =
             kCudaConcurrentPrefillWorkspaceSlots - 1;
+        // Decode projection fan-out can exceed the stream count, especially
+        // for MoE top-k gate/up decode where 8 experts become 16 projections.
+        // Only this many stream slots can be active at once; later projections
+        // reuse a slot after that slot's completion event is observed.
+        constexpr int kCudaConcurrentDecodeWorkspaceSlots = 8;
 
         struct CUDAConcurrentPrefillPool
         {
@@ -1305,6 +1312,89 @@ namespace llaminar2
                 streamk_slot_bytes);
         }
 
+        void CUDAQuantisedGemmKernel::bindConcurrentNativeDecodeScratch(
+            int m,
+            int n,
+            int k,
+            int stream_idx,
+            int projection_count) const
+        {
+            if (!impl_ || !impl_->gemv_ctx || !workspace_ || m <= 0)
+                return;
+
+            if (projection_count < 2)
+            {
+                throw std::runtime_error(
+                    "[ConcurrentDecode] NativeVNNI GEMV projection count " +
+                    std::to_string(projection_count) + " is outside the declared workspace slot range");
+            }
+
+            const int active_slots =
+                std::min(projection_count, kCudaConcurrentDecodeWorkspaceSlots);
+
+            if (stream_idx < 0 || stream_idx >= active_slots)
+            {
+                throw std::runtime_error(
+                    "[ConcurrentDecode] NativeVNNI GEMV stream slot " +
+                    std::to_string(stream_idx) + " is outside the declared workspace slot range");
+            }
+
+            const int rows = std::max(1, std::min(m, 4));
+            const int k_groups = (k + 31) / 32;
+            const size_t required_bytes =
+                static_cast<size_t>(k_groups) * static_cast<size_t>(rows) *
+                static_cast<size_t>(n) * sizeof(float);
+            if (required_bytes == 0)
+                return;
+
+            float *partials = nullptr;
+            size_t slot_bytes = 0;
+            if (stream_idx == 0)
+            {
+                void *buffer = workspace_->getBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+                slot_bytes = workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+                if (!buffer || slot_bytes < required_bytes)
+                {
+                    throw std::runtime_error(
+                        "[ConcurrentDecode] " +
+                        std::string(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS) +
+                        " workspace is missing or undersized for stream slot 0: need " +
+                        std::to_string(required_bytes) + " bytes, have " +
+                        std::to_string(slot_bytes));
+                }
+                partials = static_cast<float *>(buffer);
+            }
+            else
+            {
+                void *buffer = workspace_->getBuffer(
+                    GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+                const size_t total_bytes = workspace_->getBufferSize(
+                    GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+                const int extra_slots = active_slots - 1;
+                slot_bytes = total_bytes / static_cast<size_t>(extra_slots);
+                if (!buffer || slot_bytes < required_bytes ||
+                    stream_idx > extra_slots)
+                {
+                    throw std::runtime_error(
+                        "[ConcurrentDecode] " +
+                        std::string(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS) +
+                        " workspace is missing or undersized for stream slot " +
+                        std::to_string(stream_idx) + ": need " +
+                        std::to_string(required_bytes) + " bytes, have " +
+                        std::to_string(slot_bytes));
+                }
+
+                auto *base = static_cast<unsigned char *>(buffer);
+                partials = reinterpret_cast<float *>(
+                    base + static_cast<size_t>(stream_idx - 1) * slot_bytes);
+            }
+
+            cudaGemvContext_bindWorkspace(
+                impl_->gemv_ctx,
+                partials,
+                slot_bytes);
+        }
+
         // =====================================================================
         // ITensorGemm interface - multiply_tensor() PRIMARY ENTRY POINT
         // =====================================================================
@@ -1808,8 +1898,9 @@ namespace llaminar2
             // tiny alpha/beta gates) dispatched on separate streams so the small,
             // latency-bound gate GEMVs overlap the larger qkv read instead of running
             // strictly serially. Gated separately from prefill (LLAMINAR_CUDA_CONCURRENT_DECODE)
-            // because this is single-device decode only; the GEMV path ignores the INT32
-            // accumulator scratch, so no per-stream scratch buffers are required.
+            // because this is single-device decode only. The GEMV path ignores the INT32
+            // accumulator scratch, but KPAR reductions still need per-stream FP32
+            // partial arenas declared by the fused stage that knows projection fan-out.
             const bool decode_concurrent_eligible = use_blockwise && m == 1 &&
                                                     projections.size() >= 2 &&
                                                     debugEnv().gemm.cuda_concurrent_decode &&
@@ -1847,7 +1938,6 @@ namespace llaminar2
                         " concurrent projections with workspace-backed INT32 accumulators; got " +
                         std::to_string(num_proj));
                 }
-
                 auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
                 pool.init(cuda_device_id_, num_proj);
 
@@ -1886,6 +1976,7 @@ namespace llaminar2
                                 " has no bound workspace for GEMV context binding");
                         }
                         cuda_kernel->validateWorkspace();
+                        cuda_kernel->bindConcurrentNativeDecodeScratch(m, n, k, stream_idx, num_proj);
                     }
                     else
                     {
@@ -2645,6 +2736,11 @@ namespace llaminar2
                     packed_ ? &packed_->rowmajor_ : nullptr);
                 if (!ok)
                 {
+                    if (cudaNativeVNNIGemvSweep_isActive())
+                    {
+                        return false;
+                    }
+
                     cudaError_t le = cudaPeekAtLastError();
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] NativeVNNI small-M GEMV failed"
                               << " M=" << m
@@ -2865,12 +2961,23 @@ namespace llaminar2
                 LOG_WARN("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM failed, falling back");
             }
 
-            if (m > 1 && m <= 4 &&
-                multiply_fp32_to_fp32_small_m_gemv(
-                    d_A, d_C, nullptr, m, n, k, alpha, beta))
+            if (m > 1 && m <= 4)
             {
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (small-M row-wise native payload GEMV)");
-                return true;
+                if (multiply_fp32_to_fp32_small_m_gemv(
+                        d_A, d_C, nullptr, m, n, k, alpha, beta))
+                {
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (small-M row-wise native payload GEMV)");
+                    return true;
+                }
+
+                if (cudaNativeVNNIGemvSweep_isActive())
+                {
+                    // Training sweeps must fail closed for M=2..4. Falling
+                    // through to the generic M>1 GEMM path would time a
+                    // different kernel family while labelling the CSV row as
+                    // the requested small-M candidate.
+                    return false;
+                }
             }
 
             // Use blockwise quantization for prefill and for decode when a native

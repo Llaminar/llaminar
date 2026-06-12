@@ -16,6 +16,7 @@
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/debug/TPSnapshot.h"
+#include "execution/mtp/MTPSpecStateContract.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
@@ -23,6 +24,7 @@
 #include "utils/DebugEnv.h"
 #include "mocks/MockModelContext.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -40,6 +42,26 @@ using namespace llaminar2;
 struct ForwardMTPRendezvous
 {
     explicit ForwardMTPRendezvous(int expected_) : expected(expected_) {}
+
+    int expected = 0;
+    std::atomic<int> arrivals{0};
+    std::mutex mutex;
+    std::condition_variable cv;
+};
+
+struct MTPPublicationRendezvous
+{
+    explicit MTPPublicationRendezvous(int expected_) : expected(expected_) {}
+
+    int expected = 0;
+    std::atomic<int> arrivals{0};
+    std::mutex mutex;
+    std::condition_variable cv;
+};
+
+struct ChainedMTPRendezvous
+{
+    explicit ChainedMTPRendezvous(int expected_) : expected(expected_) {}
 
     int expected = 0;
     std::atomic<int> arrivals{0};
@@ -123,6 +145,82 @@ public:
         return forward_mtp_ok_;
     }
 
+    bool supportsChainedMTPDrafts() const override
+    {
+        return supports_chained_mtp_drafts_;
+    }
+
+    bool forwardMTPFromLastDraft(
+        int32_t draft_condition_token,
+        int position_id) override
+    {
+        forward_mtp_from_last_draft_calls_.fetch_add(1, std::memory_order_relaxed);
+        last_chained_mtp_condition_token_ = draft_condition_token;
+        last_chained_mtp_position_id_ = position_id;
+        if (chained_mtp_rendezvous_)
+        {
+            std::unique_lock<std::mutex> lock(chained_mtp_rendezvous_->mutex);
+            chained_mtp_rendezvous_->arrivals.fetch_add(1, std::memory_order_acq_rel);
+            chained_mtp_rendezvous_->cv.notify_all();
+            const bool all_arrived = chained_mtp_rendezvous_->cv.wait_for(
+                lock,
+                std::chrono::milliseconds(500),
+                [barrier = chained_mtp_rendezvous_]()
+                {
+                    return barrier->arrivals.load(std::memory_order_acquire) >= barrier->expected;
+                });
+            if (!all_arrived)
+                return false;
+        }
+        return forward_mtp_from_last_draft_ok_;
+    }
+
+    bool supportsMTPSpecStatePublication() const override
+    {
+        return supports_mtp_spec_state_publication_;
+    }
+
+    bool publishAcceptedMTPSpecState(
+        const MTPSpecStepPlan &plan,
+        std::string *error = nullptr) override
+    {
+        publish_mtp_spec_state_calls_.fetch_add(1, std::memory_order_relaxed);
+        last_mtp_spec_state_plan_ = plan;
+        if (mtp_publication_rendezvous_)
+        {
+            std::unique_lock<std::mutex> lock(mtp_publication_rendezvous_->mutex);
+            mtp_publication_rendezvous_->arrivals.fetch_add(1, std::memory_order_acq_rel);
+            mtp_publication_rendezvous_->cv.notify_all();
+            const bool all_arrived = mtp_publication_rendezvous_->cv.wait_for(
+                lock,
+                std::chrono::milliseconds(500),
+                [barrier = mtp_publication_rendezvous_]()
+                {
+                    return barrier->arrivals.load(std::memory_order_acquire) >= barrier->expected;
+                });
+            if (!all_arrived)
+            {
+                if (error)
+                    *error = "mock MTP spec-state publication rendezvous timed out";
+                return false;
+            }
+        }
+        if (!supports_mtp_spec_state_publication_)
+        {
+            if (error)
+                *error = "mock MTP spec-state publication disabled";
+            return false;
+        }
+        if (!publish_mtp_spec_state_ok_)
+        {
+            if (error)
+                *error = "mock MTP spec-state publication failed";
+            return false;
+        }
+        position_ = plan.target_cached_tokens;
+        return true;
+    }
+
     const float *mtpLogits() const override
     {
         return mtp_logits_.empty() ? logits_.data() : mtp_logits_.data();
@@ -168,8 +266,26 @@ public:
 
     LogitsLocalInfo getAllPositionLogitsLocalInfo() const override
     {
+        get_all_position_logits_local_info_calls_.fetch_add(
+            1,
+            std::memory_order_relaxed);
         if (!all_position_logits_local_)
             return {};
+        return makeAllPositionLocalInfo();
+    }
+
+    LogitsLocalInfo consumeAllPositionLogitsLocalInfoForSampling() override
+    {
+        consume_all_position_logits_local_info_calls_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        if (!all_position_logits_local_)
+            return {};
+        return makeAllPositionLocalInfo();
+    }
+
+    LogitsLocalInfo makeAllPositionLocalInfo() const
+    {
         const auto &shape = all_position_logits_local_->shape();
         return LogitsLocalInfo{
             nullptr,
@@ -377,6 +493,10 @@ public:
     void set_prefix_populate_ok(bool ok) { prefix_populate_ok_ = ok; }
     void set_prefix_terminal_restore_requires_blocks(bool required) { prefix_terminal_restore_requires_blocks_ = required; }
     void set_forward_mtp_ok(bool ok) { forward_mtp_ok_ = ok; }
+    void set_supports_chained_mtp_drafts(bool supported) { supports_chained_mtp_drafts_ = supported; }
+    void set_forward_mtp_from_last_draft_ok(bool ok) { forward_mtp_from_last_draft_ok_ = ok; }
+    void set_supports_mtp_spec_state_publication(bool supported) { supports_mtp_spec_state_publication_ = supported; }
+    void set_publish_mtp_spec_state_ok(bool ok) { publish_mtp_spec_state_ok_ = ok; }
     void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
     void set_mtp_unsupported_reason(std::string reason) { mtp_unsupported_reason_ = std::move(reason); }
     void set_prefix_live_capture_ok(bool ok) { prefix_live_capture_ok_ = ok; }
@@ -391,6 +511,14 @@ public:
     {
         forward_mtp_rendezvous_ = std::move(rendezvous);
     }
+    void set_mtp_publication_rendezvous(std::shared_ptr<MTPPublicationRendezvous> rendezvous)
+    {
+        mtp_publication_rendezvous_ = std::move(rendezvous);
+    }
+    void set_chained_mtp_rendezvous(std::shared_ptr<ChainedMTPRendezvous> rendezvous)
+    {
+        chained_mtp_rendezvous_ = std::move(rendezvous);
+    }
 
     size_t prefix_lookup_call_count() const { return prefix_lookup_calls_; }
     size_t prefix_populate_call_count() const { return prefix_populate_calls_; }
@@ -402,8 +530,15 @@ public:
     const std::vector<int32_t> &harvested_prefix_tokens() const { return harvested_prefix_tokens_; }
     int harvested_prompt_token_count() const { return harvested_prompt_token_count_; }
     size_t forward_mtp_call_count() const { return forward_mtp_calls_.load(std::memory_order_relaxed); }
+    size_t forward_mtp_from_last_draft_call_count() const { return forward_mtp_from_last_draft_calls_.load(std::memory_order_relaxed); }
+    size_t publish_mtp_spec_state_call_count() const { return publish_mtp_spec_state_calls_.load(std::memory_order_relaxed); }
     int32_t last_mtp_condition_token() const { return last_mtp_condition_token_; }
+    int32_t last_chained_mtp_condition_token() const { return last_chained_mtp_condition_token_; }
+    int last_chained_mtp_position_id() const { return last_chained_mtp_position_id_; }
+    const MTPSpecStepPlan &last_mtp_spec_state_plan() const { return last_mtp_spec_state_plan_; }
     size_t set_all_position_logits_call_count() const { return set_all_position_logits_calls_.load(std::memory_order_relaxed); }
+    size_t get_all_position_logits_local_info_call_count() const { return get_all_position_logits_local_info_calls_.load(std::memory_order_relaxed); }
+    size_t consume_all_position_logits_local_info_call_count() const { return consume_all_position_logits_local_info_calls_.load(std::memory_order_relaxed); }
     bool compute_all_position_logits() const { return compute_all_position_logits_; }
     size_t prefix_live_capture_call_count() const { return prefix_live_capture_calls_.load(std::memory_order_relaxed); }
     size_t prefix_live_restore_call_count() const { return prefix_live_restore_calls_.load(std::memory_order_relaxed); }
@@ -414,7 +549,11 @@ public:
         forward_calls_.store(0, std::memory_order_relaxed);
         clear_cache_calls_.store(0, std::memory_order_relaxed);
         forward_mtp_calls_.store(0, std::memory_order_relaxed);
+        forward_mtp_from_last_draft_calls_.store(0, std::memory_order_relaxed);
+        publish_mtp_spec_state_calls_.store(0, std::memory_order_relaxed);
         set_all_position_logits_calls_.store(0, std::memory_order_relaxed);
+        get_all_position_logits_local_info_calls_.store(0, std::memory_order_relaxed);
+        consume_all_position_logits_local_info_calls_.store(0, std::memory_order_relaxed);
         prefix_live_capture_calls_.store(0, std::memory_order_relaxed);
         prefix_live_restore_calls_.store(0, std::memory_order_relaxed);
         prefix_live_truncate_calls_.store(0, std::memory_order_relaxed);
@@ -429,12 +568,18 @@ private:
     std::shared_ptr<FP32Tensor> mtp_logits_local_;
     std::shared_ptr<FP32Tensor> all_position_logits_local_;
     std::shared_ptr<ForwardMTPRendezvous> forward_mtp_rendezvous_;
+    std::shared_ptr<MTPPublicationRendezvous> mtp_publication_rendezvous_;
+    std::shared_ptr<ChainedMTPRendezvous> chained_mtp_rendezvous_;
     PrefixLookupResult prefix_lookup_result_;
     bool prefix_populate_ok_ = true;
     bool prefix_harvest_ok_ = true;
     bool prefix_terminal_restore_ok_ = true;
     bool prefix_terminal_restore_requires_blocks_ = false;
     bool forward_mtp_ok_ = true;
+    bool supports_chained_mtp_drafts_ = false;
+    bool forward_mtp_from_last_draft_ok_ = true;
+    bool supports_mtp_spec_state_publication_ = false;
+    bool publish_mtp_spec_state_ok_ = true;
     bool set_all_position_logits_ok_ = true;
     bool compute_all_position_logits_ = false;
     std::string mtp_unsupported_reason_;
@@ -444,6 +589,9 @@ private:
     bool prefix_live_truncate_ok_ = true;
     uint64_t moe_placement_epoch_ = 0;
     int32_t last_mtp_condition_token_ = -1;
+    int32_t last_chained_mtp_condition_token_ = -1;
+    int last_chained_mtp_position_id_ = -1;
+    MTPSpecStepPlan last_mtp_spec_state_plan_;
     size_t prefix_lookup_calls_ = 0;
     size_t prefix_populate_calls_ = 0;
     size_t prefix_harvest_calls_ = 0;
@@ -456,7 +604,11 @@ private:
     mutable std::atomic<size_t> forward_calls_{0};
     mutable std::atomic<size_t> clear_cache_calls_{0};
     mutable std::atomic<size_t> forward_mtp_calls_{0};
+    mutable std::atomic<size_t> forward_mtp_from_last_draft_calls_{0};
+    mutable std::atomic<size_t> publish_mtp_spec_state_calls_{0};
     mutable std::atomic<size_t> set_all_position_logits_calls_{0};
+    mutable std::atomic<size_t> get_all_position_logits_local_info_calls_{0};
+    mutable std::atomic<size_t> consume_all_position_logits_local_info_calls_{0};
     mutable std::atomic<size_t> prefix_live_capture_calls_{0};
     mutable std::atomic<size_t> prefix_live_restore_calls_{0};
     mutable std::atomic<size_t> prefix_live_truncate_calls_{0};
@@ -860,6 +1012,32 @@ static RankOrchestrator::Config makeRankConfigForRunnerCount(int count)
     config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
     config.prefix_cache.block_size = 2;
     return config;
+}
+
+static MTPSpecStepPlan makeMTPSpecPublicationPlan(
+    int accepted_count,
+    int draft_count = 3)
+{
+    MTPSpecStepPlan plan;
+    plan.request_id = 11;
+    plan.draft_count = draft_count;
+    plan.target_rows = draft_count + 1;
+    plan.valid_sampled_count = draft_count + 1;
+    plan.committed_output_count = draft_count;
+    plan.accepted_count = accepted_count;
+    plan.base_cached_tokens = 64;
+    plan.target_cached_tokens = plan.base_cached_tokens + accepted_count;
+    plan.accepted_state_slot_index =
+        accepted_count > 0 ? accepted_count - 1 : kMTPSpecDecodeInvalidToken;
+    plan.next_condition_token = 123;
+    plan.all_drafts_accepted = accepted_count == draft_count;
+    if (plan.all_drafts_accepted)
+    {
+        plan.bonus_ready_token_row = draft_count;
+        plan.bonus_ready_token_index = draft_count;
+        plan.bonus_ready_state_slot_index = draft_count;
+    }
+    return plan;
 }
 
 // =============================================================================
@@ -1704,6 +1882,243 @@ TEST_F(Test__RankOrchestrator, ForwardMTPFailureStillAttemptsEveryLocalTPChild)
     EXPECT_EQ(runner1_ptr->forward_mtp_call_count(), 1u);
     EXPECT_EQ(runner0_ptr->last_mtp_condition_token(), 7);
     EXPECT_EQ(runner1_ptr->last_mtp_condition_token(), 7);
+}
+
+TEST_F(Test__RankOrchestrator, ChainedMTPRequiresEveryLocalTPChildSupport)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_chained_mtp_drafts(true);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_FALSE(orchestrator->supportsChainedMTPDrafts());
+    EXPECT_FALSE(orchestrator->forwardMTPFromLastDraft(55, 123));
+    EXPECT_EQ(runner0_ptr->forward_mtp_from_last_draft_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->forward_mtp_from_last_draft_call_count(), 0u);
+}
+
+TEST_F(Test__RankOrchestrator, ChainedMTPRunsOnEveryLocalTPChild)
+{
+    auto rendezvous = std::make_shared<ChainedMTPRendezvous>(2);
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_chained_mtp_drafts(true);
+    runner0_ptr->set_chained_mtp_rendezvous(rendezvous);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_supports_chained_mtp_drafts(true);
+    runner1_ptr->set_chained_mtp_rendezvous(rendezvous);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_TRUE(orchestrator->supportsChainedMTPDrafts());
+    EXPECT_TRUE(orchestrator->forwardMTPFromLastDraft(56, 124));
+    EXPECT_EQ(rendezvous->arrivals.load(std::memory_order_acquire), 2);
+    EXPECT_EQ(runner0_ptr->forward_mtp_from_last_draft_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->forward_mtp_from_last_draft_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_chained_mtp_condition_token(), 56);
+    EXPECT_EQ(runner1_ptr->last_chained_mtp_condition_token(), 56);
+    EXPECT_EQ(runner0_ptr->last_chained_mtp_position_id(), 124);
+    EXPECT_EQ(runner1_ptr->last_chained_mtp_position_id(), 124);
+}
+
+TEST_F(Test__RankOrchestrator, ChainedMTPFailureStillAttemptsEveryLocalTPChild)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_chained_mtp_drafts(true);
+    runner0_ptr->set_forward_mtp_from_last_draft_ok(false);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_supports_chained_mtp_drafts(true);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_FALSE(orchestrator->forwardMTPFromLastDraft(57, 125));
+    EXPECT_EQ(runner0_ptr->forward_mtp_from_last_draft_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->forward_mtp_from_last_draft_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_chained_mtp_condition_token(), 57);
+    EXPECT_EQ(runner1_ptr->last_chained_mtp_condition_token(), 57);
+    EXPECT_EQ(runner0_ptr->last_chained_mtp_position_id(), 125);
+    EXPECT_EQ(runner1_ptr->last_chained_mtp_position_id(), 125);
+}
+
+TEST_F(Test__RankOrchestrator, LocalTPAllPositionRowBatchSamplingConsumesVerifierStreamsOnce)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_mock_all_position_logits_local(
+        /*rows=*/2,
+        /*local_vocab=*/3,
+        {
+            0.0f, 5.0f, 1.0f,
+            1.0f, 2.0f, 3.0f,
+        });
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_mock_all_position_logits_local(
+        /*rows=*/2,
+        /*local_vocab=*/3,
+        {
+            2.0f, 3.0f, 4.0f,
+            9.0f, 0.0f, 0.0f,
+        });
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    std::array<int32_t, 2> sampled = {-1, -1};
+    ASSERT_TRUE(orchestrator->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+        /*start_row=*/0,
+        /*row_count=*/static_cast<int>(sampled.size()),
+        sampled.data()));
+
+    EXPECT_EQ(sampled[0], 1)
+        << "row 0 should choose shard 0 local column 1";
+    EXPECT_EQ(sampled[1], 3)
+        << "row 1 should choose shard 1 local column 0 with shard offset";
+    EXPECT_EQ(runner0_ptr->consume_all_position_logits_local_info_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->consume_all_position_logits_local_info_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->get_all_position_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->get_all_position_logits_local_info_call_count(), 0u);
+}
+
+TEST_F(Test__RankOrchestrator, SpecStatePublicationRequiresEveryLocalTPChildSupport)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_mtp_spec_state_publication(true);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_FALSE(orchestrator->supportsMTPSpecStatePublication());
+
+    std::string error;
+    EXPECT_FALSE(orchestrator->publishAcceptedMTPSpecState(
+        makeMTPSpecPublicationPlan(/*accepted_count=*/2),
+        &error));
+    EXPECT_NE(error.find("participant 1"), std::string::npos);
+    EXPECT_EQ(runner0_ptr->publish_mtp_spec_state_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->publish_mtp_spec_state_call_count(), 0u);
+}
+
+TEST_F(Test__RankOrchestrator, SpecStatePublicationRunsOnEveryLocalTPChild)
+{
+    auto rendezvous = std::make_shared<MTPPublicationRendezvous>(2);
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_mtp_spec_state_publication(true);
+    runner0_ptr->set_mtp_publication_rendezvous(rendezvous);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_supports_mtp_spec_state_publication(true);
+    runner1_ptr->set_mtp_publication_rendezvous(rendezvous);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    MTPSpecStepPlan plan = makeMTPSpecPublicationPlan(/*accepted_count=*/2);
+    std::string error;
+    EXPECT_TRUE(orchestrator->supportsMTPSpecStatePublication());
+    EXPECT_TRUE(orchestrator->publishAcceptedMTPSpecState(plan, &error))
+        << error;
+
+    EXPECT_EQ(rendezvous->arrivals.load(std::memory_order_acquire), 2);
+    EXPECT_EQ(runner0_ptr->publish_mtp_spec_state_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->publish_mtp_spec_state_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_mtp_spec_state_plan().accepted_count, 2);
+    EXPECT_EQ(runner1_ptr->last_mtp_spec_state_plan().accepted_count, 2);
+    EXPECT_EQ(runner0_ptr->get_position(), 66);
+    EXPECT_EQ(runner1_ptr->get_position(), 66);
+}
+
+TEST_F(Test__RankOrchestrator, SpecStatePublicationFailureStillAttemptsEveryLocalTPChild)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_mtp_spec_state_publication(true);
+    runner0_ptr->set_publish_mtp_spec_state_ok(false);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_supports_mtp_spec_state_publication(true);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    std::string error;
+    EXPECT_FALSE(orchestrator->publishAcceptedMTPSpecState(
+        makeMTPSpecPublicationPlan(/*accepted_count=*/1),
+        &error));
+    EXPECT_NE(error.find("participant 0"), std::string::npos);
+    EXPECT_EQ(runner0_ptr->publish_mtp_spec_state_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->publish_mtp_spec_state_call_count(), 1u);
 }
 
 TEST_F(Test__RankOrchestrator, AllPositionLogitToggleRunsOnEveryLocalTPChild)

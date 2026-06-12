@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "execution/compute_stages/ComputeStageUtils.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
@@ -189,6 +190,118 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 
     EXPECT_GE(partials->size_bytes,
               static_cast<size_t>(kN) * sizeof(float));
+}
+
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       SingleProjectionGemvPartials_DoNotReserveSideStreamSlots)
+{
+    auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/151);
+    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
+
+    constexpr int kM = 1;
+    constexpr int kN = 8192;
+    constexpr int kK = 2048;
+    auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
+
+    const WorkspaceDescriptor *serial =
+        reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    const WorkspaceDescriptor *concurrent =
+        reqs.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+
+    ASSERT_NE(serial, nullptr);
+    EXPECT_EQ(concurrent, nullptr)
+        << "Single-output GEMV kernels such as LM head cannot consume CUDA decode "
+           "side-stream slots. Fused stages add those slots when projection fan-out "
+           "is known.";
+}
+
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       ConcurrentDecodeGemvPartials_HelperUsesLargestProjectionSlot)
+{
+    auto weights_small = TestTensorFactory::createQ8_0Random({512, 2048}, /*seed=*/152);
+    auto weights_large = TestTensorFactory::createQ8_0Random({8192, 2048}, /*seed=*/153);
+
+    CUDAQuantisedGemmKernel kernel_small(weights_small.get(), kFakeCudaDeviceId);
+    CUDAQuantisedGemmKernel kernel_large(weights_large.get(), kFakeCudaDeviceId);
+
+    auto reqs_small = kernel_small.getWorkspaceRequirements(/*m=*/1, /*n=*/512, /*k=*/2048);
+    auto reqs_large = kernel_large.getWorkspaceRequirements(/*m=*/1, /*n=*/8192, /*k=*/2048);
+
+    const auto *small_serial = reqs_small.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    const auto *large_serial = reqs_large.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    ASSERT_NE(small_serial, nullptr);
+    ASSERT_NE(large_serial, nullptr);
+    ASSERT_GT(large_serial->size_bytes, small_serial->size_bytes);
+
+    reqs_small.merge(reqs_large);
+    addCudaConcurrentDecodeGemvSideStreamWorkspace(
+        reqs_small,
+        DeviceId::cuda(kFakeCudaDeviceId),
+        /*m=*/1,
+        /*projection_count=*/4);
+
+    const auto *merged =
+        reqs_small.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+    ASSERT_NE(merged, nullptr);
+    EXPECT_EQ(merged->size_bytes, 3u * large_serial->size_bytes)
+        << "A four-projection CUDA fused decode stage needs three side-stream slots, "
+           "each sized for the largest projection in the fused group.";
+}
+
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       ConcurrentDecodeGemvPartials_MoETopKFanoutUsesActiveStreamSlots)
+{
+    auto weights = TestTensorFactory::createQ8_0Random({4096, 2048}, /*seed=*/154);
+    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
+
+    auto reqs = kernel.getWorkspaceRequirements(/*m=*/1, /*n=*/4096, /*k=*/2048);
+    const auto *serial = reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    ASSERT_NE(serial, nullptr);
+
+    addCudaConcurrentDecodeGemvSideStreamWorkspace(
+        reqs,
+        DeviceId::cuda(kFakeCudaDeviceId),
+        /*m=*/1,
+        /*projection_count=*/16);
+
+    const auto *merged =
+        reqs.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+    ASSERT_NE(merged, nullptr);
+    EXPECT_EQ(merged->size_bytes, 7u * serial->size_bytes)
+        << "Qwen3.6 MoE decode can fuse top_k=8 gate/up into sixteen projections, "
+           "but the CUDA decode pool has eight active streams. Later projections "
+           "reuse a completed stream slot, so only seven side-stream arenas are "
+           "required.";
+}
+
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       ConcurrentDecodeGemvPartials_HelperNoOpsForNonCudaAndSingleProjection)
+{
+    WorkspaceRequirements reqs;
+    reqs.buffers.push_back({
+        GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,
+        4096,
+        256,
+        true});
+
+    addCudaConcurrentDecodeGemvSideStreamWorkspace(
+        reqs,
+        DeviceId::rocm(0),
+        /*m=*/1,
+        /*projection_count=*/4);
+    EXPECT_EQ(reqs.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS),
+              nullptr)
+        << "The helper is intentionally CUDA-only; ROCm stages own their own "
+           "workspace declarations.";
+
+    addCudaConcurrentDecodeGemvSideStreamWorkspace(
+        reqs,
+        DeviceId::cuda(kFakeCudaDeviceId),
+        /*m=*/1,
+        /*projection_count=*/1);
+    EXPECT_EQ(reqs.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS),
+              nullptr)
+        << "A single projection has no side stream and should not reserve side slots.";
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,

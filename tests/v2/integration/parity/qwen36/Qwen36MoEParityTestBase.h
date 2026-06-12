@@ -255,7 +255,16 @@ namespace llaminar2::test::parity::qwen36
     inline bool shouldUseMoEParityDeterministicMode(
         const MoEPrefixRestoreParityCase &test_case)
     {
-        return test_case.required_cuda_devices > 0;
+        /*
+         * Real-model parity compares exact greedy token streams.  CUDA and
+         * ROCm both have tuned MoE decode kernels that may change FP reduction
+         * order outside deterministic mode; near-tie logits can then select a
+         * different, still-plausible token and make the test flaky.  Keep the
+         * parity harness deterministic on every GPU backend and reserve the
+         * faster non-deterministic paths for benchmark gates.
+         */
+        return test_case.required_cuda_devices > 0 ||
+               test_case.required_rocm_devices > 0;
     }
 
     inline ExpertComputeDomain localTPMoEDomain(

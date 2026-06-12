@@ -115,6 +115,7 @@ TEST(Test__DeterministicMode, ConcurrentRoutesReturnToDefaultsWhenDeterminismIsC
         EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_decode);
         EXPECT_FALSE(debugEnv().rocm.concurrent_prefill);
         EXPECT_FALSE(debugEnv().rocm.concurrent_decode);
+        EXPECT_FALSE(debugEnv().rocm.gdn_concurrent_decode);
     }
 
     EXPECT_FALSE(debugEnv().gemm.deterministic);
@@ -122,4 +123,5 @@ TEST(Test__DeterministicMode, ConcurrentRoutesReturnToDefaultsWhenDeterminismIsC
     EXPECT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
     EXPECT_TRUE(debugEnv().rocm.concurrent_prefill);
     EXPECT_FALSE(debugEnv().rocm.concurrent_decode);
+    EXPECT_TRUE(debugEnv().rocm.gdn_concurrent_decode);
 }

@@ -21,6 +21,7 @@ namespace
         config.min_samples = window_size;
         config.cooldown_steps = cooldown_steps;
         config.promote_consecutive_windows = 1;
+        config.use_generated_policy = false;
         config.promote_full_accept_rate = 0.75;
         config.demote_zero_accept_rate = 0.30;
         config.demote_acceptance_rate = 0.65;
@@ -46,9 +47,10 @@ TEST(Test__MTPDepthController, FixedModeIgnoresAdaptiveBounds)
     config.min_depth = 1;
     config.max_depth = 3;
     config.initial_depth = 3;
-    config.window_size = 1;
-    config.min_samples = 1;
-    config.cooldown_steps = 0;
+    config.window_size = 0;
+    config.min_samples = 0;
+    config.cooldown_steps = -1;
+    config.promote_consecutive_windows = 0;
 
     MTPDepthController controller(config, /*configured_draft_tokens=*/1);
     EXPECT_EQ(controller.currentDepth(), 1);
@@ -63,7 +65,7 @@ TEST(Test__MTPDepthController, FixedModeIgnoresAdaptiveBounds)
     EXPECT_EQ(controller.stats().windows, 0u);
 }
 
-TEST(Test__MTPDepthController, DynamicDefaultInitialDepthStartsAtMinimum)
+TEST(Test__MTPDepthController, GreedyDynamicDefaultInitialDepthStartsAtDepthTwoWhenAvailable)
 {
     MTPDepthPolicyConfig config;
     config.mode = MTPDepthPolicyMode::Dynamic;
@@ -78,12 +80,110 @@ TEST(Test__MTPDepthController, DynamicDefaultInitialDepthStartsAtMinimum)
     config.demote_zero_accept_rate = 0.30;
     config.demote_acceptance_rate = 0.55;
 
-    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::Greedy);
+
+    EXPECT_EQ(controller.currentDepth(), 2)
+        << "Greedy dynamic mode should start at depth 2 when the configured "
+           "range allows it, staying below the risky deepest lane while "
+           "avoiding a short-run learning tax.";
+    EXPECT_EQ(controller.minDepth(), 1);
+    EXPECT_EQ(controller.maxDepth(), 3);
+}
+
+TEST(Test__MTPDepthController, StochasticDynamicDefaultInitialDepthStartsAtDepthOne)
+{
+    MTPDepthPolicyConfig config;
+    config.mode = MTPDepthPolicyMode::Dynamic;
+    config.min_depth = 1;
+    config.max_depth = 3;
+    config.initial_depth = 0;
+    config.window_size = 16;
+    config.min_samples = 4;
+    config.cooldown_steps = 0;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
 
     EXPECT_EQ(controller.currentDepth(), 1)
-        << "Dynamic mode should warm from the cheapest valid depth unless the "
-           "user explicitly sets an initial depth.";
+        << "Stochastic dynamic mode should begin in the cheapest useful lane; "
+           "residual rejections cannot carry ready logits, so starting too "
+           "deep pays a condition-forward learning tax.";
     EXPECT_EQ(controller.minDepth(), 1);
+    EXPECT_EQ(controller.maxDepth(), 3);
+}
+
+TEST(Test__MTPDepthController, GeneratedPolicyInitialDepthUsesLearnedMoEGreedyLane)
+{
+    MTPDepthPolicyConfig config;
+    config.mode = MTPDepthPolicyMode::Dynamic;
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::ROCm;
+    config.model_class = MTPDepthPolicyModelClass::MoE;
+    config.min_depth = 1;
+    config.max_depth = 3;
+    config.initial_depth = 0;
+    config.window_size = 16;
+    config.min_samples = 4;
+    config.cooldown_steps = 0;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::Greedy);
+
+    EXPECT_EQ(controller.currentDepth(), 3)
+        << "generated hold rows identify the fixed-depth winner, so dynamic "
+           "mode should warm-start there instead of probing through d2 first";
+}
+
+TEST(Test__MTPDepthController, GeneratedPolicyInitialDepthKeepsROCmMoEStochasticAtDepthOne)
+{
+    MTPDepthPolicyConfig config;
+    config.mode = MTPDepthPolicyMode::Dynamic;
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::ROCm;
+    config.model_class = MTPDepthPolicyModelClass::MoE;
+    config.min_depth = 1;
+    config.max_depth = 3;
+    config.initial_depth = 0;
+    config.window_size = 16;
+    config.min_samples = 4;
+    config.cooldown_steps = 0;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
+
+    EXPECT_EQ(controller.currentDepth(), 1)
+        << "the same generated warm-start path must respect stochastic lanes "
+           "whose fixed-depth evidence says d1 is the safest winner";
+}
+
+TEST(Test__MTPDepthController, DynamicDefaultInitialDepthPreservesDepthZeroBypass)
+{
+    MTPDepthPolicyConfig config;
+    config.mode = MTPDepthPolicyMode::Dynamic;
+    config.min_depth = 0;
+    config.max_depth = 3;
+    config.initial_depth = 0;
+    config.window_size = 16;
+    config.min_samples = 4;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
+
+    EXPECT_EQ(controller.currentDepth(), 0)
+        << "A min-depth-zero policy is an explicit adaptive bypass request and "
+           "must not be silently lifted to the depth-2 warm start.";
+    EXPECT_EQ(controller.minDepth(), 0);
     EXPECT_EQ(controller.maxDepth(), 3);
 }
 
@@ -118,7 +218,10 @@ TEST(Test__MTPDepthController, DynamicEarlyDemotesAfterMinSamplesWithoutFullWind
         /*cooldown_steps=*/0);
     config.min_samples = 4;
 
-    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
 
     for (int i = 0; i < 3; ++i)
     {
@@ -147,7 +250,10 @@ TEST(Test__MTPDepthController, DynamicHealthyPartialWindowWaitsForFullWindow)
         /*cooldown_steps=*/0);
     config.min_samples = 4;
 
-    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
 
     for (int i = 0; i < 4; ++i)
     {
@@ -173,9 +279,12 @@ TEST(Test__MTPDepthController, DynamicHealthyPartialWindowWaitsForFullWindow)
 
 TEST(Test__MTPDepthController, DynamicPromotesOnStableFullAcceptWindows)
 {
-    auto config = dynamicConfig(/*initial_depth=*/1, /*max_depth=*/3);
+    auto config = dynamicConfig(/*initial_depth=*/1, /*max_depth=*/2);
     config.promote_consecutive_windows = 1;
-    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/2,
+        MTPVerifyMode::SpeculativeSampling);
 
     auto d1a = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
     EXPECT_FALSE(d1a.evaluated);
@@ -187,10 +296,10 @@ TEST(Test__MTPDepthController, DynamicPromotesOnStableFullAcceptWindows)
     auto d2a = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
     EXPECT_FALSE(d2a.evaluated);
     auto d2b = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
-    EXPECT_TRUE(d2b.changed);
-    EXPECT_EQ(d2b.reason, MTPDepthDecisionReason::PromoteFullAcceptRate);
-    EXPECT_EQ(controller.currentDepth(), 3);
-    EXPECT_EQ(controller.stats().promotions, 2u);
+    EXPECT_FALSE(d2b.changed);
+    EXPECT_EQ(d2b.reason, MTPDepthDecisionReason::Hold);
+    EXPECT_EQ(controller.currentDepth(), 2);
+    EXPECT_EQ(controller.stats().promotions, 1u);
 }
 
 TEST(Test__MTPDepthController, DynamicPromotesPerfectProbeAfterMinSamples)
@@ -204,7 +313,10 @@ TEST(Test__MTPDepthController, DynamicPromotesPerfectProbeAfterMinSamples)
     config.promote_consecutive_windows = 3;
     config.promote_full_accept_rate = 1.0;
 
-    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
 
     for (int i = 0; i < 3; ++i)
     {
@@ -222,6 +334,372 @@ TEST(Test__MTPDepthController, DynamicPromotesPerfectProbeAfterMinSamples)
     EXPECT_EQ(promote.new_depth, 2);
     EXPECT_EQ(controller.currentDepth(), 2);
     EXPECT_EQ(controller.stats().promotions, 1u);
+}
+
+TEST(Test__MTPDepthController, GeneratedPolicyDoesNotPromoteWithoutBackendMatch)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/4,
+        /*cooldown_steps=*/0);
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::Any;
+    config.min_samples = 4;
+    config.promote_full_accept_rate = 1.0;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
+
+    /*
+     * Generated rows are keyed by backend.  A controller with no backend
+     * evidence must not accidentally consume a CUDA promotion row and turn a
+     * generic stochastic request into a depth increase.
+     */
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto hold = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
+
+    ASSERT_TRUE(hold.evaluated);
+    EXPECT_FALSE(hold.changed);
+    EXPECT_EQ(hold.reason, MTPDepthDecisionReason::Hold);
+    EXPECT_EQ(hold.old_depth, 1);
+    EXPECT_EQ(hold.new_depth, 1);
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.stats().promotions, 0u);
+}
+
+TEST(Test__MTPDepthController, GeneratedPolicyPromotesCUDAStochasticDepthOneToBestDepth)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/4,
+        /*cooldown_steps=*/0);
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::CUDA;
+    config.model_class = MTPDepthPolicyModelClass::Dense;
+    config.min_samples = 4;
+    config.promote_full_accept_rate = 1.0;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
+
+    /*
+     * CUDA dense stochastic fixed-depth evidence shows depth 3 is profitable
+     * from a healthy depth-1 window.  The generated policy should allow that
+     * first climb without waiting for the handwritten perfect-window fallback.
+     */
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto promote = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+
+    ASSERT_TRUE(promote.evaluated);
+    ASSERT_TRUE(promote.changed);
+    EXPECT_EQ(promote.reason, MTPDepthDecisionReason::GeneratedPolicyPromote);
+    EXPECT_EQ(promote.old_depth, 1);
+    EXPECT_EQ(promote.new_depth, 3)
+        << "generated policy rows target the empirically best fixed-depth lane, "
+           "not merely the next deeper lane";
+    EXPECT_EQ(controller.currentDepth(), 3);
+    EXPECT_EQ(controller.stats().promotions, 1u);
+}
+
+TEST(Test__MTPDepthController, GeneratedPolicyPromotesHealthyStochasticDepthTwo)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/2,
+        /*max_depth=*/3,
+        /*window_size=*/4,
+        /*cooldown_steps=*/0);
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::CUDA;
+    config.model_class = MTPDepthPolicyModelClass::Dense;
+    config.min_samples = 4;
+    config.promote_full_accept_rate = 1.0;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
+
+    for (int i = 0; i < 3; ++i)
+        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
+    auto promote = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
+
+    ASSERT_TRUE(promote.evaluated);
+    ASSERT_TRUE(promote.changed);
+    EXPECT_EQ(promote.reason, MTPDepthDecisionReason::GeneratedPolicyPromote);
+    EXPECT_EQ(promote.old_depth, 2);
+    EXPECT_EQ(promote.new_depth, 3);
+    EXPECT_EQ(controller.currentDepth(), 3);
+    EXPECT_EQ(controller.stats().promotions, 1u);
+}
+
+TEST(Test__MTPDepthController, GeneratedPolicyPromotesROCmMoEGreedyAtMoEThreshold)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/2,
+        /*max_depth=*/3,
+        /*window_size=*/5,
+        /*cooldown_steps=*/0);
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::ROCm;
+    config.model_class = MTPDepthPolicyModelClass::MoE;
+    config.min_samples = 5;
+    config.promote_full_accept_rate = 1.0;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::Greedy);
+
+    /*
+     * ROCm MoE greedy fixed-depth evidence shows depth 3 is the best lane even
+     * when depth-2 acceptance is below the dense ROCm promotion threshold.
+     * The generated MoE-specific row should climb without weakening dense.
+     */
+    for (int i = 0; i < 4; ++i)
+        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
+    auto promote = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
+
+    ASSERT_TRUE(promote.evaluated);
+    ASSERT_TRUE(promote.changed);
+    EXPECT_EQ(promote.reason, MTPDepthDecisionReason::GeneratedPolicyPromote);
+    EXPECT_EQ(promote.old_depth, 2);
+    EXPECT_EQ(promote.new_depth, 3);
+    EXPECT_EQ(controller.currentDepth(), 3);
+    EXPECT_EQ(controller.stats().promotions, 1u);
+}
+
+TEST(Test__MTPDepthController, GeneratedPolicyDemotesWeakStochasticDepthTwo)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/2,
+        /*max_depth=*/3,
+        /*window_size=*/4,
+        /*cooldown_steps=*/0);
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::ROCm;
+    config.model_class = MTPDepthPolicyModelClass::Dense;
+    config.min_samples = 4;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
+
+    controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+    controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+    controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
+    auto demote = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+
+    ASSERT_TRUE(demote.evaluated);
+    ASSERT_TRUE(demote.changed);
+    EXPECT_EQ(demote.reason, MTPDepthDecisionReason::GeneratedPolicyDemote);
+    EXPECT_EQ(demote.old_depth, 2);
+    EXPECT_EQ(demote.new_depth, 1);
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.stats().demotions, 1u);
+}
+
+TEST(Test__MTPDepthController, GeneratedPolicyDemotesWeakDepthThree)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/3,
+        /*max_depth=*/3,
+        /*window_size=*/16,
+        /*cooldown_steps=*/0);
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::ROCm;
+    config.model_class = MTPDepthPolicyModelClass::Dense;
+    config.min_samples = 4;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
+
+    for (int i = 0; i < 3; ++i)
+        controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/1));
+    auto demote = controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/1));
+
+    ASSERT_TRUE(demote.evaluated);
+    ASSERT_TRUE(demote.changed);
+    EXPECT_EQ(demote.reason, MTPDepthDecisionReason::GeneratedPolicyDemote);
+    EXPECT_EQ(demote.old_depth, 3);
+    EXPECT_EQ(demote.new_depth, 1)
+        << "generated policy rows can demote directly to the empirically best "
+           "fixed-depth lane";
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.stats().demotions, 1u);
+}
+
+TEST(Test__MTPDepthController, GeneratedPolicyHoldPinsBestMoEGreedyLane)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/3,
+        /*max_depth=*/3,
+        /*window_size=*/4,
+        /*cooldown_steps=*/0);
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::ROCm;
+    config.model_class = MTPDepthPolicyModelClass::MoE;
+    config.min_samples = 4;
+    config.promote_full_accept_rate = 1.0;
+    config.demote_acceptance_rate = 0.90;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::Greedy);
+
+    /*
+     * ROCm MoE greedy fixed-depth evidence says depth 3 is the best steady
+     * lane at roughly this acceptance level.  A generated hold row should
+     * suppress an otherwise eager handwritten low-acceptance demotion.
+     */
+    controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/3));
+    controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/3));
+    controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/2));
+    auto hold = controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/1));
+
+    ASSERT_TRUE(hold.evaluated);
+    EXPECT_FALSE(hold.changed);
+    EXPECT_EQ(hold.reason, MTPDepthDecisionReason::GeneratedPolicyHold);
+    EXPECT_EQ(hold.old_depth, 3);
+    EXPECT_EQ(hold.new_depth, 3);
+    EXPECT_EQ(controller.currentDepth(), 3);
+    EXPECT_EQ(controller.stats().demotions, 0u);
+}
+
+TEST(Test__MTPDepthController, GeneratedBestDepthWaitsForFullWindowBeforeNoisyDemotion)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/0,
+        /*max_depth=*/3,
+        /*window_size=*/16,
+        /*cooldown_steps=*/0);
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::ROCm;
+    config.model_class = MTPDepthPolicyModelClass::MoE;
+    config.min_samples = 4;
+    config.promote_full_accept_rate = 1.0;
+    config.demote_acceptance_rate = 0.90;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::Greedy);
+
+    ASSERT_EQ(controller.currentDepth(), 3);
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto decision =
+            controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/1));
+        EXPECT_FALSE(decision.evaluated)
+            << "small low-acceptance windows should not evict the learned "
+               "best fixed-depth lane";
+        EXPECT_EQ(controller.currentDepth(), 3);
+    }
+
+    for (int i = 0; i < 11; ++i)
+        controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/1));
+    auto first_full_window =
+        controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/1));
+
+    ASSERT_TRUE(first_full_window.evaluated);
+    EXPECT_FALSE(first_full_window.changed)
+        << "the learned fixed-depth winner gets one full-window grace period "
+           "before a non-catastrophic demotion";
+    EXPECT_EQ(first_full_window.reason, MTPDepthDecisionReason::GeneratedBestDepthGraceWindow);
+    EXPECT_EQ(first_full_window.old_depth, 3);
+    EXPECT_EQ(first_full_window.new_depth, 3);
+    EXPECT_EQ(controller.currentDepth(), 3);
+
+    for (int i = 0; i < 15; ++i)
+        controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/1));
+    auto second_full_window =
+        controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/1));
+
+    ASSERT_TRUE(second_full_window.evaluated);
+    ASSERT_TRUE(second_full_window.changed)
+        << "two consecutive bad full windows are request-local evidence that "
+           "the generated best lane is wrong for this prompt";
+    EXPECT_EQ(second_full_window.reason, MTPDepthDecisionReason::DemoteLowAcceptanceRate);
+    EXPECT_EQ(second_full_window.old_depth, 3);
+    EXPECT_EQ(second_full_window.new_depth, 2);
+    EXPECT_EQ(controller.currentDepth(), 2);
+}
+
+TEST(Test__MTPDepthController, GeneratedBestDepthGraceCoversObservedROCmMoEGreedyWindow)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/0,
+        /*max_depth=*/3,
+        /*window_size=*/16,
+        /*cooldown_steps=*/0);
+    config.use_generated_policy = true;
+    config.backend = MTPDepthPolicyBackend::ROCm;
+    config.model_class = MTPDepthPolicyModelClass::MoE;
+    config.min_samples = 4;
+    config.promote_full_accept_rate = 1.0;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::Greedy);
+
+    ASSERT_EQ(controller.currentDepth(), 3);
+
+    /*
+     * Regression fixture from the ROCm MoE greedy dynamic matrix:
+     * acceptance=19/48=0.395833, zero_accept=6/16=0.375,
+     * full_accept=2/16=0.125.  Fixed d3 still won the whole request, so this
+     * first noisy window should not evict the generated best lane.
+     */
+    const int accepted_prefixes[] = {
+        0, 2, 1, 3,
+        0, 2, 1, 3,
+        0, 2, 1, 0,
+        2, 0, 2, 0,
+    };
+    MTPDepthDecision decision;
+    for (int accepted_prefix : accepted_prefixes)
+        decision = controller.recordStep(observation(/*depth=*/3, accepted_prefix));
+
+    ASSERT_TRUE(decision.evaluated);
+    EXPECT_FALSE(decision.changed);
+    EXPECT_EQ(decision.reason, MTPDepthDecisionReason::GeneratedBestDepthGraceWindow);
+    EXPECT_EQ(controller.currentDepth(), 3);
+    EXPECT_EQ(controller.stats().demotions, 0u);
+}
+
+TEST(Test__MTPDepthController, GeneratedPolicyDoesNotAffectFixedMode)
+{
+    MTPDepthPolicyConfig config;
+    config.mode = MTPDepthPolicyMode::Fixed;
+    config.use_generated_policy = true;
+    config.min_depth = 1;
+    config.max_depth = 3;
+    config.initial_depth = 3;
+    config.window_size = 1;
+    config.min_samples = 1;
+    config.cooldown_steps = 0;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/1);
+    auto decision = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
+
+    EXPECT_FALSE(decision.evaluated);
+    EXPECT_FALSE(decision.changed);
+    EXPECT_EQ(decision.reason, MTPDepthDecisionReason::FixedMode);
+    EXPECT_EQ(controller.currentDepth(), 1);
 }
 
 TEST(Test__MTPDepthController, DynamicCanDemoteToZeroBypassAndProbeAfterCooldown)
@@ -442,70 +920,72 @@ TEST(Test__MTPDepthController, DynamicDoesNotExploreFromUnhealthyFloorWindows)
 TEST(Test__MTPDepthController, DynamicRequiresConsecutivePromotableWindows)
 {
     auto config = dynamicConfig(
-        /*initial_depth=*/2,
-        /*max_depth=*/3,
+        /*initial_depth=*/1,
+        /*max_depth=*/2,
         /*window_size=*/4,
         /*cooldown_steps=*/0);
     config.promote_consecutive_windows = 2;
     config.promote_full_accept_rate = 0.75;
 
-    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+    MTPDepthController controller(config, /*configured_draft_tokens=*/2);
 
     for (int i = 0; i < 3; ++i)
-        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
-    auto first_window = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+        controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto first_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
     ASSERT_TRUE(first_window.evaluated);
     EXPECT_FALSE(first_window.changed);
     EXPECT_EQ(first_window.reason, MTPDepthDecisionReason::PromotionHysteresisActive);
-    EXPECT_EQ(controller.currentDepth(), 2);
+    EXPECT_EQ(controller.currentDepth(), 1);
     EXPECT_EQ(controller.stats().promotions, 0u);
 
     for (int i = 0; i < 3; ++i)
-        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
-    auto second_window = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+        controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto second_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
     ASSERT_TRUE(second_window.evaluated);
     ASSERT_TRUE(second_window.changed);
     EXPECT_EQ(second_window.reason, MTPDepthDecisionReason::PromoteFullAcceptRate);
-    EXPECT_EQ(second_window.old_depth, 2);
-    EXPECT_EQ(second_window.new_depth, 3);
-    EXPECT_EQ(controller.currentDepth(), 3);
+    EXPECT_EQ(second_window.old_depth, 1);
+    EXPECT_EQ(second_window.new_depth, 2);
+    EXPECT_EQ(controller.currentDepth(), 2);
     EXPECT_EQ(controller.stats().promotions, 1u);
 }
 
 TEST(Test__MTPDepthController, DynamicPromotionStreakResetsAfterBadWindow)
 {
     auto config = dynamicConfig(
-        /*initial_depth=*/2,
-        /*max_depth=*/3,
-        /*window_size=*/4,
+        /*initial_depth=*/1,
+        /*max_depth=*/2,
+        /*window_size=*/1,
         /*cooldown_steps=*/0);
     config.promote_consecutive_windows = 2;
-    config.promote_full_accept_rate = 0.75;
+    config.promote_full_accept_rate = 1.0;
 
-    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+    MTPDepthController controller(config, /*configured_draft_tokens=*/2);
 
-    for (int i = 0; i < 3; ++i)
-        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
-    auto first_window = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+    auto first_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
     ASSERT_TRUE(first_window.evaluated);
-    EXPECT_EQ(first_window.reason, MTPDepthDecisionReason::PromotionHysteresisActive);
+    EXPECT_EQ(first_window.reason, MTPDepthDecisionReason::Hold);
 
-    for (int i = 0; i < 3; ++i)
-        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
-    auto broken_window = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
-    ASSERT_TRUE(broken_window.evaluated);
-    EXPECT_FALSE(broken_window.changed);
-    EXPECT_EQ(broken_window.reason, MTPDepthDecisionReason::Hold);
+    auto fresh_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    ASSERT_TRUE(fresh_window.evaluated);
+    EXPECT_TRUE(fresh_window.changed);
+    EXPECT_EQ(fresh_window.reason, MTPDepthDecisionReason::PromoteFullAcceptRate)
+        << "a perfect fresh probe may still promote immediately when the "
+           "destination depth has not been rejected";
     EXPECT_EQ(controller.currentDepth(), 2);
 
-    for (int i = 0; i < 3; ++i)
-        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
-    auto restart_window = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
+    auto demote_to_one = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
+    ASSERT_TRUE(demote_to_one.evaluated);
+    ASSERT_TRUE(demote_to_one.changed);
+    EXPECT_EQ(demote_to_one.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
+    EXPECT_EQ(controller.currentDepth(), 1);
+
+    auto restart_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
     ASSERT_TRUE(restart_window.evaluated);
     EXPECT_FALSE(restart_window.changed);
-    EXPECT_EQ(restart_window.reason, MTPDepthDecisionReason::PromotionHysteresisActive);
-    EXPECT_EQ(controller.currentDepth(), 2);
-    EXPECT_EQ(controller.stats().promotions, 0u);
+    EXPECT_EQ(restart_window.reason, MTPDepthDecisionReason::Hold);
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.stats().promotions, 1u);
 }
 
 TEST(Test__MTPDepthController, DefaultHysteresisHoldsAfterMiddlingAcceptanceWindow)
@@ -548,12 +1028,12 @@ TEST(Test__MTPDepthController, DynamicProbesHigherDepthOnceBeforeDemotingInterme
 {
     auto config = dynamicConfig(
         /*initial_depth=*/1,
-        /*max_depth=*/3,
+        /*max_depth=*/4,
         /*window_size=*/2,
         /*cooldown_steps=*/0);
     config.promote_consecutive_windows = 1;
 
-    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+    MTPDepthController controller(config, /*configured_draft_tokens=*/4);
 
     /*
      * Depth 1 is perfect, so the controller first promotes to the normal
@@ -565,9 +1045,8 @@ TEST(Test__MTPDepthController, DynamicProbesHigherDepthOnceBeforeDemotingInterme
     ASSERT_EQ(promote_to_two.new_depth, 2);
 
     /*
-     * An ambiguous weak depth-2 window should not permanently hide depth 3.
-     * The controller marks depth 2 as rejected and spends one window testing
-     * depth 3 before it settles downward.
+     * With a generic 1..4 policy, depth 3 is still an intermediate lane.  An
+     * ambiguous weak depth-2 window may probe it once before settling downward.
      */
     controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
     auto probe_three = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
@@ -621,27 +1100,18 @@ TEST(Test__MTPDepthController, DynamicRequiresFreshHysteresisBeforeRetryingRejec
 {
     auto config = dynamicConfig(
         /*initial_depth=*/1,
-        /*max_depth=*/3,
+        /*max_depth=*/2,
         /*window_size=*/1,
         /*cooldown_steps=*/0);
     config.promote_consecutive_windows = 2;
 
-    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+    MTPDepthController controller(config, /*configured_draft_tokens=*/2);
 
     ASSERT_EQ(controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1)).new_depth, 2);
-    auto probe_three = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
-    ASSERT_EQ(probe_three.reason, MTPDepthDecisionReason::ProbeHigherBeforeDemote);
-    ASSERT_EQ(controller.currentDepth(), 3);
-
-    auto reject_three = controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/0));
-    ASSERT_EQ(reject_three.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
-    ASSERT_EQ(controller.currentDepth(), 2);
-
-    auto reject_two_again = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
-    ASSERT_EQ(reject_two_again.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
-    EXPECT_EQ(reject_two_again.old_depth, 2);
-    EXPECT_EQ(reject_two_again.new_depth, 1)
-        << "rejected depth 3 must not be probed again immediately";
+    auto reject_two = controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/0));
+    ASSERT_EQ(reject_two.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
+    EXPECT_EQ(reject_two.old_depth, 2);
+    EXPECT_EQ(reject_two.new_depth, 1);
     EXPECT_EQ(controller.currentDepth(), 1);
 
     auto first_fresh_full_accept =
@@ -673,37 +1143,20 @@ TEST(Test__MTPDepthController, DynamicDoesNotForgetRejectedHigherDepthDuringProb
 
     ASSERT_EQ(controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1)).new_depth, 2);
 
-    auto first_probe_three =
+    auto weak_two_without_deepest_probe =
         controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
-    ASSERT_TRUE(first_probe_three.changed);
-    ASSERT_EQ(first_probe_three.reason, MTPDepthDecisionReason::ProbeHigherBeforeDemote);
-    ASSERT_EQ(controller.currentDepth(), 3);
-
-    auto reject_three =
-        controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/0));
-    ASSERT_TRUE(reject_three.changed);
-    ASSERT_EQ(reject_three.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
-    ASSERT_EQ(controller.currentDepth(), 2);
-
-    /*
-     * This is the ROCm stochastic failure shape from the Phase 4 benchmark:
-     * depth 2 is weak but not catastrophic, so the old controller would clear
-     * the rejected-depth bit while probing d3 and then repeat the bad d3 lane.
-     */
-    auto weak_two_after_bad_three =
-        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
-    ASSERT_TRUE(weak_two_after_bad_three.evaluated);
-    EXPECT_FALSE(weak_two_after_bad_three.changed);
-    EXPECT_EQ(weak_two_after_bad_three.reason,
+    ASSERT_TRUE(weak_two_without_deepest_probe.evaluated);
+    EXPECT_FALSE(weak_two_without_deepest_probe.changed);
+    EXPECT_EQ(weak_two_without_deepest_probe.reason,
               MTPDepthDecisionReason::Hold);
-    EXPECT_EQ(weak_two_after_bad_three.old_depth, 2);
-    EXPECT_EQ(weak_two_after_bad_three.new_depth, 2)
-        << "rejected depth 3 must not be probed again, but d2 should remain "
-           "active on a low-but-nonzero survivor window";
+    EXPECT_EQ(weak_two_without_deepest_probe.old_depth, 2);
+    EXPECT_EQ(weak_two_without_deepest_probe.new_depth, 2)
+        << "the handwritten fallback should not probe the deepest lane; d3 "
+           "requires a generated policy rule";
     EXPECT_EQ(controller.currentDepth(), 2);
 }
 
-TEST(Test__MTPDepthController, DynamicHoldsHighestUnrejectedDepthAfterDeeperRejection)
+TEST(Test__MTPDepthController, DynamicHoldsDepthTwoOnWeakNonzeroWindow)
 {
     auto config = dynamicConfig(
         /*initial_depth=*/1,
@@ -716,23 +1169,11 @@ TEST(Test__MTPDepthController, DynamicHoldsHighestUnrejectedDepthAfterDeeperReje
 
     ASSERT_EQ(controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1)).new_depth, 2);
 
-    auto probe_three =
-        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
-    ASSERT_TRUE(probe_three.changed);
-    ASSERT_EQ(probe_three.reason, MTPDepthDecisionReason::ProbeHigherBeforeDemote);
-    ASSERT_EQ(controller.currentDepth(), 3);
-
-    auto reject_three =
-        controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/0));
-    ASSERT_TRUE(reject_three.changed);
-    ASSERT_EQ(reject_three.reason, MTPDepthDecisionReason::DemoteZeroAcceptRate);
-    ASSERT_EQ(controller.currentDepth(), 2);
-
     /*
      * This mirrors the current ROCm stochastic evidence: fixed d2 is the best
-     * surviving lane after d3 proves bad, but individual d2 windows can still
-     * be imperfect.  Hold d2 on a low-but-nonzero window instead of collapsing
-     * to d1; the explicit zero-accept path remains the hard demotion signal.
+     * lane, but individual d2 windows can still be imperfect.  Hold d2 on a
+     * low-but-nonzero window instead of probing d3 or collapsing to d1; the
+     * explicit zero-accept path remains the hard demotion signal.
      */
     auto weak_but_nonzero_two =
         controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/1));
@@ -751,6 +1192,33 @@ TEST(Test__MTPDepthController, DynamicHoldsHighestUnrejectedDepthAfterDeeperReje
     EXPECT_EQ(zero_two.old_depth, 2);
     EXPECT_EQ(zero_two.new_depth, 1);
     EXPECT_EQ(controller.currentDepth(), 1);
+}
+
+TEST(Test__MTPDepthController, DynamicFallbackDoesNotEnterDeepestOnPerfectLowerWindow)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/2,
+        /*max_depth=*/3,
+        /*window_size=*/1,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 1;
+    config.promote_full_accept_rate = 1.0;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/3,
+        MTPVerifyMode::SpeculativeSampling);
+
+    auto perfect_two =
+        controller.recordStep(observation(/*depth=*/2, /*accepted_prefix=*/2));
+    ASSERT_TRUE(perfect_two.evaluated);
+    EXPECT_FALSE(perfect_two.changed);
+    EXPECT_EQ(perfect_two.reason, MTPDepthDecisionReason::Hold)
+        << "a perfect depth-2 window should not enter depth 3 unless the "
+           "generated policy table has a trained promotion rule";
+    EXPECT_EQ(perfect_two.old_depth, 2);
+    EXPECT_EQ(perfect_two.new_depth, 2);
+    EXPECT_EQ(controller.currentDepth(), 2);
 }
 
 TEST(Test__MTPDepthController, CooldownPreventsImmediateOscillation)

@@ -19,10 +19,11 @@ struct ROCmNativeVNNIDecodeTuningEntry
     ROCmNativeVNNIDecodeDispatchConfig config;
 };
 
-inline constexpr uint64_t packROCmNativeVNNIDecodeDispatchKey(int n, int k)
+inline constexpr uint64_t packROCmNativeVNNIDecodeDispatchKey(int m, int n, int k)
 {
-    return (static_cast<uint64_t>(k & 0xFFFFF) << 20) |
-           static_cast<uint64_t>(n & 0xFFFFF);
+    return (static_cast<uint64_t>(m & 0xFF) << 56) |
+           (static_cast<uint64_t>(k & 0xFFFFFF) << 28) |
+           static_cast<uint64_t>(n & 0x0FFFFFFF);
 }
 
 template <size_t Count>
@@ -51,54 +52,501 @@ inline bool findROCmNativeVNNIDecodeDispatchEntry(
 }
 
 inline bool selectROCmNativeVNNIDecodeGenerated(
-    uint8_t codebook_id, int n, int k, ROCmNativeVNNIDecodeDispatchConfig &out)
+    uint8_t codebook_id, int m, int n, int k, ROCmNativeVNNIDecodeDispatchConfig &out)
 {
-    const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(n, k);
+    const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);
     if (codebook_id == 0) { // CB=0 (Q4_0)
         static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
-            {0x000140000400ULL, {8, 24}}, // CB=0 (Q4_0) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 28.320us
-            {0x000140001800ULL, {4, 12}}, // CB=0 (Q4_0) 6144x5120 KB4/TW12 Qwen36_GDN_ZProjection 43.680us
-            {0x000140002800ULL, {2, 8}}, // CB=0 (Q4_0) 10240x5120 KB2/TW8 Qwen36_GDN_InnerProjection 63.840us
-            {0x000140004400ULL, {2, 8}}, // CB=0 (Q4_0) 17408x5120 KB2/TW8 Qwen36_FFN_GateUp 82.400us
-            {0x00014003ca00ULL, {1, 8}}, // CB=0 (Q4_0) 248320x5120 KB1/TW8 Qwen36_LM_Head 975.838us
-            {0x000180001400ULL, {8, 24}}, // CB=0 (Q4_0) 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 45.920us
-            {0x000440001400ULL, {8, 24}}, // CB=0 (Q4_0) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 83.680us
+            {0x0100014000000400ULL, {8, 4}}, // CB=0 (Q4_0) M=1 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 28.320us
+            {0x0100014000001800ULL, {8, 24}}, // CB=0 (Q4_0) M=1 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 43.840us
+            {0x0100014000002800ULL, {2, 4}}, // CB=0 (Q4_0) M=1 10240x5120 KB2/TW4 Qwen36_GDN_InnerProjection 66.240us
+            {0x0100014000004400ULL, {4, 12}}, // CB=0 (Q4_0) M=1 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 79.520us
+            {0x010001400003ca00ULL, {1, 8}}, // CB=0 (Q4_0) M=1 248320x5120 KB1/TW8 Qwen36_LM_Head 1001.119us
+            {0x0100018000001400ULL, {8, 12}}, // CB=0 (Q4_0) M=1 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 45.280us
+            {0x0100044000001400ULL, {8, 8}}, // CB=0 (Q4_0) M=1 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 83.040us
+            {0x0200014000000400ULL, {8, 8}}, // CB=0 (Q4_0) M=2 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 29.760us
+            {0x0200014000001800ULL, {8, 8}}, // CB=0 (Q4_0) M=2 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 44.640us
+            {0x0200014000002800ULL, {8, 8}}, // CB=0 (Q4_0) M=2 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 60.480us
+            {0x0200014000004400ULL, {2, 8}}, // CB=0 (Q4_0) M=2 17408x5120 KB2/TW8 Qwen36_FFN_GateUp 79.520us
+            {0x020001400003ca00ULL, {1, 8}}, // CB=0 (Q4_0) M=2 248320x5120 KB1/TW8 Qwen36_LM_Head 1007.679us
+            {0x0200018000001400ULL, {8, 8}}, // CB=0 (Q4_0) M=2 5120x6144 KB8/TW8 Qwen36_GDN_OutputProjection 46.080us
+            {0x0200044000001400ULL, {8, 24}}, // CB=0 (Q4_0) M=2 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 84.959us
+            {0x0300014000000400ULL, {8, 12}}, // CB=0 (Q4_0) M=3 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 33.760us
+            {0x0300014000001800ULL, {4, 12}}, // CB=0 (Q4_0) M=3 6144x5120 KB4/TW12 Qwen36_GDN_ZProjection 49.760us
+            {0x0300014000002800ULL, {4, 8}}, // CB=0 (Q4_0) M=3 10240x5120 KB4/TW8 Qwen36_GDN_InnerProjection 60.640us
+            {0x0300014000004400ULL, {4, 8}}, // CB=0 (Q4_0) M=3 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 85.280us
+            {0x030001400003ca00ULL, {4, 4}}, // CB=0 (Q4_0) M=3 248320x5120 KB4/TW4 Qwen36_LM_Head 1068.639us
+            {0x0300018000001400ULL, {8, 24}}, // CB=0 (Q4_0) M=3 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 51.840us
+            {0x0300044000001400ULL, {8, 24}}, // CB=0 (Q4_0) M=3 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 90.240us
+            {0x0400014000000400ULL, {8, 12}}, // CB=0 (Q4_0) M=4 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 43.040us
+            {0x0400014000001800ULL, {8, 4}}, // CB=0 (Q4_0) M=4 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 56.640us
+            {0x0400014000002800ULL, {8, 4}}, // CB=0 (Q4_0) M=4 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 73.439us
+            {0x0400014000004400ULL, {4, 12}}, // CB=0 (Q4_0) M=4 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 93.120us
+            {0x040001400003ca00ULL, {4, 12}}, // CB=0 (Q4_0) M=4 248320x5120 KB4/TW12 Qwen36_LM_Head 1122.079us
+            {0x0400018000001400ULL, {8, 4}}, // CB=0 (Q4_0) M=4 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 57.120us
+            {0x0400044000001400ULL, {8, 8}}, // CB=0 (Q4_0) M=4 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 104.480us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 4) { // CB=4 (IQ4_NL)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 8}}, // CB=4 (IQ4_NL) M=1 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 30.400us
+            {0x0100014000001800ULL, {8, 24}}, // CB=4 (IQ4_NL) M=1 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 44.960us
+            {0x0100014000002800ULL, {4, 12}}, // CB=4 (IQ4_NL) M=1 10240x5120 KB4/TW12 Qwen36_GDN_InnerProjection 58.880us
+            {0x0100014000004400ULL, {4, 4}}, // CB=4 (IQ4_NL) M=1 17408x5120 KB4/TW4 Qwen36_FFN_GateUp 82.080us
+            {0x010001400003ca00ULL, {1, 4}}, // CB=4 (IQ4_NL) M=1 248320x5120 KB1/TW4 Qwen36_LM_Head 995.678us
+            {0x0100018000001400ULL, {8, 24}}, // CB=4 (IQ4_NL) M=1 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 47.040us
+            {0x0100044000001400ULL, {8, 12}}, // CB=4 (IQ4_NL) M=1 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 87.040us
+            {0x0200014000000400ULL, {8, 12}}, // CB=4 (IQ4_NL) M=2 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 41.120us
+            {0x0200014000001800ULL, {8, 4}}, // CB=4 (IQ4_NL) M=2 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 54.080us
+            {0x0200014000002800ULL, {8, 24}}, // CB=4 (IQ4_NL) M=2 10240x5120 KB8/TW24 Qwen36_GDN_InnerProjection 65.760us
+            {0x0200014000004400ULL, {4, 8}}, // CB=4 (IQ4_NL) M=2 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 95.199us
+            {0x020001400003ca00ULL, {1, 4}}, // CB=4 (IQ4_NL) M=2 248320x5120 KB1/TW4 Qwen36_LM_Head 986.559us
+            {0x0200018000001400ULL, {8, 4}}, // CB=4 (IQ4_NL) M=2 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 53.760us
+            {0x0200044000001400ULL, {8, 4}}, // CB=4 (IQ4_NL) M=2 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 108.319us
+            {0x0300014000000400ULL, {8, 4}}, // CB=4 (IQ4_NL) M=3 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 45.759us
+            {0x0300014000001800ULL, {8, 8}}, // CB=4 (IQ4_NL) M=3 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 57.440us
+            {0x0300014000002800ULL, {8, 4}}, // CB=4 (IQ4_NL) M=3 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 75.840us
+            {0x0300014000004400ULL, {4, 8}}, // CB=4 (IQ4_NL) M=3 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 101.120us
+            {0x030001400003ca00ULL, {1, 8}}, // CB=4 (IQ4_NL) M=3 248320x5120 KB1/TW8 Qwen36_LM_Head 1078.558us
+            {0x0300018000001400ULL, {8, 24}}, // CB=4 (IQ4_NL) M=3 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 59.520us
+            {0x0300044000001400ULL, {8, 24}}, // CB=4 (IQ4_NL) M=3 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 120.640us
+            {0x0400014000000400ULL, {8, 4}}, // CB=4 (IQ4_NL) M=4 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 50.880us
+            {0x0400014000001800ULL, {8, 24}}, // CB=4 (IQ4_NL) M=4 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 63.199us
+            {0x0400014000002800ULL, {8, 8}}, // CB=4 (IQ4_NL) M=4 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 75.040us
+            {0x0400014000004400ULL, {4, 4}}, // CB=4 (IQ4_NL) M=4 17408x5120 KB4/TW4 Qwen36_FFN_GateUp 107.520us
+            {0x040001400003ca00ULL, {1, 4}}, // CB=4 (IQ4_NL) M=4 248320x5120 KB1/TW4 Qwen36_LM_Head 1088.318us
+            {0x0400018000001400ULL, {8, 4}}, // CB=4 (IQ4_NL) M=4 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 66.560us
+            {0x0400044000001400ULL, {8, 4}}, // CB=4 (IQ4_NL) M=4 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 139.200us
         };
         return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
     }
     if (codebook_id == 5) { // CB=5 (Q4_1)
         static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
-            {0x000140000400ULL, {8, 24}}, // CB=5 (Q4_1) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 34.400us
-            {0x000140001800ULL, {8, 24}}, // CB=5 (Q4_1) 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 51.680us
-            {0x000140002800ULL, {4, 12}}, // CB=5 (Q4_1) 10240x5120 KB4/TW12 Qwen36_GDN_InnerProjection 62.880us
-            {0x000140004400ULL, {4, 12}}, // CB=5 (Q4_1) 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 93.600us
-            {0x00014003ca00ULL, {1, 8}}, // CB=5 (Q4_1) 248320x5120 KB1/TW8 Qwen36_LM_Head 1071.199us
-            {0x000180001400ULL, {8, 24}}, // CB=5 (Q4_1) 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 52.640us
-            {0x000440001400ULL, {8, 24}}, // CB=5 (Q4_1) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 98.720us
+            {0x0100014000000400ULL, {8, 4}}, // CB=5 (Q4_1) M=1 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 34.240us
+            {0x0100014000001800ULL, {8, 24}}, // CB=5 (Q4_1) M=1 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 49.600us
+            {0x0100014000002800ULL, {8, 4}}, // CB=5 (Q4_1) M=1 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 63.360us
+            {0x0100014000004400ULL, {4, 8}}, // CB=5 (Q4_1) M=1 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 89.920us
+            {0x010001400003ca00ULL, {1, 4}}, // CB=5 (Q4_1) M=1 248320x5120 KB1/TW4 Qwen36_LM_Head 1100.159us
+            {0x0100018000001400ULL, {8, 12}}, // CB=5 (Q4_1) M=1 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 52.000us
+            {0x0100044000001400ULL, {8, 4}}, // CB=5 (Q4_1) M=1 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 96.640us
+            {0x0200014000000400ULL, {8, 24}}, // CB=5 (Q4_1) M=2 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 32.960us
+            {0x0200014000001800ULL, {8, 12}}, // CB=5 (Q4_1) M=2 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 50.560us
+            {0x0200014000002800ULL, {4, 4}}, // CB=5 (Q4_1) M=2 10240x5120 KB4/TW4 Qwen36_GDN_InnerProjection 61.920us
+            {0x0200014000004400ULL, {4, 8}}, // CB=5 (Q4_1) M=2 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 88.000us
+            {0x020001400003ca00ULL, {1, 4}}, // CB=5 (Q4_1) M=2 248320x5120 KB1/TW4 Qwen36_LM_Head 1118.238us
+            {0x0200018000001400ULL, {8, 24}}, // CB=5 (Q4_1) M=2 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 49.760us
+            {0x0200044000001400ULL, {8, 8}}, // CB=5 (Q4_1) M=2 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 93.280us
+            {0x0300014000000400ULL, {8, 8}}, // CB=5 (Q4_1) M=3 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 37.920us
+            {0x0300014000001800ULL, {8, 12}}, // CB=5 (Q4_1) M=3 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 54.720us
+            {0x0300014000002800ULL, {4, 4}}, // CB=5 (Q4_1) M=3 10240x5120 KB4/TW4 Qwen36_GDN_InnerProjection 69.920us
+            {0x0300014000004400ULL, {4, 12}}, // CB=5 (Q4_1) M=3 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 97.600us
+            {0x030001400003ca00ULL, {1, 8}}, // CB=5 (Q4_1) M=3 248320x5120 KB1/TW8 Qwen36_LM_Head 1141.278us
+            {0x0300018000001400ULL, {8, 4}}, // CB=5 (Q4_1) M=3 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 55.840us
+            {0x0300044000001400ULL, {8, 4}}, // CB=5 (Q4_1) M=3 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 107.040us
+            {0x0400014000000400ULL, {8, 8}}, // CB=5 (Q4_1) M=4 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 43.200us
+            {0x0400014000001800ULL, {8, 4}}, // CB=5 (Q4_1) M=4 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 60.480us
+            {0x0400014000002800ULL, {8, 8}}, // CB=5 (Q4_1) M=4 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 79.840us
+            {0x0400014000004400ULL, {8, 8}}, // CB=5 (Q4_1) M=4 17408x5120 KB8/TW8 Qwen36_FFN_GateUp 111.360us
+            {0x040001400003ca00ULL, {1, 8}}, // CB=5 (Q4_1) M=4 248320x5120 KB1/TW8 Qwen36_LM_Head 1254.079us
+            {0x0400018000001400ULL, {8, 8}}, // CB=5 (Q4_1) M=4 5120x6144 KB8/TW8 Qwen36_GDN_OutputProjection 62.400us
+            {0x0400044000001400ULL, {8, 24}}, // CB=5 (Q4_1) M=4 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 131.039us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 6) { // CB=6 (Q5_0)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 8}}, // CB=6 (Q5_0) M=1 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 33.120us
+            {0x0100014000001800ULL, {8, 4}}, // CB=6 (Q5_0) M=1 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 54.880us
+            {0x0100014000002800ULL, {8, 24}}, // CB=6 (Q5_0) M=1 10240x5120 KB8/TW24 Qwen36_GDN_InnerProjection 68.800us
+            {0x0100014000004400ULL, {4, 12}}, // CB=6 (Q5_0) M=1 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 100.960us
+            {0x010001400003ca00ULL, {4, 8}}, // CB=6 (Q5_0) M=1 248320x5120 KB4/TW8 Qwen36_LM_Head 1229.279us
+            {0x0100018000001400ULL, {8, 4}}, // CB=6 (Q5_0) M=1 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 54.720us
+            {0x0100044000001400ULL, {8, 12}}, // CB=6 (Q5_0) M=1 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 111.680us
+            {0x0200014000000400ULL, {8, 8}}, // CB=6 (Q5_0) M=2 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 39.680us
+            {0x0200014000001800ULL, {8, 24}}, // CB=6 (Q5_0) M=2 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 61.760us
+            {0x0200014000002800ULL, {8, 24}}, // CB=6 (Q5_0) M=2 10240x5120 KB8/TW24 Qwen36_GDN_InnerProjection 76.960us
+            {0x0200014000004400ULL, {4, 4}}, // CB=6 (Q5_0) M=2 17408x5120 KB4/TW4 Qwen36_FFN_GateUp 111.840us
+            {0x020001400003ca00ULL, {4, 12}}, // CB=6 (Q5_0) M=2 248320x5120 KB4/TW12 Qwen36_LM_Head 1250.558us
+            {0x0200018000001400ULL, {8, 4}}, // CB=6 (Q5_0) M=2 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 61.120us
+            {0x0200044000001400ULL, {8, 24}}, // CB=6 (Q5_0) M=2 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 127.839us
+            {0x0300014000000400ULL, {8, 8}}, // CB=6 (Q5_0) M=3 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 41.600us
+            {0x0300014000001800ULL, {8, 24}}, // CB=6 (Q5_0) M=3 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 67.360us
+            {0x0300014000002800ULL, {8, 12}}, // CB=6 (Q5_0) M=3 10240x5120 KB8/TW12 Qwen36_GDN_InnerProjection 83.360us
+            {0x0300014000004400ULL, {4, 12}}, // CB=6 (Q5_0) M=3 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 119.520us
+            {0x030001400003ca00ULL, {2, 4}}, // CB=6 (Q5_0) M=3 248320x5120 KB2/TW4 Qwen36_LM_Head 1273.758us
+            {0x0300018000001400ULL, {8, 24}}, // CB=6 (Q5_0) M=3 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 66.880us
+            {0x0300044000001400ULL, {8, 8}}, // CB=6 (Q5_0) M=3 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 138.240us
+            {0x0400014000000400ULL, {8, 4}}, // CB=6 (Q5_0) M=4 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 52.960us
+            {0x0400014000001800ULL, {8, 24}}, // CB=6 (Q5_0) M=4 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 72.800us
+            {0x0400014000002800ULL, {8, 12}}, // CB=6 (Q5_0) M=4 10240x5120 KB8/TW12 Qwen36_GDN_InnerProjection 92.639us
+            {0x0400014000004400ULL, {8, 24}}, // CB=6 (Q5_0) M=4 17408x5120 KB8/TW24 Qwen36_FFN_GateUp 129.440us
+            {0x040001400003ca00ULL, {4, 12}}, // CB=6 (Q5_0) M=4 248320x5120 KB4/TW12 Qwen36_LM_Head 1369.278us
+            {0x0400018000001400ULL, {8, 4}}, // CB=6 (Q5_0) M=4 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 75.520us
+            {0x0400044000001400ULL, {8, 12}}, // CB=6 (Q5_0) M=4 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 164.160us
         };
         return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
     }
     if (codebook_id == 7) { // CB=7 (Q5_1)
         static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
-            {0x000140000400ULL, {8, 24}}, // CB=7 (Q5_1) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 46.080us
-            {0x000140001800ULL, {8, 24}}, // CB=7 (Q5_1) 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 65.600us
-            {0x000140002800ULL, {8, 24}}, // CB=7 (Q5_1) 10240x5120 KB8/TW24 Qwen36_GDN_InnerProjection 80.640us
-            {0x000140004400ULL, {4, 12}}, // CB=7 (Q5_1) 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 122.239us
-            {0x00014003ca00ULL, {4, 12}}, // CB=7 (Q5_1) 248320x5120 KB4/TW12 Qwen36_LM_Head 1382.718us
-            {0x000180001400ULL, {8, 24}}, // CB=7 (Q5_1) 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 66.560us
-            {0x000440001400ULL, {8, 24}}, // CB=7 (Q5_1) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 141.760us
+            {0x0100014000000400ULL, {8, 24}}, // CB=7 (Q5_1) M=1 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 45.280us
+            {0x0100014000001800ULL, {8, 24}}, // CB=7 (Q5_1) M=1 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 64.800us
+            {0x0100014000002800ULL, {8, 24}}, // CB=7 (Q5_1) M=1 10240x5120 KB8/TW24 Qwen36_GDN_InnerProjection 79.360us
+            {0x0100014000004400ULL, {4, 8}}, // CB=7 (Q5_1) M=1 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 121.440us
+            {0x010001400003ca00ULL, {4, 4}}, // CB=7 (Q5_1) M=1 248320x5120 KB4/TW4 Qwen36_LM_Head 1403.838us
+            {0x0100018000001400ULL, {8, 4}}, // CB=7 (Q5_1) M=1 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 66.240us
+            {0x0100044000001400ULL, {8, 8}}, // CB=7 (Q5_1) M=1 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 139.839us
+            {0x0200014000000400ULL, {8, 8}}, // CB=7 (Q5_1) M=2 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 37.120us
+            {0x0200014000001800ULL, {8, 12}}, // CB=7 (Q5_1) M=2 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 61.760us
+            {0x0200014000002800ULL, {8, 4}}, // CB=7 (Q5_1) M=2 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 78.240us
+            {0x0200014000004400ULL, {4, 8}}, // CB=7 (Q5_1) M=2 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 113.280us
+            {0x020001400003ca00ULL, {2, 8}}, // CB=7 (Q5_1) M=2 248320x5120 KB2/TW8 Qwen36_LM_Head 1378.718us
+            {0x0200018000001400ULL, {8, 24}}, // CB=7 (Q5_1) M=2 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 60.000us
+            {0x0200044000001400ULL, {8, 12}}, // CB=7 (Q5_1) M=2 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 126.239us
+            {0x0300014000000400ULL, {8, 24}}, // CB=7 (Q5_1) M=3 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 41.440us
+            {0x0300014000001800ULL, {8, 12}}, // CB=7 (Q5_1) M=3 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 66.720us
+            {0x0300014000002800ULL, {8, 8}}, // CB=7 (Q5_1) M=3 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 86.240us
+            {0x0300014000004400ULL, {4, 8}}, // CB=7 (Q5_1) M=3 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 124.160us
+            {0x030001400003ca00ULL, {2, 8}}, // CB=7 (Q5_1) M=3 248320x5120 KB2/TW8 Qwen36_LM_Head 1393.598us
+            {0x0300018000001400ULL, {8, 4}}, // CB=7 (Q5_1) M=3 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 66.880us
+            {0x0300044000001400ULL, {8, 24}}, // CB=7 (Q5_1) M=3 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 148.800us
+            {0x0400014000000400ULL, {8, 8}}, // CB=7 (Q5_1) M=4 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 48.000us
+            {0x0400014000001800ULL, {8, 12}}, // CB=7 (Q5_1) M=4 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 75.359us
+            {0x0400014000002800ULL, {8, 8}}, // CB=7 (Q5_1) M=4 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 99.360us
+            {0x0400014000004400ULL, {8, 24}}, // CB=7 (Q5_1) M=4 17408x5120 KB8/TW24 Qwen36_FFN_GateUp 139.200us
+            {0x040001400003ca00ULL, {1, 4}}, // CB=7 (Q5_1) M=4 248320x5120 KB1/TW4 Qwen36_LM_Head 1472.958us
+            {0x0400018000001400ULL, {8, 12}}, // CB=7 (Q5_1) M=4 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 76.480us
+            {0x0400044000001400ULL, {8, 4}}, // CB=7 (Q5_1) M=4 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 173.600us
         };
         return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
     }
     if (codebook_id == 8) { // CB=8 (Q6_K)
         static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
-            {0x000140000400ULL, {8, 24}}, // CB=8 (Q6_K) 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 39.360us
-            {0x000140001800ULL, {8, 24}}, // CB=8 (Q6_K) 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 67.040us
-            {0x000140002800ULL, {8, 24}}, // CB=8 (Q6_K) 10240x5120 KB8/TW24 Qwen36_GDN_InnerProjection 82.720us
-            {0x000140004400ULL, {4, 12}}, // CB=8 (Q6_K) 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 126.239us
-            {0x00014003ca00ULL, {1, 8}}, // CB=8 (Q6_K) 248320x5120 KB1/TW8 Qwen36_LM_Head 1520.318us
-            {0x000180001400ULL, {8, 24}}, // CB=8 (Q6_K) 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 65.760us
-            {0x000440001400ULL, {8, 24}}, // CB=8 (Q6_K) 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 137.280us
+            {0x0100014000000400ULL, {8, 12}}, // CB=8 (Q6_K) M=1 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 39.519us
+            {0x0100014000001800ULL, {8, 8}}, // CB=8 (Q6_K) M=1 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 65.120us
+            {0x0100014000002800ULL, {8, 12}}, // CB=8 (Q6_K) M=1 10240x5120 KB8/TW12 Qwen36_GDN_InnerProjection 81.440us
+            {0x0100014000004400ULL, {4, 4}}, // CB=8 (Q6_K) M=1 17408x5120 KB4/TW4 Qwen36_FFN_GateUp 125.280us
+            {0x010001400003ca00ULL, {1, 4}}, // CB=8 (Q6_K) M=1 248320x5120 KB1/TW4 Qwen36_LM_Head 1543.198us
+            {0x0100018000001400ULL, {8, 12}}, // CB=8 (Q6_K) M=1 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 65.760us
+            {0x0100044000001400ULL, {8, 12}}, // CB=8 (Q6_K) M=1 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 136.640us
+            {0x0200014000000400ULL, {8, 4}}, // CB=8 (Q6_K) M=2 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 38.080us
+            {0x0200014000001800ULL, {8, 8}}, // CB=8 (Q6_K) M=2 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 68.640us
+            {0x0200014000002800ULL, {8, 4}}, // CB=8 (Q6_K) M=2 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 84.800us
+            {0x0200014000004400ULL, {4, 12}}, // CB=8 (Q6_K) M=2 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 127.200us
+            {0x020001400003ca00ULL, {1, 4}}, // CB=8 (Q6_K) M=2 248320x5120 KB1/TW4 Qwen36_LM_Head 1566.558us
+            {0x0200018000001400ULL, {8, 12}}, // CB=8 (Q6_K) M=2 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 67.520us
+            {0x0200044000001400ULL, {8, 24}}, // CB=8 (Q6_K) M=2 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 135.360us
+            {0x0300014000000400ULL, {8, 24}}, // CB=8 (Q6_K) M=3 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 43.679us
+            {0x0300014000001800ULL, {8, 24}}, // CB=8 (Q6_K) M=3 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 74.240us
+            {0x0300014000002800ULL, {8, 4}}, // CB=8 (Q6_K) M=3 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 91.840us
+            {0x0300014000004400ULL, {4, 12}}, // CB=8 (Q6_K) M=3 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 134.720us
+            {0x030001400003ca00ULL, {2, 8}}, // CB=8 (Q6_K) M=3 248320x5120 KB2/TW8 Qwen36_LM_Head 1583.358us
+            {0x0300018000001400ULL, {8, 4}}, // CB=8 (Q6_K) M=3 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 73.600us
+            {0x0300044000001400ULL, {8, 12}}, // CB=8 (Q6_K) M=3 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 153.280us
+            {0x0400014000000400ULL, {8, 8}}, // CB=8 (Q6_K) M=4 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 42.400us
+            {0x0400014000001800ULL, {8, 24}}, // CB=8 (Q6_K) M=4 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 74.400us
+            {0x0400014000002800ULL, {4, 12}}, // CB=8 (Q6_K) M=4 10240x5120 KB4/TW12 Qwen36_GDN_InnerProjection 94.400us
+            {0x0400014000004400ULL, {4, 8}}, // CB=8 (Q6_K) M=4 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 136.160us
+            {0x040001400003ca00ULL, {2, 4}}, // CB=8 (Q6_K) M=4 248320x5120 KB2/TW4 Qwen36_LM_Head 1622.718us
+            {0x0400018000001400ULL, {8, 12}}, // CB=8 (Q6_K) M=4 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 71.840us
+            {0x0400044000001400ULL, {8, 4}}, // CB=8 (Q6_K) M=4 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 150.240us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 9) { // CB=9 (Q3_K)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 8}}, // CB=9 (Q3_K) M=1 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 37.440us
+            {0x0100014000001800ULL, {8, 24}}, // CB=9 (Q3_K) M=1 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 49.600us
+            {0x0100014000002800ULL, {8, 4}}, // CB=9 (Q3_K) M=1 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 65.920us
+            {0x0100014000004400ULL, {4, 8}}, // CB=9 (Q3_K) M=1 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 87.199us
+            {0x010001400003ca00ULL, {1, 4}}, // CB=9 (Q3_K) M=1 248320x5120 KB1/TW4 Qwen36_LM_Head 881.759us
+            {0x0100018000001400ULL, {8, 4}}, // CB=9 (Q3_K) M=1 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 50.400us
+            {0x0100044000001400ULL, {8, 12}}, // CB=9 (Q3_K) M=1 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 101.600us
+            {0x0200014000000400ULL, {8, 24}}, // CB=9 (Q3_K) M=2 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 40.640us
+            {0x0200014000001800ULL, {8, 12}}, // CB=9 (Q3_K) M=2 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 54.560us
+            {0x0200014000002800ULL, {8, 24}}, // CB=9 (Q3_K) M=2 10240x5120 KB8/TW24 Qwen36_GDN_InnerProjection 69.440us
+            {0x0200014000004400ULL, {4, 4}}, // CB=9 (Q3_K) M=2 17408x5120 KB4/TW4 Qwen36_FFN_GateUp 94.400us
+            {0x020001400003ca00ULL, {1, 4}}, // CB=9 (Q3_K) M=2 248320x5120 KB1/TW4 Qwen36_LM_Head 918.879us
+            {0x0200018000001400ULL, {8, 12}}, // CB=9 (Q3_K) M=2 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 52.320us
+            {0x0200044000001400ULL, {8, 4}}, // CB=9 (Q3_K) M=2 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 106.080us
+            {0x0300014000000400ULL, {8, 12}}, // CB=9 (Q3_K) M=3 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 45.599us
+            {0x0300014000001800ULL, {8, 12}}, // CB=9 (Q3_K) M=3 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 57.440us
+            {0x0300014000002800ULL, {8, 12}}, // CB=9 (Q3_K) M=3 10240x5120 KB8/TW12 Qwen36_GDN_InnerProjection 73.920us
+            {0x0300014000004400ULL, {4, 8}}, // CB=9 (Q3_K) M=3 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 100.480us
+            {0x030001400003ca00ULL, {1, 4}}, // CB=9 (Q3_K) M=3 248320x5120 KB1/TW4 Qwen36_LM_Head 994.879us
+            {0x0300018000001400ULL, {8, 4}}, // CB=9 (Q3_K) M=3 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 59.200us
+            {0x0300044000001400ULL, {8, 8}}, // CB=9 (Q3_K) M=3 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 123.040us
+            {0x0400014000000400ULL, {8, 4}}, // CB=9 (Q3_K) M=4 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 51.040us
+            {0x0400014000001800ULL, {8, 12}}, // CB=9 (Q3_K) M=4 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 63.200us
+            {0x0400014000002800ULL, {8, 4}}, // CB=9 (Q3_K) M=4 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 80.000us
+            {0x0400014000004400ULL, {8, 4}}, // CB=9 (Q3_K) M=4 17408x5120 KB8/TW4 Qwen36_FFN_GateUp 108.800us
+            {0x040001400003ca00ULL, {1, 4}}, // CB=9 (Q3_K) M=4 248320x5120 KB1/TW4 Qwen36_LM_Head 1021.599us
+            {0x0400018000001400ULL, {8, 12}}, // CB=9 (Q3_K) M=4 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 66.720us
+            {0x0400044000001400ULL, {8, 24}}, // CB=9 (Q3_K) M=4 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 140.639us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 10) { // CB=10 (Q2_K)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 12}}, // CB=10 (Q2_K) M=1 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 28.480us
+            {0x0100014000001800ULL, {8, 8}}, // CB=10 (Q2_K) M=1 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 42.079us
+            {0x0100014000002800ULL, {4, 4}}, // CB=10 (Q2_K) M=1 10240x5120 KB4/TW4 Qwen36_GDN_InnerProjection 60.960us
+            {0x0100014000004400ULL, {4, 8}}, // CB=10 (Q2_K) M=1 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 78.880us
+            {0x010001400003ca00ULL, {1, 4}}, // CB=10 (Q2_K) M=1 248320x5120 KB1/TW4 Qwen36_LM_Head 906.079us
+            {0x0100018000001400ULL, {8, 8}}, // CB=10 (Q2_K) M=1 5120x6144 KB8/TW8 Qwen36_GDN_OutputProjection 44.160us
+            {0x0100044000001400ULL, {8, 24}}, // CB=10 (Q2_K) M=1 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 80.800us
+            {0x0200014000000400ULL, {8, 4}}, // CB=10 (Q2_K) M=2 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 31.840us
+            {0x0200014000001800ULL, {8, 12}}, // CB=10 (Q2_K) M=2 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 47.840us
+            {0x0200014000002800ULL, {4, 8}}, // CB=10 (Q2_K) M=2 10240x5120 KB4/TW8 Qwen36_GDN_InnerProjection 59.200us
+            {0x0200014000004400ULL, {4, 8}}, // CB=10 (Q2_K) M=2 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 82.560us
+            {0x020001400003ca00ULL, {1, 8}}, // CB=10 (Q2_K) M=2 248320x5120 KB1/TW8 Qwen36_LM_Head 916.639us
+            {0x0200018000001400ULL, {8, 8}}, // CB=10 (Q2_K) M=2 5120x6144 KB8/TW8 Qwen36_GDN_OutputProjection 47.360us
+            {0x0200044000001400ULL, {8, 24}}, // CB=10 (Q2_K) M=2 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 88.160us
+            {0x0300014000000400ULL, {8, 8}}, // CB=10 (Q2_K) M=3 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 35.040us
+            {0x0300014000001800ULL, {8, 8}}, // CB=10 (Q2_K) M=3 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 53.280us
+            {0x0300014000002800ULL, {4, 12}}, // CB=10 (Q2_K) M=3 10240x5120 KB4/TW12 Qwen36_GDN_InnerProjection 71.040us
+            {0x0300014000004400ULL, {4, 8}}, // CB=10 (Q2_K) M=3 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 92.320us
+            {0x030001400003ca00ULL, {1, 4}}, // CB=10 (Q2_K) M=3 248320x5120 KB1/TW4 Qwen36_LM_Head 999.359us
+            {0x0300018000001400ULL, {8, 12}}, // CB=10 (Q2_K) M=3 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 52.960us
+            {0x0300044000001400ULL, {8, 8}}, // CB=10 (Q2_K) M=3 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 106.240us
+            {0x0400014000000400ULL, {8, 12}}, // CB=10 (Q2_K) M=4 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 40.160us
+            {0x0400014000001800ULL, {4, 8}}, // CB=10 (Q2_K) M=4 6144x5120 KB4/TW8 Qwen36_GDN_ZProjection 61.119us
+            {0x0400014000002800ULL, {8, 12}}, // CB=10 (Q2_K) M=4 10240x5120 KB8/TW12 Qwen36_GDN_InnerProjection 80.320us
+            {0x0400014000004400ULL, {4, 8}}, // CB=10 (Q2_K) M=4 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 110.719us
+            {0x040001400003ca00ULL, {4, 4}}, // CB=10 (Q2_K) M=4 248320x5120 KB4/TW4 Qwen36_LM_Head 1031.679us
+            {0x0400018000001400ULL, {8, 4}}, // CB=10 (Q2_K) M=4 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 61.600us
+            {0x0400044000001400ULL, {8, 24}}, // CB=10 (Q2_K) M=4 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 126.720us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 11) { // CB=11 (IQ3_S)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 4}}, // CB=11 (IQ3_S) M=1 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 45.920us
+            {0x0100014000001800ULL, {8, 8}}, // CB=11 (IQ3_S) M=1 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 82.720us
+            {0x0100014000002800ULL, {8, 4}}, // CB=11 (IQ3_S) M=1 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 64.960us
+            {0x0100014000004400ULL, {8, 24}}, // CB=11 (IQ3_S) M=1 17408x5120 KB8/TW24 Qwen36_FFN_GateUp 85.920us
+            {0x010001400003ca00ULL, {2, 8}}, // CB=11 (IQ3_S) M=1 248320x5120 KB2/TW8 Qwen36_LM_Head 937.439us
+            {0x0100018000001400ULL, {8, 24}}, // CB=11 (IQ3_S) M=1 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 80.479us
+            {0x0100044000001400ULL, {8, 24}}, // CB=11 (IQ3_S) M=1 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 176.320us
+            {0x0200014000000400ULL, {8, 4}}, // CB=11 (IQ3_S) M=2 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 56.320us
+            {0x0200014000001800ULL, {8, 12}}, // CB=11 (IQ3_S) M=2 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 87.200us
+            {0x0200014000002800ULL, {8, 12}}, // CB=11 (IQ3_S) M=2 10240x5120 KB8/TW12 Qwen36_GDN_InnerProjection 117.280us
+            {0x0200014000004400ULL, {4, 4}}, // CB=11 (IQ3_S) M=2 17408x5120 KB4/TW4 Qwen36_FFN_GateUp 185.120us
+            {0x020001400003ca00ULL, {8, 24}}, // CB=11 (IQ3_S) M=2 248320x5120 KB8/TW24 Qwen36_LM_Head 1895.038us
+            {0x0200018000001400ULL, {8, 8}}, // CB=11 (IQ3_S) M=2 5120x6144 KB8/TW8 Qwen36_GDN_OutputProjection 92.160us
+            {0x0200044000001400ULL, {8, 12}}, // CB=11 (IQ3_S) M=2 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 196.159us
+            {0x0300014000000400ULL, {8, 12}}, // CB=11 (IQ3_S) M=3 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 60.960us
+            {0x0300014000001800ULL, {8, 8}}, // CB=11 (IQ3_S) M=3 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 92.320us
+            {0x0300014000002800ULL, {8, 24}}, // CB=11 (IQ3_S) M=3 10240x5120 KB8/TW24 Qwen36_GDN_InnerProjection 120.959us
+            {0x0300014000004400ULL, {4, 8}}, // CB=11 (IQ3_S) M=3 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 190.400us
+            {0x030001400003ca00ULL, {1, 8}}, // CB=11 (IQ3_S) M=3 248320x5120 KB1/TW8 Qwen36_LM_Head 1909.117us
+            {0x0300018000001400ULL, {8, 4}}, // CB=11 (IQ3_S) M=3 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 97.439us
+            {0x0300044000001400ULL, {8, 24}}, // CB=11 (IQ3_S) M=3 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 201.120us
+            {0x0400014000000400ULL, {8, 12}}, // CB=11 (IQ3_S) M=4 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 66.080us
+            {0x0400014000001800ULL, {8, 4}}, // CB=11 (IQ3_S) M=4 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 99.360us
+            {0x0400014000002800ULL, {8, 4}}, // CB=11 (IQ3_S) M=4 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 122.879us
+            {0x0400014000004400ULL, {4, 4}}, // CB=11 (IQ3_S) M=4 17408x5120 KB4/TW4 Qwen36_FFN_GateUp 191.520us
+            {0x040001400003ca00ULL, {8, 24}}, // CB=11 (IQ3_S) M=4 248320x5120 KB8/TW24 Qwen36_LM_Head 1939.997us
+            {0x0400018000001400ULL, {8, 4}}, // CB=11 (IQ3_S) M=4 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 103.840us
+            {0x0400044000001400ULL, {8, 24}}, // CB=11 (IQ3_S) M=4 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 219.039us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 12) { // CB=12 (IQ3_XXS)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 4}}, // CB=12 (IQ3_XXS) M=1 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 41.920us
+            {0x0100014000001800ULL, {8, 24}}, // CB=12 (IQ3_XXS) M=1 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 74.720us
+            {0x0100014000002800ULL, {1, 8}}, // CB=12 (IQ3_XXS) M=1 10240x5120 KB1/TW8 Qwen36_GDN_InnerProjection 60.000us
+            {0x0100014000004400ULL, {2, 4}}, // CB=12 (IQ3_XXS) M=1 17408x5120 KB2/TW4 Qwen36_FFN_GateUp 80.320us
+            {0x010001400003ca00ULL, {8, 24}}, // CB=12 (IQ3_XXS) M=1 248320x5120 KB8/TW24 Qwen36_LM_Head 781.439us
+            {0x0100018000001400ULL, {8, 8}}, // CB=12 (IQ3_XXS) M=1 5120x6144 KB8/TW8 Qwen36_GDN_OutputProjection 71.520us
+            {0x0100044000001400ULL, {8, 12}}, // CB=12 (IQ3_XXS) M=1 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 166.559us
+            {0x0200014000000400ULL, {8, 8}}, // CB=12 (IQ3_XXS) M=2 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 53.759us
+            {0x0200014000001800ULL, {8, 8}}, // CB=12 (IQ3_XXS) M=2 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 84.800us
+            {0x0200014000002800ULL, {8, 4}}, // CB=12 (IQ3_XXS) M=2 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 105.920us
+            {0x0200014000004400ULL, {4, 8}}, // CB=12 (IQ3_XXS) M=2 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 166.080us
+            {0x020001400003ca00ULL, {8, 12}}, // CB=12 (IQ3_XXS) M=2 248320x5120 KB8/TW12 Qwen36_LM_Head 1610.398us
+            {0x0200018000001400ULL, {8, 12}}, // CB=12 (IQ3_XXS) M=2 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 88.480us
+            {0x0200044000001400ULL, {8, 4}}, // CB=12 (IQ3_XXS) M=2 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 196.160us
+            {0x0300014000000400ULL, {8, 8}}, // CB=12 (IQ3_XXS) M=3 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 59.679us
+            {0x0300014000001800ULL, {8, 4}}, // CB=12 (IQ3_XXS) M=3 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 89.280us
+            {0x0300014000002800ULL, {8, 12}}, // CB=12 (IQ3_XXS) M=3 10240x5120 KB8/TW12 Qwen36_GDN_InnerProjection 108.320us
+            {0x0300014000004400ULL, {4, 8}}, // CB=12 (IQ3_XXS) M=3 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 175.840us
+            {0x030001400003ca00ULL, {8, 8}}, // CB=12 (IQ3_XXS) M=3 248320x5120 KB8/TW8 Qwen36_LM_Head 1642.238us
+            {0x0300018000001400ULL, {8, 4}}, // CB=12 (IQ3_XXS) M=3 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 92.479us
+            {0x0300044000001400ULL, {8, 12}}, // CB=12 (IQ3_XXS) M=3 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 201.119us
+            {0x0400014000000400ULL, {8, 12}}, // CB=12 (IQ3_XXS) M=4 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 62.560us
+            {0x0400014000001800ULL, {8, 12}}, // CB=12 (IQ3_XXS) M=4 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 95.040us
+            {0x0400014000002800ULL, {8, 4}}, // CB=12 (IQ3_XXS) M=4 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 109.920us
+            {0x0400014000004400ULL, {4, 8}}, // CB=12 (IQ3_XXS) M=4 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 176.160us
+            {0x040001400003ca00ULL, {1, 8}}, // CB=12 (IQ3_XXS) M=4 248320x5120 KB1/TW8 Qwen36_LM_Head 1646.878us
+            {0x0400018000001400ULL, {8, 8}}, // CB=12 (IQ3_XXS) M=4 5120x6144 KB8/TW8 Qwen36_GDN_OutputProjection 99.200us
+            {0x0400044000001400ULL, {8, 24}}, // CB=12 (IQ3_XXS) M=4 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 220.160us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 13) { // CB=13 (IQ2_S)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 4}}, // CB=13 (IQ2_S) M=1 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 46.400us
+            {0x0100014000001800ULL, {8, 4}}, // CB=13 (IQ2_S) M=1 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 69.920us
+            {0x0100014000002800ULL, {4, 4}}, // CB=13 (IQ2_S) M=1 10240x5120 KB4/TW4 Qwen36_GDN_InnerProjection 61.760us
+            {0x0100014000004400ULL, {1, 8}}, // CB=13 (IQ2_S) M=1 17408x5120 KB1/TW8 Qwen36_FFN_GateUp 80.000us
+            {0x010001400003ca00ULL, {1, 4}}, // CB=13 (IQ2_S) M=1 248320x5120 KB1/TW4 Qwen36_LM_Head 821.119us
+            {0x0100018000001400ULL, {8, 8}}, // CB=13 (IQ2_S) M=1 5120x6144 KB8/TW8 Qwen36_GDN_OutputProjection 74.559us
+            {0x0100044000001400ULL, {8, 4}}, // CB=13 (IQ2_S) M=1 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 175.200us
+            {0x0200014000000400ULL, {8, 8}}, // CB=13 (IQ2_S) M=2 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 42.880us
+            {0x0200014000001800ULL, {8, 24}}, // CB=13 (IQ2_S) M=2 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 61.120us
+            {0x0200014000002800ULL, {8, 8}}, // CB=13 (IQ2_S) M=2 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 84.320us
+            {0x0200014000004400ULL, {8, 12}}, // CB=13 (IQ2_S) M=2 17408x5120 KB8/TW12 Qwen36_FFN_GateUp 123.359us
+            {0x020001400003ca00ULL, {4, 12}}, // CB=13 (IQ2_S) M=2 248320x5120 KB4/TW12 Qwen36_LM_Head 1233.118us
+            {0x0200018000001400ULL, {8, 4}}, // CB=13 (IQ2_S) M=2 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 64.320us
+            {0x0200044000001400ULL, {8, 12}}, // CB=13 (IQ2_S) M=2 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 138.880us
+            {0x0300014000000400ULL, {8, 8}}, // CB=13 (IQ2_S) M=3 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 45.120us
+            {0x0300014000001800ULL, {8, 24}}, // CB=13 (IQ2_S) M=3 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 65.440us
+            {0x0300014000002800ULL, {8, 4}}, // CB=13 (IQ2_S) M=3 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 87.679us
+            {0x0300014000004400ULL, {4, 8}}, // CB=13 (IQ2_S) M=3 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 126.720us
+            {0x030001400003ca00ULL, {4, 4}}, // CB=13 (IQ2_S) M=3 248320x5120 KB4/TW4 Qwen36_LM_Head 1269.759us
+            {0x0300018000001400ULL, {8, 12}}, // CB=13 (IQ2_S) M=3 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 68.000us
+            {0x0300044000001400ULL, {8, 24}}, // CB=13 (IQ2_S) M=3 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 145.440us
+            {0x0400014000000400ULL, {8, 12}}, // CB=13 (IQ2_S) M=4 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 60.320us
+            {0x0400014000001800ULL, {8, 4}}, // CB=13 (IQ2_S) M=4 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 82.400us
+            {0x0400014000002800ULL, {8, 8}}, // CB=13 (IQ2_S) M=4 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 98.240us
+            {0x0400014000004400ULL, {4, 4}}, // CB=13 (IQ2_S) M=4 17408x5120 KB4/TW4 Qwen36_FFN_GateUp 149.279us
+            {0x040001400003ca00ULL, {1, 4}}, // CB=13 (IQ2_S) M=4 248320x5120 KB1/TW4 Qwen36_LM_Head 1337.599us
+            {0x0400018000001400ULL, {8, 12}}, // CB=13 (IQ2_S) M=4 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 87.360us
+            {0x0400044000001400ULL, {8, 4}}, // CB=13 (IQ2_S) M=4 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 195.200us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 14) { // CB=14 (IQ2_XS)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 8}}, // CB=14 (IQ2_XS) M=1 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 46.560us
+            {0x0100014000001800ULL, {8, 8}}, // CB=14 (IQ2_XS) M=1 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 70.079us
+            {0x0100014000002800ULL, {1, 4}}, // CB=14 (IQ2_XS) M=1 10240x5120 KB1/TW4 Qwen36_GDN_InnerProjection 61.920us
+            {0x0100014000004400ULL, {1, 4}}, // CB=14 (IQ2_XS) M=1 17408x5120 KB1/TW4 Qwen36_FFN_GateUp 79.200us
+            {0x010001400003ca00ULL, {1, 4}}, // CB=14 (IQ2_XS) M=1 248320x5120 KB1/TW4 Qwen36_LM_Head 832.799us
+            {0x0100018000001400ULL, {8, 12}}, // CB=14 (IQ2_XS) M=1 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 74.560us
+            {0x0100044000001400ULL, {8, 24}}, // CB=14 (IQ2_XS) M=1 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 175.040us
+            {0x0200014000000400ULL, {8, 4}}, // CB=14 (IQ2_XS) M=2 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 43.040us
+            {0x0200014000001800ULL, {8, 8}}, // CB=14 (IQ2_XS) M=2 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 62.080us
+            {0x0200014000002800ULL, {8, 4}}, // CB=14 (IQ2_XS) M=2 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 85.760us
+            {0x0200014000004400ULL, {8, 8}}, // CB=14 (IQ2_XS) M=2 17408x5120 KB8/TW8 Qwen36_FFN_GateUp 125.759us
+            {0x020001400003ca00ULL, {8, 8}}, // CB=14 (IQ2_XS) M=2 248320x5120 KB8/TW8 Qwen36_LM_Head 1269.758us
+            {0x0200018000001400ULL, {8, 8}}, // CB=14 (IQ2_XS) M=2 5120x6144 KB8/TW8 Qwen36_GDN_OutputProjection 64.800us
+            {0x0200044000001400ULL, {8, 12}}, // CB=14 (IQ2_XS) M=2 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 140.160us
+            {0x0300014000000400ULL, {8, 4}}, // CB=14 (IQ2_XS) M=3 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 45.440us
+            {0x0300014000001800ULL, {8, 24}}, // CB=14 (IQ2_XS) M=3 6144x5120 KB8/TW24 Qwen36_GDN_ZProjection 66.880us
+            {0x0300014000002800ULL, {8, 8}}, // CB=14 (IQ2_XS) M=3 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 90.880us
+            {0x0300014000004400ULL, {4, 8}}, // CB=14 (IQ2_XS) M=3 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 129.600us
+            {0x030001400003ca00ULL, {4, 8}}, // CB=14 (IQ2_XS) M=3 248320x5120 KB4/TW8 Qwen36_LM_Head 1317.279us
+            {0x0300018000001400ULL, {8, 24}}, // CB=14 (IQ2_XS) M=3 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 68.960us
+            {0x0300044000001400ULL, {8, 12}}, // CB=14 (IQ2_XS) M=3 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 148.160us
+            {0x0400014000000400ULL, {8, 8}}, // CB=14 (IQ2_XS) M=4 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 60.640us
+            {0x0400014000001800ULL, {8, 12}}, // CB=14 (IQ2_XS) M=4 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 82.720us
+            {0x0400014000002800ULL, {8, 8}}, // CB=14 (IQ2_XS) M=4 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 98.720us
+            {0x0400014000004400ULL, {4, 8}}, // CB=14 (IQ2_XS) M=4 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 149.920us
+            {0x040001400003ca00ULL, {1, 4}}, // CB=14 (IQ2_XS) M=4 248320x5120 KB1/TW4 Qwen36_LM_Head 1356.958us
+            {0x0400018000001400ULL, {8, 12}}, // CB=14 (IQ2_XS) M=4 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 87.839us
+            {0x0400044000001400ULL, {8, 24}}, // CB=14 (IQ2_XS) M=4 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 190.399us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 15) { // CB=15 (IQ2_XXS)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 4}}, // CB=15 (IQ2_XXS) M=1 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 37.760us
+            {0x0100014000001800ULL, {8, 12}}, // CB=15 (IQ2_XXS) M=1 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 54.720us
+            {0x0100014000002800ULL, {1, 8}}, // CB=15 (IQ2_XXS) M=1 10240x5120 KB1/TW8 Qwen36_GDN_InnerProjection 51.199us
+            {0x0100014000004400ULL, {2, 8}}, // CB=15 (IQ2_XXS) M=1 17408x5120 KB2/TW8 Qwen36_FFN_GateUp 66.720us
+            {0x010001400003ca00ULL, {4, 4}}, // CB=15 (IQ2_XXS) M=1 248320x5120 KB4/TW4 Qwen36_LM_Head 602.559us
+            {0x0100018000001400ULL, {8, 24}}, // CB=15 (IQ2_XXS) M=1 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 56.800us
+            {0x0100044000001400ULL, {8, 8}}, // CB=15 (IQ2_XXS) M=1 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 130.240us
+            {0x0200014000000400ULL, {8, 8}}, // CB=15 (IQ2_XXS) M=2 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 41.440us
+            {0x0200014000001800ULL, {8, 8}}, // CB=15 (IQ2_XXS) M=2 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 56.480us
+            {0x0200014000002800ULL, {8, 4}}, // CB=15 (IQ2_XXS) M=2 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 71.840us
+            {0x0200014000004400ULL, {4, 8}}, // CB=15 (IQ2_XXS) M=2 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 104.319us
+            {0x020001400003ca00ULL, {8, 4}}, // CB=15 (IQ2_XXS) M=2 248320x5120 KB8/TW4 Qwen36_LM_Head 952.799us
+            {0x0200018000001400ULL, {8, 4}}, // CB=15 (IQ2_XXS) M=2 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 59.360us
+            {0x0200044000001400ULL, {8, 24}}, // CB=15 (IQ2_XXS) M=2 5120x17408 KB8/TW24 Qwen36_FFN_DownProjection 124.960us
+            {0x0300014000000400ULL, {8, 12}}, // CB=15 (IQ2_XXS) M=3 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 44.959us
+            {0x0300014000001800ULL, {8, 4}}, // CB=15 (IQ2_XXS) M=3 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 60.000us
+            {0x0300014000002800ULL, {8, 8}}, // CB=15 (IQ2_XXS) M=3 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 74.560us
+            {0x0300014000004400ULL, {4, 12}}, // CB=15 (IQ2_XXS) M=3 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 107.520us
+            {0x030001400003ca00ULL, {8, 4}}, // CB=15 (IQ2_XXS) M=3 248320x5120 KB8/TW4 Qwen36_LM_Head 981.759us
+            {0x0300018000001400ULL, {8, 4}}, // CB=15 (IQ2_XXS) M=3 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 63.200us
+            {0x0300044000001400ULL, {8, 12}}, // CB=15 (IQ2_XXS) M=3 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 130.880us
+            {0x0400014000000400ULL, {8, 24}}, // CB=15 (IQ2_XXS) M=4 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 45.760us
+            {0x0400014000001800ULL, {8, 4}}, // CB=15 (IQ2_XXS) M=4 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 63.039us
+            {0x0400014000002800ULL, {8, 8}}, // CB=15 (IQ2_XXS) M=4 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 77.600us
+            {0x0400014000004400ULL, {4, 4}}, // CB=15 (IQ2_XXS) M=4 17408x5120 KB4/TW4 Qwen36_FFN_GateUp 109.760us
+            {0x040001400003ca00ULL, {4, 12}}, // CB=15 (IQ2_XXS) M=4 248320x5120 KB4/TW12 Qwen36_LM_Head 1002.079us
+            {0x0400018000001400ULL, {8, 12}}, // CB=15 (IQ2_XXS) M=4 5120x6144 KB8/TW12 Qwen36_GDN_OutputProjection 65.920us
+            {0x0400044000001400ULL, {8, 4}}, // CB=15 (IQ2_XXS) M=4 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 136.480us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 16) { // CB=16 (IQ1_S)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 24}}, // CB=16 (IQ1_S) M=1 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 40.160us
+            {0x0100014000001800ULL, {8, 4}}, // CB=16 (IQ1_S) M=1 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 65.280us
+            {0x0100014000002800ULL, {8, 8}}, // CB=16 (IQ1_S) M=1 10240x5120 KB8/TW8 Qwen36_GDN_InnerProjection 50.400us
+            {0x0100014000004400ULL, {8, 24}}, // CB=16 (IQ1_S) M=1 17408x5120 KB8/TW24 Qwen36_FFN_GateUp 80.160us
+            {0x010001400003ca00ULL, {1, 8}}, // CB=16 (IQ1_S) M=1 248320x5120 KB1/TW8 Qwen36_LM_Head 688.799us
+            {0x0100018000001400ULL, {8, 24}}, // CB=16 (IQ1_S) M=1 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 64.960us
+            {0x0100044000001400ULL, {8, 8}}, // CB=16 (IQ1_S) M=1 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 141.920us
+            {0x0200014000000400ULL, {8, 12}}, // CB=16 (IQ1_S) M=2 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 41.120us
+            {0x0200014000001800ULL, {4, 4}}, // CB=16 (IQ1_S) M=2 6144x5120 KB4/TW4 Qwen36_GDN_ZProjection 71.040us
+            {0x0200014000002800ULL, {4, 4}}, // CB=16 (IQ1_S) M=2 10240x5120 KB4/TW4 Qwen36_GDN_InnerProjection 97.760us
+            {0x0200014000004400ULL, {8, 24}}, // CB=16 (IQ1_S) M=2 17408x5120 KB8/TW24 Qwen36_FFN_GateUp 146.879us
+            {0x020001400003ca00ULL, {4, 12}}, // CB=16 (IQ1_S) M=2 248320x5120 KB4/TW12 Qwen36_LM_Head 1603.358us
+            {0x0200018000001400ULL, {8, 4}}, // CB=16 (IQ1_S) M=2 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 68.320us
+            {0x0200044000001400ULL, {8, 12}}, // CB=16 (IQ1_S) M=2 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 146.400us
+            {0x0300014000000400ULL, {8, 12}}, // CB=16 (IQ1_S) M=3 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 46.559us
+            {0x0300014000001800ULL, {8, 4}}, // CB=16 (IQ1_S) M=3 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 73.760us
+            {0x0300014000002800ULL, {4, 4}}, // CB=16 (IQ1_S) M=3 10240x5120 KB4/TW4 Qwen36_GDN_InnerProjection 99.680us
+            {0x0300014000004400ULL, {4, 8}}, // CB=16 (IQ1_S) M=3 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 150.080us
+            {0x030001400003ca00ULL, {2, 4}}, // CB=16 (IQ1_S) M=3 248320x5120 KB2/TW4 Qwen36_LM_Head 1595.998us
+            {0x0300018000001400ULL, {8, 8}}, // CB=16 (IQ1_S) M=3 5120x6144 KB8/TW8 Qwen36_GDN_OutputProjection 70.720us
+            {0x0300044000001400ULL, {8, 8}}, // CB=16 (IQ1_S) M=3 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 149.120us
+            {0x0400014000000400ULL, {8, 4}}, // CB=16 (IQ1_S) M=4 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 51.520us
+            {0x0400014000001800ULL, {8, 12}}, // CB=16 (IQ1_S) M=4 6144x5120 KB8/TW12 Qwen36_GDN_ZProjection 76.800us
+            {0x0400014000002800ULL, {4, 4}}, // CB=16 (IQ1_S) M=4 10240x5120 KB4/TW4 Qwen36_GDN_InnerProjection 101.600us
+            {0x0400014000004400ULL, {4, 8}}, // CB=16 (IQ1_S) M=4 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 158.240us
+            {0x040001400003ca00ULL, {4, 12}}, // CB=16 (IQ1_S) M=4 248320x5120 KB4/TW12 Qwen36_LM_Head 1637.278us
+            {0x0400018000001400ULL, {8, 4}}, // CB=16 (IQ1_S) M=4 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 73.600us
+            {0x0400044000001400ULL, {8, 4}}, // CB=16 (IQ1_S) M=4 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 156.160us
+        };
+        return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
+    }
+    if (codebook_id == 17) { // CB=17 (IQ1_M)
+        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
+            {0x0100014000000400ULL, {8, 24}}, // CB=17 (IQ1_M) M=1 1024x5120 KB8/TW24 Qwen36_GDN_TimeProjection 56.159us
+            {0x0100014000001800ULL, {8, 8}}, // CB=17 (IQ1_M) M=1 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 73.280us
+            {0x0100014000002800ULL, {8, 4}}, // CB=17 (IQ1_M) M=1 10240x5120 KB8/TW4 Qwen36_GDN_InnerProjection 56.160us
+            {0x0100014000004400ULL, {2, 8}}, // CB=17 (IQ1_M) M=1 17408x5120 KB2/TW8 Qwen36_FFN_GateUp 85.280us
+            {0x010001400003ca00ULL, {1, 4}}, // CB=17 (IQ1_M) M=1 248320x5120 KB1/TW4 Qwen36_LM_Head 711.199us
+            {0x0100018000001400ULL, {8, 24}}, // CB=17 (IQ1_M) M=1 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 81.440us
+            {0x0100044000001400ULL, {8, 4}}, // CB=17 (IQ1_M) M=1 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 189.920us
+            {0x0200014000000400ULL, {8, 4}}, // CB=17 (IQ1_M) M=2 1024x5120 KB8/TW4 Qwen36_GDN_TimeProjection 37.440us
+            {0x0200014000001800ULL, {4, 8}}, // CB=17 (IQ1_M) M=2 6144x5120 KB4/TW8 Qwen36_GDN_ZProjection 69.279us
+            {0x0200014000002800ULL, {4, 8}}, // CB=17 (IQ1_M) M=2 10240x5120 KB4/TW8 Qwen36_GDN_InnerProjection 100.160us
+            {0x0200014000004400ULL, {8, 4}}, // CB=17 (IQ1_M) M=2 17408x5120 KB8/TW4 Qwen36_FFN_GateUp 150.080us
+            {0x020001400003ca00ULL, {4, 4}}, // CB=17 (IQ1_M) M=2 248320x5120 KB4/TW4 Qwen36_LM_Head 1658.558us
+            {0x0200018000001400ULL, {8, 24}}, // CB=17 (IQ1_M) M=2 5120x6144 KB8/TW24 Qwen36_GDN_OutputProjection 68.960us
+            {0x0200044000001400ULL, {8, 8}}, // CB=17 (IQ1_M) M=2 5120x17408 KB8/TW8 Qwen36_FFN_DownProjection 150.079us
+            {0x0300014000000400ULL, {8, 8}}, // CB=17 (IQ1_M) M=3 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 45.279us
+            {0x0300014000001800ULL, {8, 8}}, // CB=17 (IQ1_M) M=3 6144x5120 KB8/TW8 Qwen36_GDN_ZProjection 74.399us
+            {0x0300014000002800ULL, {4, 12}}, // CB=17 (IQ1_M) M=3 10240x5120 KB4/TW12 Qwen36_GDN_InnerProjection 102.079us
+            {0x0300014000004400ULL, {4, 12}}, // CB=17 (IQ1_M) M=3 17408x5120 KB4/TW12 Qwen36_FFN_GateUp 153.120us
+            {0x030001400003ca00ULL, {2, 8}}, // CB=17 (IQ1_M) M=3 248320x5120 KB2/TW8 Qwen36_LM_Head 1623.518us
+            {0x0300018000001400ULL, {8, 4}}, // CB=17 (IQ1_M) M=3 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 72.000us
+            {0x0300044000001400ULL, {8, 12}}, // CB=17 (IQ1_M) M=3 5120x17408 KB8/TW12 Qwen36_FFN_DownProjection 153.600us
+            {0x0400014000000400ULL, {8, 12}}, // CB=17 (IQ1_M) M=4 1024x5120 KB8/TW12 Qwen36_GDN_TimeProjection 43.840us
+            {0x0400014000001800ULL, {8, 4}}, // CB=17 (IQ1_M) M=4 6144x5120 KB8/TW4 Qwen36_GDN_ZProjection 76.320us
+            {0x0400014000002800ULL, {4, 4}}, // CB=17 (IQ1_M) M=4 10240x5120 KB4/TW4 Qwen36_GDN_InnerProjection 104.480us
+            {0x0400014000004400ULL, {4, 8}}, // CB=17 (IQ1_M) M=4 17408x5120 KB4/TW8 Qwen36_FFN_GateUp 156.480us
+            {0x040001400003ca00ULL, {2, 8}}, // CB=17 (IQ1_M) M=4 248320x5120 KB2/TW8 Qwen36_LM_Head 1706.878us
+            {0x0400018000001400ULL, {8, 4}}, // CB=17 (IQ1_M) M=4 5120x6144 KB8/TW4 Qwen36_GDN_OutputProjection 74.560us
+            {0x0400044000001400ULL, {8, 4}}, // CB=17 (IQ1_M) M=4 5120x17408 KB8/TW4 Qwen36_FFN_DownProjection 160.000us
         };
         return findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out);
     }

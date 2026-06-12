@@ -549,6 +549,25 @@ namespace llaminar2
              */
             void bindConcurrentNativePrefillScratch(int m, int n, int k, int stream_idx) const;
 
+            /**
+             * @brief Rebind NativeVNNI GEMV partials to a concurrent fused-decode stream slot.
+             *
+             * Fused decode launches multiple M=1 projections on side streams. Some
+             * projections use the two-phase KPAR GEMV reduction, so each side stream
+             * needs a disjoint partials arena before launch.
+             *
+             * @param projection_count Number of projections launched by the fused
+             *                         stage. Slot 0 uses GEMV_KPAR_PARTIALS and the
+             *                         remaining projection_count-1 slots use
+             *                         CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS.
+             */
+            void bindConcurrentNativeDecodeScratch(
+                int m,
+                int n,
+                int k,
+                int stream_idx,
+                int projection_count) const;
+
             // =========================================================================
             // Member data
             // =========================================================================

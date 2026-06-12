@@ -93,8 +93,11 @@ namespace llaminar2
         STOCHASTIC_TARGET_PROBS,     ///< Compact verifier/main distribution probabilities [4, 256]
         STOCHASTIC_DRAFT_TOKEN_IDS,  ///< Compact MTP draft distribution token ids [3, 256]
         STOCHASTIC_DRAFT_PROBS,      ///< Compact MTP draft distribution probabilities [3, 256]
+        STOCHASTIC_PROCESSED_LOGITS, ///< Full-vocab processed-logit staging rows [4, vocab]
+        STOCHASTIC_INVERSE_REJECTION_SAMPLES, ///< vLLM inverse-exp samples [3, vocab]
         STOCHASTIC_TARGET_SAMPLE_TOKENS, ///< Device-resident sampled main/verifier target tokens [1, 4]
         STOCHASTIC_DRAFT_SAMPLE_TOKENS, ///< Device-resident sampled MTP draft tokens [1, 3]
+        STOCHASTIC_DRAFT_SAMPLE_PROBS,  ///< Device-resident sampled MTP draft probabilities [1, 3]
         STOCHASTIC_TOPK_PARTIAL_VALS, ///< Per-block stochastic top-k partial values [blocks, 32]
         STOCHASTIC_TOPK_PARTIAL_IDXS, ///< Per-block stochastic top-k partial indices [blocks, 32]
         STOCHASTIC_VERIFY_TOKENS,    ///< Scalar stochastic verifier output tokens [1, 4]
@@ -228,10 +231,16 @@ namespace llaminar2
             return "STOCHASTIC_DRAFT_TOKEN_IDS";
         case BufferId::STOCHASTIC_DRAFT_PROBS:
             return "STOCHASTIC_DRAFT_PROBS";
+        case BufferId::STOCHASTIC_PROCESSED_LOGITS:
+            return "STOCHASTIC_PROCESSED_LOGITS";
+        case BufferId::STOCHASTIC_INVERSE_REJECTION_SAMPLES:
+            return "STOCHASTIC_INVERSE_REJECTION_SAMPLES";
         case BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS:
             return "STOCHASTIC_TARGET_SAMPLE_TOKENS";
         case BufferId::STOCHASTIC_DRAFT_SAMPLE_TOKENS:
             return "STOCHASTIC_DRAFT_SAMPLE_TOKENS";
+        case BufferId::STOCHASTIC_DRAFT_SAMPLE_PROBS:
+            return "STOCHASTIC_DRAFT_SAMPLE_PROBS";
         case BufferId::STOCHASTIC_TOPK_PARTIAL_VALS:
             return "STOCHASTIC_TOPK_PARTIAL_VALS";
         case BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS:

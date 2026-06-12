@@ -891,7 +891,7 @@ TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureOnlyAppliesToReadyOrdinaryD
         << "Unstamped captures are handled by existing reset paths.";
 }
 
-TEST(Test__ForwardReplayStatePolicy, CorrectionReplayResetsOnlyOrdinaryDecodeCaches)
+TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeCaches)
 {
     ForwardGraphSignature single_token_decode;
     single_token_decode.decode = true;
@@ -920,12 +920,13 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayResetsOnlyOrdinaryDecodeCac
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
                   classifyForwardReplayStateCache(single_token_decode)),
-              ForwardReplayStateAction::ResetReplayState)
-        << "One-token condition decode reads mutable KV/GDN/short-conv state and must recapture after MTP publication.";
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "One-token condition decode updates token/position metadata before replay and reads stable live-state buffers.";
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
                   classifyForwardReplayStateCache(ordinary_decode)),
-              ForwardReplayStateAction::ResetReplayState);
+              ForwardReplayStateAction::ResetReplayState)
+        << "Multi-token ordinary decode remains conservative until a versioned state contract proves it safe.";
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
                   classifyForwardReplayStateCache(all_position_verifier)),

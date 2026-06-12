@@ -653,9 +653,12 @@ namespace llaminar2
                                  : "layer" + std::to_string(layer_idx) + "_";
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
+        // Verifier batches are tiny (draft depth + 1 rows). CUDA and ROCm both
+        // use the graph-capturable grouped verifier path so routed and shared
+        // experts publish a single combined MoE output for MTP verification.
         auto forceCudaSmallMMoEPrefill = [&](DeviceId candidate)
         {
-            return candidate.is_cuda() &&
+            return (candidate.is_cuda() || candidate.is_rocm()) &&
                    total_tokens >= 1 &&
                    total_tokens <= 4 &&
                    (config_.compute_all_position_logits || mtp_sidecar_context);
@@ -791,6 +794,7 @@ namespace llaminar2
         // Stage 3: MoE Expert Compute (routed expert SwiGLU FFN)
         // =====================================================================
         TensorBase *moe_output = buffers.get(buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
+        bool shared_gate_writes_combined_output = false;
 
         {
             // Infer expert intermediate size from weight shape
@@ -989,6 +993,19 @@ namespace llaminar2
                                                                            *overlay_plan,
                                                                            config_.moe.num_experts,
                                                                            layer_idx);
+
+            const bool can_combine_shared_verifier =
+                !use_expert_overlay &&
+                !overlay_runtime_plan &&
+                !needsTPAllreduce() &&
+                forceCudaSmallMMoEPrefill(device) &&
+                total_tokens > 1 &&
+                total_tokens <= 4 &&
+                layer.shared_expert_gate &&
+                layer.shared_expert_up &&
+                layer.shared_expert_down &&
+                layer.shared_expert_gate_inp &&
+                buffers.attn_proj;
 
             if (overlay_requested && !use_expert_overlay)
             {
@@ -1369,10 +1386,26 @@ namespace llaminar2
             }
             else
             {
-                auto expert_params = makeExpertParams(moe_output,
-                                                      buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
+                auto expert_params = makeExpertParams(can_combine_shared_verifier ? buffers.attn_proj : moe_output,
+                                                      can_combine_shared_verifier
+                                                          ? buffers.idFor(BufferId::ATTN_PROJ)
+                                                          : buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
                                                       {},
                                                       device);
+                if (can_combine_shared_verifier)
+                {
+                    expert_params.combine_shared_expert_in_verifier = true;
+                    expert_params.shared_gate_w = layer.shared_expert_gate;
+                    expert_params.shared_up_w = layer.shared_expert_up;
+                    expert_params.shared_down_w = layer.shared_expert_down;
+                    expert_params.shared_gate_inp = layer.shared_expert_gate_inp;
+                    expert_params.prepared_shared_ref_gate = preparedRefForGraphWeight(
+                        layer_bindings.shared_expert_gate, device);
+                    expert_params.prepared_shared_ref_up = preparedRefForGraphWeight(
+                        layer_bindings.shared_expert_up, device);
+                    expert_params.prepared_shared_ref_down = preparedRefForGraphWeight(
+                        layer_bindings.shared_expert_down, device);
+                }
                 (void)prepareExpertParams(expert_params, device);
 
                 graph.addNode(prefix + "moe_expert_ffn",
@@ -1380,6 +1413,8 @@ namespace llaminar2
                               device);
                 graph.addDependency(prefix + "moe_expert_ffn", prefix + "moe_routing");
                 ffn_terminal = prefix + "moe_expert_ffn";
+                if (can_combine_shared_verifier)
+                    shared_gate_writes_combined_output = true;
 
                 // Qwen35 MoE expert weights are normally replicated, so every rank
                 // computes the full routed-expert contribution. Only allreduce this
@@ -1409,7 +1444,8 @@ namespace llaminar2
         TensorBase *shared_output = buffers.get(buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
         std::string shared_ffn_last; // Track last shared expert stage (empty if no shared expert)
 
-        if (layer.shared_expert_gate && layer.shared_expert_up && layer.shared_expert_down && shared_output)
+        if (!shared_gate_writes_combined_output &&
+            layer.shared_expert_gate && layer.shared_expert_up && layer.shared_expert_down && shared_output)
         {
             DeviceId shared_device = device;
             if (overlay_runtime_plan)
@@ -1482,6 +1518,10 @@ namespace llaminar2
             // Stage 4b: Sigmoid gate on shared expert output
             if (layer.shared_expert_gate_inp)
             {
+                const bool can_fuse_gate_and_combine =
+                    !overlay_runtime_plan && !needsTPAllreduce() && shared_device == device &&
+                    moe_output && buffers.attn_proj;
+
                 SharedExpertGateStage::Params gate_params;
                 gate_params.device_id = shared_device;
                 gate_params.input = buffers.normalized;
@@ -1491,12 +1531,29 @@ namespace llaminar2
                 gate_params.d_model = config_.d_model;
                 gate_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
                 gate_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+                if (can_fuse_gate_and_combine)
+                {
+                    gate_params.routed_residual = moe_output;
+                    gate_params.combined_output = buffers.attn_proj;
+                    gate_params.residual_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+                    gate_params.combined_output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+                }
 
                 graph.addNode(prefix + "shared_expert_gate",
                               ComputeStageFactory::createSharedExpertGate(gate_params),
                               shared_device);
                 graph.addDependency(prefix + "shared_expert_gate", shared_ffn_last);
+                if (can_fuse_gate_and_combine)
+                {
+                    // The fused epilogue consumes both the shared-expert output
+                    // and the routed-expert output, so it is the final MoE FFN
+                    // producer for this single-device layer.
+                    graph.addDependency(prefix + "shared_expert_gate", ffn_terminal);
+                    shared_gate_writes_combined_output = true;
+                }
                 shared_ffn_last = prefix + "shared_expert_gate";
+                if (shared_gate_writes_combined_output)
+                    ffn_terminal = prefix + "shared_expert_gate";
             }
         }
 
@@ -1506,7 +1563,12 @@ namespace llaminar2
         // The combined MoE output goes to attn_proj so that the next layer's
         // FusedResidualNormStage handles the residual add automatically.
         {
-            if (!shared_ffn_last.empty() && shared_output)
+            if (shared_gate_writes_combined_output)
+            {
+                // SharedExpertGateStage already wrote the combined MoE output to
+                // ATTN_PROJ, so no standalone residual-add combine node is needed.
+            }
+            else if (!shared_ffn_last.empty() && shared_output)
             {
                 // Add expert_output + shared_expert_output → attn_proj
                 ResidualAddStage::Params add_params;

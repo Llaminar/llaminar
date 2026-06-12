@@ -1859,6 +1859,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
+        int force_two_phase,
         int device_id, cudaStream_t stream,
         CUDAGemvContext_ *gemv_ctx)
     {
@@ -1936,6 +1937,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
+        int force_two_phase,
         int device_id, cudaStream_t stream,
         CUDAGemvContext_ *gemv_ctx)
     {
@@ -1951,7 +1953,15 @@ namespace
         const int kb_capped = deterministic ? 1 : kb_capped_auto;
 
         const size_t partials_bytes = static_cast<size_t>(kb_capped) * 2 * N * sizeof(float);
-        const bool use_two_phase = deterministic || (partials_bytes <= kTwoPhaseMaxBytes);
+        bool use_two_phase;
+        if (deterministic)
+            use_two_phase = true;
+        else if (force_two_phase == 1)
+            use_two_phase = true;
+        else if (force_two_phase == 2)
+            use_two_phase = false;
+        else
+            use_two_phase = (partials_bytes <= kTwoPhaseMaxBytes);
 
         dim3 grid(grid_n, kb_capped);
 
@@ -2021,32 +2031,32 @@ namespace
             return launchKparM2Impl<32, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C1:
             return launchKparM2Impl<64, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C2:
             return launchKparM2Impl<64, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C1:
             return launchKparM2Impl<128, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C2:
             return launchKparM2Impl<128, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T256_C2:
             return launchKparM2Impl<256, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         }
         return false;
     }
@@ -2060,6 +2070,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
+        int force_two_phase,
         int device_id, cudaStream_t stream,
         CUDAGemvContext_ *gemv_ctx)
     {
@@ -2076,7 +2087,15 @@ namespace
         const int kb_capped = deterministic ? 1 : kb_capped_auto;
 
         const size_t partials_bytes = static_cast<size_t>(kb_capped) * M * N * sizeof(float);
-        const bool use_two_phase = deterministic || (partials_bytes <= kTwoPhaseMaxBytes);
+        bool use_two_phase;
+        if (deterministic)
+            use_two_phase = true;
+        else if (force_two_phase == 1)
+            use_two_phase = true;
+        else if (force_two_phase == 2)
+            use_two_phase = false;
+        else
+            use_two_phase = (partials_bytes <= kTwoPhaseMaxBytes);
 
         dim3 grid(grid_n, kb_capped);
 
@@ -2147,32 +2166,32 @@ namespace
             return launchKparSmallMImpl<M, 32, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C1:
             return launchKparSmallMImpl<M, 64, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C2:
             return launchKparSmallMImpl<M, 64, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C1:
             return launchKparSmallMImpl<M, 128, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C2:
             return launchKparSmallMImpl<M, 128, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T256_C2:
             return launchKparSmallMImpl<M, 256, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         }
         return false;
     }
@@ -2580,6 +2599,117 @@ namespace
         CUDAGemvContext_ *gemv_ctx,
         int device_id, cudaStream_t stream);
 
+    template <uint8_t CB>
+    bool dispatchKparM2Generated(
+        const GeneratedDispatchTuning &tuning,
+        const int8_t *d_A_int8, const uint8_t *d_payload,
+        const uint16_t *d_scales, const uint16_t *d_mins,
+        const uint32_t *d_emins, float *d_C,
+        const float *d_scales_A, int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing, const float *d_bias,
+        CUDAGemvContext_ *gemv_ctx,
+        int cuda_device_id, cudaStream_t stream)
+    {
+        switch (tuning.tile_n * 100 + tuning.cpt)
+        {
+        case 32 * 100 + 1:
+            return launchKparM2Impl<32, 1, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 64 * 100 + 1:
+            return launchKparM2Impl<64, 1, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 64 * 100 + 2:
+            return launchKparM2Impl<64, 2, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 128 * 100 + 1:
+            return launchKparM2Impl<128, 1, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 128 * 100 + 2:
+            return launchKparM2Impl<128, 2, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 256 * 100 + 2:
+            return launchKparM2Impl<256, 2, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        default:
+            return false;
+        }
+    }
+
+    template <int M, uint8_t CB>
+    bool dispatchKparSmallMGenerated(
+        const GeneratedDispatchTuning &tuning,
+        const int8_t *d_A_int8, const uint8_t *d_payload,
+        const uint16_t *d_scales, const uint16_t *d_mins,
+        const uint32_t *d_emins, float *d_C,
+        const float *d_scales_A, int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing, const float *d_bias,
+        CUDAGemvContext_ *gemv_ctx,
+        int cuda_device_id, cudaStream_t stream)
+    {
+        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
+        switch (tuning.tile_n * 100 + tuning.cpt)
+        {
+        case 32 * 100 + 1:
+            return launchKparSmallMImpl<M, 32, 1, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 64 * 100 + 1:
+            return launchKparSmallMImpl<M, 64, 1, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 64 * 100 + 2:
+            return launchKparSmallMImpl<M, 64, 2, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 128 * 100 + 1:
+            return launchKparSmallMImpl<M, 128, 1, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 128 * 100 + 2:
+            return launchKparSmallMImpl<M, 128, 2, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 256 * 100 + 2:
+            return launchKparSmallMImpl<M, 256, 2, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        default:
+            return false;
+        }
+    }
+
     // =====================================================================
     // Per-codebook dispatcher — selects kernel family based on shape
     // When g_sweep.active, routes to sweepLaunchKpar / wide with overridden params.
@@ -2721,13 +2851,14 @@ namespace
         CUDARowMajorWeights_ **rm_slot,
         int cuda_device_id, cudaStream_t stream)
     {
-        const NativeGemvShape shape = classifyShapeGenerated<CB>(N, K);
+        const NativeGemvShape shape = classifyShapeGenerated<CB>(2, N, K);
+        const GeneratedDispatchTuning tuning = selectGeneratedTuning<CB>(2, N, K);
         if (shape == NativeGemvShape::WIDE)
             return false;
 
         if constexpr (CB != 19)
         {
-            if (isRowParEnabled() && rm_slot)
+            if (shape == NativeGemvShape::ROWPAR && isRowParEnabled() && rm_slot)
             {
                 if (!*rm_slot)
                 {
@@ -2738,23 +2869,26 @@ namespace
                 }
                 if (*rm_slot && (*rm_slot)->d_payload && (*rm_slot)->d_scales)
                 {
-                    const int k_blocks = K / BLOCK_K;
-                    const int nwarps = (k_blocks >= 256) ? 4 : 2;
                     return launchRowParM2<CB>(
                         d_A_int8, (*rm_slot)->d_payload, (*rm_slot)->d_scales,
                         (*rm_slot)->d_mins, (*rm_slot)->d_emins, d_C,
                         d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-                        nwarps, stream);
+                        tuning.tile_n, stream);
                 }
 
                 cudaGetLastError(); // Clear row-major allocation/launch errors before the KPAR route.
             }
         }
 
-        return launchKparM2<CB>(
-            d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-            d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-            gemv_ctx, cuda_device_id, stream);
+        if (shape == NativeGemvShape::KPAR)
+        {
+            return dispatchKparM2Generated<CB>(
+                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                gemv_ctx, cuda_device_id, stream);
+        }
+
+        return false;
     }
 
     template <int M, uint8_t CB>
@@ -2770,13 +2904,58 @@ namespace
         int cuda_device_id, cudaStream_t stream)
     {
         static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
-        const NativeGemvShape shape = classifyShapeGenerated<CB>(N, K);
+        NativeGemvShape shape = NativeGemvShape::KPAR;
+        GeneratedDispatchTuning tuning{};
+
+        if (g_sweep.active)
+        {
+            /**
+             * The generated-dispatch trainer drives this path for verifier
+             * buckets M=2..4.  Keep the sweep override local to backend
+             * tuning: production dispatch still comes from the generated
+             * classifier below, while the perf harness can time real KPAR
+             * small-M candidates instead of accidentally timing the current
+             * generated route and labelling it as every candidate.
+             */
+            switch (g_sweep.kernel_family)
+            {
+            case 0:
+                shape = NativeGemvShape::WIDE;
+                break;
+            case 1:
+                shape = NativeGemvShape::KPAR;
+                break;
+            case 2:
+                shape = NativeGemvShape::DIRECT;
+                break;
+            case 3:
+                shape = NativeGemvShape::ROWPAR;
+                break;
+            default:
+                return false;
+            }
+
+            tuning = GeneratedDispatchTuning{
+                g_sweep.tile_n,
+                g_sweep.cpt,
+                g_sweep.target_waves,
+                g_sweep.mkg,
+                g_sweep.max_kb,
+                g_sweep.force_two_phase,
+            };
+        }
+        else
+        {
+            shape = classifyShapeGenerated<CB>(M, N, K);
+            tuning = selectGeneratedTuning<CB>(M, N, K);
+        }
+
         if (shape == NativeGemvShape::WIDE)
             return false;
 
         if constexpr (CB != 19)
         {
-            if (isRowParEnabled() && rm_slot)
+            if (shape == NativeGemvShape::ROWPAR && isRowParEnabled() && rm_slot)
             {
                 if (!*rm_slot)
                 {
@@ -2787,23 +2966,26 @@ namespace
                 }
                 if (*rm_slot && (*rm_slot)->d_payload && (*rm_slot)->d_scales)
                 {
-                    const int k_blocks = K / BLOCK_K;
-                    const int nwarps = (k_blocks >= 256) ? 4 : 2;
                     return launchRowParSmallM<M, CB>(
                         d_A_int8, (*rm_slot)->d_payload, (*rm_slot)->d_scales,
                         (*rm_slot)->d_mins, (*rm_slot)->d_emins, d_C,
                         d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-                        nwarps, stream);
+                        tuning.tile_n, stream);
                 }
 
                 cudaGetLastError(); // Clear row-major allocation/launch errors before KPAR fallback.
             }
         }
 
-        return launchKparSmallM<M, CB>(
-            d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-            d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-            gemv_ctx, cuda_device_id, stream);
+        if (shape == NativeGemvShape::KPAR)
+        {
+            return dispatchKparSmallMGenerated<M, CB>(
+                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                gemv_ctx, cuda_device_id, stream);
+        }
+
+        return false;
     }
 
     template <int M>
@@ -3180,6 +3362,11 @@ extern "C"
     void cudaNativeVNNIGemvSweep_clearConfig()
     {
         g_sweep.active = false;
+    }
+
+    bool cudaNativeVNNIGemvSweep_isActive()
+    {
+        return g_sweep.active;
     }
 
     void cudaNativeVNNIGemvTuned_clearStaticState()

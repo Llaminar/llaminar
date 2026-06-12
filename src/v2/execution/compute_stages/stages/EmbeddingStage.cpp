@@ -190,6 +190,7 @@ namespace llaminar2
                          ? params_.local_vocab_size
                          : static_cast<int>(embed_table_base->rows());
         kernel->setVocabRange(params_.vocab_offset, local_vocab_size);
+        kernel->setAllowOutOfRangeTokenIds(allowsZeroOutput());
 
         // Handle batched vs single sequence input
         if (params_.token_batches)

@@ -155,6 +155,18 @@ namespace llaminar2
         EXPECT_TRUE(pool->isAllocated());
     }
 
+    TEST(Test__LoadOrchestrator, AllocateRejectsPinnedStagingWithoutStreams)
+    {
+        LoadOrchestrator orch;
+        orch.addDevice(0);
+        orch.planRawWeight(0, "raw_weight", 64, 64, 1024);
+
+        // A raw upload requires a pinned ring slot and an H2D stream. Without
+        // this guard, load() fails later with a misleading "pinned ring not
+        // allocated" error after the pool has already been allocated.
+        EXPECT_THROW(orch.allocate(1024, 0), std::runtime_error);
+    }
+
     TEST(Test__LoadOrchestrator, AllocateFailsBeforeBackendAllocationWhenVramBudgetExceeded)
     {
         BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,

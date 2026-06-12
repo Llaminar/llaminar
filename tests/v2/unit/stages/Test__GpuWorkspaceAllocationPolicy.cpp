@@ -541,6 +541,85 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
     EXPECT_NE(partial_body.find("waitForPendingShiftedMTPKVReady"), std::string::npos);
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIDispatchSweepUsesExplicitStream)
+{
+    const auto source =
+        readFile(repoRoot() / "tests/v2/performance/kernels/cuda/gemm/Perf__CUDABlockwiseTensorCoreGemmSweep.cpp");
+
+    EXPECT_NE(source.find("cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)"), std::string::npos)
+        << "The CUDA NativeVNNI dispatch trainer must create an explicit non-blocking stream.";
+    EXPECT_NE(source.find("kernel->setGPUStream(static_cast<void *>(stream))"), std::string::npos)
+        << "The CUDA NativeVNNI dispatch trainer must bind its GEMM kernel to the explicit stream.";
+    EXPECT_NE(source.find("kernel->setGPUStream(nullptr)"), std::string::npos)
+        << "The CUDA NativeVNNI dispatch trainer must unbind the stream before leaving the run.";
+    EXPECT_NE(source.find("cudaEventRecord(start, stream)"), std::string::npos)
+        << "Benchmark timing must record the start event on the same explicit stream as GEMV.";
+    EXPECT_NE(source.find("cudaEventRecord(stop, stream)"), std::string::npos)
+        << "Benchmark timing must record the stop event on the same explicit stream as GEMV.";
+    EXPECT_EQ(source.find("cudaEventRecord(start);"), std::string::npos)
+        << "A missing stream argument records on the default stream and invalidates capture-sensitive timing.";
+    EXPECT_EQ(source.find("cudaEventRecord(stop);"), std::string::npos)
+        << "A missing stream argument records on the default stream and invalidates capture-sensitive timing.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNISmallMDispatchSweepUsesRealCandidates)
+{
+    const auto tuned_source =
+        readFile(repoRoot() / "src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu");
+    const auto kernel_source =
+        readFile(repoRoot() / "src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp");
+    const auto sweep_source =
+        readFile(repoRoot() / "tests/v2/performance/kernels/cuda/gemm/Perf__CUDABlockwiseTensorCoreGemmSweep.cpp");
+
+    const auto small_m_body = sliceBetween(
+        tuned_source,
+        "bool dispatchCodebookSmallMRowPar(",
+        "template <int M>");
+
+    EXPECT_NE(small_m_body.find("if (g_sweep.active)"), std::string::npos)
+        << "CUDA M=2..4 NativeVNNI trainer rows must time the requested candidate, not the generated runtime route.";
+    EXPECT_NE(small_m_body.find("tuning = GeneratedDispatchTuning{"), std::string::npos)
+        << "The small-M sweep override must forward tile/family parameters into the real launch.";
+
+    EXPECT_NE(kernel_source.find("if (cudaNativeVNNIGemvSweep_isActive())"), std::string::npos)
+        << "Small-M training sweeps must fail closed instead of falling through to generic M>1 GEMM.";
+
+    EXPECT_NE(sweep_source.find("candidateSupportedByGpuPreparedSweepPath"), std::string::npos)
+        << "The CUDA NativeVNNI trainer must filter candidate families unsupported by the GPU-prepared harness.";
+    EXPECT_NE(sweep_source.find("if (m > 1)\n            return candidate.family == SweepFamily::KPar;"),
+              std::string::npos)
+        << "M=2..4 trainer cases must not label WIDE/DIRECT/ROWPAR rows as specialized small-M timings.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIDispatchSweepUsesFastDeterministicWeights)
+{
+    const auto source =
+        readFile(repoRoot() / "tests/v2/performance/kernels/cuda/gemm/Perf__CUDABlockwiseTensorCoreGemmSweep.cpp");
+    const auto format_table = sliceBetween(
+        source,
+        "const std::vector<FormatSpec> kFormats",
+        "const NativeVnniFormatInfo &requireNativeVnniInfo");
+
+    EXPECT_NE(source.find("createFastSweepTensor"), std::string::npos)
+        << "CUDA NativeVNNI dispatch sweeps should use deterministic packed payloads.";
+    EXPECT_EQ(format_table.find("TestTensorFactory::create"), std::string::npos)
+        << "Format weights in the dispatch trainer must not use random quantizers; "
+           "giant LM-head refreshes need O(weight_bytes) deterministic construction.";
+
+    const auto run_body = sliceBetween(
+        source,
+        "RunResult runTunedGemv(",
+        "DeviceId device_ = DeviceId::cpu();");
+    EXPECT_EQ(run_body.find("makeGpuPreparedGemm("), std::string::npos)
+        << "Candidate measurements must not rebuild/repack the GPU weight payload.";
+    EXPECT_NE(source.find("workspaceBudgetFor(reqs)"), std::string::npos)
+        << "The dispatch trainer workspace budget must come from declared kernel requirements.";
+    EXPECT_EQ(source.find("512ull * 1024ull * 1024ull"), std::string::npos)
+        << "A fixed 512 MiB trainer workspace cap breaks giant LM-head small-M sweeps.";
+    EXPECT_NE(source.find("Prepare/upload/repack once per format+shape"), std::string::npos)
+        << "The dispatch sweep should document why preparation sits outside the candidate loop.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPGpuSidecarsStageConditionTokensInArenaBuffer)
 {
     const auto source =
@@ -621,6 +700,77 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTargetDistributionBuildPreservesDefe
         << "Draft distribution builds still clear draft sample readiness because "
            "draft distribution slots and draft sampled-token slots share one "
            "step-local producer/consumer pair.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPStochasticVerifierDoesNotAllocateLegacyFullProbabilityRows)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto buffer_ids =
+        readFile(repoRoot() / "src/v2/memory/BufferId.h");
+    const auto build_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::buildStochasticDistributionOnDevice(",
+        "bool DeviceGraphOrchestrator::sampleStochasticDistributionOnDeviceImpl(");
+    const auto executable_build_body = stripCommentsAndStringLiterals(build_body);
+
+    /*
+     * The vLLM-style stochastic path keeps draft proposals as sampled tokens plus
+     * q(token), and verifies target rows through processed logits. Reintroducing
+     * full-vocab target/draft probability rows would allocate several extra
+     * vocab-sized buffers per GPU runner and revive the removed scalar verifier.
+     */
+    EXPECT_EQ(buffer_ids.find("STOCHASTIC_TARGET_FULL_PROBS"), std::string::npos);
+    EXPECT_EQ(buffer_ids.find("STOCHASTIC_DRAFT_FULL_PROBS"), std::string::npos);
+    EXPECT_EQ(header.find("stochastic_target_full_probs_dev_"), std::string::npos);
+    EXPECT_EQ(header.find("stochastic_draft_full_probs_dev_"), std::string::npos);
+    EXPECT_EQ(source.find("BufferId::STOCHASTIC_TARGET_FULL_PROBS"), std::string::npos);
+    EXPECT_EQ(source.find("BufferId::STOCHASTIC_DRAFT_FULL_PROBS"), std::string::npos);
+    EXPECT_EQ(executable_build_body.find("buildStochasticProbabilityRowsOnDevice"),
+              std::string::npos)
+        << "Compact stochastic distribution builds must not materialize full "
+           "softmax rows as a hidden side effect.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPStochasticBatchOutcomeCopiesOnlySemanticRowsByDefault)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(",
+        "    // =========================================================================\n"
+        "    // Batch Interface Implementation");
+    const auto compact = removeAsciiWhitespace(stripCommentsAndStringLiterals(body));
+
+    /*
+     * The compact stochastic outcome has exactly one required host-visible
+     * boundary: output tokens plus summary metadata. Per-row probabilities,
+     * thresholds, and draft-token details are debug aids only.  Keeping those
+     * copies behind capture_row_debug prevents each decode step from adding
+     * extra stream synchronizations on ROCm/CUDA production runs.
+     */
+    EXPECT_NE(compact.find("constboolcapture_row_debug="), std::string::npos);
+    const size_t debug_gate =
+        compact.find("if(copied_summary&&capture_row_debug){");
+    ASSERT_NE(debug_gate, std::string::npos)
+        << "Debug-only stochastic batch outcome copies must be gated.";
+
+    const std::vector<std::string> debug_copies = {
+        "deviceToHostFast(debug_accept_probs.data()",
+        "deviceToHostFast(debug_accept_thresholds.data()",
+        "deviceToHostFast(debug_draft_tokens.data()",
+        "deviceToHostFast(debug_draft_probs.data()",
+    };
+    for (const auto &needle : debug_copies)
+    {
+        const size_t copy = compact.find(needle);
+        ASSERT_NE(copy, std::string::npos) << needle;
+        EXPECT_GT(copy, debug_gate)
+            << needle << " must stay behind capture_row_debug.";
+    }
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecStatePublicationPreservesSidecarReplayState)
@@ -718,6 +868,90 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDAMoEExecutionScratchUsesWorkspace)
     EXPECT_NE(route_scratch.find("bindWorkspaceBuffer"), std::string::npos);
     EXPECT_NE(grouped_scratch.find("bindWorkspaceBuffer"), std::string::npos);
     EXPECT_NE(source.find("requires graph-owned MoE workspace"), std::string::npos);
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDAMoERuntimePointerArraysUseWorkspace)
+{
+    const auto source = readFile(repoRoot() / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp");
+    const auto runtime_pointer_arrays = sliceBetween(
+        source,
+        "bool CUDAMoEKernel::ensureRuntimeGateUpPointerArrays(",
+        "bool CUDAMoEKernel::routeCore(");
+
+    expectNoRawGpuAllocationCalls(
+        runtime_pointer_arrays,
+        "CUDAMoEKernel grouped decode runtime pointer arrays");
+    EXPECT_NE(runtime_pointer_arrays.find("CUDA_DECODE_GATEUP_GATE_PTRS"), std::string::npos);
+    EXPECT_NE(runtime_pointer_arrays.find("CUDA_DECODE_GATEUP_UP_PTRS"), std::string::npos);
+    EXPECT_NE(runtime_pointer_arrays.find("CUDA_DECODE_DOWN_GATE_PTRS"), std::string::npos);
+    EXPECT_NE(runtime_pointer_arrays.find("CUDA_DECODE_DOWN_UP_PTRS"), std::string::npos);
+    EXPECT_NE(runtime_pointer_arrays.find("grouped gate/up pointer cache miss during graph capture"),
+              std::string::npos);
+    EXPECT_NE(runtime_pointer_arrays.find("grouped down pointer cache miss during graph capture"),
+              std::string::npos);
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDAMoEWorkspaceRebindPreservesCaptureMetadata)
+{
+    const auto source = readFile(repoRoot() / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp");
+    const auto header = readFile(repoRoot() / "src/v2/kernels/cuda/moe/CUDAMoEKernel.h");
+    const auto bind_workspace = sliceBetween(
+        source,
+        "void CUDAMoEKernel::bindWorkspace(DeviceWorkspaceManager *workspace)",
+        "bool CUDAMoEKernel::bindWorkspaceBuffer(");
+
+    EXPECT_NE(header.find("uint64_t bound_workspace_id_"), std::string::npos)
+        << "The CUDA MoE singleton must remember durable workspace identity, "
+           "not just the manager host pointer.";
+    EXPECT_NE(bind_workspace.find("workspace->id()"), std::string::npos)
+        << "Same-pointer workspace reuse can be an ABA reallocation. "
+           "Use DeviceWorkspaceManager::id() to distinguish real same-manager "
+           "rebinds from new managers at the same host address.";
+    EXPECT_NE(bind_workspace.find("workspace_ == workspace"), std::string::npos)
+        << "Same-workspace rebinds happen as sibling MoE stages touch the singleton kernel. "
+           "They must not clear runtime pointer arrays populated by graph warmup.";
+    EXPECT_NE(bind_workspace.find("bound_workspace_id_ == next_workspace_id"), std::string::npos)
+        << "The same-workspace no-op must also compare the manager's durable id.";
+    EXPECT_NE(bind_workspace.find("bound_workspace_id_ = next_workspace_id"), std::string::npos)
+        << "CUDA MoE workspace binding must record the durable manager id.";
+    EXPECT_LT(bind_workspace.find("workspace_ == workspace"),
+              bind_workspace.find("clearWorkspaceScratchBindings()"))
+        << "The idempotent rebind guard must run before clearing graph-capture metadata.";
+    EXPECT_LT(bind_workspace.find("bound_workspace_id_ = next_workspace_id"),
+              bind_workspace.find("clearWorkspaceScratchBindings()"))
+        << "The durable id must be updated before clearing stale scratch bindings.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDAMoERouteScratchReuseRequiresWorkspaceBinding)
+{
+    const auto source = readFile(repoRoot() / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp");
+    const auto route_capacity = sliceBetween(
+        source,
+        "bool CUDAMoEKernel::ensureRouteBufferCapacity(",
+        "bool CUDAMoEKernel::ensureGroupingBufferCapacity(");
+    const auto executable_route_capacity =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(route_capacity));
+
+    EXPECT_NE(executable_route_capacity.find("if(route_buffers_workspace_bound_&&"),
+              std::string::npos)
+        << "CUDA MoE routing scratch is owned by the graph workspace. Capacity "
+           "alone must not make a cached route buffer reusable across singleton "
+           "kernel rebinds.";
+    EXPECT_NE(executable_route_capacity.find("d_route_logits_&&d_route_indices_&&d_route_weights_"),
+              std::string::npos)
+        << "Route-buffer reuse must also require non-null workspace pointers.";
+    EXPECT_LT(executable_route_capacity.find("if(route_buffers_workspace_bound_&&"),
+              executable_route_capacity.find("bindWorkspaceBuffer(&route_logits"))
+        << "The binding-aware reuse guard must be checked before rebinding route scratch.";
+
+    const auto bind_workspace_buffer = sliceBetween(
+        source,
+        "bool CUDAMoEKernel::bindWorkspaceBuffer(",
+        "void CUDAMoEKernel::clearWorkspaceScratchBindings()");
+    EXPECT_NE(bind_workspace_buffer.find("workspace_->device() != expected"), std::string::npos)
+        << "CUDA MoE scratch binding must reject workspaces for any other device.";
+    EXPECT_NE(bind_workspace_buffer.find("requireCudaDevicePointer(buffer"), std::string::npos)
+        << "Workspace scratch must be validated as a CUDA device pointer at bind time.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEExecutionScratchUsesWorkspace)

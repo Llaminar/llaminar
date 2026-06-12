@@ -179,8 +179,7 @@ namespace llaminar2
         ForwardReplayStateCacheClass cache_class)
     {
         if (mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary &&
-            cache_class != ForwardReplayStateCacheClass::OrdinaryDecode &&
-            cache_class != ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode)
+            cache_class != ForwardReplayStateCacheClass::OrdinaryDecode)
         {
             return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
         }
@@ -354,11 +353,12 @@ namespace llaminar2
         bool phase3_active = false;
 
         /// Live replay-state epoch that the current segmented capture is safe for.
-        /// Ordinary decode graphs are invalidated when speculative state
-        /// publication advances the live state to a newer epoch.  This includes
-        /// one-token condition/decode graphs: their token/position metadata is
-        /// dynamic, but captured kernels may still retain assumptions about the
-        /// live KV, recurrent, and short-conv state they read.
+        /// Multi-token ordinary decode graphs are invalidated when speculative
+        /// publication advances the live state to a newer epoch. Single-token
+        /// decode, including MTP condition decode, is version-safe: it updates
+        /// token/position metadata before every launch and reads stable live-state
+        /// buffer addresses, so accepted-state publication only requires stream
+        /// rebinding and a fresh epoch stamp.
         uint64_t segmented_capture_live_state_epoch = 0;
 
         bool requiresLiveStateEpochRecapture(bool ordinary_decode_context,
@@ -471,8 +471,10 @@ namespace llaminar2
          * @brief Stamp a preserved replay capture for the current live state.
          *
          * This is intentionally reserved for replay classes whose state-safety
-         * has been proven separately.  Ordinary decode caches should recapture
-         * across MTP publication instead of calling this helper.
+         * has been proven separately.  In particular, single-token condition
+         * decode and all-position verifier captures may be preserved across
+         * MTP accepted-state publication; multi-token ordinary decode remains
+         * conservative and recaptures.
          */
         void markReplayStateSafeForLiveEpoch(uint64_t live_state_epoch)
         {

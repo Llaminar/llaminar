@@ -266,6 +266,22 @@ namespace llaminar2
             ITensor *input, ITensor *gate_inp, ITensor *shared_output,
             int seq_len, int d_model);
 
+        /**
+         * @brief Gate shared expert output and add routed MoE output in one step.
+         *
+         * Computes, for each token row:
+         *   combined[t, j] = routed_residual[t, j]
+         *                    + sigmoid(dot(gate_inp, input[t])) * shared_output[t, j]
+         *
+         * The default CPU implementation is intentionally generic and preserves
+         * @p shared_output as read-only. GPU backends override this with a fused
+         * kernel so graph-captured MoE decode avoids a separate residual-add node.
+         */
+        virtual void sharedExpertGateAddFromTensors(
+            ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+            ITensor *routed_residual, ITensor *combined_output,
+            int seq_len, int d_model);
+
         /// Tensor-aware SwiGLU: gate = silu(gate) * up, on active device.
         virtual void swiGLUFromTensors(ITensor *gate, ITensor *up, int count);
 
@@ -806,6 +822,40 @@ namespace llaminar2
         virtual bool prepareSharedExpertPrefillGroup(int seq_len)
         {
             (void)seq_len;
+            return false;
+        }
+
+        /**
+         * @brief Prepare verifier grouping with the shared expert appended.
+         *
+         * The appended shared expert is exposed to the grouped-prefill pipeline
+         * as logical expert `num_experts` with one additional route slot per
+         * verifier row. Its route weight is the Qwen shared-expert gate:
+         *
+         *   sigmoid(dot(shared_gate_inp, hidden[row]))
+         *
+         * Descriptor tables passed to executeGroupedPrefillPipeline() must
+         * therefore contain `num_experts + 1` entries, with the final entry
+         * holding the shared expert's gate/up/down descriptors.
+         */
+        virtual bool prepareExpertGroupsWithSharedGateAsync(
+            ITensor *routing_indices,
+            ITensor *routing_weights,
+            ITensor *hidden,
+            ITensor *shared_gate_inp,
+            int seq_len,
+            int d_model,
+            int num_experts,
+            int top_k)
+        {
+            (void)routing_indices;
+            (void)routing_weights;
+            (void)hidden;
+            (void)shared_gate_inp;
+            (void)seq_len;
+            (void)d_model;
+            (void)num_experts;
+            (void)top_k;
             return false;
         }
 

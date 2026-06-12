@@ -744,6 +744,11 @@ __global__ void rocm_moe_softmax_topk_kernel(
     if (token >= seq_len) return;
 
     float *row = logits + token * num_experts;
+    __shared__ float values[kDeviceMoEMaxExperts];
+    __shared__ float reductions[256];
+    __shared__ int reduction_indices[256];
+    __shared__ int selected_indices[kDeviceMoEMaxTopK];
+    __shared__ float selected_weights[kDeviceMoEMaxTopK];
 
     // Step 1: Find max (thread-parallel)
     float local_max = -FLT_MAX;
@@ -804,59 +809,79 @@ __global__ void rocm_moe_softmax_topk_kernel(
     // Step 3: Normalize probabilities
     for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
     {
-        row[e] *= inv_sum;
+        const float prob = row[e] * inv_sum;
+        row[e] = prob;
+        values[e] = prob;
     }
     __syncthreads();
 
-    // Step 4: Top-k selection (single thread — k is small, typically 8)
-    // NOTE: We must NOT modify row[] here — it contains post-softmax probabilities
-    // that will be copied to result.router_logits by the host.
+    /**
+     * Select top-k with a block-wide argmax reduction.
+     *
+     * The old ROCm path did the whole top_k * num_experts scan on lane 0 after
+     * softmax. MTP verifier rows execute this kernel for every MoE layer, so
+     * leaving 255 lanes idle made routing dominate ROCm verifier time. This
+     * mirrors the CUDA contract: each round finds one winner in parallel, masks
+     * it from the shared-memory copy only, and leaves row[] intact for callers
+     * that inspect router probabilities. Ties intentionally choose the lowest
+     * expert id, matching the previous ascending serial scan.
+     */
+    float topk_sum = 0.0f;
+    for (int k = 0; k < top_k; ++k)
+    {
+        float best_value = -1.0f;
+        int best_idx = 0;
+        for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        {
+            const float value = values[e];
+            if (value > best_value)
+            {
+                best_value = value;
+                best_idx = e;
+            }
+        }
+        reductions[threadIdx.x] = best_value;
+        reduction_indices[threadIdx.x] = best_idx;
+        __syncthreads();
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if (threadIdx.x < stride)
+            {
+                const float other = reductions[threadIdx.x + stride];
+                const int other_idx = reduction_indices[threadIdx.x + stride];
+                const float current = reductions[threadIdx.x];
+                const int current_idx = reduction_indices[threadIdx.x];
+                if (other > current || (other == current && other_idx < current_idx))
+                {
+                    reductions[threadIdx.x] = other;
+                    reduction_indices[threadIdx.x] = other_idx;
+                }
+            }
+            __syncthreads();
+        }
+
+        const int winner = reduction_indices[0];
+        const float winner_value = reductions[0];
+        topk_sum += winner_value;
+        if (threadIdx.x == 0)
+        {
+            selected_indices[k] = winner;
+            selected_weights[k] = winner_value;
+            values[winner] = -1.0f;
+        }
+        __syncthreads();
+    }
+
     if (threadIdx.x == 0)
     {
         int *out_idx = expert_indices + token * top_k;
         float *out_wt = expert_weights + token * top_k;
-
-        // Initialize selected indices to -1 for the "already picked" check
-        for (int k = 0; k < top_k; ++k)
-            out_idx[k] = -1;
-
+        const float inv_topk_sum = (normalize_weights && topk_sum > 0.0f) ? 1.0f / topk_sum : 1.0f;
         for (int k = 0; k < top_k; ++k)
         {
-            float best_val = -1.0f;
-            int best_idx = 0;
-            for (int e = 0; e < num_experts; ++e)
-            {
-                if (row[e] > best_val)
-                {
-                    // Check not already selected
-                    bool already_picked = false;
-                    for (int j = 0; j < k; ++j)
-                    {
-                        if (out_idx[j] == e) { already_picked = true; break; }
-                    }
-                    if (!already_picked)
-                    {
-                        best_val = row[e];
-                        best_idx = e;
-                    }
-                }
-            }
-            out_idx[k] = best_idx;
-            out_wt[k] = best_val;
-        }
-
-        // Step 5: Optionally renormalize top-k weights
-        if (normalize_weights)
-        {
-            float topk_sum = 0.0f;
-            for (int k = 0; k < top_k; ++k)
-                topk_sum += out_wt[k];
-            if (topk_sum > 0.0f)
-            {
-                float inv = 1.0f / topk_sum;
-                for (int k = 0; k < top_k; ++k)
-                    out_wt[k] *= inv;
-            }
+            out_idx[k] = selected_indices[k];
+            out_wt[k] = selected_weights[k] * inv_topk_sum;
         }
     }
 }
@@ -1528,6 +1553,50 @@ __global__ void rocm_moe_shared_expert_gate_decode_fused_kernel(
     }
 }
 
+__global__ void rocm_moe_shared_expert_gate_add_kernel(
+    const float *__restrict__ input,            // [seq_len, d_model]
+    const float *__restrict__ gate_inp,         // [d_model]
+    const float *__restrict__ shared_output,    // [seq_len, d_model]
+    const float *__restrict__ routed_residual,  // [seq_len, d_model]
+    float *__restrict__ combined_output,        // [seq_len, d_model]
+    int seq_len, int d_model)
+{
+    const int token = blockIdx.x;
+    if (token >= seq_len) return;
+
+    const size_t row_offset = static_cast<size_t>(token) * d_model;
+    const float *x = input + row_offset;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        sum += x[i] * gate_inp[i];
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    __shared__ float warp_sums[16];
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        float block_sum = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            block_sum += __shfl_down(block_sum, offset);
+        if (lane == 0)
+            warp_sums[0] = 1.0f / (1.0f + expf(-block_sum));
+    }
+    __syncthreads();
+
+    const float gate = warp_sums[0];
+    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        combined_output[row_offset + i] =
+            routed_residual[row_offset + i] + gate * shared_output[row_offset + i];
+}
+
 // =========================================================================
 // Kernel 6: SwiGLU — silu(gate) * up
 //
@@ -1921,6 +1990,14 @@ bool hipMoE_softmax_topk(
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
+    if (!stream || !logits || !expert_indices || !expert_weights ||
+        seq_len <= 0 || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK || top_k > num_experts)
+    {
+        fprintf(stderr, "HIP MoE softmax_topk invalid arguments\n");
+        return false;
+    }
+
     // One block per token, 256 threads for parallel softmax
     const int threads = 256;
     hipLaunchKernelGGL(rocm_moe_softmax_topk_kernel,
@@ -2223,6 +2300,39 @@ bool hipMoE_shared_expert_gate_decode_fused(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE shared_expert_gate_decode_fused kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    return true;
+}
+
+bool hipMoE_shared_expert_gate_add(
+    const float *input, const float *gate_inp,
+    const float *shared_output, const float *routed_residual,
+    float *combined_output, int seq_len, int d_model,
+    int device_idx, void *stream)
+{
+    if (!input || !gate_inp || !shared_output || !routed_residual ||
+        !combined_output || seq_len <= 0 || d_model <= 0)
+    {
+        fprintf(stderr, "HIP MoE shared_expert_gate_add invalid args\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_shared_expert_gate_add_kernel,
+        dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        input, gate_inp, shared_output, routed_residual, combined_output,
+        seq_len, d_model);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE shared_expert_gate_add kernel launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }
@@ -2559,6 +2669,7 @@ __global__ void rocm_moe_group_tokens_small_float_kernel(
     int *__restrict__ expert_counts,
     int *__restrict__ expert_offsets,
     int *__restrict__ grouped_token_indices,
+    int *__restrict__ original_to_grouped,
     float *__restrict__ grouped_weights,
     int *__restrict__ active_expert_ids,
     int total_slots,
@@ -2581,6 +2692,7 @@ __global__ void rocm_moe_group_tokens_small_float_kernel(
 
     if (tid < total_slots)
     {
+        original_to_grouped[tid] = -1;
         const int expert_id = static_cast<int>(routing_indices[tid]);
         if (expert_id >= 0 && expert_id < num_experts)
             atomicAdd(&counts[expert_id], 1);
@@ -2618,6 +2730,7 @@ __global__ void rocm_moe_group_tokens_small_float_kernel(
             const int local = atomicAdd(&write_heads[expert_id], 1);
             const int dest = offsets[expert_id] + local;
             grouped_token_indices[dest] = tid / top_k;
+            original_to_grouped[tid] = dest;
             grouped_weights[dest] = routing_weights[tid];
         }
     }
@@ -2627,6 +2740,7 @@ __global__ void rocm_moe_prepare_shared_expert_group_kernel(
     int *__restrict__ expert_offsets,
     int *__restrict__ expert_counts,
     int *__restrict__ grouped_token_indices,
+    int *__restrict__ original_to_grouped,
     float *__restrict__ grouped_weights,
     int *__restrict__ active_expert_ids,
     int seq_len)
@@ -2641,7 +2755,144 @@ __global__ void rocm_moe_prepare_shared_expert_group_kernel(
     if (idx < seq_len)
     {
         grouped_token_indices[idx] = idx;
+        original_to_grouped[idx] = idx;
         grouped_weights[idx] = 1.0f;
+    }
+}
+
+/**
+ * @brief Build combined routed+shared verifier grouping metadata.
+ *
+ * The shared expert is appended as logical expert `num_routed_experts`.
+ * Its route weight is the Qwen shared-expert sigmoid gate.  The grouped
+ * prefill pipeline then scatters routed and gated shared outputs in one pass.
+ */
+__global__ void rocm_moe_group_tokens_with_shared_gate_kernel(
+    const float *__restrict__ routing_indices,
+    const float *__restrict__ routing_weights,
+    const float *__restrict__ hidden,
+    const float *__restrict__ shared_gate_inp,
+    int *__restrict__ expert_counts,
+    int *__restrict__ expert_offsets,
+    int *__restrict__ grouped_token_indices,
+    int *__restrict__ original_to_grouped,
+    int *__restrict__ single_expert_ids,
+    int *__restrict__ active_expert_ids,
+    float *__restrict__ grouped_weights,
+    int seq_len,
+    int d_model,
+    int num_routed_experts,
+    int routed_top_k,
+    int max_active_experts)
+{
+    const int tid = threadIdx.x;
+    const int shared_expert = num_routed_experts;
+    const int combined_experts = num_routed_experts + 1;
+    const int routed_slots = seq_len * routed_top_k;
+    const int combined_top_k = routed_top_k + 1;
+    const int combined_slots = seq_len * combined_top_k;
+
+    __shared__ int counts[kDeviceMoEMaxExperts + 1];
+    __shared__ int offsets[kDeviceMoEMaxExperts + 1];
+    __shared__ float partial[256];
+
+    for (int expert = tid; expert < combined_experts; expert += blockDim.x)
+    {
+        counts[expert] = 0;
+        offsets[expert] = 0;
+    }
+    if (tid < max_active_experts)
+        active_expert_ids[tid] = -1;
+    if (tid == 0)
+        single_expert_ids[0] = shared_expert;
+    for (int slot = tid; slot < combined_slots; slot += blockDim.x)
+        original_to_grouped[slot] = -1;
+    __syncthreads();
+
+    if (tid < routed_slots)
+    {
+        const int expert = static_cast<int>(routing_indices[tid]);
+        if (expert >= 0 && expert < num_routed_experts)
+            atomicAdd(&counts[expert], 1);
+    }
+    if (tid == 0)
+        counts[shared_expert] = seq_len;
+    __syncthreads();
+
+    if (tid == 0)
+    {
+        int running = 0;
+        int active_count = 0;
+        for (int expert = 0; expert < combined_experts; ++expert)
+        {
+            offsets[expert] = running;
+            const int count = counts[expert];
+            if (count > 0 && active_count < max_active_experts)
+                active_expert_ids[active_count++] = expert;
+            running += count;
+        }
+    }
+    __syncthreads();
+
+    /*
+     * Qwen3.6 MoE has 256 routed experts plus one logical shared expert.
+     * A 256-thread block therefore cannot use a single `tid < combined_experts`
+     * copy without dropping expert 256.  Use the same strided form as the
+     * initialization so the shared expert count/offset is always published.
+     */
+    for (int expert = tid; expert < combined_experts; expert += blockDim.x)
+    {
+        expert_counts[expert] = counts[expert];
+        expert_offsets[expert] = offsets[expert];
+    }
+
+    if (tid < routed_slots)
+    {
+        const int expert = static_cast<int>(routing_indices[tid]);
+        if (expert >= 0 && expert < num_routed_experts)
+        {
+            int local = 0;
+            for (int prev = 0; prev < tid; ++prev)
+            {
+                if (static_cast<int>(routing_indices[prev]) == expert)
+                    ++local;
+            }
+            const int row = tid / routed_top_k;
+            const int route = tid - row * routed_top_k;
+            const int grouped = offsets[expert] + local;
+            const int original_slot = row * combined_top_k + route;
+            grouped_token_indices[grouped] = row;
+            original_to_grouped[original_slot] = grouped;
+            grouped_weights[grouped] = routing_weights[tid];
+        }
+    }
+    __syncthreads();
+
+    for (int row = 0; row < seq_len; ++row)
+    {
+        float dot = 0.0f;
+        const float *x = hidden + static_cast<size_t>(row) * d_model;
+        for (int col = tid; col < d_model; col += blockDim.x)
+            dot += x[col] * shared_gate_inp[col];
+
+        partial[tid] = dot;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride)
+                partial[tid] += partial[tid + stride];
+            __syncthreads();
+        }
+
+        if (tid == 0)
+        {
+            const int grouped = offsets[shared_expert] + row;
+            const int original_slot = row * combined_top_k + routed_top_k;
+            grouped_token_indices[grouped] = row;
+            original_to_grouped[original_slot] = grouped;
+            grouped_weights[grouped] = 1.0f / (1.0f + expf(-partial[0]));
+        }
+        __syncthreads();
     }
 }
 
@@ -2899,7 +3150,8 @@ bool hipMoE_scatter_tokens(
 bool hipMoE_group_tokens_small_float(
     const float *routing_indices, const float *routing_weights,
     int *expert_counts, int *expert_offsets,
-    int *grouped_token_indices, float *grouped_weights,
+    int *grouped_token_indices, int *original_to_grouped,
+    float *grouped_weights,
     int *active_expert_ids,
     int total_slots, int num_experts, int top_k,
     int max_active_experts,
@@ -2910,7 +3162,8 @@ bool hipMoE_group_tokens_small_float(
 
     if (!stream ||
         !routing_indices || !routing_weights || !expert_counts || !expert_offsets ||
-        !grouped_token_indices || !grouped_weights || !active_expert_ids ||
+        !grouped_token_indices || !original_to_grouped ||
+        !grouped_weights || !active_expert_ids ||
         total_slots <= 0 || total_slots > 64 ||
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
         top_k <= 0 || top_k > kDeviceMoEMaxTopK ||
@@ -2925,7 +3178,7 @@ bool hipMoE_group_tokens_small_float(
         dim3(1), dim3(256), 0, static_cast<hipStream_t>(stream),
         routing_indices, routing_weights,
         expert_counts, expert_offsets,
-        grouped_token_indices, grouped_weights,
+        grouped_token_indices, original_to_grouped, grouped_weights,
         active_expert_ids,
         total_slots, num_experts, top_k,
         max_active_experts);
@@ -2939,10 +3192,67 @@ bool hipMoE_group_tokens_small_float(
     return true;
 }
 
+bool hipMoE_group_tokens_small_float_with_shared_gate(
+    const float *routing_indices,
+    const float *routing_weights,
+    const float *hidden,
+    const float *shared_gate_inp,
+    int *expert_counts,
+    int *expert_offsets,
+    int *grouped_token_indices,
+    int *original_to_grouped,
+    int *single_expert_ids,
+    int *active_expert_ids,
+    float *grouped_weights,
+    int seq_len,
+    int d_model,
+    int num_routed_experts,
+    int routed_top_k,
+    int max_active_experts,
+    int device_idx,
+    void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const int combined_experts = num_routed_experts + 1;
+    const int combined_slots = seq_len * (routed_top_k + 1);
+    if (!stream || !routing_indices || !routing_weights || !hidden ||
+        !shared_gate_inp || !expert_counts || !expert_offsets ||
+        !grouped_token_indices || !original_to_grouped || !single_expert_ids ||
+        !active_expert_ids || !grouped_weights ||
+        seq_len <= 0 || seq_len > 4 || d_model <= 0 ||
+        num_routed_experts <= 0 || num_routed_experts > kDeviceMoEMaxExperts ||
+        routed_top_k <= 0 || routed_top_k > kDeviceMoEMaxTopK ||
+        max_active_experts <= 0 || max_active_experts > combined_slots ||
+        max_active_experts > combined_experts)
+    {
+        fprintf(stderr, "HIP MoE combined shared grouping invalid arguments\n");
+        return false;
+    }
+
+    hipLaunchKernelGGL(rocm_moe_group_tokens_with_shared_gate_kernel,
+        dim3(1), dim3(256), 0, static_cast<hipStream_t>(stream),
+        routing_indices, routing_weights, hidden, shared_gate_inp,
+        expert_counts, expert_offsets, grouped_token_indices, original_to_grouped,
+        single_expert_ids, active_expert_ids, grouped_weights,
+        seq_len, d_model, num_routed_experts, routed_top_k, max_active_experts);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE combined shared grouping kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 bool hipMoE_prepare_shared_expert_group(
     int *expert_offsets,
     int *expert_counts,
     int *grouped_token_indices,
+    int *original_to_grouped,
     float *grouped_weights,
     int *active_expert_ids,
     int seq_len,
@@ -2953,7 +3263,8 @@ bool hipMoE_prepare_shared_expert_group(
     (void)hipGetLastError();
 
     if (!stream || !expert_offsets || !expert_counts ||
-        !grouped_token_indices || !grouped_weights || !active_expert_ids ||
+        !grouped_token_indices || !original_to_grouped ||
+        !grouped_weights || !active_expert_ids ||
         seq_len <= 0)
     {
         fprintf(stderr, "HIP MoE shared expert grouping invalid arguments\n");
@@ -2965,7 +3276,7 @@ bool hipMoE_prepare_shared_expert_group(
     hipLaunchKernelGGL(rocm_moe_prepare_shared_expert_group_kernel,
         dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
         expert_offsets, expert_counts,
-        grouped_token_indices, grouped_weights,
+        grouped_token_indices, original_to_grouped, grouped_weights,
         active_expert_ids, seq_len);
 
     hipError_t err = hipGetLastError();

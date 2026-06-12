@@ -141,6 +141,19 @@ namespace llaminar2
 
         for (auto &ctx : devices_)
         {
+            /**
+             * A non-zero pinned slot means the later H2D pipeline will need at
+             * least one upload stream and a pinned-ring slot. Silently allowing
+             * zero streams here creates a half-allocated orchestrator: the pool
+             * exists, but load() cannot stage any raw bytes. Fail at allocation
+             * time so tests and callers see the real contract violation.
+             */
+            if (pinned_slot_size > 0 && num_h2d_streams <= 0)
+            {
+                throw std::runtime_error("LoadOrchestrator: pinned staging requested with no H2D streams for device " +
+                                         std::to_string(ctx.device_id));
+            }
+
             const int staging_slots = std::max(0, num_h2d_streams);
             const size_t planned_weight_bytes = ctx.pool ? ctx.pool->totalPlannedBytes() : 0;
             const size_t staging_bytes = pinned_slot_size * static_cast<size_t>(staging_slots);
@@ -271,7 +284,9 @@ namespace llaminar2
             if (!ctx.pinned_ring || !ctx.pinned_ring->isAllocated())
             {
                 throw std::runtime_error("LoadOrchestrator::load: pinned ring not allocated for device " +
-                                         std::to_string(ctx.device_id));
+                                         std::to_string(ctx.device_id) +
+                                         " pending_jobs=" + std::to_string(ctx.pending_jobs.size()) +
+                                         " pool_allocated=" + std::string((ctx.pool && ctx.pool->isAllocated()) ? "true" : "false"));
             }
 
             const int num_streams = ctx.pinned_ring->numSlots();

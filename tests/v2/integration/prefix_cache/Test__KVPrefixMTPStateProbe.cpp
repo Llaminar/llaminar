@@ -888,8 +888,12 @@ namespace
             << "decode-equivalent verifier fallback";
         if (backend_name == "ROCm" || backend_name == "CUDA")
         {
-            EXPECT_GE(counter("stochastic_topk_smallk_scratch_distribution_builds"), 2.0)
-                << backend_name << " stochastic MTP must use the arena-declared small-k top-k scratch path";
+            EXPECT_GE(counter("stochastic_draft_greedy_proposals"), 1.0)
+                << backend_name << " vLLM-style stochastic MTP must draft with "
+                << "device argmax/one-hot q rather than building full draft probabilities";
+            EXPECT_GE(counter("stochastic_topk_smallk_scratch_distribution_builds"), 1.0)
+                << backend_name << " stochastic MTP target sampling must use the "
+                << "arena-declared small-k top-k scratch path";
             if (!use_presence_penalty)
             {
                 EXPECT_GE(counter("first_token_stochastic_deferred_host_reads"), 1.0)

@@ -470,16 +470,60 @@ namespace llaminar2
         return std::nullopt;
     }
 
+    /**
+     * @brief Coarse execution backend used by the generated MTP depth policy.
+     *
+     * The online controller intentionally avoids clocks and backend-specific
+     * performance probes.  The offline trainer can still learn that CUDA,
+     * ROCm, and CPU prefer different speculative depths by keying generated
+     * rules on this small backend class.
+     */
+    enum class MTPDepthPolicyBackend
+    {
+        Any,
+        CPU,
+        CUDA,
+        ROCm,
+    };
+
+    /**
+     * @brief Coarse model family used by the generated MTP depth policy.
+     *
+     * Dynamic-depth economics differ between dense and MoE graphs even when
+     * token acceptance looks similar: MoE verifier cost, routed expert work,
+     * and condition-forward replay can make a depth profitable or unprofitable
+     * at different acceptance rates.  Keep this intentionally small so the
+     * runtime remains deterministic and the offline trainer can learn separate
+     * tables without depending on model-specific strings.
+     */
+    enum class MTPDepthPolicyModelClass
+    {
+        Any,
+        Dense,
+        MoE,
+    };
+
     struct MTPDepthPolicyConfig
     {
         MTPDepthPolicyMode mode = MTPDepthPolicyMode::Fixed;
+        MTPDepthPolicyBackend backend = MTPDepthPolicyBackend::Any;
+        MTPDepthPolicyModelClass model_class = MTPDepthPolicyModelClass::Any;
         int min_depth = 1;
         int max_depth = 0;     ///< 0 derives from MTPRuntimeConfig::draft_tokens.
-        int initial_depth = 0; ///< 0 derives from min_depth in Dynamic mode, otherwise max_depth.
+        int initial_depth = 0; ///< 0 derives from a policy-specific default.
         int window_size = 16;
         int min_samples = 4;
         int cooldown_steps = 8;
         int promote_consecutive_windows = 3;
+        /**
+         * @brief Use the offline-trained depth policy table for dynamic mode.
+         *
+         * The generated table is deterministic C++ produced by the benchmark
+         * training pipeline. It can make earlier promote/demote decisions from
+         * the same rolling-window counters as the handwritten fallback policy.
+         * Fixed mode ignores this flag.
+         */
+        bool use_generated_policy = true;
         double promote_full_accept_rate = 1.0;
         double demote_zero_accept_rate = 0.30;
         /**
@@ -494,6 +538,36 @@ namespace llaminar2
          */
         double demote_acceptance_rate = 0.55;
     };
+
+    /**
+     * @brief Resolve the effective initial MTP draft depth.
+     *
+     * Fixed mode pins to the configured fixed depth.  Greedy dynamic/observe
+     * starts at depth 2 when available because recent dense lanes show that as
+     * a cheap warm start below the risky deepest lane.  Stochastic
+     * dynamic/observe starts at depth 1: rejection sampling cannot legally
+     * produce ready logits after residual corrections, so a bad first window
+     * at depth 2 has an outsized condition-forward tax.  An explicit
+     * depth-zero bypass range still starts at zero so operators can force a
+     * conservative adaptive warmup.
+     */
+    inline int resolveMTPDepthPolicyInitialDepth(
+        const MTPDepthPolicyConfig &config,
+        int configured_draft_tokens,
+        MTPVerifyMode verify_mode = MTPVerifyMode::Greedy)
+    {
+        const int effective_max_depth =
+            config.max_depth > 0 ? config.max_depth : configured_draft_tokens;
+        if (config.initial_depth > 0)
+            return config.initial_depth;
+        if (config.mode == MTPDepthPolicyMode::Fixed)
+            return configured_draft_tokens;
+        if (config.min_depth == 0)
+            return 0;
+        if (verify_mode == MTPVerifyMode::SpeculativeSampling)
+            return config.min_depth;
+        return std::clamp(2, config.min_depth, effective_max_depth);
+    }
 
     struct MTPRuntimeConfig
     {

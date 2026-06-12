@@ -368,6 +368,12 @@ namespace llaminar2::test
         EXPECT_NE(scatter_body.find("output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE"),
                   std::string::npos);
 
+        const std::string gate_add_body = functionBody(
+            "void ROCmMoEKernel::sharedExpertGateAddFromTensors",
+            "void ROCmMoEKernel::swiGLUFromTensors");
+        EXPECT_NE(gate_add_body.find("markDeviceWritten(combined_output"),
+                  std::string::npos);
+
         const std::string weighted_add_body = functionBody(
             "void ROCmMoEKernel::weightedAddFromTensors",
             "int ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable");
@@ -407,7 +413,8 @@ namespace llaminar2::test
             {"void ROCmMoEKernel::zeroBuffer", "void ROCmMoEKernel::gatherTokenBatchFromTensors"},
             {"void ROCmMoEKernel::gatherTokenBatchFromTensors", "void ROCmMoEKernel::scatterAddWeightedFromTensors"},
             {"void ROCmMoEKernel::scatterAddWeightedFromTensors", "void ROCmMoEKernel::sharedExpertGateFromTensors"},
-            {"void ROCmMoEKernel::sharedExpertGateFromTensors", "void ROCmMoEKernel::swiGLUFromTensors"},
+            {"void ROCmMoEKernel::sharedExpertGateFromTensors", "void ROCmMoEKernel::sharedExpertGateAddFromTensors"},
+            {"void ROCmMoEKernel::sharedExpertGateAddFromTensors", "void ROCmMoEKernel::swiGLUFromTensors"},
             {"void ROCmMoEKernel::swiGLUFromTensors", "void ROCmMoEKernel::weightedAddFromTensors"},
             {"void ROCmMoEKernel::weightedAddFromTensors", "int ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable"},
             {"bool ROCmMoEKernel::groupPrefillRoutes", "bool ROCmMoEKernel::gatherPrefillExpertBatchFromRuntime"},
@@ -603,7 +610,7 @@ namespace llaminar2::test
         const std::string forward_body = dgo_contents.substr(forward_start, forward_end - forward_start);
 
         const size_t forward_mtp = forward_body.find("populateMTPShiftedCacheFromPrefill(tokens, seq_len, batch_size");
-        const size_t forward_terminal = forward_body.find("refreshMTPTerminalHiddenState(seq_len, batch_size)");
+        const size_t forward_terminal = forward_body.find("noteMainForwardHiddenProducedForMTP(seq_len, batch_size)");
         const size_t forward_release = forward_body.find("releaseHostResidentWeightData();");
         ASSERT_NE(forward_mtp, std::string::npos);
         ASSERT_NE(forward_terminal, std::string::npos);
@@ -619,7 +626,7 @@ namespace llaminar2::test
         const std::string chunk_body = dgo_contents.substr(chunk_start, chunk_end - chunk_start);
 
         const size_t chunk_mtp = chunk_body.find("populateMTPShiftedCacheFromPrefill(tokens, seq_len, 1");
-        const size_t chunk_terminal = chunk_body.find("refreshMTPTerminalHiddenState(terminal_seq_len, 1)");
+        const size_t chunk_terminal = chunk_body.find("noteMainForwardHiddenProducedForMTP(terminal_seq_len, 1)");
         const size_t chunk_release = chunk_body.find("releaseHostResidentWeightData();");
         ASSERT_NE(chunk_mtp, std::string::npos);
         ASSERT_NE(chunk_terminal, std::string::npos);

@@ -356,18 +356,44 @@ TEST_F(Test__DeviceGraphOrchestrator, NullGraphBuilderThrows)
         std::invalid_argument);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsDenseInitializedOnly)
+TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedAndTopologyBounded)
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.mtp.enabled = true;
+    moe_config.moe.expert_mode = MoEExpertMode::ExpertParallel;
+    moe_config.moe.local_expert_start = 0;
+    moe_config.moe.local_expert_count = -1;
     DeviceGraphOrchestrator moe_orchestrator(
         std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
         nullptr);
     ASSERT_TRUE(moe_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     EXPECT_FALSE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
-        << "MoE sidecar preservation stays disabled until routed/shared expert "
-           "scratch and sparse collective state have a dedicated equivalence proof.";
+        << "CPU MoE keeps the conservative restore path; the skip exists to let "
+           "GPU verifier graphs mature to replay.";
+
+    DeviceId gpu_device = DeviceId::invalid();
+    if (DeviceManager::instance().cuda_device_count() > 0)
+    {
+        gpu_device = DeviceId::cuda(0);
+    }
+    else if (DeviceManager::instance().rocm_device_count() > 0)
+    {
+        gpu_device = DeviceId::rocm(0);
+    }
+    if (gpu_device.is_valid())
+    {
+        auto gpu_moe_config = moe_config;
+        gpu_moe_config.default_device = gpu_device;
+        DeviceGraphOrchestrator gpu_moe_orchestrator(
+            std::make_shared<Qwen35MoEGraph>(gpu_moe_config, nullptr),
+            nullptr);
+        ASSERT_TRUE(gpu_moe_orchestrator.initializeInferenceStateFromArena(1, 16, gpu_device));
+        EXPECT_TRUE(gpu_moe_orchestrator.supportsMTPSidecarPreservesMainState())
+            << "SingleDevice GPU MoE with full expert ownership has real-model "
+               "CUDA/ROCm verifier-row preservation coverage and can skip the "
+               "verifier-base restore.";
+    }
 
     auto dense_config = config_;
     dense_config.mtp.enabled = true;

@@ -109,6 +109,11 @@ namespace llaminar2
             ITensor *input, ITensor *gate_inp, ITensor *shared_output,
             int seq_len, int d_model) override;
 
+        void sharedExpertGateAddFromTensors(
+            ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+            ITensor *routed_residual, ITensor *combined_output,
+            int seq_len, int d_model) override;
+
         void swiGLUFromTensors(ITensor *gate, ITensor *up, int count) override;
 
         void weightedAddFromTensors(
@@ -149,6 +154,17 @@ namespace llaminar2
 
         /// @brief Prepare grouped prefill metadata for the always-active shared expert.
         bool prepareSharedExpertPrefillGroup(int seq_len) override;
+
+        /// @brief Prepare verifier grouping with shared expert appended as logical expert num_experts.
+        bool prepareExpertGroupsWithSharedGateAsync(
+            ITensor *routing_indices,
+            ITensor *routing_weights,
+            ITensor *hidden,
+            ITensor *shared_gate_inp,
+            int seq_len,
+            int d_model,
+            int num_experts,
+            int top_k) override;
 
         /// @brief Execute fixed-topology grouped MoE prefill without host synchronization.
         bool executeGroupedPrefillPipeline(
@@ -244,6 +260,7 @@ namespace llaminar2
 
     private:
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
+        static constexpr std::size_t kRuntimePointerArrayWorkspaceEntries = 1024;
 
         struct DeviceRouteBuffers
         {
@@ -311,6 +328,7 @@ namespace llaminar2
             int d_model = 0;
             int intermediate = 0;
             uint8_t codebook_id = 0;
+            uint32_t codebook_mask = 0;
             bool valid = false;
         };
 
@@ -324,6 +342,7 @@ namespace llaminar2
             int d_model = 0;
             int intermediate = 0;
             uint8_t codebook_id = 0;
+            uint32_t codebook_mask = 0;
             bool valid = false;
         };
 
@@ -331,6 +350,7 @@ namespace llaminar2
         {
             int table_id = -1;
             int top_k = 0;
+            int workspace_slot = -1;
             std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> gate_ptr_values = {};
             std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> up_ptr_values = {};
             float **d_gate_ptrs = nullptr;
@@ -341,6 +361,7 @@ namespace llaminar2
         {
             int table_id = -1;
             int top_k = 0;
+            int workspace_slot = -1;
             std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> gate_ptr_values = {};
             std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> up_ptr_values = {};
             const float **d_gate_ptrs = nullptr;
@@ -360,6 +381,7 @@ namespace llaminar2
         size_t route_logits_capacity_ = 0;
         size_t route_topk_capacity_ = 0;
         bool route_buffers_workspace_bound_ = false;
+        uint64_t bound_workspace_id_ = 0;
 
         int *d_group_int_indices_ = nullptr;
         int *d_group_offsets_ = nullptr;
@@ -371,6 +393,7 @@ namespace llaminar2
         float *d_group_weights_ = nullptr;
         int *d_group_active_expert_ids_ = nullptr;
         int group_active_expert_slots_ = 0;
+        bool group_has_appended_single_expert_ = false;
         int group_slots_cap_ = 0;
         int group_experts_cap_ = 0;
 

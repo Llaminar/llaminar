@@ -136,6 +136,24 @@ namespace llaminar2
             bool force_grouped_verifier_prefill_for_decode = false;
             bool force_decode_equivalent_verifier_prefill = false;
 
+            /**
+             * @brief Append the shared expert to the routed verifier pipeline.
+             *
+             * This CUDA-only verifier fast path represents the shared expert as
+             * logical expert `num_experts` with one extra route per row.  The
+             * grouped pipeline writes the final MoE FFN output directly, so the
+             * graph must not add separate shared-expert FFN/gate/combine stages
+             * for the same layer.
+             */
+            bool combine_shared_expert_in_verifier = false;
+            TensorBase *shared_gate_w = nullptr;
+            TensorBase *shared_up_w = nullptr;
+            TensorBase *shared_down_w = nullptr;
+            TensorBase *shared_gate_inp = nullptr;
+            std::optional<PreparedWeightRef> prepared_shared_ref_gate;
+            std::optional<PreparedWeightRef> prepared_shared_ref_up;
+            std::optional<PreparedWeightRef> prepared_shared_ref_down;
+
             // Output
             TensorBase *output = nullptr; ///< Combined output [seq_len, d_model]
 
@@ -324,12 +342,15 @@ namespace llaminar2
         bool ensureGemmEnginesForExperts(const std::vector<int> &expert_ids);
         bool ensureGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         bool ensureGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
+        bool ensureCombinedSharedGroupedDescriptorTables(IMoEKernel *kernel, int d_model, int intermediate);
         bool initializeMoERuntimeTableForGroupedDecode();
         bool initializeMoERuntimeTableForGroupedPrefill();
         bool initializeFixedTopologyGroupedPrefill();
         bool runtimeTableHasActiveGroupedDecodeBank() const;
         bool canUseRuntimePrefillGrouping() const;
         bool canUseFixedTopologyGroupedPrefill() const;
+        bool canUseCombinedSharedVerifierPrefill() const;
+        bool executeCombinedSharedVerifierPrefill(IMoEKernel *kernel) const;
         bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
         bool supportsFixedTopologyPrefillGraphCapturePreflight() const;
@@ -352,6 +373,12 @@ namespace llaminar2
         mutable int grouped_down_desc_table_num_experts_ = 0;
         mutable int grouped_down_desc_table_d_model_ = 0;
         mutable int grouped_down_desc_table_intermediate_ = 0;
+
+        mutable int combined_shared_gateup_desc_table_id_ = -1;
+        mutable int combined_shared_down_desc_table_id_ = -1;
+        mutable int combined_shared_desc_table_num_experts_ = 0;
+        mutable int combined_shared_desc_table_d_model_ = 0;
+        mutable int combined_shared_desc_table_intermediate_ = 0;
 
         DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
         bool moe_runtime_table_initialized_ = false;
@@ -411,6 +438,7 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
         bool usesGroupedVerifierPrefillRouteForTesting() const;
         bool usesCPUDecodeEquivalentVerifierPrefillForTesting() const;
+        bool usesGroupedDecodeForTesting() const;
 
         // =====================================================================
         // IWorkspaceConsumer Implementation
@@ -446,12 +474,23 @@ namespace llaminar2
         mutable std::shared_ptr<FP32Tensor> scratch_input_row_;
         mutable std::shared_ptr<FP32Tensor> scratch_output_row_;
         mutable int scratch_seq_len_ = 0;
+        /**
+         * @brief True once normal single-token grouped decode has populated
+         * graph-owned runtime pointer arrays for the currently bound workspace.
+         *
+         * The CUDA grouped decode kernels read device-side arrays of scratch
+         * tensor pointers during graph replay.  Those arrays are produced by a
+         * warmup execution outside capture; capture is only safe after that
+         * exact route has succeeded with the current scratch/workspace owner.
+         */
+        mutable bool grouped_decode_warmed_ = false;
 
         void ensureGemmEnginesCached() const;
         bool ensureSharedGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool ensureSharedGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool shouldUseGroupedVerifierPrefillRoute() const;
         bool shouldUseCPUDecodeEquivalentVerifierPrefill() const;
+        bool shouldUseGroupedDecodeRoute() const;
         bool tryGroupedVerifierPrefill(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool tryGroupedDecode(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool executeCPUDecodeEquivalentVerifierPrefill(IMoEKernel *kernel, int d_model, int intermediate);
@@ -472,15 +511,21 @@ namespace llaminar2
         // Test accessors
         void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
         void setScratchSeqLenForTesting(int n) { scratch_seq_len_ = n; }
+        void setGroupedDecodeWarmedForTesting(bool warmed) { grouped_decode_warmed_ = warmed; }
     };
 
     /**
      * @brief Shared expert sigmoid gate stage
      *
-     * Computes: output = sigmoid(gate_inp · input) ⊙ shared_expert_output
+     * Computes one of two equivalent shared-expert epilogues:
+     * - In-place gate: shared_output *= sigmoid(gate_inp · input)
+     * - Fused combine: combined_output = routed_residual + shared_output * sigmoid(...)
+     *
+     * The fused-combine form is used by single-device MoE graphs to avoid a
+     * separate ResidualAddStage between the shared expert and routed expert paths.
      * - gate_inp: [d_model] vector
      * - input: [seq_len, d_model]
-     * - shared_expert_output: [seq_len, d_model] (modified in-place)
+     * - shared_expert_output: [seq_len, d_model]
      */
     class SharedExpertGateStage : public IComputeStage
     {
@@ -491,12 +536,21 @@ namespace llaminar2
 
             TensorBase *input = nullptr;         ///< Normalized hidden [seq_len, d_model]
             TensorBase *gate_inp = nullptr;      ///< Gate vector [d_model]
-            TensorBase *shared_output = nullptr; ///< Shared expert output (in-place) [seq_len, d_model]
+            TensorBase *shared_output = nullptr; ///< Shared expert output [seq_len, d_model]
+
+            /// Optional routed MoE output to add after shared-expert gating.
+            /// When both routed_residual and combined_output are set, the stage
+            /// treats shared_output as read-only and writes the fused result to
+            /// combined_output. When omitted, the legacy in-place gate path is used.
+            TensorBase *routed_residual = nullptr;
+            TensorBase *combined_output = nullptr;
             int seq_len = 0;
             int d_model = 0;
 
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
+            BufferId residual_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+            BufferId combined_output_buffer_id = BufferId::ATTN_PROJ;
         };
 
         explicit SharedExpertGateStage(Params params);

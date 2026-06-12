@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
@@ -843,9 +844,11 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsOnCPU)
     EXPECT_FALSE(stage.isGraphCapturable());
 }
 
-TEST_F(SharedExpertFFNPrefillGraphCapture, DecodeAlwaysCapturableOnRocmWithoutScratch)
+TEST_F(SharedExpertFFNPrefillGraphCapture, RocmDecodeCapturableAfterWarmupWhenGroupedRouteIsDisabled)
 {
     ScopedRocmMoEFlags flags(true, true, true);
+    const bool old_shared_grouped = mutableDebugEnv().rocm.shared_expert_grouped_decode;
+    mutableDebugEnv().rocm.shared_expert_grouped_decode = false;
 
     SharedExpertFFNStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -856,14 +859,18 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, DecodeAlwaysCapturableOnRocmWithoutSc
     params.output = output_.get();
 
     SharedExpertFFNStage stage(params);
-    // No scratch needed for decode, no kernel needed for decode path
 
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "Cold decode still waits for the normal warmup pass to allocate scratch.";
+    stage.setScratchSeqLenForTesting(1);
     EXPECT_TRUE(stage.isGraphCapturable())
-        << "Decode SharedExpertFFN should always be capturable on ROCm";
+        << "Non-grouped decode is capturable once warmup has allocated scratch.";
 #else
     EXPECT_FALSE(stage.isGraphCapturable());
 #endif
+
+    mutableDebugEnv().rocm.shared_expert_grouped_decode = old_shared_grouped;
 }
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedVerifierSmallMUsesGroupedPrefillRoute)
@@ -975,6 +982,101 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayKeepsGroupedPref
 #else
     expect_backend(DeviceId::rocm(0), false, "ROCm");
 #endif
+}
+
+TEST_F(SharedExpertFFNPrefillGraphCapture, ForcedDecodeReplayCapturesAfterGroupedPrefillWarmup)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    auto expect_backend = [&](DeviceId device, bool supported, const char *backend_name)
+    {
+        SharedExpertFFNStage::Params params;
+        params.device_id = device;
+        params.seq_len = 1;
+        params.d_model = D_MODEL;
+        params.intermediate = INTERMEDIATE;
+        params.input = input_.get();
+        params.gate_w = gate_w.get();
+        params.up_w = up_w.get();
+        params.down_w = down_w.get();
+        params.output = output_.get();
+        params.force_grouped_verifier_prefill_for_decode = true;
+
+        SharedExpertFFNStage stage(params);
+        EXPECT_EQ(stage.supportsPaddedPrefillGraphCapturePreflight(), supported)
+            << backend_name << " forced verifier replay should preflight as grouped prefill";
+        EXPECT_FALSE(stage.isGraphCapturable())
+            << backend_name << " cold forced verifier replay still needs warmup resources";
+
+        stage.setMoEKernelForTesting(&stub_kernel_);
+        stage.setScratchSeqLenForTesting(1);
+        stage.setGroupedDecodeWarmedForTesting(false);
+        EXPECT_EQ(stage.isGraphCapturable(), supported)
+            << backend_name
+            << " forced verifier replay must not depend on the normal grouped-decode warmed flag";
+    };
+
+#if defined(HAVE_CUDA) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    expect_backend(DeviceId::cuda(0), true, "CUDA");
+#else
+    expect_backend(DeviceId::cuda(0), false, "CUDA");
+#endif
+
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    expect_backend(DeviceId::rocm(0), true, "ROCm");
+#else
+    expect_backend(DeviceId::rocm(0), false, "ROCm");
+#endif
+}
+
+TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalDecodeUsesWorkspaceBackedGroupedTableRoute)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    SharedExpertFFNStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.intermediate = INTERMEDIATE;
+    params.input = input_.get();
+    params.gate_w = gate_w.get();
+    params.up_w = up_w.get();
+    params.down_w = down_w.get();
+    params.output = output_.get();
+
+    SharedExpertFFNStage stage(params);
+    EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting())
+        << "Normal CUDA shared-expert decode must not borrow the verifier-only grouped prefill route";
+#if defined(HAVE_CUDA) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.usesGroupedDecodeForTesting())
+        << "CUDA shared-expert normal decode should use the grouped table route once its "
+           "pointer arrays are declared in graph-owned workspace.";
+    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture())
+        << "Cold grouped decode must execute one warmup pass to upload runtime pointer arrays";
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "Grouped decode is not capturable until the warmup pass has populated pointer arrays.";
+    stage.setMoEKernelForTesting(&stub_kernel_);
+    stage.setScratchSeqLenForTesting(1);
+    stage.setGroupedDecodeWarmedForTesting(true);
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "After successful warmup, grouped decode is safe for graph capture.";
+#else
+    (void)stage;
+#endif
+
+    const auto reqs = MoEWorkspaceBuffers::cudaMoE(4, D_MODEL, INTERMEDIATE, 256, 8);
+    EXPECT_NE(reqs.find(MoEWorkspaceBuffers::CUDA_DECODE_GATEUP_GATE_PTRS), nullptr);
+    EXPECT_NE(reqs.find(MoEWorkspaceBuffers::CUDA_DECODE_GATEUP_UP_PTRS), nullptr);
+    EXPECT_NE(reqs.find(MoEWorkspaceBuffers::CUDA_DECODE_DOWN_GATE_PTRS), nullptr);
+    EXPECT_NE(reqs.find(MoEWorkspaceBuffers::CUDA_DECODE_DOWN_UP_PTRS), nullptr);
 }
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayRequiresGroupedPrefillEnabled)

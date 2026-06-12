@@ -34,6 +34,10 @@ FIELDS = (
     "shifted_kv_ready_waits",
     "shifted_kv_syncs_deferred",
     "sampling_ms",
+    "sampling_enqueue_ms",
+    "stochastic_batch_outcome_ms",
+    "stochastic_batch_d2h_sync_ms",
+    "greedy_summary_ms",
     "checkpoint_ms",
     "sidecar_graph_hits",
     "sidecar_graph_misses",
@@ -190,7 +194,9 @@ def summarize(path: Path | None) -> dict[str, float | int]:
         records,
         "mtp",
         (
+            "all_position_stochastic_device_batch_outcome",
             "all_position_stochastic_host_target_distribution",
+            "all_position_verifier_greedy_device_summary",
             "all_position_verifier_sample_rows",
             "sample_first_token_device",
             "sample_first_token_host",
@@ -203,6 +209,36 @@ def summarize(path: Path | None) -> dict[str, float | int]:
             "sample_mtp_token_stochastic_distribution",
             "sample_stochastic_distribution_enqueue",
         ),
+        phase="decode",
+    )
+    sampling_enqueue_ms = _sum_total_ms_many(
+        records,
+        "mtp",
+        (
+            "sample_stochastic_distribution_enqueue",
+            "stochastic_distribution_batch_build_enqueue",
+            "stochastic_batch_verify_enqueue",
+            "stochastic_batch_bonus_sample_enqueue",
+            "stochastic_batch_summary_enqueue",
+        ),
+        phase="decode",
+    )
+    stochastic_batch_outcome_ms = _sum_total_ms(
+        records,
+        "mtp",
+        "all_position_stochastic_device_batch_outcome",
+        phase="decode",
+    )
+    stochastic_batch_d2h_sync_ms = _sum_total_ms(
+        records,
+        "mtp",
+        "stochastic_batch_summary_d2h_sync",
+        phase="decode",
+    )
+    greedy_summary_ms = _sum_total_ms(
+        records,
+        "mtp",
+        "all_position_verifier_greedy_device_summary",
         phase="decode",
     )
     checkpoint_ms = _sum_total_ms_many(
@@ -303,6 +339,10 @@ def summarize(path: Path | None) -> dict[str, float | int]:
             phase="decode",
         ),
         "sampling_ms": sampling_ms,
+        "sampling_enqueue_ms": sampling_enqueue_ms,
+        "stochastic_batch_outcome_ms": stochastic_batch_outcome_ms,
+        "stochastic_batch_d2h_sync_ms": stochastic_batch_d2h_sync_ms,
+        "greedy_summary_ms": greedy_summary_ms,
         "checkpoint_ms": checkpoint_ms,
         "sidecar_graph_hits": _sum_count(
             records,

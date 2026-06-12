@@ -445,12 +445,12 @@ namespace
 
 } // namespace
 
-TEST(GDNROCmConfig, ConcurrentDecodeFlagDefaultsOffAndParsesEnv)
+TEST(GDNROCmConfig, ConcurrentDecodeFlagDefaultsOnAndParsesEnv)
 {
     ScopedEnvVar flag("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
 
     flag.clear();
-    EXPECT_FALSE(debugEnv().rocm.gdn_concurrent_decode);
+    EXPECT_TRUE(debugEnv().rocm.gdn_concurrent_decode);
 
     flag.set("1");
     EXPECT_TRUE(debugEnv().rocm.gdn_concurrent_decode);

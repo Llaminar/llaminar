@@ -181,27 +181,78 @@ unless the user explicitly asks for a temporary experiment. The durable path is:
 
 1. Add or confirm the production shapes in
    `tests/v2/performance/kernels/cuda/gemm/CUDANativeVNNIGemmPerfCommon.h`.
-2. Sweep the relevant codebooks, shapes, and canonical `M` buckets with
-   `v2_perf_cuda_native_vnni_gemm`. Prefill dispatch training should align with
-   `src/v2/utils/PrefillGraphBucketDefaults.h`, especially verifier `M={2,3,4}`
-   and graph-prefill buckets such as `M=600`.
-3. Generate prefill tables with
+2. For decode/GEMV dispatch tables, prefer the turnkey refresh wrapper:
+   `scripts/refresh_native_vnni_dispatch_tables.sh --backend cuda --profile qwen36`.
+   It sweeps canonical `M={1,2,3,4}` verifier buckets, trains the tree model,
+   overlays exact known-shape winners, validates the generated include, and can
+   install it with `--install`.
+   The CUDA decode sweep trainer uses deterministic structurally-valid packed
+   payloads, not per-element random quantization, so giant LM-head refreshes do
+   not stall in host fixture generation. It still constructs the real tensor
+   classes and production VRAM-pool preparation path.
+   The default CUDA decode family set is `wide,kpar,direct`.  The perf harness
+   uses the production VRAM-pool preparation path, which does not own ROWPAR's
+   optional row-major auxiliary weight view; do not add `rowpar` back to the
+   standard refresh unless the trainer has an explicit row-major-owner mode and
+   model-level parity proves the generated table.
+   If the full qwen36 inventory is too large for one pass, use the same staged
+   profiles as ROCm: `--profile qwen36-core` for FFN/GDN projections and
+   `--profile qwen36-lm-head` for the LM-head shape. Do not install either
+   staged artifact until the combined model-level parity and benchmark gates
+   have passed.
+3. Use `--profile family-smoke` for a bounded representative training pass before
+   a full acceptance refresh. This profile is stratified by format: it runs one
+   small sweep per codebook/family, writes per-format partial CSVs, combines them,
+   then runs the normal train/generate/validate flow. This avoids a capped sweep
+   accidentally covering only the first format in the list.
+
+   ```bash
+   scripts/refresh_native_vnni_dispatch_tables.sh --backend cuda \
+     --profile family-smoke \
+     --cuda-formats Q4_0,IQ4_XS \
+     --m-values 1,2
+   ```
+
+   `family-smoke` is a workflow/proxy gate, not production acceptance. Do not
+   replace broad checked-in tables from this profile alone; run `qwen36` or
+   `all`, then model-level parity and benchmark gates, before `--install`.
+   The wrapper intentionally uses proxy hit-rate thresholds for `family-smoke`;
+   production fallback-family/exact thresholds apply only to `qwen36` and `all`.
+4. Generate prefill tables with
    `tests/v2/performance/kernels/cuda/gemm/analyze_cuda_tc_gemm_dispatch.py`.
    This reads `TileSweep_AllStrategies` CSVs, validates codebook ids through the
    shared `tests/v2/performance/kernels/native_vnni_codebooks.py` map, skips
    off-policy `M` rows by default, can merge an existing generated include via
    `--base-include`, and emits
    `src/v2/kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc`.
-4. Generate decode/GEMV tables with
-   `tests/v2/performance/kernels/cuda/gemm/analyze_cuda_tc_gemv_dispatch.py`.
-   This consumes best-row GEMV sweep CSVs and emits exact plus fallback tuning
-   rules for native-payload decode.
-5. Validate generated artifacts with
+5. When debugging the decode trainer itself, the lower-level flow is:
+   `v2_perf_cuda_blockwise_tensorcore_gemm_sweep` emits the sweep CSV,
+   `infer_gemv_dispatch_heuristic.py` trains the M-aware fallback tree, and
+   `analyze_cuda_tc_gemv_dispatch.py --base-include <tree.inc>` overlays exact
+   `(M,N,K)` known-shape winners. Both the fallback tree and overlay fallback
+   must stay M-aware; Qwen3.6 LM-head can legitimately prefer WIDE/DIRECT at
+   M=1 and KPAR at M=2..4 for the same `(N,K)`.
+   The overlay must score the runtime dispatch surface, not raw source-format
+   rows. CUDA NativeVNNI GEMV dispatch is keyed by `(codebook,M,N,K)`, and
+   aliases such as `Q4_1/Q4_K`, `Q5_1/Q5_K`, and `IQ4_NL/IQ4_XS` cannot receive
+   separate runtime tunings for the same key. Collapse alias rows to one
+   aggregate codebook-level winner before enforcing exact-hit thresholds.
+   The trainer must bind an explicit non-blocking CUDA stream to the GEMM kernel
+   and record CUDA events on that stream. A `stream=0` trainer log or
+   `cudaEventRecord(start)` without a stream argument is a bug, not a benign perf
+   detail.
+   The trainer must prepare/upload/repack each weight once per format+shape
+   before candidate timing and size its `DeviceWorkspaceManager` from
+   `IWorkspaceConsumer::getWorkspaceRequirements()`; fixed 512 MiB budgets fail
+   on giant LM-head small-M partial buffers.
+6. Validate generated artifacts with
    `tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py`
    and the CUDA generator alias tests:
    `V2_Unit_CUDAPrefillDispatchGeneratorAliases`,
    `V2_Unit_CUDAGemvDispatchGeneratorAliases`, and
-   `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`.
+   `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`. For decode trainer changes,
+   include `V2_Unit_GpuWorkspaceAllocationPolicy` so the explicit-stream
+   trainer contract is checked.
 
 Example prefill-generation shape:
 

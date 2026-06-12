@@ -1,5 +1,6 @@
 #include "MTPSpecStateContract.h"
 
+#include <algorithm>
 #include <sstream>
 #include <utility>
 
@@ -36,6 +37,38 @@ namespace llaminar2
         bool isInvalidIndex(int32_t value)
         {
             return value == kMTPSpecDecodeInvalidToken;
+        }
+
+        MTPSpecCommonStepPlan commonStepFailure(std::string reason)
+        {
+            MTPSpecCommonStepPlan result;
+            result.ok = false;
+            result.error = std::move(reason);
+            return result;
+        }
+
+        bool sameLogicalSpecStep(
+            const MTPSpecStepPlan &lhs,
+            const MTPSpecStepPlan &rhs)
+        {
+            return lhs.request_id == rhs.request_id &&
+                   lhs.draft_count == rhs.draft_count &&
+                   lhs.target_rows == rhs.target_rows &&
+                   lhs.base_cached_tokens == rhs.base_cached_tokens &&
+                   lhs.committed_output_count == rhs.committed_output_count &&
+                   lhs.valid_sampled_count == rhs.valid_sampled_count &&
+                   lhs.next_condition_token == rhs.next_condition_token &&
+                   lhs.stopped == rhs.stopped;
+        }
+
+        void clearSpeculativeSuffixState(MTPSpecStepPlan &step)
+        {
+            step.correction_replay_start_index = kMTPSpecDecodeInvalidToken;
+            step.correction_replay_count = 0;
+            step.bonus_ready_token_row = kMTPSpecDecodeInvalidToken;
+            step.bonus_ready_token_index = kMTPSpecDecodeInvalidToken;
+            step.bonus_ready_state_slot_index = kMTPSpecDecodeInvalidToken;
+            step.all_drafts_accepted = false;
         }
     } // namespace
 
@@ -279,6 +312,85 @@ namespace llaminar2
         }
 
         return buildMTPSpecStepPlans(batch, publication_plan);
+    }
+
+    MTPSpecCommonStepPlan coordinateMTPSpecCommonAcceptedPrefix(
+        const std::vector<MTPSpecStepPlan> &participant_steps)
+    {
+        if (participant_steps.empty())
+            return commonStepFailure("MTP common-prefix coordination has no participants");
+
+        const MTPSpecStepPlan &reference = participant_steps.front();
+        if (reference.draft_count <= 0 || reference.target_rows != reference.draft_count + 1)
+        {
+            return commonStepFailure("MTP common-prefix reference step has invalid draft/target shape");
+        }
+
+        int common_accepted = reference.accepted_count;
+        bool all_direct = true;
+        for (size_t i = 0; i < participant_steps.size(); ++i)
+        {
+            const MTPSpecStepPlan &step = participant_steps[i];
+            if (!sameLogicalSpecStep(reference, step))
+            {
+                std::ostringstream msg;
+                msg << "participant " << i
+                    << " describes a different MTP speculative step";
+                return commonStepFailure(msg.str());
+            }
+            if (step.accepted_count < 0 || step.accepted_count > step.draft_count)
+            {
+                std::ostringstream msg;
+                msg << "participant " << i
+                    << " accepted count is outside the draft prefix";
+                return commonStepFailure(msg.str());
+            }
+            common_accepted = std::min(common_accepted, step.accepted_count);
+            all_direct = all_direct && step.accepted_count == reference.accepted_count;
+        }
+
+        MTPSpecCommonStepPlan result;
+        result.ok = true;
+        result.common_accepted_count = common_accepted;
+        result.all_participants_direct = all_direct;
+        result.requires_common_fallback_replay = !all_direct;
+        result.clamped_steps.reserve(participant_steps.size());
+
+        for (const MTPSpecStepPlan &input_step : participant_steps)
+        {
+            MTPSpecStepPlan step = input_step;
+            const bool clamped_participant =
+                step.accepted_count != common_accepted;
+            if (clamped_participant)
+            {
+                /*
+                 * A participant that ran further than the common prefix may
+                 * have verifier-row state the rest of the domain cannot use.
+                 * Clamp the publishable state and force the topology owner to
+                 * replay from the common prefix instead of pretending the
+                 * participant-local suffix is globally valid.
+                 */
+                step.accepted_count = common_accepted;
+                step.target_cached_tokens =
+                    step.base_cached_tokens + common_accepted;
+                step.accepted_state_slot_index =
+                    common_accepted > 0
+                        ? common_accepted - 1
+                        : kMTPSpecDecodeInvalidToken;
+            }
+            if (result.requires_common_fallback_replay || common_accepted == 0)
+            {
+                if (common_accepted == 0)
+                {
+                    step.target_cached_tokens = step.base_cached_tokens;
+                    step.accepted_state_slot_index = kMTPSpecDecodeInvalidToken;
+                }
+                clearSpeculativeSuffixState(step);
+            }
+            result.clamped_steps.push_back(step);
+        }
+
+        return result;
     }
 
 } // namespace llaminar2

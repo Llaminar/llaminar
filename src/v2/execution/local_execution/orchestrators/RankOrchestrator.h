@@ -424,7 +424,23 @@ namespace llaminar2
          */
         const float *logits() const override;
         bool forwardMTP(int32_t draft_condition_token) override;
+        /**
+         * @brief True when every LocalTP participant can consume a previous
+         *        MTP sidecar hidden row as the next draft input.
+         *
+         * Depth-2/3 MTP is only valid for a rank when all child runners can
+         * keep their shifted MTP KV and sidecar hidden state in lockstep.
+         */
         bool supportsChainedMTPDrafts() const override;
+
+        /**
+         * @brief Run one chained MTP sidecar step on every LocalTP participant.
+         *
+         * The token and logical shifted-cache position are rank-wide scalar
+         * decisions.  Every child receives the same values and must complete
+         * before the rank reports success, preserving the vLLM-style
+         * participant-symmetric graph sequence.
+         */
         bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
@@ -454,10 +470,36 @@ namespace llaminar2
         bool setMTPSpecVerifierInputPlan(
             const MTPSpecDecodeVerifierInputPlan &plan) override;
         void clearMTPSpecVerifierInputPlan() override;
+        /**
+         * @brief True when every active LocalTP participant can publish accepted
+         *        verifier state from the current MTP target verifier graph.
+         *
+         * Rank-level publication is an all-participant contract.  The rank must
+         * not advertise this capability unless each child runner can restore its
+         * own KV/recurrent/terminal-hidden slice from the same speculative step.
+         */
+        bool supportsMTPSpecStatePublication() const override;
+
+        /**
+         * @brief Publish accepted MTP verifier state on every LocalTP child.
+         *
+         * The same logical step plan is coordinated through the shared
+         * common-prefix contract before fan-out.  Today LocalTP receives one
+         * accepted-count decision from the rank-level verifier; this hook keeps
+         * the publication path symmetric so future per-participant plans can be
+         * clamped at the same boundary instead of growing a special case.
+         */
+        bool publishAcceptedMTPSpecState(
+            const MTPSpecStepPlan &plan,
+            std::string *error = nullptr) override;
         const float *getAllPositionLogits() const override;
         std::string mtpDecodeUnsupportedReason() const override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
         int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
+        bool sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            int start_row,
+            int row_count,
+            int32_t *out_tokens) override;
 
         /**
          * @brief GPU-side greedy sampling for decode

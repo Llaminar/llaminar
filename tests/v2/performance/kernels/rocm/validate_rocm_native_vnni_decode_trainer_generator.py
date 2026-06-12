@@ -42,11 +42,13 @@ def main() -> int:
         text = output.read_text()
         summary_text = summary.read_text()
         required_fragments = [
+            "packROCmNativeVNNIDecodeDispatchKey(int m, int n, int k)",
             "selectROCmNativeVNNIDecodeGenerated",
             "ROCmNativeVNNIDecodeDispatchConfig",
             "CB=5 (Q4_1)",
             "CB=7 (Q5_1)",
             "CB=19 (Q8_0)",
+            "M=1",
             "{1, 8}",
             "KB1/TW8",
             "alias_q4_1",

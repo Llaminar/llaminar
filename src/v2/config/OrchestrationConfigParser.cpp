@@ -388,6 +388,10 @@ namespace llaminar2
                 if (config.mtp.depth_policy.promote_consecutive_windows <= 0)
                     throw std::invalid_argument("mtp depth_promote_windows must be > 0");
             }
+            else if (key == "depth_generated_policy")
+            {
+                config.mtp.depth_policy.use_generated_policy = parseBoolValue(value);
+            }
             else if (key == "depth_promote_full_accept")
             {
                 config.mtp.depth_policy.promote_full_accept_rate = std::stod(value);
@@ -1902,6 +1906,17 @@ namespace llaminar2
                     {
                         throw std::invalid_argument("--mtp-depth-demote-acceptance must be in [0, 1]");
                     }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-depth-generated-policy",
+            .category = "MTP",
+            .value_label = "<bool>",
+            .description = "Use the generated dynamic MTP depth policy table",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.use_generated_policy = parseBoolValue(v);
                 }),
         });
 

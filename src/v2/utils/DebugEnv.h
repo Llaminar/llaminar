@@ -2560,16 +2560,18 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_NVNNI_Q8_DIRECT=1` - Force Q8_0 native-VNNI GEMV direct path (KB=1, no reduce kernel)
      * - `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` - Disable generated ROCm NativeVNNI dispatch tables during trainer sweeps
      * - `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` - Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (default: off)
-     * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=1` - Enable experimental multi-stream GDN decode projection GEMVs (default: off)
+     * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=0` - Disable multi-stream GDN decode projection GEMVs (default: on outside deterministic mode)
      * - `LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE=1` - Enable experimental shared-expert decode through MoE grouped FFN kernels (default: off)
      * - `LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE=0` - Disable parallel-expert grouped MoE decode down projection
      * - `LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE=0` - Disable K-partitioned grouped MoE gate/up decode projection
      * - `LLAMINAR_ROCM_MOE_GATEUP_KPARTS=<2|4|8>` - K partitions for grouped MoE gate/up decode projection (default: 8)
+     * - `LLAMINAR_ROCM_MOE_PREFILL_TILE_M=<0|2|4|8>` - Force grouped MoE prefill verifier row tile size (`0` = auto)
      * - `LLAMINAR_ROCM_MOE_ROUTER_Q8=1` - Enable cached Q8 router gate weights for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_FP16=1` - Enable cached FP16 router gate weights for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE=1` - Enable K-partitioned FP32 router logits for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPARTS=<2|4|8|16>` - K partitions for FP32 router logits decode routing (default: 8)
      * - `LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK=0` - Disable shared-memory ROCm MoE decode softmax/top-k runtime kernel for <=256 experts (default: on)
+     * - `LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS=<0|16|32|64|128>` - Override batched Qwen-style top-k partial block cap (`0` = auto)
      *
      * @code
      *   LLAMINAR_ROCM_TRACE_COHERENCE=1 \
@@ -2634,7 +2636,7 @@ namespace llaminar2
         bool concurrent_prefill = true;            ///< Multi-stream concurrent fused GEMM projections during prefill (LLAMINAR_ROCM_CONCURRENT_PREFILL, default ON)
         bool concurrent_decode = false;            ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
         bool concurrent_m2_rows = false;           ///< Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (LLAMINAR_ROCM_CONCURRENT_M2_ROWS)
-        bool gdn_concurrent_decode = false;        ///< Enable multi-stream GDN decode projection GEMVs only (LLAMINAR_ROCM_GDN_CONCURRENT_DECODE)
+        bool gdn_concurrent_decode = true;         ///< Enable multi-stream GDN decode projection GEMVs only (LLAMINAR_ROCM_GDN_CONCURRENT_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         bool shared_expert_grouped_decode = false; ///< Enable shared-expert decode through grouped MoE FFN kernels (LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE)
         bool moe_grouped_decode = true;            ///< Enable grouped MoE decode down path when supported (LLAMINAR_ROCM_MOE_GROUPED_DECODE)
         bool moe_grouped_decode_router = false;    ///< Enable experimental grouped MoE decode router logits path (LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER)
@@ -2648,6 +2650,8 @@ namespace llaminar2
         int moe_gateup_kparts = 8;                 ///< K partitions for grouped MoE gate/up decode projection (LLAMINAR_ROCM_MOE_GATEUP_KPARTS)
         bool moe_device_routed_decode = true;      ///< Enable runtime-table device routed MoE decode (LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE)
         bool moe_grouped_prefill = true;           ///< Enable grouped MoE prefill path when supported (LLAMINAR_ROCM_MOE_GROUPED_PREFILL)
+        int moe_prefill_tile_m = 0;                ///< Tokens-per-block override for grouped MoE prefill on ROCm (LLAMINAR_ROCM_MOE_PREFILL_TILE_M, valid 0|2|4|8, default 0=auto)
+        int topk_smallk_partial_blocks = 0;        ///< Override small-k top-k partial block cap (LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS, valid 0|16|32|64|128; 0=auto)
 
         // --- Startup GPU weight loading pipeline (LoadOrchestrator) ---
         int repack_slots = 3;     ///< Ring-buffer slot count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_SLOTS)
@@ -2717,7 +2721,7 @@ namespace llaminar2
             concurrent_prefill = true;
             concurrent_decode = false;
             concurrent_m2_rows = false;
-            gdn_concurrent_decode = false;
+            gdn_concurrent_decode = true;
             shared_expert_grouped_decode = false;
             moe_grouped_decode = true;
             moe_grouped_decode_router = false;
@@ -2731,6 +2735,8 @@ namespace llaminar2
             moe_gateup_kparts = 8;
             moe_device_routed_decode = true;
             moe_grouped_prefill = true;
+            moe_prefill_tile_m = 0;
+            topk_smallk_partial_blocks = 0;
             repack_slots = 3;
             repack_budget_mb = 0;
             repack_streams = 3;
@@ -3172,6 +3178,25 @@ namespace llaminar2
             if (moe_grouped_prefill_env)
             {
                 moe_grouped_prefill = (std::atoi(moe_grouped_prefill_env) != 0);
+            }
+            const char *moe_prefill_tile_m_env = std::getenv("LLAMINAR_ROCM_MOE_PREFILL_TILE_M");
+            if (moe_prefill_tile_m_env)
+            {
+                const int requested = std::atoi(moe_prefill_tile_m_env);
+                if (requested == 0 || requested == 2 || requested == 4 || requested == 8)
+                {
+                    moe_prefill_tile_m = requested;
+                }
+            }
+            const char *topk_partial_blocks_env = std::getenv("LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS");
+            if (topk_partial_blocks_env)
+            {
+                const int requested = std::atoi(topk_partial_blocks_env);
+                if (requested == 0 || requested == 16 || requested == 32 ||
+                    requested == 64 || requested == 128)
+                {
+                    topk_smallk_partial_blocks = requested;
+                }
             }
 
             const char *repack_slots_env = std::getenv("LLAMINAR_ROCM_REPACK_SLOTS");

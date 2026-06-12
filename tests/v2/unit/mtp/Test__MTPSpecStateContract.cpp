@@ -80,6 +80,32 @@ namespace
         plan.accepted_count = accepted_count;
         return plan;
     }
+
+    MTPSpecStepPlan participantPlan(int participant_id, int accepted_count)
+    {
+        MTPSpecStepPlan plan;
+        plan.request_index = participant_id;
+        plan.request_id = 42;
+        plan.draft_count = 3;
+        plan.target_rows = 4;
+        plan.valid_sampled_count = 4;
+        plan.committed_output_count = 3;
+        plan.accepted_count = accepted_count;
+        plan.rejected_count = 0;
+        plan.base_cached_tokens = 100;
+        plan.target_cached_tokens = plan.base_cached_tokens + accepted_count;
+        plan.accepted_state_slot_index =
+            accepted_count > 0 ? accepted_count - 1 : kMTPSpecDecodeInvalidToken;
+        plan.next_condition_token = 77;
+        plan.all_drafts_accepted = accepted_count == plan.draft_count;
+        if (plan.all_drafts_accepted)
+        {
+            plan.bonus_ready_token_row = 3;
+            plan.bonus_ready_token_index = 3;
+            plan.bonus_ready_state_slot_index = 3;
+        }
+        return plan;
+    }
 } // namespace
 
 TEST(Test__MTPSpecStateContract, BuildsAcceptAllPlanWithBonusReadyRow)
@@ -124,6 +150,76 @@ TEST(Test__MTPSpecStateContract, BuildsAcceptAllPlanWithBonusReadyRow)
     EXPECT_EQ(step.bonus_ready_token_row, 3);
     EXPECT_EQ(step.bonus_ready_token_index, 3);
     EXPECT_EQ(step.bonus_ready_state_slot_index, 3);
+}
+
+TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixLeavesMatchingParticipantsDirect)
+{
+    std::vector<MTPSpecStepPlan> participants = {
+        participantPlan(/*participant_id=*/0, /*accepted_count=*/3),
+        participantPlan(/*participant_id=*/1, /*accepted_count=*/3),
+    };
+
+    MTPSpecCommonStepPlan common =
+        coordinateMTPSpecCommonAcceptedPrefix(participants);
+
+    ASSERT_TRUE(common.ok) << common.error;
+    EXPECT_EQ(common.common_accepted_count, 3);
+    EXPECT_TRUE(common.all_participants_direct);
+    EXPECT_FALSE(common.requires_common_fallback_replay);
+    ASSERT_THAT(common.clamped_steps, SizeIs(2));
+    EXPECT_EQ(common.clamped_steps[0].accepted_count, 3);
+    EXPECT_EQ(common.clamped_steps[1].accepted_count, 3);
+    EXPECT_TRUE(common.clamped_steps[0].hasBonusReadyToken());
+}
+
+TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixClampsLongerParticipant)
+{
+    std::vector<MTPSpecStepPlan> participants = {
+        participantPlan(/*participant_id=*/0, /*accepted_count=*/3),
+        participantPlan(/*participant_id=*/1, /*accepted_count=*/1),
+    };
+    /*
+     * Participant 1 is already at the common prefix, but it still carries a
+     * participant-local correction suffix.  Once any other participant is
+     * shortened, the topology owner must replay from the shared prefix, so that
+     * local suffix is no longer safe to publish either.
+     */
+    participants[1].correction_replay_start_index = 1;
+    participants[1].correction_replay_count = 1;
+
+    MTPSpecCommonStepPlan common =
+        coordinateMTPSpecCommonAcceptedPrefix(participants);
+
+    ASSERT_TRUE(common.ok) << common.error;
+    EXPECT_EQ(common.common_accepted_count, 1);
+    EXPECT_FALSE(common.all_participants_direct);
+    EXPECT_TRUE(common.requires_common_fallback_replay);
+    ASSERT_THAT(common.clamped_steps, SizeIs(2));
+
+    for (const MTPSpecStepPlan &step : common.clamped_steps)
+    {
+        EXPECT_EQ(step.accepted_count, 1);
+        EXPECT_EQ(step.target_cached_tokens, step.base_cached_tokens + 1);
+        EXPECT_EQ(step.accepted_state_slot_index, 0);
+        EXPECT_FALSE(step.hasBonusReadyToken());
+        EXPECT_FALSE(step.requiresCorrectionReplay());
+        EXPECT_FALSE(step.all_drafts_accepted);
+    }
+}
+
+TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixRejectsDifferentTokenStreams)
+{
+    std::vector<MTPSpecStepPlan> participants = {
+        participantPlan(/*participant_id=*/0, /*accepted_count=*/2),
+        participantPlan(/*participant_id=*/1, /*accepted_count=*/2),
+    };
+    participants[1].next_condition_token = 88;
+
+    MTPSpecCommonStepPlan common =
+        coordinateMTPSpecCommonAcceptedPrefix(participants);
+
+    EXPECT_FALSE(common.ok);
+    EXPECT_THAT(common.error, HasSubstr("different MTP speculative step"));
 }
 
 TEST(Test__MTPSpecStateContract, BuildsRejectedSuffixPlanWithCorrectionReplay)

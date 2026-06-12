@@ -48,7 +48,7 @@ namespace
         return test_case;
     }
 
-    void expectCudaMoESharedExpertGroupedDecodePath()
+    void expectCudaMoENormalDecodeUsesGroupedSharedExpertTablePath()
     {
         const auto records = PerfStatsCollector::snapshot(
             {"kernel.cuda_moe_grouped_decode_gateup_calls",
@@ -78,12 +78,16 @@ namespace
         };
 
         ASSERT_TRUE(has_shared_decode_record("cuda_moe_grouped_decode_gateup_calls"))
-            << "CUDA shared expert decode must use the grouped table gate/up path.\n"
+            << "CUDA shared expert decode should use the grouped table gate/up "
+            << "path now that runtime pointer arrays are workspace-backed and "
+            << "warmup-dependent graph capture can replay stable metadata.\n"
             << PerfStatsCollector::summaryString(
                    {"kernel.cuda_moe_grouped_decode_gateup_calls",
                     "kernel.cuda_moe_grouped_decode_down_calls"});
         ASSERT_TRUE(has_shared_decode_record("cuda_moe_grouped_decode_down_calls"))
-            << "CUDA shared expert decode must use the grouped table down path.\n"
+            << "CUDA shared expert decode should use the grouped table down "
+            << "path now that runtime pointer arrays are workspace-backed and "
+            << "replay-stable.\n"
             << PerfStatsCollector::summaryString(
                    {"kernel.cuda_moe_grouped_decode_gateup_calls",
                     "kernel.cuda_moe_grouped_decode_down_calls"});
@@ -165,7 +169,7 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, Depth1RejectedCorrectionDefer
     PerfStatsCollector::reset();
 }
 
-TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, NoMTPBenchmarkStyleUsesGroupedDecodePath)
+TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, NoMTPBenchmarkStyleUsesWorkspaceBackedGroupedSharedExpertTablePath)
 {
     ScopedEnvironmentValues perf_stats_enabled({
         {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
@@ -174,7 +178,7 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, NoMTPBenchmarkStyleUsesGroupe
     runMoENoMTPBenchmarkStyleSkipGatherArgmaxParity(
         cudaSingleDeviceBenchmarkPromptCase(),
         16);
-    expectCudaMoESharedExpertGroupedDecodePath();
+    expectCudaMoENormalDecodeUsesGroupedSharedExpertTablePath();
     PerfStatsCollector::reset();
 }
 

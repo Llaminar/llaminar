@@ -56,6 +56,29 @@ namespace llaminar2
         std::vector<MTPSpecStepPlan> steps;
     };
 
+    /**
+     * @brief Common-prefix decision for one speculative decode step.
+     *
+     * Multi-device MTP must make one publication decision for the whole
+     * topology.  A TP shard, PP stage, or ExpertParallel participant is not
+     * allowed to publish a verifier state row that another participant cannot
+     * publish.  This result records the minimum accepted prefix, a per-
+     * participant clamped publication plan, and whether the clamping changed
+     * any participant enough that the caller should replay from the common
+     * prefix instead of publishing directly.
+     */
+    struct MTPSpecCommonStepPlan
+    {
+        bool ok = false;
+        std::string error;
+
+        int common_accepted_count = 0;
+        bool all_participants_direct = false;
+        bool requires_common_fallback_replay = false;
+
+        std::vector<MTPSpecStepPlan> clamped_steps;
+    };
+
     class IMTPSpecStateBackend
     {
     public:
@@ -75,5 +98,18 @@ namespace llaminar2
     MTPSpecStepPlanBatch buildMTPSpecStepPlans(
         const MTPSpecDecodeMetadataBatch &batch,
         const std::vector<int32_t> &base_cached_tokens);
+
+    /**
+     * @brief Clamp participant-local MTP publication plans to one common prefix.
+     *
+     * The input plans must describe the same logical request and sampled token
+     * stream.  The returned `clamped_steps` never publish more verifier state
+     * than the smallest participant-local `accepted_count`.  If any participant
+     * had to be shortened, `requires_common_fallback_replay` is set so the
+     * topology coordinator can clear speculative local state and replay from
+     * that common point.
+     */
+    MTPSpecCommonStepPlan coordinateMTPSpecCommonAcceptedPrefix(
+        const std::vector<MTPSpecStepPlan> &participant_steps);
 
 } // namespace llaminar2

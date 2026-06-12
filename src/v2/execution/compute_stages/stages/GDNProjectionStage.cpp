@@ -4,6 +4,7 @@
  */
 
 #include "GDNProjectionStage.h"
+#include "../ComputeStageUtils.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
@@ -613,6 +614,8 @@ namespace llaminar2
         mergeFrom(self->params_.w_z, self->params_.gemm_z, "w_z", self->params_.n_z);
         mergeFrom(self->params_.w_a, self->params_.gemm_a, "w_a", self->params_.n_a);
         mergeFrom(self->params_.w_b, self->params_.gemm_b, "w_b", self->params_.n_b);
+        addCudaConcurrentDecodeGemvSideStreamWorkspace(
+            combined, self->params_.device_id, workspace_m, /*projection_count=*/4);
         return combined;
     }
 

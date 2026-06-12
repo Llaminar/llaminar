@@ -93,6 +93,25 @@ def _validate_rocm_decode_graph_safe_kb(path: Path, text: str) -> None:
             )
 
 
+def _validate_binary_search_tables_sorted(path: Path, text: str) -> None:
+    """Ensure generated tables stay sorted for their binary-search helpers."""
+
+    table_pattern = re.compile(
+        r"static\s+constexpr\s+[A-Za-z0-9_:<>]+\s+kTable\[\]\s*=\s*\{(?P<body>.*?)\n\s*\};",
+        re.DOTALL,
+    )
+    for table_index, match in enumerate(table_pattern.finditer(text), start=1):
+        keys = [int(raw, 16) for raw in re.findall(r"\{\s*0x([0-9a-fA-F]+)ULL\s*,", match.group("body"))]
+        if len(keys) < 2:
+            continue
+        for left, right in zip(keys, keys[1:]):
+            if left > right:
+                raise SystemExit(
+                    f"{path}: generated table #{table_index} is not sorted for binary search "
+                    f"(0x{left:x} appears before 0x{right:x})"
+                )
+
+
 def validate_file(path: Path) -> int:
     if not path.is_file():
         raise SystemExit(f"generated include not found: {path}")
@@ -112,6 +131,7 @@ def validate_file(path: Path) -> int:
 
     _validate_labeled_branches(path, text)
     _validate_rocm_decode_graph_safe_kb(path, text)
+    _validate_binary_search_tables_sorted(path, text)
     return len(codebooks)
 
 

@@ -32,7 +32,7 @@ COMMON_REQUIRED = {
 }
 
 PHASE_REQUIRED = {
-    "decode": {"weight_bytes", "eff_bw_gbs", "speedup_vs_int8", "variant", "kb", "target_waves", "is_best"},
+    "decode": {"m", "weight_bytes", "eff_bw_gbs", "speedup_vs_int8", "variant", "kb", "target_waves", "is_best"},
     "batched_decode": {
         "m",
         "projections",
@@ -175,6 +175,9 @@ def validate_file(
                 if is_best not in (0, 1):
                     raise SystemExit(f"{path}:{row_index}: is_best must be 0 or 1")
             elif phase == "decode":
+                m = _parse_int(path, row_index, "m", row.get("m", ""))
+                if m <= 0:
+                    raise SystemExit(f"{path}:{row_index}: decode M must be > 0")
                 kb = _parse_int(path, row_index, "kb", row.get("kb", ""))
                 target_waves = _parse_int(path, row_index, "target_waves", row.get("target_waves", ""))
                 is_best = _parse_int(path, row_index, "is_best", row.get("is_best", ""))

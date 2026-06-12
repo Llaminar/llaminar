@@ -4,6 +4,7 @@
  */
 
 #include "MoEExpertComputeStage.h"
+#include "../ComputeStageUtils.h"
 #include "../../../execution/moe/DecodeExpertHistogram.h"
 #include "../../../execution/moe/ExpertWeightTransfer.h"
 #include "../../../execution/moe/ExpertWeightPayloadProvider.h"
@@ -23,6 +24,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include <mpi.h>
 
 #include <algorithm>
@@ -169,7 +171,16 @@ namespace llaminar2
 #else
 #if defined(HAVE_CUDA)
             if (device.is_cuda())
+            {
+                /*
+                 * CUDA keeps the shared-expert decode shortcut enabled once
+                 * its pointer-array metadata is workspace-backed.  The warmup
+                 * run uploads stable per-stage pointer arrays into graph-owned
+                 * slots; capture then replays kernels that reference those
+                 * immutable slots instead of kernel-scoped device allocation pools.
+                 */
                 return true;
+            }
 #endif
 #if defined(HAVE_ROCM)
             if (device.is_rocm())
@@ -467,10 +478,6 @@ namespace llaminar2
         // Get device-appropriate MoE kernel for gather/scatter
         IMoEKernel *kernel = ensureMoEKernel();
 
-        // Zero the output buffer via tensor-aware kernel (works for both CPU and GPU)
-        const size_t output_bytes = static_cast<size_t>(seq_len) * d_model * sizeof(float);
-        kernel->zeroBuffer(params_.output, output_bytes);
-
         // Expert Parallelism: determine which experts this rank processes
         const int local_start = params_.local_expert_start;
         const int local_count = (params_.local_expert_count < 0)
@@ -487,17 +494,33 @@ namespace llaminar2
         // All 5 kernels launched with zero host sync, counts stay on device.
         // This is the ONLY ROCm prefill path — no per-expert fallback.
         // =====================================================================
-        if (is_gpu && canUseFixedTopologyGroupedPrefill())
+        const bool use_fixed_topology_grouped_prefill =
+            is_gpu && canUseFixedTopologyGroupedPrefill();
+        if (use_fixed_topology_grouped_prefill)
         {
+            /*
+             * The grouped prefill kernel owns output initialization because
+             * its final scatter-add path accumulates routed expert slots into
+             * the dense output. Keep that clear inside the backend pipeline so
+             * graph replay captures exactly one initialization node per MoE
+             * layer. The generic zero below remains for the older paths where
+             * the stage itself owns accumulation setup.
+             */
             // Ensure descriptor tables are built (lazy, only first call)
             bool tables_ready = true;
-            if (grouped_gateup_desc_table_id_ < 0 || grouped_down_desc_table_id_ < 0)
+            if (static_cast<int>(all_expert_ids_.size()) != num_experts)
             {
-                if (static_cast<int>(all_expert_ids_.size()) != num_experts)
-                {
-                    all_expert_ids_.resize(static_cast<size_t>(num_experts));
-                    std::iota(all_expert_ids_.begin(), all_expert_ids_.end(), 0);
-                }
+                all_expert_ids_.resize(static_cast<size_t>(num_experts));
+                std::iota(all_expert_ids_.begin(), all_expert_ids_.end(), 0);
+            }
+
+            if (canUseCombinedSharedVerifierPrefill())
+            {
+                tables_ready = ensureGemmEnginesForExperts(all_expert_ids_) &&
+                               ensureCombinedSharedGroupedDescriptorTables(kernel, d_model, intermediate);
+            }
+            else if (grouped_gateup_desc_table_id_ < 0 || grouped_down_desc_table_id_ < 0)
+            {
                 tables_ready = ensureGemmEnginesForExperts(all_expert_ids_) &&
                                ensureGroupedGateUpDescriptorTable(kernel, d_model, intermediate) &&
                                ensureGroupedDownDescriptorTable(kernel, d_model, intermediate);
@@ -510,7 +533,10 @@ namespace llaminar2
                 return false;
             }
 
-            if (!executeFixedTopologyGroupedPrefill(kernel, seq_len))
+            const bool grouped_ok = canUseCombinedSharedVerifierPrefill()
+                                        ? executeCombinedSharedVerifierPrefill(kernel)
+                                        : executeFixedTopologyGroupedPrefill(kernel, seq_len);
+            if (!grouped_ok)
             {
                 LOG_ERROR("[MoEExpertComputeStage] Grouped prefill pipeline failed, layer "
                           << params_.layer_idx);
@@ -521,6 +547,10 @@ namespace llaminar2
                 markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
             return true;
         }
+
+        // Zero the output buffer via tensor-aware kernel (works for both CPU and GPU).
+        const size_t output_bytes = static_cast<size_t>(seq_len) * d_model * sizeof(float);
+        kernel->zeroBuffer(params_.output, output_bytes);
 
         if (params_.seq_len == 1 && params_.force_grouped_verifier_prefill_for_decode)
         {
@@ -1990,6 +2020,108 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEExpertComputeStage::ensureCombinedSharedGroupedDescriptorTables(
+        IMoEKernel *kernel, int d_model, int intermediate)
+    {
+        if (!kernel || !params_.combine_shared_expert_in_verifier ||
+            !params_.prepared_store ||
+            !params_.prepared_shared_ref_gate ||
+            !params_.prepared_shared_ref_up ||
+            !params_.prepared_shared_ref_down)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Combined shared verifier path is missing required prepared state"
+                      << " layer=" << params_.layer_idx
+                      << " kernel=" << (kernel ? "yes" : "no")
+                      << " store=" << (params_.prepared_store ? "yes" : "no")
+                      << " gate_ref=" << (params_.prepared_shared_ref_gate ? "yes" : "no")
+                      << " up_ref=" << (params_.prepared_shared_ref_up ? "yes" : "no")
+                      << " down_ref=" << (params_.prepared_shared_ref_down ? "yes" : "no"));
+            return false;
+        }
+
+        const int combined_experts = params_.num_experts + 1;
+        if (combined_shared_gateup_desc_table_id_ >= 0 &&
+            combined_shared_down_desc_table_id_ >= 0 &&
+            combined_shared_desc_table_num_experts_ == combined_experts &&
+            combined_shared_desc_table_d_model_ == d_model &&
+            combined_shared_desc_table_intermediate_ == intermediate)
+        {
+            return true;
+        }
+
+        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(static_cast<size_t>(combined_experts));
+        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(static_cast<size_t>(combined_experts));
+        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(static_cast<size_t>(combined_experts));
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            if (cached_gate_gemm_.size() <= static_cast<size_t>(expert_id) ||
+                cached_up_gemm_.size() <= static_cast<size_t>(expert_id) ||
+                cached_down_gemm_.size() <= static_cast<size_t>(expert_id) ||
+                !cached_gate_gemm_[static_cast<size_t>(expert_id)] ||
+                !cached_up_gemm_[static_cast<size_t>(expert_id)] ||
+                !cached_down_gemm_[static_cast<size_t>(expert_id)])
+            {
+                return false;
+            }
+            if (!cached_gate_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(expert_id)]) ||
+                !cached_up_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(expert_id)]) ||
+                !cached_down_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert_id)]))
+            {
+                return false;
+            }
+        }
+
+        ITensorGemm *shared_gate =
+            params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_gate);
+        ITensorGemm *shared_up =
+            params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_up);
+        ITensorGemm *shared_down =
+            params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_down);
+        if (!shared_gate || !shared_up || !shared_down)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Combined shared verifier path requires prepared shared expert GEMM engines"
+                      << " layer=" << params_.layer_idx
+                      << " gate=" << (shared_gate ? "yes" : "no")
+                      << " up=" << (shared_up ? "yes" : "no")
+                      << " down=" << (shared_down ? "yes" : "no"));
+            return false;
+        }
+
+        shared_gate->setGPUStream(gpuStream());
+        shared_up->setGPUStream(gpuStream());
+        shared_down->setGPUStream(gpuStream());
+        auto bind_if_needed = [&](ITensorGemm *gemm)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
+                consumer->bindWorkspace(bound_workspace_);
+        };
+        bind_if_needed(shared_gate);
+        bind_if_needed(shared_up);
+        bind_if_needed(shared_down);
+
+        const int shared_slot = params_.num_experts;
+        if (!shared_gate->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(shared_slot)]) ||
+            !shared_up->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(shared_slot)]) ||
+            !shared_down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(shared_slot)]))
+        {
+            return false;
+        }
+
+        const int gateup_table = kernel->uploadGroupedExpertGateUpDescriptorTables(
+            gate_descs.data(), up_descs.data(), combined_experts, d_model, intermediate);
+        const int down_table = kernel->uploadGroupedExpertDownDescriptorTable(
+            down_descs.data(), combined_experts, d_model, intermediate);
+        if (gateup_table < 0 || down_table < 0)
+            return false;
+
+        combined_shared_gateup_desc_table_id_ = gateup_table;
+        combined_shared_down_desc_table_id_ = down_table;
+        combined_shared_desc_table_num_experts_ = combined_experts;
+        combined_shared_desc_table_d_model_ = d_model;
+        combined_shared_desc_table_intermediate_ = intermediate;
+        return true;
+    }
+
     bool MoEExpertComputeStage::initializeMoERuntimeTableForGroupedDecode()
     {
         if (!params_.moe_runtime_table || params_.layer_idx < 0 ||
@@ -2124,6 +2256,78 @@ namespace llaminar2
                hasFullLocalExpertOwnership() &&
                expertMaskAllEnabled() &&
                params_.replica_set.num_replicated == 0;
+    }
+
+    bool MoEExpertComputeStage::canUseCombinedSharedVerifierPrefill() const
+    {
+        return params_.combine_shared_expert_in_verifier &&
+               (params_.device_id.is_cuda() || params_.device_id.is_rocm()) &&
+               params_.seq_len > 1 &&
+               params_.seq_len <= 4 &&
+               params_.d_model > 0 &&
+               params_.expert_intermediate > 0 &&
+               params_.num_experts > 0 &&
+               params_.top_k > 0 &&
+               params_.routing_indices &&
+               params_.routing_weights &&
+               params_.shared_gate_inp &&
+               params_.prepared_store &&
+               params_.prepared_shared_ref_gate &&
+               params_.prepared_shared_ref_up &&
+               params_.prepared_shared_ref_down &&
+               hasFullLocalExpertOwnership() &&
+               expertMaskAllEnabled() &&
+               params_.replica_set.num_replicated == 0;
+    }
+
+    bool MoEExpertComputeStage::executeCombinedSharedVerifierPrefill(IMoEKernel *kernel) const
+    {
+        if (!kernel || combined_shared_gateup_desc_table_id_ < 0 ||
+            combined_shared_down_desc_table_id_ < 0)
+        {
+            return false;
+        }
+
+        if (!kernel->prepareExpertGroupsWithSharedGateAsync(
+                params_.routing_indices,
+                params_.routing_weights,
+                params_.input,
+                params_.shared_gate_inp,
+                params_.seq_len,
+                params_.d_model,
+                params_.num_experts,
+                params_.top_k))
+        {
+            LOG_ERROR("[MoEExpertComputeStage::executeCombinedSharedVerifierPrefill] grouping failed");
+            return false;
+        }
+
+        const int combined_experts = params_.num_experts + 1;
+        const int combined_top_k = params_.top_k + 1;
+        const bool ok = kernel->executeGroupedPrefillPipeline(
+            params_.input,
+            params_.output,
+            combined_shared_gateup_desc_table_id_,
+            combined_shared_down_desc_table_id_,
+            params_.seq_len,
+            params_.d_model,
+            params_.expert_intermediate,
+            combined_experts,
+            combined_top_k);
+        if (ok)
+        {
+            const char *counter_name = params_.device_id.is_rocm()
+                                           ? "rocm_moe_combined_shared_prefill_pipeline_calls"
+                                           : "cuda_moe_combined_shared_prefill_pipeline_calls";
+            PerfStatsCollector::addCounter(
+                "kernel", counter_name, 1.0, {}, {},
+                {{"seq_len", std::to_string(params_.seq_len)},
+                 {"mode", "single_table"},
+                 {"routed_top_k", std::to_string(params_.top_k)},
+                 {"combined_top_k", std::to_string(combined_top_k)},
+                 {"combined_experts", std::to_string(combined_experts)}});
+        }
+        return ok;
     }
 
     bool MoEExpertComputeStage::executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const
@@ -2528,14 +2732,18 @@ namespace llaminar2
     WorkspaceRequirements MoEExpertComputeStage::getWorkspaceRequirements(int m, int n, int k) const
     {
         WorkspaceRequirements combined;
+        const int workspace_experts =
+            params_.combine_shared_expert_in_verifier ? params_.num_experts + 1 : params_.num_experts;
+        const int workspace_top_k =
+            params_.combine_shared_expert_in_verifier ? params_.top_k + 1 : params_.top_k;
         if (params_.device_id.is_cuda())
         {
             combined.merge(MoEWorkspaceBuffers::expertExecution(
                 params_.seq_len,
                 params_.d_model,
                 params_.expert_intermediate,
-                params_.num_experts,
-                params_.top_k));
+                workspace_experts,
+                workspace_top_k));
         }
         else if (params_.device_id.is_rocm())
         {
@@ -2543,8 +2751,8 @@ namespace llaminar2
                 params_.seq_len,
                 params_.d_model,
                 params_.expert_intermediate,
-                params_.num_experts,
-                params_.top_k));
+                workspace_experts,
+                workspace_top_k));
         }
 
         // All expert GEMM engines use shared buffer names (not per-instance),
@@ -2560,6 +2768,11 @@ namespace llaminar2
             if (consumer)
             {
                 combined.merge(consumer->getWorkspaceRequirements(m, n, k));
+                addCudaConcurrentDecodeGemvSideStreamWorkspace(
+                    combined,
+                    params_.device_id,
+                    m,
+                    static_cast<size_t>(std::max(0, workspace_top_k)) * 2u);
                 return combined;
             }
         }
@@ -2827,6 +3040,18 @@ namespace llaminar2
         return shouldUseCPUDecodeEquivalentVerifierPrefill();
     }
 
+    bool SharedExpertFFNStage::shouldUseGroupedDecodeRoute() const
+    {
+        return params_.device_id.is_gpu() &&
+               params_.seq_len == 1 &&
+               shouldUseSharedExpertGroupedDecode(params_.device_id);
+    }
+
+    bool SharedExpertFFNStage::usesGroupedDecodeForTesting() const
+    {
+        return shouldUseGroupedDecodeRoute();
+    }
+
     bool SharedExpertFFNStage::executeCPUDecodeEquivalentVerifierPrefill(
         IMoEKernel *kernel, int d_model, int intermediate)
     {
@@ -2952,7 +3177,7 @@ namespace llaminar2
 
         ITensor *gate_tensors[1] = {scratch_gate_.get()};
         ITensor *up_tensors[1] = {scratch_up_.get()};
-        return kernel->groupedExpertDownDecodeFromTable(
+        const bool ok = kernel->groupedExpertDownDecodeFromTable(
             gate_tensors,
             up_tensors,
             &expert_id,
@@ -2962,6 +3187,9 @@ namespace llaminar2
             params_.output,
             d_model,
             intermediate);
+        if (ok)
+            grouped_decode_warmed_ = true;
+        return ok;
     }
 
     bool SharedExpertFFNStage::execute(IDeviceContext *ctx)
@@ -2999,6 +3227,7 @@ namespace llaminar2
             scratch_gate_ = makeScratchFP32(seq_len, intermediate, params_.device_id);
             scratch_up_ = makeScratchFP32(seq_len, intermediate, params_.device_id);
             scratch_seq_len_ = seq_len;
+            grouped_decode_warmed_ = false;
         }
 
         IMoEKernel *kernel = ensureMoEKernel();
@@ -3024,9 +3253,7 @@ namespace llaminar2
         }
 
         const bool grouped_decode_required =
-            params_.device_id.is_gpu() &&
-            seq_len == 1 &&
-            shouldUseSharedExpertGroupedDecode(params_.device_id);
+            shouldUseGroupedDecodeRoute();
         if (grouped_decode_required)
         {
             if (!tryGroupedDecode(kernel, d_model, intermediate))
@@ -3070,7 +3297,16 @@ namespace llaminar2
     {
         if (!moe_kernel_)
             moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
-        return bindStageStream(moe_kernel_);
+        auto *kernel = bindStageStream(moe_kernel_);
+        if (bound_workspace_)
+        {
+            // The shared expert can be the first user of the singleton MoE
+            // kernel in focused tests and verifier-only paths. Bind explicitly
+            // so workspace-owned pointer arrays never depend on sibling stages.
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel))
+                consumer->bindWorkspace(bound_workspace_);
+        }
+        return kernel;
     }
 
     size_t SharedExpertFFNStage::estimatedFlops() const
@@ -3102,22 +3338,51 @@ namespace llaminar2
 #if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
 #else
-        // After warmup: GEMM engines cached, scratch buffers allocated,
-        // all operations are pure kernel launches (fused gate+up, swiglu, down).
-        // Capturable for both decode and prefill once scratch is pre-sized.
         if (!supportsGroupedPrefillGraphCaptureBackend(params_.device_id))
             return false;
-        // Decode: always ready after warmup (scratch not used for seq_len==1 grouped path)
+
+        /*
+         * Forced verifier replay is a small-M grouped-prefill path even when
+         * seq_len == 1.  Do not test grouped_decode_warmed_ here: that flag is
+         * only written by tryGroupedDecode(), while verifier replay deliberately
+         * executes tryGroupedVerifierPrefill() so M=1 correction rows share the
+         * same graph-capturable contract as M=2..4 verifier rows.
+         */
+        if (shouldUseGroupedVerifierPrefillRoute())
+            return scratch_seq_len_ >= params_.seq_len && moe_kernel_ != nullptr;
+
+        /*
+         * Normal grouped decode bakes device-side pointer arrays into CUDA graph
+         * replay.  A cold stage can be warmed by Phase 1, but Phase 2 capture
+         * must not start until that warmup has populated arrays for this stage's
+         * current scratch buffers and workspace binding.
+         */
         if (params_.seq_len == 1)
-            return true;
-        // Prefill: scratch must be pre-allocated to at least current seq_len
+        {
+            if (shouldUseGroupedDecodeRoute())
+                return grouped_decode_warmed_ && scratch_seq_len_ >= 1 && moe_kernel_ != nullptr;
+            return scratch_seq_len_ >= 1;
+        }
+
+        // Prefill capture is safe only after warmup has allocated scratch and
+        // resolved the MoE kernel used by fused SwiGLU/down.
         return scratch_seq_len_ >= params_.seq_len && moe_kernel_ != nullptr;
 #endif
     }
 
     bool SharedExpertFFNStage::supportsWarmupDependentGraphCapture() const
     {
-        return supportsPaddedPrefillGraphCapturePreflight();
+        if (supportsPaddedPrefillGraphCapturePreflight())
+            return true;
+
+        return shouldUseGroupedDecodeRoute() &&
+               params_.d_model > 0 &&
+               params_.intermediate > 0 &&
+               params_.input &&
+               params_.gate_w &&
+               params_.up_w &&
+               params_.down_w &&
+               params_.output;
     }
 
     bool SharedExpertFFNStage::supportsPaddedPrefillGraphCapturePreflight() const
@@ -3198,11 +3463,45 @@ namespace llaminar2
             combined.merge(c->getWorkspaceRequirements(m, n, k));
         if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_down_gemm_))
             combined.merge(c->getWorkspaceRequirements(m, n, k));
+
+        /*
+         * Grouped shared-expert decode and verifier prefill use IMoEKernel
+         * scratch in addition to the three projection GEMM workspaces.  Declare
+         * those buffers here so a standalone shared-expert stage cannot rely on
+         * a sibling routed-MoE stage to happen to reserve pointer arrays,
+         * metadata, and INT8 activation scratch for graph capture.
+         */
+        const bool may_use_grouped_moe =
+            params_.device_id.is_gpu() &&
+            (shouldUseGroupedDecodeRoute() || shouldUseGroupedVerifierPrefillRoute());
+        if (may_use_grouped_moe)
+        {
+            const int workspace_seq_len = std::max(1, params_.seq_len);
+            if (params_.device_id.is_cuda())
+            {
+                combined.merge(MoEWorkspaceBuffers::cudaMoE(
+                    workspace_seq_len,
+                    params_.d_model,
+                    params_.intermediate,
+                    /*num_experts=*/1,
+                    /*top_k=*/1));
+            }
+            else if (params_.device_id.is_rocm())
+            {
+                combined.merge(MoEWorkspaceBuffers::rocmMoE(
+                    workspace_seq_len,
+                    params_.d_model,
+                    params_.intermediate,
+                    /*num_experts=*/1,
+                    /*top_k=*/1));
+            }
+        }
         return combined;
     }
 
     void SharedExpertFFNStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
+        const bool workspace_changed = bound_workspace_ != workspace;
         ensureGemmEnginesCached();
 
         if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_gate_gemm_))
@@ -3213,6 +3512,8 @@ namespace llaminar2
             c->bindWorkspace(workspace);
 
         bound_workspace_ = workspace;
+        if (workspace_changed)
+            grouped_decode_warmed_ = false;
         LOG_DEBUG("[SharedExpertFFNStage] Bound workspace to gate/up/down GEMM engines");
     }
 
@@ -3226,6 +3527,7 @@ namespace llaminar2
             c->unbindWorkspace();
 
         bound_workspace_ = nullptr;
+        grouped_decode_warmed_ = false;
     }
 
     bool SharedExpertFFNStage::hasWorkspace() const
@@ -3294,6 +3596,13 @@ namespace llaminar2
             return false;
         }
 
+        const bool fused_combine = params_.routed_residual || params_.combined_output;
+        if (fused_combine && (!params_.routed_residual || !params_.combined_output))
+        {
+            LOG_ERROR("[SharedExpertGateStage] Fused combine requires both routed_residual and combined_output");
+            return false;
+        }
+
         const int seq_len = params_.seq_len;
         const int d_model = params_.d_model;
 
@@ -3308,11 +3617,20 @@ namespace llaminar2
 
         IMoEKernel *kernel = ensureMoEKernel();
 
+        if (fused_combine)
+        {
+            kernel->sharedExpertGateAddFromTensors(
+                params_.input, gate_inp, params_.shared_output,
+                params_.routed_residual, params_.combined_output,
+                seq_len, d_model);
+            markGpuTensorWritten(params_.combined_output, params_.device_id, gpuStream());
+            return true;
+        }
+
         kernel->sharedExpertGateFromTensors(
             params_.input, gate_inp, params_.shared_output,
             seq_len, d_model);
         markGpuTensorWritten(params_.shared_output, params_.device_id, gpuStream());
-
         if (params_.device_id.is_gpu() && params_.shared_output->needsUpload())
         {
             if (!params_.shared_output->ensureOnDevice(params_.device_id, gpuStream()))
@@ -3335,8 +3653,12 @@ namespace llaminar2
 
     size_t SharedExpertGateStage::estimatedFlops() const
     {
-        // dot product + sigmoid + elementwise multiply
-        return static_cast<size_t>(params_.seq_len) * (2 * params_.d_model + params_.d_model);
+        // Dot product + sigmoid + elementwise multiply, plus one add in fused-combine mode.
+        const size_t per_token = static_cast<size_t>(2 * params_.d_model + params_.d_model);
+        const size_t fused_add = (params_.routed_residual && params_.combined_output)
+                                     ? static_cast<size_t>(params_.d_model)
+                                     : 0u;
+        return static_cast<size_t>(params_.seq_len) * (per_token + fused_add);
     }
 
     bool SharedExpertGateStage::supportsBackend(ComputeBackendType backend) const
@@ -3383,7 +3705,9 @@ namespace llaminar2
                params_.d_model > 0 &&
                params_.input &&
                params_.gate_inp &&
-               params_.shared_output;
+               params_.shared_output &&
+               ((!params_.routed_residual && !params_.combined_output) ||
+                (params_.routed_residual && params_.combined_output));
 #endif
     }
 
@@ -3394,7 +3718,9 @@ namespace llaminar2
                params_.d_model > 0 &&
                params_.input &&
                params_.gate_inp &&
-               params_.shared_output;
+               params_.shared_output &&
+               ((!params_.routed_residual && !params_.combined_output) ||
+                (params_.routed_residual && params_.combined_output));
     }
 
     StageBufferRequirements SharedExpertGateStage::getBufferRequirements() const
@@ -3403,7 +3729,16 @@ namespace llaminar2
         if (params_.input)
             reqs.addInput("input", params_.input->shape(), toBufferTensorType(params_.input->native_type()));
         if (params_.shared_output)
-            reqs.addOutput("shared_output", params_.shared_output->shape(), toBufferTensorType(params_.shared_output->native_type()));
+        {
+            if (params_.routed_residual && params_.combined_output)
+                reqs.addInput("shared_output", params_.shared_output->shape(), toBufferTensorType(params_.shared_output->native_type()));
+            else
+                reqs.addOutput("shared_output", params_.shared_output->shape(), toBufferTensorType(params_.shared_output->native_type()));
+        }
+        if (params_.routed_residual)
+            reqs.addInput("routed_residual", params_.routed_residual->shape(), toBufferTensorType(params_.routed_residual->native_type()));
+        if (params_.combined_output)
+            reqs.addOutput("combined_output", params_.combined_output->shape(), toBufferTensorType(params_.combined_output->native_type()));
         return reqs;
     }
 
@@ -3412,7 +3747,16 @@ namespace llaminar2
         auto contract = StageBufferContract::build();
 
         contract.addInput(params_.input_buffer_id);
-        contract.addInOut(params_.output_buffer_id);
+        if (params_.routed_residual && params_.combined_output)
+        {
+            contract.addInput(params_.output_buffer_id);
+            contract.addInput(params_.residual_buffer_id);
+            contract.addOutput(params_.combined_output_buffer_id);
+        }
+        else
+        {
+            contract.addInOut(params_.output_buffer_id);
+        }
 
         // Gate vector is a model weight, not arena-managed
         if (params_.gate_inp)
@@ -3429,7 +3773,16 @@ namespace llaminar2
         if (params_.gate_inp)
             info.addWeight("gate_inp", params_.gate_inp);
         if (params_.shared_output)
-            info.addOutput("shared_output", params_.shared_output, params_.seq_len, params_.d_model);
+        {
+            if (params_.routed_residual && params_.combined_output)
+                info.addInput("shared_output", params_.shared_output, params_.seq_len, params_.d_model);
+            else
+                info.addOutput("shared_output", params_.shared_output, params_.seq_len, params_.d_model);
+        }
+        if (params_.routed_residual)
+            info.addInput("routed_residual", params_.routed_residual, params_.seq_len, params_.d_model);
+        if (params_.combined_output)
+            info.addOutput("combined_output", params_.combined_output, params_.seq_len, params_.d_model);
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("d_model", params_.d_model);
         return info;

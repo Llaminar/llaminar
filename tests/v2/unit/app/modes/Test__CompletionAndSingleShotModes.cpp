@@ -52,8 +52,9 @@ namespace
             auto owned_runner = std::make_unique<NiceMock<MockOrchestrationRunner>>();
             runner = owned_runner.get();
             tokenizer = std::make_shared<NiceMock<MockTokenizer>>();
+            mpi = std::make_shared<MockMPIContext>(rank, world_size);
 
-            ctx.mpi_ctx = std::make_shared<MockMPIContext>(rank, world_size);
+            ctx.mpi_ctx = mpi;
             ctx.runner = std::move(owned_runner);
             ctx.tokenizer = tokenizer;
             ctx.config.prompt = "Hello";
@@ -62,6 +63,7 @@ namespace
 
         AppContext ctx;
         NiceMock<MockOrchestrationRunner> *runner = nullptr;
+        std::shared_ptr<MockMPIContext> mpi;
         std::shared_ptr<NiceMock<MockTokenizer>> tokenizer;
     };
 }

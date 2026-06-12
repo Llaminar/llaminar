@@ -4,10 +4,15 @@
  */
 #pragma once
 
+#include "../../backends/DeviceId.h"
+#include "../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../interfaces/IWorkspaceConsumer.h"
 #include "../../tensors/ITensor.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/Logger.h"
 #include "../../utils/Assertions.h"
+
+#include <algorithm>
 
 namespace llaminar2
 {
@@ -85,6 +90,55 @@ namespace llaminar2
         auto *base = dynamic_cast<const TensorBase *>(tensor);
         LLAMINAR_ASSERTF(base, name << " must derive from TensorBase");
         return base;
+    }
+
+    /**
+     * @brief Add CUDA decode side-stream GEMV partials for fused projection stages.
+     *
+     * CUDA NativeVNNI decode can launch several M=1 projections from one fused stage
+     * on separate streams. Slot 0 uses the normal `GEMV_KPAR_PARTIALS` buffer; the
+     * remaining projections need one disjoint side-stream slot each. Single-output
+     * GEMV stages such as LM head cannot consume these slots, so the declaration
+     * belongs at the fused-stage layer where the projection fan-out is known.
+     *
+     * @param reqs Merged per-projection workspace requirements to augment.
+     * @param device Stage device; only CUDA receives this CUDA-specific buffer.
+     * @param m Declared row count. Only exact decode M=1 needs side-stream slots.
+     * @param projection_count Number of fused projections the stage may launch.
+     * @param max_concurrent_streams Maximum active projection streams used by
+     *                               the backend's fused decode pool.
+     */
+    inline void addCudaConcurrentDecodeGemvSideStreamWorkspace(
+        WorkspaceRequirements &reqs,
+        const DeviceId &device,
+        int m,
+        size_t projection_count,
+        size_t max_concurrent_streams = 8)
+    {
+        if (!device.is_cuda() || m != 1 || projection_count <= 1 || max_concurrent_streams <= 1)
+            return;
+
+        const WorkspaceDescriptor *serial =
+            reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+        if (!serial || serial->size_bytes == 0)
+            return;
+
+        const size_t active_streams =
+            std::min(projection_count, max_concurrent_streams);
+
+        // The merged serial descriptor is already sized for the largest
+        // projection. Give every active side stream a slot of that largest size
+        // so mixed-width fused groups cannot alias or underflow the partial
+        // arena. Projection fan-out may exceed active_streams; those later
+        // projections reuse stream slots only after the previous launch on that
+        // slot has completed.
+        WorkspaceRequirements extra;
+        extra.buffers.push_back({
+            GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS,
+            (active_streams - 1) * serial->size_bytes,
+            serial->alignment,
+            true});
+        reqs.merge(extra);
     }
 
     // =========================================================================

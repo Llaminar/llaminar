@@ -1637,6 +1637,12 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36MoEMixedQKVConcurrentDecod
         reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
     ASSERT_NE(kpar, nullptr)
         << "Q8_0 K/V decode may use two-phase KPAR and must have declared partials.";
+    const auto *concurrent_kpar =
+        reqs.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+    ASSERT_NE(concurrent_kpar, nullptr)
+        << "Concurrent decode must reserve side-stream GEMV partial slots; otherwise "
+           "Q/K/V projections can race through the same KPAR reduction buffer.";
+    EXPECT_GE(concurrent_kpar->size_bytes, 7ULL * kpar->size_bytes);
 
     workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 256 * 1024 * 1024);
     ASSERT_TRUE(workspace_->allocate(reqs));
@@ -1644,36 +1650,66 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36MoEMixedQKVConcurrentDecod
     k_ws->bindWorkspace(workspace_.get());
     v_ws->bindWorkspace(workspace_.get());
 
-    FP32Tensor input({M, K});
-    FP32Tensor q_output({M, N_Q});
-    FP32Tensor k_output({M, N_KV});
-    FP32Tensor v_output({M, N_KV});
+    auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
     for (int i = 0; i < M * K; ++i)
-        input.mutable_data()[i] = dist_(rng_);
+        input->mutable_data()[i] = dist_(rng_);
 
-    ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
-    ASSERT_TRUE(q_output.ensureOnDevice(gpu_device_, stream));
-    ASSERT_TRUE(k_output.ensureOnDevice(gpu_device_, stream));
-    ASSERT_TRUE(v_output.ensureOnDevice(gpu_device_, stream));
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    struct DecodeSnapshot
+    {
+        std::vector<float> q;
+        std::vector<float> k;
+        std::vector<float> v;
+    };
+
+    auto run_decode = [&](const char *concurrent_decode) -> DecodeSnapshot
+    {
+        ScopedDebugEnvOverride concurrent_env("LLAMINAR_CUDA_CONCURRENT_DECODE", concurrent_decode);
+        auto q_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_Q});
+        auto k_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_KV});
+        auto v_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_KV});
+        std::vector<TensorProjectionDesc> projections = {
+            {q_kernel, q_output.get(), N_Q, nullptr, "Q"},
+            {k_kernel, k_output.get(), N_KV, nullptr, "K"},
+            {v_kernel, v_output.get(), N_KV, nullptr, "V"}};
+
+        EXPECT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {q_output.get(), k_output.get(), v_output.get()},
+            [&]
+            {
+                return q_kernel->multiply_fused_tensor(
+                    input.get(), projections, M, K, nullptr, workspace_.get());
+            }))
+            << "fused decode with LLAMINAR_CUDA_CONCURRENT_DECODE=" << concurrent_decode;
+
+        const float *q = q_output->data();
+        const float *k = k_output->data();
+        const float *v = v_output->data();
+        return {
+            std::vector<float>(q, q + N_Q),
+            std::vector<float>(k, k + N_KV),
+            std::vector<float>(v, v + N_KV),
+        };
+    };
 
     q_kernel->setGPUStream(stream);
     k_kernel->setGPUStream(stream);
     v_kernel->setGPUStream(stream);
 
-    std::vector<TensorProjectionDesc> projections = {
-        {q_kernel, &q_output, N_Q, nullptr, "Q"},
-        {k_kernel, &k_output, N_KV, nullptr, "K"},
-        {v_kernel, &v_output, N_KV, nullptr, "V"}};
+    const DecodeSnapshot serial = run_decode("0");
+    const DecodeSnapshot concurrent = run_decode("1");
 
-    ASSERT_TRUE(q_kernel->multiply_fused_tensor(
-        &input,
-        projections,
-        M,
-        K,
-        nullptr,
-        workspace_.get()));
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    const DiffSummary q_diff = summarizeDiffs(concurrent.q.data(), serial.q.data(), concurrent.q.size());
+    const DiffSummary k_diff = summarizeDiffs(concurrent.k.data(), serial.k.data(), concurrent.k.size());
+    const DiffSummary v_diff = summarizeDiffs(concurrent.v.data(), serial.v.data(), concurrent.v.size());
+    printDiffSummary("concurrent-vs-serial Q", q_diff);
+    printDiffSummary("concurrent-vs-serial K", k_diff);
+    printDiffSummary("concurrent-vs-serial V", v_diff);
+
+    EXPECT_LT(q_diff.max_abs, 1e-4f);
+    EXPECT_LT(k_diff.max_abs, 1e-4f);
+    EXPECT_LT(v_diff.max_abs, 1e-4f);
 
     q_ws->unbindWorkspace();
     k_ws->unbindWorkspace();
@@ -1818,11 +1854,18 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurren
     reqs.merge(k_ws->getWorkspaceRequirements(M, N_KV, K));
     reqs.merge(v_ws->getWorkspaceRequirements(M, N_KV, K));
 
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
     workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
     ASSERT_TRUE(workspace_->allocate(reqs));
     q_ws->bindWorkspace(workspace_.get());
     k_ws->bindWorkspace(workspace_.get());
     v_ws->bindWorkspace(workspace_.get());
+    q_kernel->setGPUStream(stream);
+    k_kernel->setGPUStream(stream);
+    v_kernel->setGPUStream(stream);
 
     auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
     for (int i = 0; i < M * K; ++i)
@@ -1874,6 +1917,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurren
     k_ws->unbindWorkspace();
     v_ws->unbindWorkspace();
     workspace_.reset();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 #endif
 }
 

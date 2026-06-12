@@ -217,21 +217,63 @@ experiments.
    `tests/v2/performance/kernels/rocm/Perf__NativeVNNI_Sweep.cpp` for prefill
    and `tests/v2/performance/kernels/rocm/Perf__NativeVNNI_Throughput.cpp` for
    decode/GEMV.
-2. Run sweeps with `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1`. This is important:
+2. For decode/GEMV dispatch tables, prefer the turnkey refresh wrapper:
+   `scripts/refresh_native_vnni_dispatch_tables.sh --backend rocm --profile qwen36`.
+   It runs with `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1`, sweeps canonical
+   `M={1,2,3,4}` verifier buckets, generates the M-aware include, validates it,
+   and can install it with `--install`.
+   Keep the generated decision surface keyed by M as well as N/K.  Qwen3.6
+   verifier buckets can prefer different families at M=1 versus M=2..4 for the
+   same projection shape, and CUDA/ROCm refresh evidence must stay comparable.
+   Score generated tables on the runtime dispatch surface, not raw
+   source-format rows. If several GGUF formats share a NativeVNNI codebook, the
+   runtime can only choose one `(codebook,M,N,K)` tuning; analyzers should
+   collapse aliases before enforcing exact-hit thresholds.
+   Use staged strict profiles when the full shape inventory is too expensive in
+   one pass: `--profile qwen36-core` covers FFN/GDN projections and
+   `--profile qwen36-lm-head` covers the giant LM-head shape. The LM-head
+   profile defaults to `LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE=native-auto`, which
+   compares candidates with a reset-AUTO native output instead of building a
+   multi-GB FP32 hipBLAS mirror. Treat that as a dispatch-equivalence trainer
+   proxy; model parity and benchmarks still gate any `--install`.
+3. Use `--profile family-smoke` for a bounded representative training pass before
+   a full acceptance refresh. This profile is stratified by format: it runs one
+   small sweep per codebook/family, writes per-format partial CSVs, combines them,
+   then runs the normal train/generate/validate flow. This avoids a capped sweep
+   accidentally covering only the first format in the list.
+
+   ```bash
+   scripts/refresh_native_vnni_dispatch_tables.sh --backend rocm \
+     --profile family-smoke \
+     --rocm-formats Q4_0,IQ4_XS \
+     --m-values 1,2
+   ```
+
+   `family-smoke` is a workflow/proxy gate, not production acceptance. Do not
+   replace broad checked-in tables from this profile alone; run `qwen36` or
+   `all`, then model-level parity and benchmark gates, before `--install`.
+   Treat the trainer's FP32 cosine as a health filter, not the exact dispatch
+   oracle: packed K-quant formats such as Q4_K/Q2_K can sit just below the
+   generic FP32 gate while still matching the native packed contract. Keep
+   `V2_Integration_ROCm_NativeVNNI_GEMV`,
+   `V2_Integration_ROCmQuantisedGemmSmallM`, and model parity as the promotion
+   gates.
+4. If you are debugging the ROCm trainer directly, run sweeps with
+   `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1`. This is important:
    AUTO normally consumes the checked-in generated tables, so training without
    this guard can benchmark the previous table and emit no explicit winner.
-3. Validate CSVs with
+5. Validate CSVs with
    `tests/v2/performance/kernels/rocm/validate_rocm_native_vnni_trainer_csv.py`.
    It checks decode/prefill schema, shared codebook ids, and canonical prefill
    bucket policy from `src/v2/utils/PrefillGraphBucketDefaults.h`.
-4. Generate prefill tables with
+6. Generate prefill tables with
    `tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_trainer.py` and
    decode tables with
    `tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_decode_trainer.py`.
    The checked-in outputs are
    `src/v2/kernels/rocm/gemm/ROCmNativeVNNIPrefillDispatchGenerated.inc` and
    `src/v2/kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc`.
-5. Validate generated codebook references with
+7. Validate generated codebook references with
    `tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py`
    and run the focused units:
    `V2_Unit_ROCmNativeVNNITrainerCsvValidator`,

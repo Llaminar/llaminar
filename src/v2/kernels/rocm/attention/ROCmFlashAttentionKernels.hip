@@ -415,6 +415,15 @@ namespace
             return selection;
         }
 
+        if (llaminar2::debugEnv().gemm.deterministic)
+        {
+            // Deterministic parity runs require a stable launch policy across
+            // fresh runners.  The autotuner is performance state, not model
+            // state, so rotating through trial TPB values can make two identical
+            // requests execute different kernels in one process.
+            return selection;
+        }
+
         const uint32_t key = makeDecodeAutotuneKey(kv_len, head_dim, max_allowed, n_heads);
 
         std::lock_guard<std::mutex> guard(decodeAutotuneMutex());

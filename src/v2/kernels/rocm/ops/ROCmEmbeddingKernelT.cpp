@@ -319,7 +319,8 @@ namespace llaminar2
                 int value = token_ids[i];
                 min_id = std::min(min_id, value);
                 max_id = std::max(max_id, value);
-                if ((value < 0 || value >= vocab_size) && first_invalid_pos < 0)
+                const bool has_upper_bound = vocab_size > 0;
+                if ((value < 0 || (has_upper_bound && value >= vocab_size)) && first_invalid_pos < 0)
                 {
                     first_invalid_pos = i;
                     first_invalid_id = value;
@@ -327,7 +328,7 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[ROCmEmbeddingKernelT] Host token stats: num_tokens=" << num_tokens
-                                                                             << " vocab_size=" << vocab_size
+                                                                             << " vocab_size=" << (vocab_size > 0 ? std::to_string(vocab_size) : std::string("unchecked"))
                                                                              << " min_id=" << min_id
                                                                              << " max_id=" << max_id
                                                                              << " first_id=" << token_ids[0]
@@ -364,7 +365,12 @@ namespace llaminar2
             return false;
         }
 
-        hipError_t err = hipOps_embedding_fp32(embed_data, token_ids, output, num_tokens, d_model, INT_MAX, 0, static_cast<hipStream_t>(getStream()));
+        const int launch_vocab_size = explicit_vocab_range_ && local_vocab_size_ > 0
+                                          ? local_vocab_size_
+                                          : INT_MAX;
+        const int launch_vocab_offset = explicit_vocab_range_ ? vocab_offset_ : 0;
+        hipError_t err = hipOps_embedding_fp32(embed_data, token_ids, output, num_tokens, d_model,
+                                               launch_vocab_size, launch_vocab_offset, static_cast<hipStream_t>(getStream()));
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err));
@@ -555,9 +561,13 @@ namespace llaminar2
                                : workspace_token_ids;
 
         const bool validate_gpu_ptrs = debugEnv().validation.validate_gpu_ptrs;
+        const int host_token_vocab_bound =
+            allow_out_of_range_token_ids_
+                ? 0
+                : static_cast<int>(embed_table->rows());
         if (!use_device_token_ids &&
             validate_gpu_ptrs &&
-            !validateTokenIdsHost(token_ids, num_tokens, static_cast<int>(embed_table->rows()), /*fail_on_invalid=*/true))
+            !validateTokenIdsHost(token_ids, num_tokens, host_token_vocab_bound, /*fail_on_invalid=*/true))
         {
             return false;
         }
@@ -648,8 +658,12 @@ namespace llaminar2
             }
             LOG_DEBUG("[ROCmEmbeddingKernelT] FP32 fast path: d_embed=" << static_cast<void *>(d_embed)
                                                                         << " num_tokens=" << num_tokens << " d_model=" << d_model);
+            const int launch_vocab_size = explicit_vocab_range_ && local_vocab_size_ > 0
+                                              ? local_vocab_size_
+                                              : static_cast<int>(embed_fp32->rows());
+            const int launch_vocab_offset = explicit_vocab_range_ ? vocab_offset_ : 0;
             err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model,
-                                        static_cast<int>(embed_fp32->rows()), 0, stream);
+                                        launch_vocab_size, launch_vocab_offset, stream);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err));
@@ -797,15 +811,16 @@ namespace llaminar2
                               << hipGetErrorString(token_copy_err));
                     return false;
                 }
-                const bool single_participant =
-                    !mpi_ctx || mpi_ctx->world_size() <= 1;
+                const bool zero_token_rows_allowed =
+                    allow_out_of_range_token_ids_ ||
+                    (mpi_ctx && mpi_ctx->world_size() > 1);
                 for (int i = 0; i < num_tokens; ++i)
                 {
                     const int token_id = sampled_tokens[static_cast<size_t>(i)];
                     const bool in_local_range =
                         token_id >= vocab_offset &&
                         token_id < vocab_offset + local_vocab_size;
-                    if (!in_local_range && single_participant)
+                    if (!in_local_range && !zero_token_rows_allowed)
                     {
                         LOG_ERROR("[ROCmEmbeddingKernelT] Device-token embedding would zero single-device token="
                                   << token_id << " local_vocab_size=" << local_vocab_size

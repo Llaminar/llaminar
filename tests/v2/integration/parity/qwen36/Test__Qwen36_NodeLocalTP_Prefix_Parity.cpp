@@ -28,6 +28,11 @@ TEST(Qwen36NodeLocalTPPrefixParity, MTPGreedyMatchesPyTorchDecodeTokens)
     runDenseMTPParity(nodeLocalTPCase(), false);
 }
 
+TEST(Qwen36NodeLocalTPPrefixParity, MTPGreedyDepth3MatchesPyTorchDecodeTokens)
+{
+    runDenseMTPParity(nodeLocalTPCase(), false, 3);
+}
+
 TEST(Qwen36NodeLocalTPPrefixParity, PrefixCacheMTPRestore)
 {
     runDenseMTPParity(nodeLocalTPCase(), true);

@@ -640,6 +640,42 @@ namespace llaminar2
         }
 
         /**
+         * @brief Enqueue GPU-side greedy argmax for several contiguous FP32 rows.
+         *
+         * Unlike argmaxF32BatchedRows(), this vLLM-style primitive leaves the
+         * row-local argmax values and indices on device. It performs no
+         * allocation, host copy, or synchronization, and is suitable for graph
+         * capture plus downstream device-side speculative verification summary.
+         *
+         * @param out_values_device Device buffer [rows] for max values.
+         * @param out_indices_device Device buffer [rows] for row-local token ids.
+         */
+        virtual bool enqueueArgmaxF32BatchedRowsDevice(
+            const void *data_device,
+            int rows,
+            int cols,
+            int device_id,
+            void *stream,
+            void *out_values_device,
+            void *out_indices_device,
+            void *partial_vals = nullptr,
+            void *partial_idxs = nullptr,
+            int partial_capacity = 0)
+        {
+            (void)data_device;
+            (void)rows;
+            (void)cols;
+            (void)device_id;
+            (void)stream;
+            (void)out_values_device;
+            (void)out_indices_device;
+            (void)partial_vals;
+            (void)partial_idxs;
+            (void)partial_capacity;
+            return false;
+        }
+
+        /**
          * @brief GPU-side top-k selection over FP32 data
          *
          * Finds the k largest elements (value and index) entirely on the GPU.
@@ -763,6 +799,103 @@ namespace llaminar2
         }
 
         /**
+         * @brief Enqueue graph-capturable top-k/top-p distribution construction for rows.
+         *
+         * Builds `row_count` compact probability tables from a contiguous logits
+         * matrix without allocating, synchronizing, or touching the default GPU
+         * stream. `row_stride` is measured in FP32 elements between input rows;
+         * `out_stride` is measured in INT32/FP32 entries between compact output
+         * slots. Scratch capacity is the total number of `(value,index)` entries
+         * available across every row in the batched launch.
+         *
+         * This is the vLLM-style target/bonus verifier-row companion to the
+         * scalar distribution builder above. It lets the runner queue all
+         * all-position verifier target rows behind one explicit stream handoff
+         * instead of launching a scalar table builder per row.
+         */
+        virtual bool enqueueBuildTopKTopPDistributionsF32Device(
+            const void *data_device,
+            int row_count,
+            int n,
+            int row_stride,
+            int top_k,
+            float top_p,
+            float temperature,
+            int device_id,
+            void *stream,
+            void *out_token_ids_device,
+            int out_stride,
+            void *out_probs_device,
+            void *scratch_values_device = nullptr,
+            void *scratch_indices_device = nullptr,
+            int scratch_capacity = 0)
+        {
+            (void)data_device;
+            (void)row_count;
+            (void)n;
+            (void)row_stride;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_ids_device;
+            (void)out_stride;
+            (void)out_probs_device;
+            (void)scratch_values_device;
+            (void)scratch_indices_device;
+            (void)scratch_capacity;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable top-k/top-p processing into full logits.
+         *
+         * Converts raw logits into the processed-logit representation consumed by
+         * the vLLM-style stochastic verifier: temperature is applied, tokens
+         * outside the top-k/top-p nucleus are set to -inf, and active tokens keep
+         * logits whose softmax exactly matches the compact top-k/top-p
+         * distribution. `out_logits_device` may alias `data_device` after the
+         * implementation has computed top-k partials, which lets graph stages
+         * process LM-head output in place when ownership permits.
+         *
+         * Implementations must only enqueue work on `stream`; they must not
+         * allocate, synchronize, or use a default/null GPU stream.
+         */
+        virtual bool enqueueBuildTopKTopPProcessedLogitsF32Device(
+            const void *data_device,
+            int row_count,
+            int n,
+            int row_stride,
+            int top_k,
+            float top_p,
+            float temperature,
+            int device_id,
+            void *stream,
+            void *out_logits_device,
+            int out_row_stride,
+            void *scratch_values_device = nullptr,
+            void *scratch_indices_device = nullptr,
+            int scratch_capacity = 0)
+        {
+            (void)data_device;
+            (void)row_count;
+            (void)n;
+            (void)row_stride;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)device_id;
+            (void)stream;
+            (void)out_logits_device;
+            (void)out_row_stride;
+            (void)scratch_values_device;
+            (void)scratch_indices_device;
+            (void)scratch_capacity;
+            return false;
+        }
+
+        /**
          * @brief Enqueue graph-capturable sampling from a compact probability table.
          *
          * The threshold is a host-provided random draw in [0, 1), allowing callers
@@ -777,7 +910,8 @@ namespace llaminar2
             float threshold,
             int device_id,
             void *stream,
-            void *out_token_device)
+            void *out_token_device,
+            void *out_probability_device = nullptr)
         {
             (void)token_ids_device;
             (void)probs_device;
@@ -786,6 +920,180 @@ namespace llaminar2
             (void)device_id;
             (void)stream;
             (void)out_token_device;
+            (void)out_probability_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable sampling from processed full logits.
+         *
+         * The logits row is already in sampling space: temperature, penalties,
+         * and any token masks have been applied. This is the vLLM-style
+         * full-logit companion to enqueueSampleDistributionF32Device(), used for
+         * bonus-ready or residual rows without materializing compact top-k
+         * tables. Implementations must use the explicit non-null stream only.
+         */
+        virtual bool enqueueSampleProcessedLogitsF32Device(
+            const void *logits_device,
+            int vocab_size,
+            int row_stride,
+            float threshold,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_probability_device = nullptr)
+        {
+            (void)logits_device;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)threshold;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_probability_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue vLLM-style draft proposal from raw logits.
+         *
+         * Draft proposal deliberately uses only temperature-scaled raw logits:
+         * target rows own top-k/top-p, penalties, and residual correction. The
+         * kernel writes the full proposal probability row plus the sampled draft
+         * token and q(sampled_token), giving the verifier everything it needs
+         * without building a compact top-k/top-p draft table.
+         *
+         * Implementations must only enqueue work on `stream`; they must not
+         * allocate, synchronize, or use a device-default/null stream.
+         */
+        virtual bool enqueueSoftmaxAndSampleTemperatureLogitsF32Device(
+            const void *logits_device,
+            int vocab_size,
+            int row_stride,
+            float temperature,
+            float threshold,
+            int device_id,
+            void *stream,
+            void *out_probabilities_device,
+            int out_row_stride,
+            void *out_token_device,
+            void *out_probability_device = nullptr)
+        {
+            (void)logits_device;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)temperature;
+            (void)threshold;
+            (void)device_id;
+            (void)stream;
+            (void)out_probabilities_device;
+            (void)out_row_stride;
+            (void)out_token_device;
+            (void)out_probability_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue vLLM-style draft proposal while preserving draft logits.
+         *
+         * This is the production draft-side companion to
+         * enqueueSoftmaxAndSampleTemperatureLogitsF32Device(). It samples from
+         * the temperature-only proposal distribution, writes the sampled token
+         * plus q(sampled_token), and stores the temperature-scaled proposal
+         * logits in `out_logits_device` for rejection verification.
+         *
+         * The verifier can then compute p/q and recovered-token weights from
+         * logits/logsumexp, avoiding a full-vocab draft probability matrix.
+         * Implementations must only enqueue work on `stream`; they must not
+         * allocate, synchronize, or use a device-default/null stream.
+         */
+        virtual bool enqueueScaleAndSampleTemperatureLogitsF32Device(
+            const void *logits_device,
+            int vocab_size,
+            int row_stride,
+            float temperature,
+            float threshold,
+            int device_id,
+            void *stream,
+            void *out_logits_device,
+            int out_row_stride,
+            void *out_token_device,
+            void *out_probability_device = nullptr)
+        {
+            (void)logits_device;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)temperature;
+            (void)threshold;
+            (void)device_id;
+            (void)stream;
+            (void)out_logits_device;
+            (void)out_row_stride;
+            (void)out_token_device;
+            (void)out_probability_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable softmax for processed full-logit rows.
+         *
+         * The input rows are already in sampling space: temperature, penalties,
+         * and token masks have been applied. Non-finite logits are written as
+         * probability zero. This is the vLLM-style materialization step that
+         * feeds full-probability rejection sampling.
+         *
+         * Implementations must only enqueue work on `stream`; they must not
+         * allocate, synchronize, or use a device-default/null stream.
+         */
+        virtual bool enqueueSoftmaxProcessedLogitsF32Device(
+            const void *logits_device,
+            int row_count,
+            int vocab_size,
+            int row_stride,
+            int device_id,
+            void *stream,
+            void *out_probabilities_device,
+            int out_row_stride)
+        {
+            (void)logits_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)device_id;
+            (void)stream;
+            (void)out_probabilities_device;
+            (void)out_row_stride;
+            return false;
+        }
+
+        /**
+         * @brief Fill vLLM-style inverse-exponential rejection samples on device.
+         *
+         * Writes `row_count` full-vocab rows. Row `r` uses logical position
+         * `first_logical_position + r` so the same speculative verification
+         * step produces identical recovered-token choices whether it is captured
+         * or replayed. Implementations must only enqueue work on the explicit
+         * non-null stream; no allocation, synchronization, or default/null
+         * stream use is allowed.
+         */
+        virtual bool enqueueFillInverseExponentialSamplesF32Device(
+            void *out_samples_device,
+            int row_count,
+            int vocab_size,
+            int row_stride,
+            uint64_t seed,
+            int first_logical_position,
+            int device_id,
+            void *stream)
+        {
+            (void)out_samples_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)seed;
+            (void)first_logical_position;
+            (void)device_id;
+            (void)stream;
             return false;
         }
 
@@ -928,9 +1236,14 @@ namespace llaminar2
          * sampled draft token sequence already lives in arena-owned device
          * memory, so the verifier kernel reads `draft_tokens_device[row]`
          * directly instead of receiving draft tokens as host scalar kernel
-         * arguments. Thresholds remain scalar host values for now because they
-         * are deterministic RNG outputs owned by the runner; moving them to
-         * device memory is a later plumbing step.
+         * arguments. If `draft_token_probabilities_device` is provided, row `r`
+         * contains q(draft_tokens_device[r]) from the draft sampler and the
+         * verifier can skip the sampled-token lookup in the compact draft
+         * table. Residual sampling still uses the full draft table.
+         *
+         * Thresholds remain scalar host values for now because they are
+         * deterministic RNG outputs owned by the runner; moving them to device
+         * memory is a later plumbing step.
          *
          * Implementations must only enqueue work on `stream`; they must not
          * allocate, synchronize, or use a default/null GPU stream.
@@ -951,7 +1264,8 @@ namespace llaminar2
             void *out_token_device,
             void *out_accepted_device,
             void *out_accept_probability_device = nullptr,
-            void *out_accept_threshold_device = nullptr)
+            void *out_accept_threshold_device = nullptr,
+            const void *draft_token_probabilities_device = nullptr)
         {
             (void)target_token_ids_device;
             (void)target_probs_device;
@@ -969,6 +1283,221 @@ namespace llaminar2
             (void)out_accepted_device;
             (void)out_accept_probability_device;
             (void)out_accept_threshold_device;
+            (void)draft_token_probabilities_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue batched stochastic verification from processed full logits.
+         *
+         * This is the vLLM-style sibling of the compact-table verifier. The
+         * target and draft rows are already processed into sampling space
+         * (temperature/penalties/masks applied), and the kernel recovers only
+         * the sampled draft token probabilities needed for accept/reject. On a
+         * rejection it samples the residual distribution from the full logits.
+         *
+         * Implementations must launch only on the explicit non-null `stream`;
+         * no allocation, synchronization, or device-default/null stream use is
+         * allowed.
+         */
+        virtual bool enqueueSpeculativeVerifyProcessedLogitsF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_logits_device,
+            const void *draft_logits_device,
+            int row_count,
+            int vocab_size,
+            int target_row_stride,
+            int draft_row_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            const float *residual_thresholds_host,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr,
+            const void *draft_token_probabilities_device = nullptr)
+        {
+            (void)target_logits_device;
+            (void)draft_logits_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)target_row_stride;
+            (void)draft_row_stride;
+            (void)draft_tokens_device;
+            (void)accept_thresholds_host;
+            (void)residual_thresholds_host;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            (void)draft_token_probabilities_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue vLLM-style verify from target logits and draft probabilities.
+         *
+         * The target rows are processed logits: penalties, top-k/top-p masks,
+         * and temperature have already been applied. The draft rows are
+         * temperature-only proposal probabilities captured when each MTP draft
+         * token was sampled. In vLLM-style greedy-draft mode
+         * @p no_draft_probabilities treats the draft distribution as one-hot at
+         * the sampled token. The kernel computes p(draft) from the target row,
+         * reads or synthesizes q(draft), and on rejection samples the recovered
+         * token by reducing `max(p - q, 0) * inverse_exp(token)`.
+         *
+         * This keeps the production path closer to vLLM by avoiding target
+         * full-probability rows and inverse-random matrices. Implementations
+         * must launch only on the explicit non-null `stream`; no allocation,
+         * synchronization, or device-default/null stream use is allowed.
+         */
+        virtual bool enqueueSpeculativeVerifyProcessedTargetDraftProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_logits_device,
+            const void *draft_probabilities_device,
+            int row_count,
+            int vocab_size,
+            int target_row_stride,
+            int draft_row_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_first_logical_position,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr,
+            bool no_draft_probabilities = false)
+        {
+            (void)target_logits_device;
+            (void)draft_probabilities_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)target_row_stride;
+            (void)draft_row_stride;
+            (void)draft_tokens_device;
+            (void)accept_thresholds_host;
+            (void)inverse_sample_seed;
+            (void)inverse_sample_first_logical_position;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            (void)no_draft_probabilities;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue vLLM-style verify from target and draft logits.
+         *
+         * Target rows are processed logits: penalties, top-k/top-p masks, and
+         * temperature have already been applied. Draft rows are temperature-only
+         * proposal logits captured when each MTP draft token was sampled. The
+         * kernel computes p(draft) and q(draft) from row-local logsumexp and, on
+         * rejection, samples the recovered token with the same inverse-exp race
+         * used by vLLM-style probability rejection.
+         *
+         * This is a measured alternative to the probability-row path. It avoids
+         * materializing full draft probability rows while preserving exact
+         * rejection semantics, but production promotion still depends on
+         * backend-specific perf evidence. Implementations must launch only on
+         * the explicit non-null `stream`; no allocation, synchronization, or
+         * default/null stream use is allowed.
+         */
+        virtual bool enqueueSpeculativeVerifyProcessedTargetDraftLogitsF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_logits_device,
+            const void *draft_logits_device,
+            int row_count,
+            int vocab_size,
+            int target_row_stride,
+            int draft_row_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_first_logical_position,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr,
+            const void *draft_token_probabilities_device = nullptr)
+        {
+            (void)target_logits_device;
+            (void)draft_logits_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)target_row_stride;
+            (void)draft_row_stride;
+            (void)draft_tokens_device;
+            (void)accept_thresholds_host;
+            (void)inverse_sample_seed;
+            (void)inverse_sample_first_logical_position;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            (void)draft_token_probabilities_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue vLLM-style stochastic verify from full probability rows.
+         *
+         * `target_probabilities_device` and `draft_probabilities_device` are
+         * full-vocab probability rows for each verifier row. On rejection, the
+         * kernel samples the recovered token by reducing
+         * `max(target_prob - draft_prob, 0) * inverse_rejection_samples`.
+         *
+         * This mirrors vLLM's random rejection sampler and is the target
+         * production contract for stochastic MTP. Implementations must launch
+         * only on the explicit non-null `stream`; no allocation,
+         * synchronization, or device-default/null stream use is allowed.
+         */
+        virtual bool enqueueSpeculativeVerifyProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_probabilities_device,
+            const void *draft_probabilities_device,
+            const void *inverse_rejection_samples_device,
+            int row_count,
+            int vocab_size,
+            int target_row_stride,
+            int draft_row_stride,
+            int inverse_sample_row_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr,
+            bool no_draft_probabilities = false)
+        {
+            (void)target_probabilities_device;
+            (void)draft_probabilities_device;
+            (void)inverse_rejection_samples_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)target_row_stride;
+            (void)draft_row_stride;
+            (void)inverse_sample_row_stride;
+            (void)draft_tokens_device;
+            (void)accept_thresholds_host;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            (void)no_draft_probabilities;
             return false;
         }
 
@@ -1047,6 +1576,50 @@ namespace llaminar2
             (void)stop_token_count;
             (void)bonus_token_device;
             (void)has_bonus_token;
+            (void)device_id;
+            (void)stream;
+            (void)out_tokens_device;
+            (void)out_meta_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue device-side reduction of greedy verifier rows.
+         *
+         * Greedy MTP uses the same vLLM-style compact batch contract as the
+         * stochastic verifier, but row acceptance is simply
+         * `verify_tokens[row] == draft_tokens[row + 1]`. Backends must launch a
+         * small graph-capturable kernel on the explicit non-null `stream`,
+         * compare the device-resident verifier argmax rows with the
+         * device-resident compact verifier input row, and write only compact
+         * output tokens plus metadata for the host handoff.
+         *
+         * @param verify_tokens_device INT32 verifier argmax rows
+         *        `[compare_row_count + 1]`; the final row is the bonus ready
+         *        token used only when all speculative rows accept.
+         * @param draft_tokens_device INT32 verifier input row
+         *        `[first_token, draft_1, ...]`.
+         * @param compare_row_count Number of speculative rows to compare.
+         * @param first_token Host copy of `draft_tokens_device[0]`.
+         */
+        virtual bool enqueueSummarizeGreedySpeculativeVerifyBatch(
+            const void *verify_tokens_device,
+            const void *draft_tokens_device,
+            int compare_row_count,
+            int first_token,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_meta_device)
+        {
+            (void)verify_tokens_device;
+            (void)draft_tokens_device;
+            (void)compare_row_count;
+            (void)first_token;
+            (void)stop_tokens_host;
+            (void)stop_token_count;
             (void)device_id;
             (void)stream;
             (void)out_tokens_device;

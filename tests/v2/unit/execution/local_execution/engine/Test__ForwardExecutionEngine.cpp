@@ -1284,12 +1284,21 @@ TEST_F(Test__ForwardExecutionEngine, ReplayCacheObservationsTrackOrdinaryAndVeri
 
     const ForwardExecutionEngine::ReplayStateResetSummary summary =
         engine.resetCapturedReplayStateForCorrectionReplay(/*live_state_epoch=*/123);
-    EXPECT_EQ(summary.reset_replay_state, 1u);
-    EXPECT_EQ(summary.ordinary_decode_reset, 1u);
-    EXPECT_EQ(summary.preserved_for_stream_rebind, 1u);
+    EXPECT_EQ(summary.reset_replay_state, 0u);
+    EXPECT_EQ(summary.ordinary_decode_reset, 0u);
+    EXPECT_EQ(summary.preserved_for_stream_rebind, 2u);
     EXPECT_EQ(summary.all_position_verifier_preserved, 1u);
-    EXPECT_EQ(summary.other_preserved, 0u)
-        << "Only the all-position verifier cache is preserved; one-token condition decode must recapture.";
+    EXPECT_EQ(summary.other_preserved, 1u)
+        << "Single-token condition decode and all-position verifier captures are both version-safe at MTP publication.";
+
+    const auto observations_after_reset =
+        engine.replayCacheObservations(/*live_state_epoch=*/123);
+    ASSERT_EQ(observations_after_reset.size(), 2u);
+    for (const auto &observation : observations_after_reset)
+    {
+        EXPECT_EQ(observation.segmented_capture_live_state_epoch, 123u);
+        EXPECT_FALSE(observation.requires_live_state_epoch_recapture);
+    }
 
     host.mock_compute_all_position_logits = false;
     ordinary_token = 46;

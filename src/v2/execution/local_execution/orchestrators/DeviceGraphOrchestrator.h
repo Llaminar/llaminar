@@ -244,6 +244,18 @@ namespace llaminar2
         std::shared_ptr<TensorBase> prefix_terminal_hidden;
         std::shared_ptr<TensorBase> prefix_terminal_logits;
 
+        /// Shape of the most recent main-model forward that populated `hidden`.
+        /// MTP sidecars use this to decide whether `hidden` is already a single
+        /// terminal row or whether a compact row-select is required first.
+        int last_forward_seq_len = 0;
+        int last_forward_batch_size = 0;
+
+        /// True when `prefix_terminal_hidden` is the accepted terminal row for
+        /// the current live state. Ordinary forward makes this stale; prefix
+        /// restore, accepted-state publication, or an explicit terminal refresh
+        /// makes it current again.
+        bool mtp_terminal_hidden_current = false;
+
         /// Per-device KV caches for Pipeline Parallelism
         /// When PP is enabled, each PP stage device has its own KV cache containing
         /// only the layers processed by that stage. Key is DeviceId, value is the cache.
@@ -338,6 +350,9 @@ namespace llaminar2
             }
             std::fill(positions.begin(), positions.end(), 0);
             std::fill(sequence_lengths.begin(), sequence_lengths.end(), 0);
+            last_forward_seq_len = 0;
+            last_forward_batch_size = 0;
+            mtp_terminal_hidden_current = false;
         }
 
         /**
@@ -1387,6 +1402,22 @@ namespace llaminar2
          */
         const InferenceState &inferenceState() const { return state_; }
 
+        /**
+         * @brief Mark the current hidden tensor as freshly produced by main forward for tests.
+         *
+         * Unit tests that inject `state_.hidden` directly bypass the normal forward
+         * path that records terminal-hidden freshness for MTP sidecars. This helper
+         * preserves the production invariant: sidecar execution must only consume a
+         * hidden tensor that was explicitly published as current.
+         *
+         * @param seq_len Number of rows represented by the injected hidden tensor.
+         * @param batch_size Batch size represented by the injected hidden tensor.
+         */
+        void markMainForwardHiddenProducedForTesting(int seq_len, int batch_size)
+        {
+            noteMainForwardHiddenProducedForMTP(seq_len, batch_size);
+        }
+
         // =====================================================================
         // IInferenceRunner: Device & Logits Local API overrides
         // =====================================================================
@@ -1416,6 +1447,43 @@ namespace llaminar2
                 // Expose this runner's arena-owned argmax scratch so the
                 // multi-device sampler can drive the multi-block reduction
                 // without any hot-path allocation.
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_};
+        }
+
+        LogitsLocalInfo consumeLogitsLocalInfoForSampling() override
+        {
+            if (!state_.logits_local)
+                return {};
+
+            const auto &shape = state_.logits_local->shape();
+            auto device_opt = state_.logits_local->current_device();
+
+            /*
+             * TP sampling is the semantic consumer of main-decode logits.  Use
+             * the stream published by graph replay when present; otherwise use
+             * this runner's explicit worker stream.  Sampling on any unrelated
+             * stream can race graph-captured decode and read an older logits
+             * row, which is both nondeterministic and very hard to diagnose.
+             */
+            void *stream = nullptr;
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = consumePendingLogitsStream(
+                    PendingLogitsStreamRole::MainDecode,
+                    "consumeLogitsLocalInfoForSampling");
+                if (!stream)
+                    stream = explicitGPUStreamForOperation(
+                        "consumeLogitsLocalInfoForSampling");
+            }
+
+            return LogitsLocalInfo{
+                state_.logits_local->gpu_data_ptr(),
+                device_opt,
+                shape.size() >= 2 ? shape[1] : 0,
+                state_.logits_local.get(),
+                stream,
                 argmax_partial_vals_dev_,
                 argmax_partial_idxs_dev_,
                 argmax_partial_capacity_};
@@ -1482,6 +1550,38 @@ namespace llaminar2
                 argmax_partial_vals_dev_,
                 argmax_partial_idxs_dev_,
                 argmax_partial_capacity_};
+        }
+
+        LogitsLocalInfo consumeAllPositionLogitsLocalInfoForSampling() override
+        {
+            if (!hasAllPositionLogitsLocal())
+                return {};
+
+            LogitsLocalInfo info = getAllPositionLogitsLocalInfo();
+            if (!info)
+                return {};
+
+            if (info.device.has_value() && info.device->is_gpu())
+            {
+                /*
+                 * All-position verifier sampling is the semantic consumer of
+                 * verifier graph replay.  Consume the replay stream here so
+                 * LocalTP argmax reads this shard only after graph replay has
+                 * produced it; non-captured execution still uses an explicit
+                 * non-null worker stream.
+                 */
+                void *stream = consumePendingLogitsStream(
+                    PendingLogitsStreamRole::AllPositionVerifier,
+                    "consumeAllPositionLogitsLocalInfoForSampling");
+                if (!stream)
+                {
+                    stream = explicitGPUStreamForOperation(
+                        "consumeAllPositionLogitsLocalInfoForSampling");
+                }
+                info.stream = stream;
+            }
+
+            return info;
         }
 
         /**
@@ -1587,6 +1687,12 @@ namespace llaminar2
             int start_row,
             int row_count,
             int32_t *out_tokens) override;
+        bool verifyGreedyAllPositionBatchOutcomeOnDevice(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeVerifyBatchOutcome *out) override;
 
         /**
          * @brief Get current position offset for a sequence
@@ -1921,6 +2027,36 @@ namespace llaminar2
             int slot,
             const SamplingParams &params,
             int vocab_size) override;
+        bool buildStochasticDistributionsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        bool buildStochasticProcessedLogitRowsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        int sampleStochasticDraftProposalOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold) override;
+        bool sampleStochasticDraftProposalOnDeviceDeferred(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold) override;
         int sampleStochasticDistributionOnDevice(
             DeviceDistributionBuffer buffer,
             int slot,
@@ -1961,7 +2097,10 @@ namespace llaminar2
             int stop_token_count,
             int bonus_target_slot,
             float bonus_threshold,
-            DeviceSpeculativeVerifyBatchOutcome *out) override;
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
         bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
             int first_target_slot,
             int first_draft_slot,
@@ -1974,7 +2113,10 @@ namespace llaminar2
             int stop_token_count,
             int bonus_target_slot,
             float bonus_threshold,
-            DeviceSpeculativeVerifyBatchOutcome *out) override;
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
 
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)
@@ -2018,6 +2160,7 @@ namespace llaminar2
             for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
                 cache.resetSessionState();
             mtp_terminal_hidden_row_select_cache_.resetSessionState();
+            mtp_terminal_hidden_rows_select_cache_.resetSessionState();
             last_pos_offset_ = -1;
             defer_next_mtp_main_decode_sync_ = false;
             defer_all_position_verifier_sync_ = false;
@@ -2418,21 +2561,25 @@ namespace llaminar2
         void clearStochasticTargetSampleReadySlots();
 
         /**
-         * @brief Record that a deferred GPU sampler has written a draft token slot.
+         * @brief Record that a GPU sampler has written a draft token slot.
          *
-         * The deferred stochastic path avoids a host D2H token read, so the host
-         * can no longer act as an ordering point.  This helper records a backend
-         * event on the producer stream immediately after the sample kernel so
-         * later GPU consumers can wait without synchronizing the CPU.
+         * Host-visible and deferred stochastic paths both write the same
+         * runner-owned device slot.  A host D2H scalar read is only an optional
+         * observation of that slot; it must not erase the device readiness edge.
+         * This helper records a backend event on the producer stream immediately
+         * after the sample kernel so later GPU consumers can wait without using
+         * the device-default stream or synchronizing the CPU.
          */
         bool recordStochasticDraftSampleReady(int slot, void *producer_stream);
 
         /**
-         * @brief Record that a deferred GPU sampler has written a target token slot.
+         * @brief Record that a GPU sampler has written a target token slot.
          *
-         * This mirrors recordStochasticDraftSampleReady(), but target samples
-         * live in a separate arena buffer so verifier row outputs can overwrite
-         * STOCHASTIC_VERIFY_TOKENS without corrupting the first generated token.
+         * This mirrors recordStochasticDraftSampleReady(). Target samples live
+         * in a separate arena buffer so verifier row outputs can overwrite
+         * STOCHASTIC_VERIFY_TOKENS without corrupting the first generated token,
+         * and a host read of the first token remains independent from device
+         * summary-kernel ownership.
          */
         bool recordStochasticTargetSampleReady(int slot, void *producer_stream);
 
@@ -2526,14 +2673,31 @@ namespace llaminar2
         /**
          * @brief Shared implementation for compact device-side stochastic sampling.
          *
-         * When `out_token_host` is non-null the helper also performs the trusted
-         * fast D2H scalar read used by legacy host-driven callers.  When it is
-         * null, the sampled token remains only in the runner-owned device slot
-         * for later sidecar/verifier graph stages to consume.
+         * The sample kernel always writes a runner-owned device slot and records
+         * a readiness event for later GPU consumers. When `out_token_host` is
+         * non-null the helper also performs the trusted fast D2H scalar read used
+         * by legacy host-driven callers; that read does not transfer ownership
+         * away from the device slot.
          */
         bool sampleStochasticDistributionOnDeviceImpl(
             DeviceDistributionBuffer buffer,
             int slot,
+            float threshold,
+            int32_t *out_token_host);
+
+        /**
+         * @brief Shared vLLM-style draft proposal implementation.
+         *
+         * This writes the sampled draft token plus q(sampled_token). It follows
+         * vLLM's default greedy draft branch, so later rejection verification
+         * treats the draft distribution as one-hot at the sampled token.
+         */
+        bool sampleStochasticDraftProposalOnDeviceImpl(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
             float threshold,
             int32_t *out_token_host);
 
@@ -2558,7 +2722,22 @@ namespace llaminar2
             int stop_token_count,
             int bonus_target_slot,
             float bonus_threshold,
-            DeviceSpeculativeVerifyBatchOutcome *out);
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_first_logical_position,
+            bool use_vllm_probability_rejection);
+
+        /** Build processed verifier rows without the full-softmax writeback. */
+        bool buildStochasticProcessedLogitRowsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size,
+            void *stream,
+            const char *operation_name);
 
         /** Monotonic live-state epoch used by versioned decode replay. */
         uint64_t liveReplayStateEpoch() const override { return live_replay_state_epoch_; }
@@ -2726,6 +2905,27 @@ namespace llaminar2
                                                 int batch_size,
                                                 int position_offset);
         void updateMTPShiftedCacheMetadata(int active_batch_size);
+
+        /**
+         * @brief Record that main forward produced a new hidden-state tensor.
+         *
+         * This deliberately invalidates any compact terminal-hidden cache.  A
+         * later MTP sidecar must either consume the one-row `HIDDEN_STATE`
+         * directly or explicitly refresh `PREFIX_TERMINAL_HIDDEN` from the
+         * latest multi-row forward output.
+         */
+        void noteMainForwardHiddenProducedForMTP(int seq_len, int batch_size);
+
+        /**
+         * @brief Resolve the terminal-hidden tensor that should seed a first MTP sidecar.
+         *
+         * The resolver centralizes freshness rules so ordinary forward never
+         * runs helper row-select graphs just because MTP is enabled, while MTP
+         * sidecar entry points cannot accidentally consume a stale prefix row.
+         */
+        bool resolveMTPTerminalHiddenInput(TensorBase **terminal_hidden,
+                                           BufferId *terminal_hidden_buffer_id,
+                                           const char *operation);
 
         struct MTPSidecarGraphCache
         {
@@ -3075,13 +3275,16 @@ namespace llaminar2
         void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [4, 256]
         void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [3, 256]
         void *stochastic_draft_probs_dev_ = nullptr;      ///< FP32 [3, 256]
+        void *stochastic_processed_logits_dev_ = nullptr; ///< FP32 staging [4, vocab]
+        void *stochastic_inverse_rejection_samples_dev_ = nullptr; ///< FP32 [3, vocab]
         void *stochastic_target_sample_tokens_dev_ = nullptr; ///< INT32 [1, 4]
         void *stochastic_draft_sample_tokens_dev_ = nullptr; ///< INT32 [1, 3]
+        void *stochastic_draft_sample_probs_dev_ = nullptr; ///< FP32 [1, 3], p(sampled draft token)
         void *mtp_sidecar_condition_token_dev_ = nullptr; ///< INT32 [1, mtp_sidecar_condition_token_capacity_]
         int mtp_sidecar_condition_token_capacity_ = 0; ///< Total staged condition-token scalars across all sidecar slots.
         void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 [1, 4], stable verifier token input
-        void *stochastic_topk_partial_vals_dev_ = nullptr; ///< FP32 [partial_blocks, 32]
-        void *stochastic_topk_partial_idxs_dev_ = nullptr; ///< INT32 [partial_blocks, 32]
+        void *stochastic_topk_partial_vals_dev_ = nullptr; ///< FP32 batched top-k partial scratch.
+        void *stochastic_topk_partial_idxs_dev_ = nullptr; ///< INT32 batched top-k partial scratch.
         int stochastic_topk_partial_capacity_ = 0;
         void *stochastic_verify_tokens_dev_ = nullptr;    ///< INT32 [1, 4]
         void *stochastic_verify_accepted_dev_ = nullptr;  ///< INT32 [1, 4]

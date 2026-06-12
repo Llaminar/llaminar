@@ -32,7 +32,7 @@ Case sets:
 Variants:
   acceptance: baseline,fixed_d1,fixed_d3,dynamic
   grid:       fixed_d1,fixed_d3,dynamic_p70,dynamic_p80,dynamic_p90,dynamic_p95
-  all:        baseline,fixed_d1,fixed_d2,fixed_d3,dynamic,dynamic_p70,dynamic_p80,dynamic_p90,dynamic_p95,dynamic_p90_d70
+  all:        baseline,fixed_d1,fixed_d2,fixed_d3,dynamic,dynamic_generated_off,dynamic_p70,dynamic_p80,dynamic_p90,dynamic_p95,dynamic_p90_d70
 
 Environment:
   LLAMINAR_MTP_HYSTERESIS_MODEL
@@ -169,7 +169,7 @@ expand_selection() {
     case "${selection}" in
       acceptance) echo "baseline fixed_d1 fixed_d3 dynamic" ;;
       grid) echo "fixed_d1 fixed_d3 dynamic_p70 dynamic_p80 dynamic_p90 dynamic_p95" ;;
-      all) echo "baseline fixed_d1 fixed_d2 fixed_d3 dynamic dynamic_p70 dynamic_p80 dynamic_p90 dynamic_p95 dynamic_p90_d70" ;;
+      all) echo "baseline fixed_d1 fixed_d2 fixed_d3 dynamic dynamic_generated_off dynamic_p70 dynamic_p80 dynamic_p90 dynamic_p95 dynamic_p90_d70" ;;
       *) echo "${selection}" | tr ',' ' ' ;;
     esac
   fi
@@ -232,6 +232,9 @@ describe_variant() {
       ;;
     dynamic)
       variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic)
+      ;;
+    dynamic_generated_off)
+      variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic --mtp-depth-generated-policy false)
       ;;
     dynamic_promote1)
       variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic --mtp-depth-promote-windows 1)
@@ -299,7 +302,9 @@ metadata_path="${output_dir}/metadata.txt"
   git -C "${repo_root}" status --short || true
 } > "${metadata_path}"
 
-printf 'case\tvariant\tsuccess\tdecode_tps\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tdraft\tdepth\tmin_depth\tmax_depth\tupdates\tpromotions\tdemotions\twindows\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tjson\n' > "${summary_path}"
+model_name="$(basename "${model_path}")"
+
+printf 'device\tmodel\tmode\tcase\tvariant\tsuccess\tdecode_tps\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\tupdates\tpromotions\tdemotions\twindows\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tjson\n' > "${summary_path}"
 : > "${commands_path}"
 
 cases=($(expand_selection "${case_selection}" cases))
@@ -309,7 +314,15 @@ append_summary() {
   local case_name="$1"
   local variant="$2"
   local json_path="$3"
-  jq -r --arg case "${case_name}" --arg variant "${variant}" --arg json "${json_path}" '[
+  jq -r \
+    --arg device "${device_spec}" \
+    --arg model "${model_name}" \
+    --arg case "${case_name}" \
+    --arg variant "${variant}" \
+    --arg json "${json_path}" '[
+    $device,
+    $model,
+    (if (.config.mtp_verify_mode // "greedy") == "speculative-sampling" then "stochastic" else (.config.mtp_verify_mode // "greedy") end),
     $case,
     $variant,
     (.success // false),
@@ -318,6 +331,7 @@ append_summary() {
     (.tokens.prefill // 0),
     (.tokens.decode // 0),
     (.config.mtp_depth_policy // "none"),
+    (.config.mtp_depth_generated_policy // false),
     (.config.mtp_draft_tokens // 0),
     (.mtp.current_depth // 0),
     (.mtp.min_depth // 0),

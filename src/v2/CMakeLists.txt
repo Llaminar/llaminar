@@ -375,6 +375,7 @@ if(HAVE_CUDA)
     
     if(EXISTS "${CUTLASS_DIR}/include")
         message(STATUS "V2: Found CUTLASS at ${CUTLASS_DIR}")
+        set(LLAMINAR_HAVE_CUTLASS ON)
         target_include_directories(cuda_backend PUBLIC "${CUTLASS_DIR}/include")
         target_compile_definitions(cuda_backend PUBLIC HAVE_CUTLASS)
         
@@ -1772,6 +1773,10 @@ message(STATUS "V2: Linked device benchmarks library")
 
 if(HAVE_CUDA)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_CUDA)
+    if(LLAMINAR_HAVE_CUTLASS)
+        target_compile_definitions(llaminar2_core PUBLIC HAVE_CUTLASS)
+        target_include_directories(llaminar2_core PUBLIC "${CUTLASS_DIR}/include")
+    endif()
     target_include_directories(llaminar2_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(llaminar2_core PUBLIC 
         CUDA::cudart 

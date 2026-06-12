@@ -191,6 +191,34 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "all_position_stochastic_device_batch_outcome",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 10.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_batch_summary_d2h_sync",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 20.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "all_position_verifier_greedy_device_summary",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 30.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "sample_stochastic_distribution_d2h_sync",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 40.0,
+                },
+                {
+                    "domain": "mtp",
                     "name": "capture_live_prefix_state",
                     "phase": "decode",
                     "count": 1,
@@ -284,11 +312,11 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                     "count": 2,
                     "tags": {
                         "replay_state": "reset",
-                        "forward_replay_reset_cache_count": "1",
-                        "forward_replay_stream_rebind_cache_count": "2",
-                        "forward_replay_ordinary_decode_reset_count": "1",
+                        "forward_replay_reset_cache_count": "0",
+                        "forward_replay_stream_rebind_cache_count": "3",
+                        "forward_replay_ordinary_decode_reset_count": "0",
                         "forward_replay_all_position_verifier_rebind_count": "1",
-                        "forward_replay_other_rebind_count": "1",
+                        "forward_replay_other_rebind_count": "2",
                     },
                 },
                 {
@@ -339,7 +367,11 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["shifted_kv_ready_events"], 4)
         self.assertEqual(summary["shifted_kv_ready_waits"], 5)
         self.assertEqual(summary["shifted_kv_syncs_deferred"], 6)
-        self.assertEqual(summary["sampling_ms"], 1.5)
+        self.assertEqual(summary["sampling_ms"], 41.5)
+        self.assertEqual(summary["sampling_enqueue_ms"], 0.5)
+        self.assertEqual(summary["stochastic_batch_outcome_ms"], 10.0)
+        self.assertEqual(summary["stochastic_batch_d2h_sync_ms"], 20.0)
+        self.assertEqual(summary["greedy_summary_ms"], 30.0)
         self.assertEqual(summary["checkpoint_ms"], 6.0)
         self.assertEqual(summary["sidecar_graph_hits"], 7)
         self.assertEqual(summary["sidecar_graph_misses"], 8)
@@ -351,11 +383,11 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["main_verifier_replay"], 5)
         self.assertEqual(summary["replay_resets"], 2)
         self.assertEqual(summary["replay_preserves"], 6)
-        self.assertEqual(summary["replay_reset_caches"], 2)
-        self.assertEqual(summary["replay_rebind_caches"], 4)
-        self.assertEqual(summary["replay_ordinary_decode_resets"], 2)
+        self.assertEqual(summary["replay_reset_caches"], 0)
+        self.assertEqual(summary["replay_rebind_caches"], 6)
+        self.assertEqual(summary["replay_ordinary_decode_resets"], 0)
         self.assertEqual(summary["replay_verifier_rebinds"], 2)
-        self.assertEqual(summary["replay_other_rebinds"], 2)
+        self.assertEqual(summary["replay_other_rebinds"], 4)
 
     def test_missing_path_emits_zero_tsv(self) -> None:
         result = subprocess.run(
@@ -365,7 +397,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
             capture_output=True,
         )
         values = result.stdout.strip().split("\t")
-        self.assertEqual(len(values), 40)
+        self.assertEqual(len(values), 44)
         self.assertTrue(all(value in ("0", "0.0") for value in values))
 
     def test_multiple_paths_emit_table_for_matrix_comparison(self) -> None:

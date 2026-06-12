@@ -392,6 +392,7 @@ namespace llaminar2
                 {"mtp_min_draft_tokens", config->mtp.depth_policy.min_depth},
                 {"mtp_max_draft_tokens", config->mtp.depth_policy.max_depth},
                 {"mtp_depth_window", config->mtp.depth_policy.window_size},
+                {"mtp_depth_generated_policy", config->mtp.depth_policy.use_generated_policy},
                 {"mtp_depth_promote_windows",
                  config->mtp.depth_policy.promote_consecutive_windows},
                 {"sampling",

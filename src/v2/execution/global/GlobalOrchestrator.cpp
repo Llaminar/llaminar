@@ -451,6 +451,28 @@ namespace llaminar2
         }
     }
 
+    bool StageRunnerRegistry::supportsChainedMTPDraftsAll() const
+    {
+        bool saw_runner = false;
+        for (const auto &entry : entries_)
+        {
+            saw_runner = true;
+            if (!entry.runner->supportsChainedMTPDrafts())
+            {
+                return false;
+            }
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            if (!compatibility_runner_->supportsChainedMTPDrafts())
+            {
+                return false;
+            }
+        }
+        return saw_runner;
+    }
+
     bool StageRunnerRegistry::forwardMTPAll(int32_t draft_condition_token)
     {
         bool saw_runner = false;
@@ -464,6 +486,31 @@ namespace llaminar2
         {
             saw_runner = true;
             ok = compatibility_runner_->forwardMTP(draft_condition_token) && ok;
+        }
+        return saw_runner && ok;
+    }
+
+    bool StageRunnerRegistry::forwardMTPFromLastDraftAll(
+        int32_t draft_condition_token,
+        int position_id)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner->forwardMTPFromLastDraft(
+                     draft_condition_token,
+                     position_id) &&
+                 ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            ok = compatibility_runner_->forwardMTPFromLastDraft(
+                     draft_condition_token,
+                     position_id) &&
+                 ok;
         }
         return saw_runner && ok;
     }
@@ -1300,6 +1347,24 @@ namespace llaminar2
         if (!mtpDecodeUnsupportedReason().empty())
             return false;
         return stage_runners_.forwardMTPAll(draft_condition_token);
+    }
+
+    bool GlobalOrchestrator::supportsChainedMTPDrafts() const
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.supportsChainedMTPDraftsAll();
+    }
+
+    bool GlobalOrchestrator::forwardMTPFromLastDraft(
+        int32_t draft_condition_token,
+        int position_id)
+    {
+        if (!supportsChainedMTPDrafts())
+            return false;
+        return stage_runners_.forwardMTPFromLastDraftAll(
+            draft_condition_token,
+            position_id);
     }
 
     bool GlobalOrchestrator::commitMTPShiftedRowsFromLastForward(

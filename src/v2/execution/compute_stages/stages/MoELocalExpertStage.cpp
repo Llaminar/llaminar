@@ -7,6 +7,7 @@
 
 #include "MoEExpertComputeStage.h"
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
+#include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../tensors/Tensors.h"
@@ -834,7 +835,44 @@ namespace llaminar2
 
     WorkspaceRequirements MoELocalExpertStage::getWorkspaceRequirements(int m, int n, int k) const
     {
-        auto firstRequirements = [&](const std::vector<ITensorGemm *> &engines) -> WorkspaceRequirements
+        const int compact_rows_from_sparse_payload =
+            params_.input_rows
+                ? static_cast<int>(std::max<size_t>(params_.input_rows->entry_capacity, 1u))
+                : 0;
+        const int compact_rows_from_graph_hint =
+            std::max(1, m) * std::max(1, params_.top_k);
+        const int max_compact_rows =
+            std::max(compact_rows_from_sparse_payload, compact_rows_from_graph_hint);
+
+        WorkspaceRequirements reqs;
+        if (params_.device_id.is_cuda())
+        {
+            reqs.merge(MoEWorkspaceBuffers::expertExecution(
+                max_compact_rows,
+                params_.d_model,
+                params_.expert_intermediate,
+                params_.num_experts,
+                /*top_k=*/1));
+        }
+        else if (params_.device_id.is_rocm())
+        {
+            reqs.merge(MoEWorkspaceBuffers::rocmMoE(
+                max_compact_rows,
+                params_.d_model,
+                params_.expert_intermediate,
+                params_.num_experts,
+                /*top_k=*/1));
+        }
+
+        /**
+         * The local expert stage compacts sparse routes into one row per active
+         * route before delegating to MoEExpertComputeStage.  The nested stage is
+         * constructed at execute() time, so the graph allocator cannot discover
+         * its GEMM scratch unless we advertise it here with the projected shapes.
+         */
+        auto mergeGemmRequirements = [&](const std::vector<ITensorGemm *> &engines,
+                                         int out_features,
+                                         int in_features)
         {
             for (auto *gemm : engines)
             {
@@ -842,18 +880,26 @@ namespace llaminar2
                     continue;
                 auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
                 if (consumer)
-                    return consumer->getWorkspaceRequirements(m, n, k);
+                    reqs.merge(consumer->getWorkspaceRequirements(
+                        max_compact_rows,
+                        out_features,
+                        in_features));
             }
-            return WorkspaceRequirements{};
         };
 
-        WorkspaceRequirements reqs = firstRequirements(params_.prepared_gate_gemm);
-        if (!reqs.buffers.empty())
-            return reqs;
-        reqs = firstRequirements(params_.prepared_up_gemm);
-        if (!reqs.buffers.empty())
-            return reqs;
-        return firstRequirements(params_.prepared_down_gemm);
+        mergeGemmRequirements(params_.prepared_gate_gemm,
+                              params_.expert_intermediate,
+                              params_.d_model);
+        mergeGemmRequirements(params_.prepared_up_gemm,
+                              params_.expert_intermediate,
+                              params_.d_model);
+        mergeGemmRequirements(params_.prepared_down_gemm,
+                              params_.d_model,
+                              params_.expert_intermediate);
+
+        (void)n;
+        (void)k;
+        return reqs;
     }
 
     void MoELocalExpertStage::bindWorkspace(DeviceWorkspaceManager *workspace)

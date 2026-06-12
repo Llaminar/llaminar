@@ -90,6 +90,33 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Infer the coarse model class used by generated MTP depth rules.
+         *
+         * The controller should not depend on exact GGUF architecture strings,
+         * but MoE and dense models have different speculative-depth economics.
+         * Collapse the metadata string into the smallest useful policy key.
+         */
+        MTPDepthPolicyModelClass inferMTPDepthPolicyModelClass(
+            const std::shared_ptr<ModelContext> &model_ctx)
+        {
+            if (!model_ctx)
+                return MTPDepthPolicyModelClass::Any;
+
+            std::string architecture = model_ctx->architecture();
+            std::transform(
+                architecture.begin(),
+                architecture.end(),
+                architecture.begin(),
+                [](unsigned char c)
+                { return static_cast<char>(std::tolower(c)); });
+            if (architecture.empty())
+                return MTPDepthPolicyModelClass::Any;
+            if (architecture.find("moe") != std::string::npos)
+                return MTPDepthPolicyModelClass::MoE;
+            return MTPDepthPolicyModelClass::Dense;
+        }
+
         bool samplingParamsEqual(const SamplingParams &a, const SamplingParams &b)
         {
             return a.temperature == b.temperature &&
@@ -1091,13 +1118,25 @@ namespace llaminar2
         {
             return "MTP decode with --mtp-draft-tokens > 1 requires runner support for chained MTP sidecars";
         }
-        if (mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic &&
-            (plan_.usesLocalTP() ||
-             plan_.usesLocalPP() ||
-             plan_.usesGlobalTP() ||
-             (mpi_ctx_ && mpi_ctx_->world_size() > 1)))
+        if (mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic)
         {
-            return "MTP dynamic depth policy is currently implemented only for SingleDevice execution";
+            /*
+             * The adaptive controller is intentionally owned by this
+             * OrchestrationRunner, not by child device runners. LocalTP is safe
+             * because one in-process runner chooses a single depth and then
+             * fans out that same request to every participant. Multi-process
+             * domains need an explicit scalar coordination step before we let
+             * ranks adapt independently.
+             */
+            if (plan_.usesLocalPP())
+            {
+                return "MTP dynamic depth policy is not enabled for PP topologies";
+            }
+            if (plan_.usesGlobalTP() ||
+                (mpi_ctx_ && mpi_ctx_->world_size() > 1))
+            {
+                return "MTP dynamic depth policy requires SingleDevice or LocalTP; GlobalTP/MPI depth coordination is not implemented yet";
+            }
         }
         if (mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
             !active_sampling_params_.is_greedy() &&
@@ -1197,8 +1236,24 @@ namespace llaminar2
         {
             if (!mtp_depth_controller_)
             {
+                MTPDepthPolicyConfig depth_policy = mtp.depth_policy;
+                const DeviceId primary_device = runner_->primaryDeviceId();
+                if (primary_device.is_cuda())
+                    depth_policy.backend = MTPDepthPolicyBackend::CUDA;
+                else if (primary_device.is_rocm())
+                    depth_policy.backend = MTPDepthPolicyBackend::ROCm;
+                else if (primary_device.is_cpu())
+                    depth_policy.backend = MTPDepthPolicyBackend::CPU;
+                else
+                    depth_policy.backend = MTPDepthPolicyBackend::Any;
+                depth_policy.model_class =
+                    inferMTPDepthPolicyModelClass(model_ctx_);
+
                 mtp_depth_controller_ =
-                    std::make_unique<MTPDepthController>(mtp.depth_policy, mtp.draft_tokens);
+                    std::make_unique<MTPDepthController>(
+                        depth_policy,
+                        mtp.draft_tokens,
+                        mtp.verify_mode);
             }
             return true;
         }
@@ -1383,6 +1438,26 @@ namespace llaminar2
             result.error = message;
             return result;
         };
+
+        if (use_ready_logits && ready_sampled_token.has_value())
+        {
+            /*
+             * A ready verifier token is sampled one decode step before it is
+             * consumed. Treat it as part of the atomic MTP transaction: if the
+             * active sampling contract changed, consuming the cached token would
+             * silently mix two sampling regimes in one request.
+             */
+            if (!ready_sampled_params.has_value())
+            {
+                return fail_after_checkpoint(
+                    "Ready MTP verifier token is missing the sampling parameters that produced it");
+            }
+            if (!samplingParamsEqual(*ready_sampled_params, active_sampling_params_))
+            {
+                return fail_after_checkpoint(
+                    "Ready MTP verifier token was sampled with different sampling parameters");
+            }
+        }
 
         const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
         const bool stochastic_verify =
@@ -1908,7 +1983,7 @@ namespace llaminar2
                  * The condition forward's logits are consumed immediately by a
                  * GPU sampler or distribution-builder.  Arm a one-shot stream
                  * handoff so graph replay can skip the CPU sync boundary and
-                 * let that consumer enforce ordering on the same stream.
+                * let that consumer enforce ordering on the same stream.
                 */
                 runner_->setMTPMainDecodeSyncDeferralEnabled(can_defer_main_decode_sync);
                 ok = runner_->forward(&condition_token, 1);
@@ -2285,36 +2360,13 @@ namespace llaminar2
             {
                 if (stochastic_device_verify)
                 {
-                    if (active_sampling_params_.has_penalties())
-                    {
-                        PerfStatsCollector::ScopedTimer timer(
-                            "mtp",
-                            "sample_mtp_token_stochastic_penalties",
-                            "decode");
-                        auto penalty_map =
-                            draft_sampler.compute_penalty_map(active_sampling_params_, vocab);
-                        if (!penalty_map.empty() &&
-                            !runner_->applyPenaltiesToMTPLogitsOnDevice(penalty_map, vocab))
-                        {
-                            return -1;
-                        }
-                    }
-                    {
-                        PerfStatsCollector::ScopedTimer timer(
-                            "mtp",
-                            "sample_mtp_token_stochastic_distribution",
-                            "decode");
-                        if (!runner_->buildStochasticDistributionOnDevice(
-                                DeviceLogitsSource::MTP,
-                                0,
-                                DeviceDistributionBuffer::Draft,
-                                draft_idx,
-                                active_sampling_params_,
-                                vocab))
-                        {
-                            return -1;
-                        }
-                    }
+                    /*
+                     * vLLM's default draft-sample mode is greedy: the draft
+                     * side emits only a token, and target-side rejection treats
+                     * q as a one-hot distribution. That avoids building full
+                     * draft probability rows on every MTP sidecar step while
+                     * preserving stochastic target correction semantics.
+                     */
                     {
                         PerfStatsCollector::ScopedTimer timer("mtp", "sample_mtp_token_stochastic_device", "decode");
                         const float threshold =
@@ -2323,9 +2375,12 @@ namespace llaminar2
                                 checkpoint.cached_tokens + 1 + draft_idx);
                         if (defer_host_read)
                         {
-                            if (!runner_->sampleStochasticDistributionOnDeviceDeferred(
-                                    DeviceDistributionBuffer::Draft,
+                            if (!runner_->sampleStochasticDraftProposalOnDeviceDeferred(
+                                    DeviceLogitsSource::MTP,
+                                    0,
                                     draft_idx,
+                                    active_sampling_params_,
+                                    vocab,
                                     threshold))
                             {
                                 return -1;
@@ -2339,9 +2394,12 @@ namespace llaminar2
                                 {{"draft_idx", std::to_string(draft_idx)}});
                             return kDeferredMTPDraftTokenShadow;
                         }
-                        token = runner_->sampleStochasticDistributionOnDevice(
-                            DeviceDistributionBuffer::Draft,
+                        token = runner_->sampleStochasticDraftProposalOnDevice(
+                            DeviceLogitsSource::MTP,
+                            0,
                             draft_idx,
+                            active_sampling_params_,
+                            vocab,
                             threshold);
                     }
                     if (token < 0)
@@ -2550,9 +2608,16 @@ namespace llaminar2
                         {{"draft_idx", std::to_string(draft_idx)}});
                 }
             }
-            else if (!runner_->flushPendingMTPWork())
+            else
             {
-                return fail_after_checkpoint("MTP sidecar stream flush failed");
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "sidecar_iteration_flush",
+                    "decode");
+                if (!runner_->flushPendingMTPWork())
+                {
+                    return fail_after_checkpoint("MTP sidecar stream flush failed");
+                }
             }
 
             if (draft_idx == 0)
@@ -2614,9 +2679,15 @@ namespace llaminar2
             PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
         }
 
-        if (!runner_->flushPendingMTPWork())
         {
-            return fail_after_checkpoint("MTP sidecar stream flush failed before verification");
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "sidecar_final_flush_before_verification",
+                "decode");
+            if (!runner_->flushPendingMTPWork())
+            {
+                return fail_after_checkpoint("MTP sidecar stream flush failed before verification");
+            }
         }
 
         if (DebugEnv::isTruthyEnv("LLAMINAR_MTP_VERIFY_SIDECAR_PRESERVES_MAIN_STATE"))
@@ -3401,23 +3472,107 @@ namespace llaminar2
                     {
                         return false;
                     }
-                    return runner_->buildStochasticDistributionOnDevice(
-                        DeviceLogitsSource::AllPosition,
-                        row,
-                        DeviceDistributionBuffer::Target,
+	                    return runner_->buildStochasticDistributionOnDevice(
+	                        DeviceLogitsSource::AllPosition,
+	                        row,
+	                        DeviceDistributionBuffer::Target,
                         slot,
                         active_sampling_params_,
-                        vocab);
+	                        vocab);
+	                };
+
+                auto inverse_sample_seed_for_thresholds =
+                    [&](const float *thresholds, size_t count) -> uint64_t
+                {
+                    if (active_sampling_params_.seed != 0)
+                    {
+                        return static_cast<uint64_t>(
+                            active_sampling_params_.seed);
+                    }
+
+                    /*
+                     * Unseeded stochastic decode still needs GPU-side random
+                     * inverse-exponential rows for vLLM rejection recovery.
+                     * Mix the residual draws that already belong to this
+                     * verifier step so captured and uncaptured execution use a
+                     * stable per-step random matrix without a host full-vocab
+                     * upload.
+                     */
+                    uint64_t seed = 0xD1B54A32D192ED03ull;
+                    for (size_t i = 0; i < count; ++i)
+                    {
+                        uint32_t bits = 0;
+                        std::memcpy(&bits, thresholds + i, sizeof(bits));
+                        seed = sampling_math::splitmix64(
+                            seed ^ static_cast<uint64_t>(bits));
+                    }
+                    return seed;
                 };
 
-                // We can prebuild every target distribution only when the
-                // sampler history cannot change logits between verifier rows.
-                // With presence/frequency/DRY penalties, each accepted token
-                // changes the next row's target distribution, so those paths
-                // deliberately keep the existing row-by-row verifier.
+                auto apply_vllm_row_penalties =
+                    [&](int compare_rows, int bonus_row) -> bool
+                {
+                    if (!active_sampling_params_.has_penalties())
+                        return true;
+                    if (first_token == kDeferredMTPFirstTokenShadow)
+                        return false;
+
+                    /*
+                     * Row i is consumed only on the branch where all previous
+                     * draft rows accepted.  That makes the row-local penalty
+                     * history deterministic: base sampler history, first
+                     * target token, then draft[1..i-1].  This is the same
+                     * speculative-row metadata shape vLLM uses; it preserves
+                     * exact sampler history without a per-row host sync.
+                     */
+                    Sampler row_penalty_sampler = sampler_;
+                    row_penalty_sampler.record_token(first_token);
+                    for (int row = 0; row < compare_rows; ++row)
+                    {
+                        auto penalty_map =
+                            row_penalty_sampler.compute_penalty_map(
+                                active_sampling_params_,
+                                vocab);
+                        if (!penalty_map.empty() &&
+                            !runner_->applyPenaltiesToAllPositionLogitsOnDeviceRow(
+                                row,
+                                penalty_map,
+                                vocab))
+                        {
+                            return false;
+                        }
+                        row_penalty_sampler.record_token(
+                            draft_tokens[static_cast<size_t>(row + 1)]);
+                    }
+
+                    auto bonus_penalty_map =
+                        row_penalty_sampler.compute_penalty_map(
+                            active_sampling_params_,
+                            vocab);
+                    if (!bonus_penalty_map.empty() &&
+                        !runner_->applyPenaltiesToAllPositionLogitsOnDeviceRow(
+                            bonus_row,
+                            bonus_penalty_map,
+                            vocab))
+                    {
+                        return false;
+                    }
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_vllm_penalty_rows_preapplied",
+                        static_cast<double>(compare_rows + 1),
+                        "decode",
+                        {},
+                        {{"verifier_path", "all_position_state_publication"}});
+                    return true;
+                };
+
+                const bool can_batch_penalty_rows =
+                    !active_sampling_params_.has_penalties() ||
+                    first_token != kDeferredMTPFirstTokenShadow;
                 const bool batched_device_rejection =
                     stochastic_device_verify &&
-                    !active_sampling_params_.has_penalties() &&
+                    can_batch_penalty_rows &&
                     draft_tokens.size() > 1 &&
                     !stochastic_stopped_on_output &&
                     stop_tokens_.size() <=
@@ -3428,18 +3583,38 @@ namespace llaminar2
                 std::vector<float> batched_residual_thresholds;
                 if (batched_device_rejection)
                 {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "all_position_stochastic_device_batch_outcome",
+                        "decode",
+                        {},
+                        {{"verifier_path", "all_position_state_publication"}});
                     const int compare_rows =
                         static_cast<int>(draft_tokens.size()) - 1;
                     batched_accept_thresholds.reserve(static_cast<size_t>(compare_rows));
                     batched_residual_thresholds.reserve(static_cast<size_t>(compare_rows));
 
+                    const int bonus_row = compare_rows;
+                    if (!apply_vllm_row_penalties(compare_rows, bonus_row))
+                    {
+                        return fail_after_checkpoint(
+                            "All-position stochastic MTP vLLM row penalty application failed");
+                    }
+                    if (!runner_->buildStochasticProcessedLogitRowsOnDevice(
+                            DeviceLogitsSource::AllPosition,
+                            /*first_row=*/0,
+                            DeviceDistributionBuffer::Target,
+                            /*first_slot=*/0,
+                            /*row_count=*/compare_rows + 1,
+                            active_sampling_params_,
+                            vocab))
+                    {
+                        return fail_after_checkpoint(
+                            "All-position stochastic MTP batched target processed-row build failed");
+                    }
+
                     for (int row = 0; row < compare_rows; ++row)
                     {
-                        if (!build_all_position_target_distribution(row, row))
-                        {
-                            return fail_after_checkpoint(
-                                "All-position stochastic MTP batched target distribution build failed");
-                        }
                         const int row_logical_position =
                             checkpoint.cached_tokens + 1 + row;
                         batched_accept_thresholds.push_back(
@@ -3452,15 +3627,6 @@ namespace llaminar2
                                 row_logical_position));
                     }
 
-                    const int bonus_row = compare_rows;
-                    if (!build_all_position_target_distribution(
-                            bonus_row,
-                            bonus_row))
-                    {
-                        return fail_after_checkpoint(
-                            "All-position stochastic MTP batched bonus distribution build failed");
-                    }
-
                     // Preserve seeded RNG semantics: the bonus threshold is
                     // drawn from a copy and committed only when the device
                     // summary says the bonus token was semantically consumed.
@@ -3470,7 +3636,12 @@ namespace llaminar2
                             bonus_sampler,
                             checkpoint.cached_tokens +
                                 static_cast<int>(draft_tokens.size()));
-
+                    const uint64_t inverse_sample_seed =
+                        inverse_sample_seed_for_thresholds(
+                            batched_residual_thresholds.data(),
+                            batched_residual_thresholds.size());
+                    const int inverse_sample_first_logical_position =
+                        checkpoint.cached_tokens + 1;
                     DeviceSpeculativeVerifyBatchOutcome device_outcome;
                     const bool device_outcome_ok =
                         first_token == kDeferredMTPFirstTokenShadow
@@ -3486,7 +3657,10 @@ namespace llaminar2
                                   static_cast<int>(stop_tokens_.size()),
                                   bonus_row,
                                   bonus_threshold,
-                                  &device_outcome)
+                                  &device_outcome,
+                                  inverse_sample_seed,
+                                  inverse_sample_first_logical_position,
+                                  /*use_vllm_probability_rejection=*/true)
                             : runner_->verifyStochasticDistributionsBatchOutcomeOnDevice(
                                   /*first_target_slot=*/0,
                                   /*first_draft_slot=*/0,
@@ -3499,7 +3673,10 @@ namespace llaminar2
                                   static_cast<int>(stop_tokens_.size()),
                                   bonus_row,
                                   bonus_threshold,
-                                  &device_outcome);
+                                  &device_outcome,
+                                  inverse_sample_seed,
+                                  inverse_sample_first_logical_position,
+                                  /*use_vllm_probability_rejection=*/true);
                     if (!device_outcome_ok)
                     {
                         return fail_after_checkpoint(
@@ -3595,6 +3772,16 @@ namespace llaminar2
                     used_device_batch_outcome = true;
                 }
 
+                if (!used_device_batch_outcome &&
+                    stochastic_device_verify &&
+                    !stochastic_stopped_on_output &&
+                    draft_tokens.size() > 1)
+                {
+                    return fail_after_checkpoint(
+                        "GPU stochastic MTP requires the vLLM batched device outcome verifier; "
+                        "the legacy scalar full-probability row verifier has been removed");
+                }
+
                 for (int draft_idx = 1;
                      !used_device_batch_outcome &&
                      !stochastic_stopped_on_output &&
@@ -3619,52 +3806,22 @@ namespace llaminar2
                             sampler_,
                             checkpoint.cached_tokens + draft_idx);
                     MTPRejectionSampleRowResult row_result;
-                    if (stochastic_device_verify)
+                    if (row < 0 ||
+                        row >= static_cast<int>(host_mtp_draft_distributions.size()) ||
+                        host_mtp_draft_distributions[static_cast<size_t>(row)].empty() ||
+                        host_target_distribution.empty())
                     {
-                        DeviceSpeculativeVerifyResult verify_result;
-                        if (!runner_->verifyStochasticDistributionsBatchOnDevice(
-                                /*first_target_slot=*/row,
-                                /*first_draft_slot=*/row,
-                                &draft_token,
-                                &accept_threshold,
-                                &residual_threshold,
-                                /*row_count=*/1,
-                                &verify_result))
-                        {
-                            return fail_after_checkpoint(
-                                "All-position stochastic MTP device verifier failed");
-                        }
-                        row_result.ok = verify_result.token >= 0;
-                        row_result.error = row_result.ok
-                                               ? std::string()
-                                               : "device stochastic verifier produced no token";
-                        row_result.draft_token = draft_token;
-                        row_result.token = verify_result.token;
-                        row_result.accepted = verify_result.accepted;
-                        row_result.accept_probability =
-                            verify_result.accept_probability;
-                        row_result.accept_threshold =
-                            verify_result.accept_threshold;
+                        return fail_after_checkpoint(
+                            "All-position stochastic MTP host verifier missing distributions");
                     }
-                    else
-                    {
-                        if (row < 0 ||
-                            row >= static_cast<int>(host_mtp_draft_distributions.size()) ||
-                            host_mtp_draft_distributions[static_cast<size_t>(row)].empty() ||
-                            host_target_distribution.empty())
-                        {
-                            return fail_after_checkpoint(
-                                "All-position stochastic MTP host verifier missing distributions");
-                        }
-                        const auto &draft_distribution =
-                            host_mtp_draft_distributions[static_cast<size_t>(row)];
-                        row_result = sampleMTPRejectionRowFromDistributions(
-                            host_target_distribution,
-                            draft_distribution,
-                            draft_token,
-                            accept_threshold,
-                            residual_threshold);
-                    }
+                    const auto &draft_distribution =
+                        host_mtp_draft_distributions[static_cast<size_t>(row)];
+                    row_result = sampleMTPRejectionRowFromDistributions(
+                        host_target_distribution,
+                        draft_distribution,
+                        draft_token,
+                        accept_threshold,
+                        residual_threshold);
                     if (!row_result.ok)
                     {
                         return fail_after_checkpoint(
@@ -3806,21 +3963,86 @@ namespace llaminar2
             }
             else
             {
-                PerfStatsCollector::ScopedTimer sample_timer(
-                    "mtp",
-                    "all_position_verifier_sample_rows",
-                    "decode");
-                if (!runner_->sampleGreedyFromAllPositionLogitsOnDeviceRows(
-                        0,
-                        static_cast<int>(sampled_verifier_rows.size()),
-                        sampled_verifier_rows.data()))
+                const bool use_greedy_device_batch_outcome =
+                    runner_->primaryDeviceId().is_gpu() &&
+                    first_token != kDeferredMTPFirstTokenShadow &&
+                    stop_tokens_.size() <=
+                        static_cast<size_t>(
+                            sampling_math::kSpeculativeBatchMaxStopTokens) &&
+                    draft_tokens.size() <=
+                        static_cast<size_t>(
+                            sampling_math::kSpeculativeBatchMaxOutputTokens);
+                if (use_greedy_device_batch_outcome)
                 {
-                    return fail_after_checkpoint(
-                        "All-position MTP verifier could not sample verifier rows");
+                    PerfStatsCollector::ScopedTimer sample_timer(
+                        "mtp",
+                        "all_position_verifier_greedy_device_summary",
+                        "decode");
+                    DeviceSpeculativeVerifyBatchOutcome device_outcome;
+                    if (!runner_->verifyGreedyAllPositionBatchOutcomeOnDevice(
+                            draft_tokens.data(),
+                            static_cast<int>(draft_tokens.size()),
+                            stop_tokens_.data(),
+                            static_cast<int>(stop_tokens_.size()),
+                            &device_outcome))
+                    {
+                        return fail_after_checkpoint(
+                            "All-position greedy MTP compact device outcome verifier failed");
+                    }
+                    catchup =
+                        buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+                            catchup_request,
+                            device_outcome);
+                    if (!catchup.ok)
+                        return fail_after_checkpoint(catchup.error);
+
+                    for (size_t i = 0;
+                         i < catchup.verifier_tokens.size() &&
+                         i < sampled_verifier_rows.size();
+                         ++i)
+                    {
+                        sampled_verifier_rows[i] = catchup.verifier_tokens[i];
+                    }
+                    if (device_outcome.sampled_terminal &&
+                        device_outcome.consumed_verifier_rows >= 0 &&
+                        static_cast<size_t>(device_outcome.consumed_verifier_rows) <
+                            sampled_verifier_rows.size())
+                    {
+                        sampled_verifier_rows[
+                            static_cast<size_t>(
+                                device_outcome.consumed_verifier_rows)] =
+                            device_outcome.ready_token;
+                    }
+
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "all_position_greedy_device_batch_outcomes",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"draft_tokens", std::to_string(draft_tokens.size())},
+                         {"accepted_prefix",
+                          std::to_string(
+                              device_outcome.accepted_speculative_prefix)}});
                 }
-                catchup = buildAllPositionMTPDecodeCatchupGreedyResult(
-                    catchup_request,
-                    sampled_verifier_rows);
+                else
+                {
+                    PerfStatsCollector::ScopedTimer sample_timer(
+                        "mtp",
+                        "all_position_verifier_sample_rows",
+                        "decode");
+                    if (!runner_->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                            0,
+                            static_cast<int>(sampled_verifier_rows.size()),
+                            sampled_verifier_rows.data()))
+                    {
+                        return fail_after_checkpoint(
+                            "All-position MTP verifier could not sample verifier rows");
+                    }
+                    catchup = buildAllPositionMTPDecodeCatchupGreedyResult(
+                        catchup_request,
+                        sampled_verifier_rows);
+                }
             }
             if (!catchup.ok)
                 return fail_after_checkpoint(catchup.error);

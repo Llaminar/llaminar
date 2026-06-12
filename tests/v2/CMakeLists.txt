@@ -1626,6 +1626,24 @@ set_tests_properties(V2_Unit_MTPIterationBenchmarkMatrix PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_MTPDepthPolicyTrainer
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_mtp_depth_policy_trainer.py
+)
+set_tests_properties(V2_Unit_MTPDepthPolicyTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;Benchmark;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIDispatchRefreshScript
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_dispatch_refresh.py
+)
+set_tests_properties(V2_Unit_NativeVNNIDispatchRefreshScript PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;Dispatch;Trainer;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_CUDAGemvDispatchGeneratorAliases
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_gemv_dispatch_generator.py
@@ -4536,6 +4554,48 @@ add_v2_test(V2_Perf_MoEGraphNativeOverlay
     MPI_PROCS 1
 )
 
+# Focused MoE MTP verifier-prefill speedometer.
+# Times CUDA/ROCm grouped verifier prefill for M=2/3/4 routed and shared expert
+# cases, with parity against decode-equivalent rows before reporting CSV rows.
+add_executable(v2_perf_moe_verifier_prefill
+    performance/kernels/moe/Perf__MoEVerifierPrefill.cpp
+    performance/kernels/moe/Perf__ROCmMoEVerifierPrefill.cpp
+)
+target_link_libraries(v2_perf_moe_verifier_prefill
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+if(HAVE_CUDA)
+    target_link_libraries(v2_perf_moe_verifier_prefill CUDA::cudart)
+endif()
+add_v2_test(V2_Perf_MoEVerifierPrefill
+    COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
+    LABELS "V2;Performance;Benchmark;MoE;MTP;Verifier;CUDA;ROCm;GraphCapture"
+    MPI_PROCS 1
+)
+
+# Focused GPU speculative-summary speedometer.
+# Isolates the Qwen3.6-sized verifier argmax + compact greedy summary path from
+# full-model graph stream handoff timing, so MoE MTP tuning can tell whether a
+# backend primitive is slow or merely waiting on earlier queued verifier work.
+add_executable(v2_perf_gpu_speculative_summary
+    performance/kernels/Perf__GPUSpeculativeSummary.cpp
+)
+target_link_libraries(v2_perf_gpu_speculative_summary
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+if(HAVE_CUDA)
+    target_link_libraries(v2_perf_gpu_speculative_summary CUDA::cudart)
+endif()
+add_v2_test(V2_Perf_GPUSpeculativeSummary
+    COMMAND $<TARGET_FILE:v2_perf_gpu_speculative_summary>
+    LABELS "V2;Performance;Benchmark;MTP;Sampling;CUDA;ROCm;GraphCapture"
+    MPI_PROCS 1
+)
+
 # HostBackend Cross-Vendor Copy Benchmark
 # =============================================================================
 add_executable(v2_perf_host_backend_cross_vendor performance/Perf__HostBackendCrossVendorCopy.cpp)
@@ -5303,6 +5363,49 @@ if(ZLIB_FOUND)
     # tensors, so this matrix uses the Qwen3.5 PyTorch reference generator.
     # The harness regenerates metadata-only PyTorch references when absent.
     # =========================================================================
+
+    add_executable(v2_integration_parity_qwen36_single_device_math
+        integration/parity/qwen36/Test__Qwen36_SingleDevice_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36_single_device_math
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen36_single_device_math PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set(QWEN36_DENSE_SINGLE_DEVICE_PARITY_LABELS
+        V2 Integration Parity Qwen36 Dense GatedDeltaNet
+        CPU CUDA ROCm SingleDevice PyTorch GoldenReference FullModel
+    )
+    set(QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASES
+        PrefillParity CPU  Qwen36Dense_27B_CPU_KV_FP16
+        PrefillParity CUDA Qwen36Dense_27B_CUDA_KV_FP16
+        PrefillParity ROCm Qwen36Dense_27B_ROCm_KV_FP16
+        DecodeParity  CPU  Qwen36Dense_27B_CPU_KV_FP16
+        DecodeParity  CUDA Qwen36Dense_27B_CUDA_KV_FP16
+        DecodeParity  ROCm Qwen36Dense_27B_ROCm_KV_FP16
+        SnapshotInfrastructure CPU  Qwen36Dense_27B_CPU_KV_FP16
+        SnapshotInfrastructure CUDA Qwen36Dense_27B_CUDA_KV_FP16
+        SnapshotInfrastructure ROCm Qwen36Dense_27B_ROCm_KV_FP16
+    )
+    list(LENGTH QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASES QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASE_COUNT)
+    math(EXPR QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASE_LAST "${QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASE_COUNT} - 1")
+    foreach(CASE_INDEX RANGE 0 ${QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASE_LAST} 3)
+        math(EXPR BACKEND_INDEX "${CASE_INDEX} + 1")
+        math(EXPR CONFIG_INDEX "${CASE_INDEX} + 2")
+        list(GET QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASES ${CASE_INDEX} CASE_NAME)
+        list(GET QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASES ${BACKEND_INDEX} CASE_BACKEND)
+        list(GET QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASES ${CONFIG_INDEX} CASE_CONFIG)
+        add_v2_test(V2_Integration_Parity_Qwen36_SingleDevice_Math_${CASE_NAME}_${CASE_BACKEND}
+            COMMAND $<TARGET_FILE:v2_integration_parity_qwen36_single_device_math>
+                    --gtest_filter=Qwen36Dense/Qwen36DenseSingleDeviceParityTest.${CASE_NAME}/${CASE_CONFIG}
+            LABELS ${QWEN36_DENSE_SINGLE_DEVICE_PARITY_LABELS}
+            MPI_PROCS 1
+            TIMEOUT 3600
+        )
+    endforeach()
 
     add_executable(v2_integration_parity_qwen36_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_SingleDevice_PrefixMTP_Parity.cpp

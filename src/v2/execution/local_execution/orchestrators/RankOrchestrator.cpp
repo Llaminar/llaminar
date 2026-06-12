@@ -17,6 +17,7 @@
 #include "LogitsGatherer.h"
 #include "DeviceSampler.h"
 #include "DeviceGraphOrchestrator.h"
+#include "../../mtp/MTPSpecStateContract.h"
 #include "../../factory/InferenceRunnerFactory.h"
 #include "../../prefix_cache/PrefixCacheCoordinator.h"
 #include "../../../collective/ILocalTPContext.h"
@@ -2262,21 +2263,198 @@ namespace llaminar2
 
     bool RankOrchestrator::supportsChainedMTPDrafts() const
     {
-        if (device_runners_.size() != 1 || !device_runners_[0])
+        if (!pp_stage_runners_.empty() || device_runners_.empty())
         {
             return false;
         }
-        return device_runners_[0]->supportsChainedMTPDrafts();
+
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner || !runner->supportsChainedMTPDrafts())
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool RankOrchestrator::forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id)
     {
-        if (device_runners_.size() != 1 || !device_runners_[0])
+        PerfStatsCollector::ScopedTimer total_timer(
+            "mtp",
+            "rank_forward_mtp_chained_total",
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())}});
+        if (!pp_stage_runners_.empty())
         {
-            LOG_ERROR("[RankOrchestrator] Chained MTP drafts are not enabled for multi-participant TP domains yet");
+            LOG_ERROR("[RankOrchestrator] Chained MTP drafts are not enabled for PP topologies yet");
             return false;
         }
-        return device_runners_[0]->forwardMTPFromLastDraft(draft_condition_token, position_id);
+        if (device_runners_.empty())
+        {
+            LOG_ERROR("[RankOrchestrator] Chained MTP drafts require at least one rank participant");
+            return false;
+        }
+
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            if (!device_runners_[i] ||
+                !device_runners_[i]->supportsChainedMTPDrafts())
+            {
+                LOG_ERROR("[RankOrchestrator] Chained MTP draft participant "
+                          << i << " does not support chained sidecar execution");
+                return false;
+            }
+        }
+
+        if (device_runners_.size() == 1)
+        {
+            return device_runners_[0]->forwardMTPFromLastDraft(
+                draft_condition_token,
+                position_id);
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            if (tp_ctx_)
+            {
+                tp_worker_pool_->setFailureCallback([this]()
+                                                    {
+                    LOG_WARN("[TPWorkerPool] Chained MTP worker failure detected - aborting collective backend");
+                    tp_ctx_->requestAbort(); });
+            }
+        }
+
+        auto kernel_phase = KernelProfiler::getCurrentPhase();
+        auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        auto executor_phase = GraphExecutorStats::currentPhase();
+
+        {
+            PerfStatsCollector::ScopedTimer dispatch_timer(
+                "mtp",
+                "rank_forward_mtp_chained_dispatch",
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())}});
+            tp_worker_pool_->dispatch(
+                [this, draft_condition_token, position_id, kernel_phase,
+                 rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
+                {
+                    KernelProfiler::setCurrentPhase(kernel_phase);
+                    ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                    CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                    KVCacheProfiler::setCurrentPhase(kv_phase);
+                    GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                    auto device_id = device_runners_[i]->primaryDeviceId();
+                    ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                    CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+
+                    if (debugEnv().tp_collective_contract_trace)
+                    {
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_mtp_chained_enter"
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " token=" << draft_condition_token
+                                  << " position=" << position_id);
+                    }
+
+                    const bool ok =
+                        device_runners_[i] &&
+                        device_runners_[i]->forwardMTPFromLastDraft(
+                            draft_condition_token,
+                            position_id);
+
+                    if (debugEnv().tp_collective_contract_trace)
+                    {
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_mtp_chained_leave"
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " success=" << (ok ? 1 : 0));
+                    }
+                    return ok;
+                });
+        }
+
+        bool all_success = true;
+        std::exception_ptr first_exception = nullptr;
+        size_t first_exception_device = 0;
+        std::vector<TPWorkerPool::WorkerResult> results;
+        {
+            PerfStatsCollector::ScopedTimer collect_timer(
+                "mtp",
+                "rank_forward_mtp_chained_collect",
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())}});
+            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+        }
+
+        bool worker_timeout = false;
+        for (auto &r : results)
+        {
+            if (!r.completed)
+            {
+                LOG_ERROR("RankOrchestrator::forwardMTPFromLastDraft: Device "
+                          << r.worker_index << " did not complete (stuck)");
+                worker_timeout = true;
+                all_success = false;
+                if (debugEnv().tp_collect_timeout_ms > 0)
+                {
+                    abortAfterTPWorkerTimeout(
+                        "forwardMTPFromLastDraft",
+                        debugEnv().tp_collect_timeout_ms,
+                        tp_worker_pool_->completedCount(),
+                        tp_worker_pool_->numWorkers());
+                }
+                if (tp_ctx_)
+                {
+                    LOG_WARN("RankOrchestrator::forwardMTPFromLastDraft: requesting TP context abort after worker timeout");
+                    tp_ctx_->requestAbort();
+                }
+                continue;
+            }
+
+            if (r.exception)
+            {
+                all_success = false;
+                if (!first_exception)
+                {
+                    first_exception = r.exception;
+                    first_exception_device = r.worker_index;
+                }
+                continue;
+            }
+
+            if (!r.success)
+            {
+                LOG_ERROR("RankOrchestrator::forwardMTPFromLastDraft: Device "
+                          << r.worker_index << " chained MTP forward failed");
+                all_success = false;
+            }
+        }
+
+        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        {
+            abortAfterTPWorkerTimeout(
+                "forwardMTPFromLastDraft",
+                debugEnv().tp_collect_timeout_ms,
+                tp_worker_pool_->completedCount(),
+                tp_worker_pool_->numWorkers());
+        }
+
+        if (first_exception)
+        {
+            LOG_ERROR("RankOrchestrator::forwardMTPFromLastDraft: Re-throwing primary exception from device "
+                      << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+
+        return all_success;
     }
 
     bool RankOrchestrator::commitMTPShiftedRowsFromLastForward(
@@ -2833,6 +3011,95 @@ namespace llaminar2
         return DeviceSampler::sampleGreedyFromLocalInfos(local_infos, row);
     }
 
+    bool RankOrchestrator::sampleGreedyFromAllPositionLogitsOnDeviceRows(
+        int start_row,
+        int row_count,
+        int32_t *out_tokens)
+    {
+        if (device_runners_.empty() ||
+            start_row < 0 ||
+            row_count <= 0 ||
+            !out_tokens)
+        {
+            return false;
+        }
+        if (device_runners_.size() == 1)
+        {
+            return device_runners_[0] &&
+                   device_runners_[0]->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                       start_row,
+                       row_count,
+                       out_tokens);
+        }
+
+        bool any_local_logits = false;
+        bool all_local_logits = true;
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner)
+                return false;
+            const bool has_local = runner->hasAllPositionLogitsLocal();
+            any_local_logits = any_local_logits || has_local;
+            all_local_logits = all_local_logits && has_local;
+        }
+
+        if (!any_local_logits)
+        {
+            /*
+             * Some LocalTP tests and replicated-logits topologies expose a full
+             * verifier-logits tensor on each child instead of vocab shards. One
+             * representative child can sample those rows directly.
+             */
+            return device_runners_[0]->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                start_row,
+                row_count,
+                out_tokens);
+        }
+
+        if (!all_local_logits)
+        {
+            return false;
+        }
+
+        /*
+         * Column-parallel LocalTP all-position verifier rows are logits shards.
+         * Sampling is the verifier replay consumer, so collect one consuming
+         * LogitsLocalInfo per child and reuse those exact streams for every
+         * row in this batch.  Using the non-consuming getter here would sample
+         * on child default streams and can race graph-captured verifier replay.
+         */
+        std::vector<LogitsLocalInfo> local_infos;
+        local_infos.reserve(device_runners_.size());
+        for (const auto &runner : device_runners_)
+        {
+            LogitsLocalInfo info =
+                runner->consumeAllPositionLogitsLocalInfoForSampling();
+            if (!info)
+                return false;
+            local_infos.push_back(info);
+        }
+
+        for (int i = 0; i < row_count; ++i)
+        {
+            const int token = DeviceSampler::sampleGreedyFromLocalInfos(
+                local_infos,
+                start_row + i);
+            if (token < 0)
+                return false;
+            out_tokens[i] = static_cast<int32_t>(token);
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_all_position_verifier_token_batch_samples",
+            static_cast<double>(row_count),
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"start_row", std::to_string(start_row)}});
+        return true;
+    }
+
     bool RankOrchestrator::setComputeAllPositionLogits(bool enabled)
     {
         if (device_runners_.empty())
@@ -2906,6 +3173,268 @@ namespace llaminar2
             if (runner)
                 runner->clearMTPSpecVerifierInputPlan();
         }
+    }
+
+    bool RankOrchestrator::supportsMTPSpecStatePublication() const
+    {
+        if (!pp_stage_runners_.empty() || device_runners_.empty())
+        {
+            return false;
+        }
+
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner || !runner->supportsMTPSpecStatePublication())
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool RankOrchestrator::publishAcceptedMTPSpecState(
+        const MTPSpecStepPlan &plan,
+        std::string *error)
+    {
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            if (error)
+                *error = reason;
+            LOG_ERROR("[RankOrchestrator] " << reason);
+            return false;
+        };
+
+        PerfStatsCollector::ScopedTimer total_timer(
+            "mtp",
+            "rank_mtp_spec_state_publication_total",
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())}});
+
+        if (!pp_stage_runners_.empty())
+        {
+            return fail("MTP spec-state publication is not enabled for PP topologies yet");
+        }
+        if (device_runners_.empty())
+        {
+            return fail("MTP spec-state publication requires at least one rank participant");
+        }
+
+        /*
+         * Build one participant plan per child even though the current
+         * rank-level verifier has a single accepted-count decision.  Keeping
+         * this path on the shared common-prefix helper prevents the LocalTP,
+         * NodeLocalTP, PP, and ExpertParallel implementations from drifting
+         * once participant-local accepted-state availability is introduced.
+         */
+        std::vector<MTPSpecStepPlan> participant_plans(
+            device_runners_.size(),
+            plan);
+        MTPSpecCommonStepPlan common_plan =
+            coordinateMTPSpecCommonAcceptedPrefix(participant_plans);
+        if (!common_plan.ok ||
+            common_plan.clamped_steps.size() != device_runners_.size())
+        {
+            return fail(
+                std::string("MTP spec-state common-prefix coordination failed: ") +
+                (common_plan.ok ? std::string("missing clamped participant plans")
+                                : common_plan.error));
+        }
+        if (common_plan.requires_common_fallback_replay)
+        {
+            return fail("MTP spec-state publication cannot publish divergent rank participants directly");
+        }
+
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            if (!device_runners_[i])
+            {
+                std::ostringstream msg;
+                msg << "MTP spec-state publication participant " << i
+                    << " is unavailable";
+                return fail(msg.str());
+            }
+            if (!device_runners_[i]->supportsMTPSpecStatePublication())
+            {
+                std::ostringstream msg;
+                msg << "MTP spec-state publication participant " << i
+                    << " does not support verifier-state publication";
+                return fail(msg.str());
+            }
+        }
+
+        if (device_runners_.size() == 1)
+        {
+            return device_runners_[0]->publishAcceptedMTPSpecState(
+                common_plan.clamped_steps.front(),
+                error);
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            if (tp_ctx_)
+            {
+                tp_worker_pool_->setFailureCallback([this]()
+                                                    {
+                    LOG_WARN("[TPWorkerPool] MTP spec-state publication failure detected - aborting collective backend");
+                    tp_ctx_->requestAbort(); });
+            }
+        }
+
+        std::vector<std::string> child_errors(device_runners_.size());
+        auto kernel_phase = KernelProfiler::getCurrentPhase();
+        auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        auto executor_phase = GraphExecutorStats::currentPhase();
+
+        {
+            PerfStatsCollector::ScopedTimer dispatch_timer(
+                "mtp",
+                "rank_mtp_spec_state_publication_dispatch",
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())}});
+            tp_worker_pool_->dispatch(
+                [this, &common_plan, &child_errors, kernel_phase, rocm_phase,
+                 cuda_phase, kv_phase, executor_phase](size_t i) -> bool
+                {
+                    KernelProfiler::setCurrentPhase(kernel_phase);
+                    ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                    CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                    KVCacheProfiler::setCurrentPhase(kv_phase);
+                    GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                    auto device_id = device_runners_[i]->primaryDeviceId();
+                    ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                    CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+
+                    if (debugEnv().tp_collective_contract_trace)
+                    {
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=mtp_spec_state_publication_enter"
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " accepted_count="
+                                  << common_plan.clamped_steps[i].accepted_count);
+                    }
+
+                    const bool ok =
+                        device_runners_[i] &&
+                        device_runners_[i]->publishAcceptedMTPSpecState(
+                            common_plan.clamped_steps[i],
+                            &child_errors[i]);
+
+                    if (debugEnv().tp_collective_contract_trace)
+                    {
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=mtp_spec_state_publication_leave"
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " success=" << (ok ? 1 : 0));
+                    }
+                    return ok;
+                });
+        }
+
+        bool all_success = true;
+        std::exception_ptr first_exception = nullptr;
+        size_t first_exception_device = 0;
+        std::vector<TPWorkerPool::WorkerResult> results;
+        {
+            PerfStatsCollector::ScopedTimer collect_timer(
+                "mtp",
+                "rank_mtp_spec_state_publication_collect",
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())}});
+            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+        }
+
+        bool worker_timeout = false;
+        for (auto &r : results)
+        {
+            if (!r.completed)
+            {
+                LOG_ERROR("RankOrchestrator::publishAcceptedMTPSpecState: Device "
+                          << r.worker_index << " did not complete (stuck)");
+                worker_timeout = true;
+                all_success = false;
+                if (debugEnv().tp_collect_timeout_ms > 0)
+                {
+                    abortAfterTPWorkerTimeout(
+                        "publishAcceptedMTPSpecState",
+                        debugEnv().tp_collect_timeout_ms,
+                        tp_worker_pool_->completedCount(),
+                        tp_worker_pool_->numWorkers());
+                }
+                if (tp_ctx_)
+                {
+                    LOG_WARN("RankOrchestrator::publishAcceptedMTPSpecState: requesting TP context abort after worker timeout");
+                    tp_ctx_->requestAbort();
+                }
+                continue;
+            }
+
+            if (r.exception)
+            {
+                all_success = false;
+                if (!first_exception)
+                {
+                    first_exception = r.exception;
+                    first_exception_device = r.worker_index;
+                }
+                continue;
+            }
+
+            if (!r.success)
+            {
+                LOG_ERROR("RankOrchestrator::publishAcceptedMTPSpecState: Device "
+                          << r.worker_index << " publication failed: "
+                          << child_errors[static_cast<size_t>(r.worker_index)]);
+                all_success = false;
+            }
+        }
+
+        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        {
+            abortAfterTPWorkerTimeout(
+                "publishAcceptedMTPSpecState",
+                debugEnv().tp_collect_timeout_ms,
+                tp_worker_pool_->completedCount(),
+                tp_worker_pool_->numWorkers());
+        }
+
+        if (first_exception)
+        {
+            LOG_ERROR("RankOrchestrator::publishAcceptedMTPSpecState: Re-throwing primary exception from device "
+                      << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+
+        if (!all_success)
+        {
+            for (size_t i = 0; i < child_errors.size(); ++i)
+            {
+                if (!child_errors[i].empty())
+                {
+                    std::ostringstream msg;
+                    msg << "MTP spec-state publication failed on participant "
+                        << i << ": " << child_errors[i];
+                    return fail(msg.str());
+                }
+            }
+            return fail("MTP spec-state publication failed on at least one participant");
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mtp_spec_state_publications",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"accepted_count", std::to_string(common_plan.common_accepted_count)}});
+        return true;
     }
 
     const float *RankOrchestrator::getAllPositionLogits() const

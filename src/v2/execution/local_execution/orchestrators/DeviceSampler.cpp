@@ -37,7 +37,7 @@ namespace llaminar2
             if (!runner || !runner->hasLogitsLocal())
                 return -1;
 
-            auto info = runner->getLogitsLocalInfo();
+            auto info = runner->consumeLogitsLocalInfoForSampling();
             if (!info || info.vocab_local == 0)
                 return -1;
             LOG_TRACE("[DeviceSampler::sampleGreedy] Device "
@@ -213,7 +213,7 @@ namespace llaminar2
             if (!runner || !runner->hasLogitsLocal())
                 return -1;
 
-            auto info = runner->getLogitsLocalInfo();
+            auto info = runner->consumeLogitsLocalInfoForSampling();
             if (!info || info.vocab_local == 0)
                 return -1;
 

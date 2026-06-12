@@ -2632,6 +2632,20 @@ namespace llaminar2
             (void)vocab_offset;
             (void)local_vocab_size;
         }
+
+        /**
+         * @brief Declare whether tokens outside the local vocab range are legal.
+         *
+         * Vocab-parallel embeddings intentionally return zero rows for tokens
+         * owned by another TP participant. A later allreduce sums the one
+         * non-zero shard back into the replicated hidden state. GPU kernels use
+         * this flag only for host/device-token validation; the actual embedding
+         * kernels still enforce the local range and write zeros for misses.
+         */
+        virtual void setAllowOutOfRangeTokenIds(bool allow)
+        {
+            (void)allow;
+        }
     };
 
     /**

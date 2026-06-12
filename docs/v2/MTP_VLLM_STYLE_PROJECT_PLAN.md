@@ -101,9 +101,13 @@ Subsystem boundaries:
   the verifier rows needed by `target_logits_indices` and `bonus_logits_indices`;
   computing a full all-position LM head is a compatibility path, not the target.
 - Rejection sampler: greedy is a deterministic specialization of the stochastic
-  contract. Stochastic verification consumes target logits/probs, draft
-  probabilities, uniform/residual randoms, and emits output tokens plus
-  `num_accepted_tokens`.
+  contract. The accepted stochastic target follows vLLM's worker fast path:
+  draft proposal is greedy by default, so verifier `q` is one-hot at the draft
+  token (`NO_DRAFT_PROBS` in vLLM terms); target rows are processed once, the
+  first rejected or bonus row is sampled on device, and full draft
+  probabilities are only an optional future lane for genuinely stochastic draft
+  proposal. Compact top-k/top-p tables are compatibility scaffolding, not the
+  MoE performance target.
 - State publication: KV, shifted MTP KV, GDN recurrence, short-conv state,
   terminal hidden/logits, sampler history, and positions are published from
   accepted speculative slots. Rejected suffix and bonus-only rows never mutate
@@ -182,6 +186,10 @@ Done:
 - Request/session reset now invalidates request-scoped prefill graph captures
   with `PrefillGraphRejectReason::SessionReset`, fixing CUDA reused-runner
   no-MTP determinism after `clearCache()` without relying on logits gather.
+- ROCm dense no-MTP fresh-runner determinism is fixed. Deterministic parity now
+  bypasses ROCm flash-decode autotune trial rotation, because the autotuner is
+  performance state rather than model state. Focused ROCm no-MTP determinism,
+  ROCm MTP forward-only parity, and CUDA symmetry checks passed.
 - CUDA/ROCm compact stochastic sampling kernels exist for top-k/top-p tables.
 - `V2_Integration_GPUSamplingKernels` now includes Qwen3.6 real-logit-style
   seeded rows with close whitespace/code-token probabilities. CUDA and ROCm
@@ -194,6 +202,10 @@ Done:
 - Dense CPU/CUDA/ROCm SingleDevice Prefix+MTP parity now shares one declarative
   18-case test surface, including prefix restore, split prefill, dynamic/fixed
   depth, no-MTP determinism, forward-only MTP, and stochastic verifier coverage.
+- Dense Qwen3.6 SingleDevice now also has a classic layer-by-layer math suite
+  matching the Qwen3.5/Qwen3.6 MoE parity style. CPU/CUDA/ROCm prefill, decode,
+  and snapshot infrastructure all pass with shared PyTorch snapshots, cosine
+  thresholds of 0.96 prefill and 0.93 decode, and all first 8 layers gated.
 - CPU stochastic MTP now uses the shared sampler probability/residual math on
   host for the decode-equivalent verifier path, while GPUs still hard-fail
   without device-resident stochastic verification.
@@ -205,8 +217,83 @@ Done:
   The fixed root causes were stale singleton MoE scratch bindings across
   workspace-manager ABA and ROCm shared-expert gate wrappers reading host-only
   gate tensors without ensuring device residency on the explicit HIP stream.
+- ROCm combined routed+shared verifier grouping now handles Qwen3.6 MoE's
+  256 routed experts plus one logical shared-expert slot. The grouping kernel
+  publishes counts/offsets with a strided loop, so slot 256 is not silently
+  dropped by a 256-thread block. `V2_Integration_ROCmMoEKernel` and focused
+  ROCm Qwen3.6 MoE greedy/stochastic/all-position parity gates pass.
 - CUDA and ROCm dense/MoE stochastic verifier parity now pass on the same
   all-position state-publication path.
+- vLLM-style stochastic verification is wired into the GPU SingleDevice runner
+  path using processed target logits plus device-resident sampled draft tokens.
+  Draft proposals follow the vLLM default greedy draft branch, so the verifier
+  treats `q` as one-hot instead of allocating full draft probability rows.
+  Penalty-free and penalty-sensitive rows batch through the same processed-logit
+  outcome verifier; penalty-sensitive rows pre-apply the vLLM speculative branch
+  history per verifier row. Host-visible sampled tokens still keep their
+  arena-owned device sample-slot readiness edge, so the batch verifier consumes
+  device tokens instead of re-uploading host shadows. Focused runner units,
+  `V2_Unit_MTPRejectionSampler`, `V2_Integration_GPUSamplingKernels`, and
+  Qwen3.6 CUDA/ROCm dense+MoE stochastic parity pass after a full relink.
+- The latest GPU stochastic matrix on the vLLM greedy-draft/one-hot-q path is
+  `benchmark_results/mtp_vllm_style/20260612T170149Z-gpu-stochastic-vllm-greedyq-c4096-post-moe-workspace/`.
+  Dense is speed-positive on CUDA and ROCm: CUDA baseline/d1/d2/d3/dyn is
+  44.7/52.6/52.6/47.7/47.7 tok/s and ROCm is
+  31.3/37.0/28.7/27.0/36.9 tok/s. MoE stochastic is correctness-green but
+  still performance-red: CUDA is 115.3/78.5/76.0/79.0/78.3 tok/s and ROCm is
+  69.1/51.8/48.5/40.7/51.6 tok/s. The next MoE stochastic slice must reduce
+  verifier/condition/sampling economics rather than returning to compact
+  top-k/top-p shortcuts.
+- Diagnostic probabilistic draft proposals were benchmarked in
+  `benchmark_results/mtp_vllm_style/20260612T175223Z-moe-stochastic-probabilistic-draft-smoke/`.
+  They improve CUDA d1 acceptance to 75% but remain speed-negative
+  (CUDA 77.6 vs 115.2 tok/s baseline; ROCm 49.1 vs 67.7 tok/s baseline), so the
+  accepted architecture remains vLLM's default greedy draft proposal with
+  one-hot `q`. The MoE work stays focused on verifier, condition, and outcome
+  costs.
+- GPU stochastic MTP now follows the vLLM default draft branch: draft proposal
+  uses device argmax, the processed-target verifier treats `q` as one-hot
+  (`no_draft_probabilities=true`), and null draft-probability buffers hard-fail
+  unless that contract is explicit. Focused coverage passed for
+  `V2_Integration_GPUSamplingKernels`, `V2_Unit_MTPRejectionSampler`,
+  `V2_Unit_PrefillDecodeTransition`, and Qwen3.6 CUDA/ROCm stochastic graph
+  smokes. Dense and MoE CUDA/ROCm
+  `MTPStochasticSamplingVerifierRuns` parity also passes on the new path. The
+  production proxy in `V2_Perf_GPUSpeculativeSummary` shows rows=3 CUDA
+  probability 3.96/3.81/3.69 ms improved to greedy-q 1.76/1.76/2.13 ms, and
+  ROCm probability 8.91/8.93/8.96 ms improved to 4.79/4.78/5.67 ms for
+  reject0/prefix1/all. Full-model matrices confirm dense speedups but not MoE
+  speedups yet.
+- CUDA MoE decode now declares workspace for Qwen3.6 top-k=8 gate/up fused
+  fan-out. That path launches 16 logical projections but only eight active CUDA
+  stream slots, so the stage reserves seven side-stream GEMV partial arenas.
+  This fixes the former `[ConcurrentDecode] ... got 16` hard failure without
+  reintroducing LM-head-sized global decode scratch. Regression:
+  `V2_Unit_CUDAQuantisedGemmWorkspace`.
+- Legacy full target/draft probability arena rows were removed from production
+  `DeviceGraphOrchestrator` state after the vLLM greedy-draft/one-hot-q path
+  became the accepted GPU stochastic contract. Compact distribution builds no
+  longer materialize hidden full-softmax side rows, and the old scalar
+  full-probability device verifier is no longer implemented by GPU runners.
+  Guards passed: `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_PrefillDecodeTransition`, release `llaminar2`, and a CUDA Qwen3.6
+  MoE d1 stochastic smoke whose perf JSON emitted processed-logit batch verifier
+  counters with no full-probability rows.
+- A lower-memory draft-logit proposal/verifier branch is now implemented as a
+  backend/perf primitive for CUDA and ROCm, with graph-captured integration
+  coverage against the CPU inverse-exponential sampler oracle. It is not
+  production-promoted: focused `V2_Perf_GPUSpeculativeSummary` shows mixed CUDA
+  movement and clear ROCm regression versus the existing processed-target plus
+  draft-probability path, especially reject-at-prefix-0 rows. This proves the
+  next vLLM-aligned win is not simply "store logits instead of q"; it must fuse
+  or lazily skip target/draft probability-stat work that cannot affect the
+  accepted prefix.
+- A one-block prefix-stop verifier was also implemented, measured, and removed
+  in the same slice. It was graph-capturable and correct, but focused perf only
+  helped CUDA reject-at-prefix-0 and regressed prefix-1/all-accepted cases; ROCm
+  reject-at-prefix-0 was effectively flat and deeper prefixes regressed. Do not
+  reintroduce a serial prefix verifier without changing the larger target-logit
+  materialization economics.
 - ShortConv1d and GDN recurrence stages now refresh their shared-kernel
   verifier workspace bindings from `onGraphReplayed()`, so captured verifier
   graph replay can publish accepted rows after normal/correction graphs have
@@ -348,6 +435,133 @@ Done:
   prepares implicit shared-expert group metadata on the explicit HIP stream, and
   has focused `V2_Unit_PrefillGraphCapturability` plus
   `ROCmMoEKernel.SharedExpertGroupedPrefillMatchesSequentialPath` coverage.
+- ROCm and CUDA MoE verifier-prefill now use graph-capturable combined
+  routed/shared verifier launches for Qwen3.6-scale M=2/3/4 rows. Focused
+  production-shape perf correctness is cosine 1.0 on both backends. Fresh
+  focused timings from `V2_Perf_MoEVerifierPrefill` show CUDA graph M=2/3/4 at
+  about 0.117/0.151/0.176 ms and ROCm graph M=2/3/4 at about
+  0.237/0.266/0.303 ms, so isolated expert-prefill kernels are no longer the
+  only MoE blocker.
+- ROCm GDN concurrent decode is now promoted to the default outside
+  deterministic mode. Focused coverage `V2_Unit_GDNKernels` and
+  `V2_Unit_DeterministicMode` proves the default and deterministic override.
+  No-env probe
+  `benchmark_results/mtp_vllm_style/20260612T_rocm_moe_gdn_default_probe/`
+  shows ROCm MoE greedy fixed d3 at 92.1 tok/s versus 77.3 baseline (1.19x)
+  with 81.5% acceptance. ROCm MoE stochastic remains rejected for performance:
+  dynamic is 61.7 tok/s versus 78.0 baseline and fixed d3 acceptance is only
+  30.6%, so the next accepted MoE slice must reduce stochastic target
+  distribution/verifier work rather than toggling more concurrency flags.
+- The focused ROCm MoE parity gate exposed a loader contract regression before
+  it reached math comparison: integration tests could enter `load()` with a
+  GPU pool but no pinned upload ring. The fix clamps the repack stream count at
+  the `WeightManager` call site and makes `LoadOrchestrator::allocate()` reject
+  pinned staging with zero H2D streams. Regression coverage:
+  `V2_Unit_LoadOrchestrator`, serial
+  `MTPStochasticSamplingVerifierRuns`,
+  `MainVerifierAllPositionRowsMatchSerialDecode`,
+  `MTPGreedyDepth3MatchesBaselineTokens`, and
+  `MTPBenchmarkStyleDepth3LongPromptGreedyMatchesReference`.
+- ROCm stochastic small-k partial-block sweep is rejected as a performance
+  fix. `20260612T_rocm_moe_stochastic_topk_partial_sweep` tested caps
+  16/32/64/128; best dynamic was cap 64 at 64.0 tok/s versus a 77.7 tok/s
+  baseline, and fixed d3 stayed around 0.58x. Keep the automatic/default
+  partial-block policy and move to fused/lazy stochastic verifier work that
+  avoids building target/bonus distributions for rows that cannot be consumed
+  after an early rejection.
+- Generated MTP depth policy now keys on backend plus dense/MoE model class,
+  emits direct target-depth deltas and learned hold rows, and uses hold rows as
+  dynamic warm starts. Focused trainer/controller units pass. Diagnostic MoE
+  smoke `20260611T-moe-generated-best-depth-guard-smoke` shows ROCm greedy
+  dynamic stable at depth 3 with 96.2 vs 78.8 tok/s; CUDA MoE remains
+  verifier-bound at 122.2 vs 143.8 tok/s.
+- Dynamic MoE greedy now gives the generated best-depth lane one
+  non-catastrophic full-window grace period before demoting. This fixes the
+  ROCm depth-3 churn found in
+  `20260612T_moe_rocm_splitk_depth_matrix`: a first window with
+  acceptance=0.395833 and zero_accept=0.375 demoted even though fixed d3 won
+  the whole request. `V2_Unit_MTPDepthController` covers that exact window and
+  the second-consecutive-bad-window demotion escape hatch. Focused matrix
+  `20260612T_moe_gpu_greedy_dynamic_grace` shows CUDA dynamic 147.2 vs 138.5
+  baseline and ROCm dynamic 94.2 vs 78.0 baseline, both with zero demotions.
+- Current MoE same-run matrices are
+  `benchmark_results/mtp_vllm_style/20260612T_moe_cuda_splitk_depth_matrix/`,
+  `benchmark_results/mtp_vllm_style/20260612T_moe_rocm_splitk_depth_matrix/`,
+  and
+  `benchmark_results/mtp_vllm_style/20260612T_moe_gpu_stochastic_refresh/`.
+  CUDA greedy is correct but only weakly positive: fixed d3 is 146.8 tok/s vs
+  139.2 baseline (1.05x). ROCm greedy is better but still short of dense-class
+  wins: fixed d3 is 97.9 tok/s vs 77.3 baseline (1.27x). CUDA stochastic is
+  still negative with best dynamic at 133.1 vs 139.2 tok/s. ROCm stochastic is
+  still negative with best dynamic at 66.7 vs 77.8 tok/s.
+- CUDA MoE tuning has rejected the latest gate/up=32, down=16, tile-M=2 full
+  model A/B even though it helped isolated shapes: real d3 fell to 144.5 tok/s.
+  Do not revive one-off tile/kpart overrides without a same-run matrix win.
+  CUDA's next MoE target is verifier/condition transaction economics across
+  the full 40-layer graph, not the already-fast isolated combined expert
+  prefill kernel.
+- ROCm stochastic attribution now shows the compact D2H copy itself is small in
+  isolation, about 0.04 ms. The real cost is the queued GPU work before that
+  host-visible boundary, especially Qwen-sized top-k/top-p target and draft
+  distribution builds. `V2_Perf_GPUSpeculativeSummary` shows ROCm stochastic
+  rows 1/2/3 at about 5.13/5.79/6.50 ms, dominated by target/draft
+  distribution build, while CUDA is about 1.59/1.92/2.21 ms. A durable ROCm
+  stochastic MoE win likely needs a lazy or fused target-distribution verifier
+  that avoids bonus/later-row top-k work after early rejection, not another
+  host read tweak.
+- Focused MoE GPU sprint
+  `benchmark_results/mtp_vllm_style/20260612T120836Z-moe-gpu-focused-sprint/`
+  confirms that compact verifier polishing is the wrong center of gravity.
+  CUDA MoE stochastic is still speed-negative despite high d1 acceptance
+  (90.6%), while ROCm MoE stochastic has both poor speed and very different
+  acceptance (45.8/56.9/31.3% for d1/d2/d3). The follow-up architecture slice
+  proved the useful vLLM idea is not persistent full target/draft probability
+  rows; it is greedy draft proposal, processed target rows, one-hot `q`, and a
+  batched device outcome that can sample the rejected or bonus row without host
+  participation.
+- The first vLLM-style recovered-token primitive is implemented as a shared
+  CPU reference plus CUDA/ROCm graph-capturable backend kernels. Focused gates
+  passed: `V2_Unit_MTPRejectionSampler`,
+  `V2_Integration_GPUSamplingKernels`, and `V2_Perf_GPUSpeculativeSummary`.
+  Direct perf for `StochasticFullProbabilityQwen36Rows` shows rejection
+  recovery itself is not the remaining MoE blocker: CUDA M=1/2/3 is about
+  0.146/0.152/0.223 ms and ROCm is about 1.196/1.208/1.195 ms for Qwen-sized
+  rows. Graph-capturable processed-logit softmax materialization is now also
+  implemented and covered in the same GPU sampler/perf gates. Direct perf for
+  `ProcessedLogitSoftmaxQwen36Rows` is CUDA M=1/2/3 about
+  0.425/0.425/0.426 ms and ROCm about 0.969/1.013/1.143 ms. The accepted
+  production slice wires processed target logits, device-resident draft tokens,
+  one-hot `q`, and the existing stochastic summary reducer instead of allocating
+  persistent full-probability buffers.
+- The first lazy-target proof is deliberately perf-harness-only, not a
+  production path. `Perf__GPUSpeculativeSummary.StochasticLazyTargetQwen36Rows`
+  uses real backend kernels with deterministic accepted-prefix fixtures. It
+  shows a host-loop lazy verifier is not viable: ROCm M=3 reject-at-0 is
+  slightly cheaper than eager (about 6.00 ms vs 6.50 ms), but reject-after-1 and
+  accept-all are much worse (about 8.54 ms and 13.37 ms). If we pursue lazy
+  target verification, it must be one fused GPU-side reducer that scans rows
+  until rejection without per-row host-visible boundaries.
+- A production compact lazy-bonus A/B was also rejected and removed. Diagnostic
+  matrices `20260612T_lazy_bonus_off_moe_stochastic_diag` and
+  `20260612T_lazy_bonus_on_moe_stochastic_diag` showed CUDA dynamic falling
+  from 136.0 to 130.2 tok/s and ROCm dynamic from 61.7 to 59.6 tok/s; only ROCm
+  fixed d3 moved from 43.9 to 44.8 tok/s, not enough to justify a branchy
+  env-only path. The next lazy attempt must be fused GPU-side, not
+  summarize-then-build-bonus on the host boundary.
+- Same-run stochastic accepted-prefix histograms explain why this is primarily
+  a ROCm MoE target today. CUDA fixed d3 accepts all three drafts in about 54%
+  of verifier steps and averages about 2.09 accepted drafts, so eager batched
+  target distributions remain reasonable. ROCm fixed d3 rejects at prefix 0 in
+  about 65% of verifier steps and averages about 0.51 accepted drafts, so it
+  frequently pays for target rows and a bonus row that cannot be consumed.
+- A longer greedy capture-amortization check
+  `benchmark_results/mtp_vllm_style/20260612T_moe_gpu_greedy_long256_capture_check/`
+  shows first-use graph economics are part, but not all, of CUDA MoE's weak
+  speedup. CUDA fixed d3 improves to 170.7 tok/s vs 146.7 baseline (1.16x) at
+  256 decode tokens, compared with 1.05x in the decode-64 matrix. ROCm fixed d3
+  is 96.2 tok/s vs 79.4 baseline (1.21x). This keeps both GPU MoE greedy lanes
+  below the dense-class target and confirms that the next accepted win must
+  reduce steady-state verifier/condition work, not merely hide capture warmup.
 - `scripts/run_mtp_iteration_benchmark_matrix.sh` now has `--decode-tokens N`
   for bounded all-device iteration sweeps. The default remains the full
   benchmark decode length.
@@ -841,6 +1055,76 @@ Work:
   First slice complete: `MTPRejectionSampler` defines the distribution-row
   contract and all-position stochastic catch-up construction for the current
   SingleDevice path.
+- Phase 4 follow-up for MoE performance: replace the compact-table stochastic
+  verifier with the vLLM worker-style full-logit path. The focused
+  `V2_Perf_GPUSpeculativeSummary.StochasticLazyTargetQwen36Rows` trial rejected
+  two shortcuts: single-block lazy full-logit verification is far slower than
+  compact tables on CUDA/ROCm, and conditional bonus sampling does not beat the
+  current compact batch. Both rejected prototypes and their tests were removed
+  after focused rebuild, integration, and perf-smoke guards passed. The
+  accepted design now needs
+  full-vocab block stats over target/draft logits, accepted-count reduction
+  from draft-token probability lookups, and one-row rejected/bonus resampling.
+  Shared slices complete: `MTPRejectionSampler` now has processed full-logit
+  row stats, probability lookup, residual sampling, bonus sampling, and
+  batch/catch-up helpers with focused `V2_Unit_MTPRejectionSampler` coverage.
+  CUDA/ROCm expose graph-capturable processed-logit row verifier and bonus
+  sampler kernels that match the CPU reference, reject null/default streams,
+  and are covered by the verifier+bonus+summary mini-transaction in
+  `V2_Integration_GPUSamplingKernels`. The direct full-vocab perf lane
+  `V2_Perf_GPUSpeculativeSummary.StochasticProcessedLogitQwen36Rows` now
+  exists. The first optimization slice made processed-logit verification
+  row-parallel, one block per verifier row, instead of serializing rows inside
+  one block. Focused correctness still passes, and release smoke now shows
+  CUDA reject/all-accept cases at about 1.00/1.25 ms and ROCm at about
+  2.58/2.57 ms for three verifier rows. This is correct and graph-capturable,
+  but not production-promoted until the next optimization slice reduces the
+  remaining full-vocab stochastic verifier cost. The next accepted slice adds
+  an optional device draft-token-probability vector to the processed-logit
+  verifier, matching the vLLM worker idea that the sampled draft row already
+  knows `q(sampled_token)`. CUDA/ROCm now skip draft full-row stats on accepted
+  rows and compute them only when residual sampling is needed after a
+  rejection. Focused guards passed:
+  `V2_Unit_MTPRejectionSampler|V2_Integration_GPUSamplingKernels`, and release
+  `StochasticProcessedLogitQwen36Rows` reports CUDA reject/prefix1/all-accept
+  0.98/0.95/0.65 ms and ROCm 2.47/2.48/1.81 ms for three Qwen3.6-sized rows.
+  Follow-up plumbing complete: compact device draft sampling can now write
+  `p(sampled_draft_token)` into arena-owned `STOCHASTIC_DRAFT_SAMPLE_PROBS`
+  without an extra kernel or sync. The shared CPU/CUDA/ROCm sampling helper
+  reports the selected probability, CUDA/ROCm graph-captured sampler tests
+  prove it on Qwen3.6 top-k/top-p rows, and
+  `V2_Unit_GpuWorkspaceAllocationPolicy` covers the new arena buffer.
+  A fused compact target-partials verifier prototype is correct and graph
+  capturable, but it is not an accepted MoE performance path: focused Release
+  perf shows only noise-level CUDA movement and a clear ROCm regression
+  (rows 1/2/3 compact about 5129/5792/6520 us versus fused about
+  6238/6884/7597 us). Do not wire this compact fusion into production. The
+  processed-logit top-k/top-p warper slice is now implemented and correct for
+  CUDA/ROCm: it builds full processed-logit rows from raw Qwen3.6-sized logits,
+  preserves compact top-k/top-p probability semantics, rejects null/default
+  streams, graph-captures with processed-logit sampling, and can publish the
+  sampled-token probability. The regression
+  `TopKTopPProcessedLogits_Qwen36VocabTopK40_MatchesCPUAndCaptures` covers the
+  large-vocab, top-k=40, top-p=0.95, temperature=0.6 path on both GPU backends.
+  Focused guards passed:
+  `V2_Unit_MTPRejectionSampler|V2_Integration_GPUSamplingKernels` and release
+  `V2_Perf_GPUSpeculativeSummary`. Production wiring is now aligned with the
+  vLLM worker contract instead of the earlier compact-table shortcut:
+  GPU runners build processed target logits on the explicit verifier stream,
+  consume sampled draft tokens from device slots, and run the batched outcome
+  verifier with `no_draft_probabilities=true` so `q` is one-hot. Penalty-free
+  and history-dependent penalty rows use the batched verifier; penalty rows
+  first apply their deterministic vLLM speculative branch history.
+  Host-visible sampled tokens keep their device sample-slot readiness edge, so
+  the batch verifier still consumes device draft-token slots. Focused runner
+  units, GPU sampler capture, and Qwen3.6 CUDA/ROCm dense+MoE stochastic parity
+  pass. The final cleanup removed the hidden full target/draft probability arena
+  rows and scalar probability-row verifier from production GPU runners; new
+  tuning should reduce verifier/condition economics rather than returning to
+  full-probability or compact-table dead ends.
+  A fused prefix-stop verifier experiment was benchmark-rejected and removed:
+  it only modestly helped ROCm reject-at-0 and was worse for
+  prefix-1/all-accepted cases, so it is not an accepted path.
 - GPU kernels produce output tokens plus `num_accepted_tokens` without CPU
   participation. CPU uses scalar/AVX2/AVX512 dispatch plus OpenMP where useful.
   First GPU step complete for penalty-free SingleDevice all-position verifier:
@@ -1007,7 +1291,327 @@ Work:
   checkpoints.
 - Tune M=1..4 GEMV/GEMM, GDN/short-conv publication, row-indexed LM-head, and
   dynamic-depth hysteresis using the same evidence across CPU/CUDA/ROCm.
+- Build a generated dynamic-depth policy pipeline, mirroring the GEMM/GEMV
+  dispatch trainer pattern:
+  - collect prompt/device/mode rows from
+    `scripts/run_mtp_depth_hysteresis_sweep.sh` and the standard iteration
+    matrix;
+  - derive train/holdout labels from same-run fixed d1/d2/d3 throughput,
+    acceptance, verifier cost, and sampling mode;
+  - train a compact deterministic policy surface offline;
+  - emit a checked-in C++ `.inc` table consumed by `MTPDepthController`;
+  - validate generated policy decisions against holdout prompts before any table
+    is accepted.
+  The generated policy must stay explainable: runtime code consumes binned
+  window statistics and emits promote/hold/demote decisions, not a black-box
+  runtime model. The controller remains deterministic and all fixed-mode
+  behavior remains untouched.
 - Keep CUDA, ROCm, and CPU correctness surfaces symmetric.
+
+Status:
+
+- Generated dynamic-depth policy side quest is implemented. The checked-in
+  trainer `scripts/train_mtp_depth_policy.py` consumes matrix/hysteresis
+  `summary.tsv` rows, derives fixed-depth labels, enforces deterministic
+  train/holdout gates when requested, skips low-confidence generated rules, and emits
+  `src/v2/execution/mtp/MTPDepthPolicyGenerated.inc`. `MTPDepthController`
+  consumes that table only in dynamic mode, keeps fixed mode untouched, and
+  reports generated promote/demote reasons through normal depth-policy stats.
+  The table is now verify-mode-aware: greedy and stochastic rows do not share a
+  single depth-2 acceptance threshold, which avoids promoting stochastic d2
+  requests into a known-poor d3 lane just because acceptance is high.
+- The runtime and benchmark config surfaces expose
+  `mtp_depth_generated_policy`, and the hysteresis plus iteration-matrix scripts
+  report whether each dynamic lane used the generated table.
+- Focused side-quest gates passed:
+  `V2_Unit_MTPDepthController`, `V2_Unit_MTPDepthPolicyTrainer`,
+  `V2_Unit_PrefillDecodeTransition`, `V2_Integration_GPUSamplingKernels`, and
+  CUDA/ROCm Qwen3.6 stochastic verifier parity. Older proving-ground coverage
+  also includes `V2_Unit_MTPIterationBenchmarkMatrix` and
+  `V2_Perf_MTPDepthController`.
+- The latest policy refresh
+  `benchmark_results/mtp_depth_hysteresis/20260611T-rocm-dense-mode-aware-policy-short-code/`
+  retrains from dense fixed d1/d2/d3 rows plus ROCm short/text/code prompts.
+  The checked-in table uses conservative thresholds: greedy d1 promotes at
+  acceptance >=0.87, greedy d2 at >=0.73, stochastic d1 at >=0.50, and
+  stochastic d3 demotes at <=0.83. Stochastic d2 promotion is intentionally
+  absent because the current runtime features cannot separate cases where d3 is
+  best from cases where d2 should hold. A regression test now proves ambiguous
+  generated rules are skipped, and the depth-zero bypass regression proves a
+  generated promote cannot override an all-zero window.
+- Conservative generated-policy sanity
+  `benchmark_results/mtp_depth_hysteresis/20260611T-rocm-dense-conservative-policy-sanity/`
+  shows generated-on is now neutral on QBF, modestly positive on C++ and tech
+  prompts, and slightly negative on the Python prompt. This is accepted as a
+  safe seed table; restoring stochastic depth-2 promotion requires richer live
+  features than acceptance rate alone.
+- Dense ROCm/CUDA catch-up slice refreshed fixed d1/d2/d3 plus dynamic for
+  greedy and stochastic. ROCm greedy is in the CUDA speedup class
+  (`20260611T-rocm-dense-catchup-baseline/`: fixed d3 67.6 tok/s, 2.16x).
+  ROCm stochastic has now caught CUDA by speedup class after the accepted
+  top-k=40 specialization, batched target/bonus top-k/top-p distribution API,
+  and the latest NativeVNNI graph-capture cleanup. The batched API is a
+  backend/runner contract for contiguous all-position verifier rows; it uses
+  declared orchestrator scratch, explicit streams, and no allocation or
+  synchronization in the kernels. ROCm NativeVNNI small-M graph capture now
+  defaults to workspace split-reduce, with atomic reduce kept as an explicit
+  tuning opt-in. `20260611T-rocm-dense-stochastic-split-reduce/` reports fixed
+  d2 at 42.1 tok/s versus 30.2 baseline (1.394x), while
+  `20260611T-rocm-dense-stochastic-explicit-atomic-ab/` reports 41.7 tok/s
+  (1.374x).
+  The full ROCm depth matrix
+  `20260611T-rocm-dense-stochastic-full-depth-matrix/` reports d1/d2/d3 at
+  37.1/41.7/35.2 tok/s over 30.2 baseline, proving d2 is the best stochastic
+  lane for this prompt. The final dynamic run
+  `20260611T-rocm-dense-stochastic-dynamic-generated-d3-only/` holds depth 2,
+  reaches 41.9 tok/s (1.385x), and records zero depth updates. CUDA reference
+  `20260611T-cuda-rocm-dense-stochastic-long-d2-dynamic/` reports fixed d2
+  64.4 tok/s (1.473x) and dynamic 59.1 tok/s (1.351x), so ROCm is accepted as
+  the same speedup class even though its absolute tok/s still lags.
+  Fresh iteration evidence
+  `20260611T124556Z-rocm-dense-stochastic-refresh` confirms the accepted
+  status with the standard baseline,d1,d2,d3,dynamic lane set at 64 decode
+  tokens: ROCm dynamic reaches 42.60 tok/s over 30.29 baseline (1.41x),
+  accepts 108 tokens, rejects 12, records 90% acceptance, and promotes to
+  depth 2 without rollbacks. The remaining dense ROCm work is absolute
+  verifier/condition throughput, not a correctness or policy blocker.
+  Focused gates passed: `V2_Unit_MTPDepthController`,
+  `V2_Integration_ROCm_NativeVNNI_GEMV`,
+  `V2_Integration_ROCmQuantisedGemmSmallM`, and ROCm Qwen3.6 stochastic
+  verifier parity. Remaining ROCm dense absolute-gap evidence points at
+  verifier/sidecar work drained at the all-position stochastic batch outcome
+  sync, about 6.8s in the 128-token run, rather than the policy or sampler
+  enqueue path.
+  A one-token condition-decode replay-preservation experiment was
+  benchmark-rejected and removed because the bounded lane reached
+  warmup/capture but not replay, dropping ROCm d2 to 32.23 tok/s.
+- ROCm batched NativeVNNI generated dispatch is not accepted for runtime use.
+  The 2026-06-11 dense guard proved microbench cosine is not a sufficient
+  promotion gate: generated batched entries collapsed ROCm dense d2 acceptance
+  to near zero, while the restored generic path kept the expected 80%
+  acceptance. The trainer now resets KB/TW overrides before building its
+  canonical reference, but future batched generated entries must pass a
+  model/verifier-equivalence gate before runtime promotion.
+- NativeVNNI decode dispatch training is now M-aware and shared across the CUDA
+  and ROCm refresh path. CUDA sweep CSVs include `m`, the CUDA tree trainer
+  keys features by `(M,N,K)`, exact overlay keys pack `M`, and the CUDA small-M
+  runtime path consumes generated shape/tuning for verifier rows instead of
+  using an N,K-only route. ROCm decode trainer and runtime already use the same
+  M-aware key shape. `scripts/refresh_native_vnni_dispatch_tables.sh` is the
+  canonical sweep -> train -> validate wrapper for CUDA and ROCm; it has a
+  dry-run unit guard, a stratified `family-smoke` profile that runs one bounded
+  sweep per requested format before combining CSVs, and can install validated
+  generated includes. The compact CUDA smoke
+  `benchmark_results/native_vnni_dispatch/20260611T063908Z-cuda-m-aware-refresh-smoke/`
+  produced real Q4_1 M=1..4 rows and a validated generated include. Stratified
+  CUDA/ROCm smoke refreshes
+  `benchmark_results/native_vnni_dispatch/20260611T065536Z-cuda-family-smoke-stratified/`
+  and
+  `benchmark_results/native_vnni_dispatch/20260611T065515Z-rocm-family-smoke-stratified/`
+  proved actual per-format partial CSV generation, CSV combine, training, and
+  generated-include validation for representative simple and IQ codebook
+  families. The wrapper unit test now also guards the default `family-smoke`
+  inventory so CUDA includes its `Q8_0` extension while ROCm stays on the
+  supported quantized weight families. Project CUDA/ROCm tuning skills document
+  `family-smoke` as the bounded proxy and `qwen36`/`all` plus parity/benchmarks
+  as the only table-install acceptance path. Focused gates passed:
+  `V2_Unit_NativeVNNIDispatchRefreshScript`,
+  `V2_Unit_CUDAGemvDispatchGeneratorAliases`,
+  `V2_Unit_CUDAGemvDispatchBaseMerge`,
+  `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeVNNITrainerCsvValidator`,
+  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`, and dense CUDA Qwen3.6
+  depth-3 MTP parity. The wrapper now also exposes staged strict profiles:
+  `qwen36-core` for Qwen3.6 FFN/GDN projections and `qwen36-lm-head` for the
+  high-cost LM-head shape. ROCm `qwen36-core` completed without installing
+  tables:
+  `benchmark_results/native_vnni_dispatch/20260611T072617Z-rocm-qwen36-core-refresh/`
+  generated 360 entries across 15 codebook families and passed generated
+  codebook validation. The post-refresh focused gate passed
+  `V2_Unit_NativeVNNIDispatchRefreshScript`,
+  `V2_Unit_CUDAGemvDispatchGeneratorAliases`,
+  `V2_Unit_CUDAGemvDispatchBaseMerge`,
+  `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeVNNITrainerCsvValidator`,
+  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`,
+  `V2_Integration_ROCm_NativeVNNI_GEMV`, and
+  `V2_Integration_ROCmQuantisedGemmSmallM`. A first full CUDA `qwen36-core`
+  attempt was stopped after two completed cases in roughly two minutes, because
+  the full strict profile is a long-running acceptance job rather than an
+  inner-loop gate. That attempt exposed a trainer stream-hygiene regression:
+  the CUDA sweep harness called `multiply_tensor()` without binding an explicit
+  stream. `Perf__CUDABlockwiseTensorCoreGemmSweep.cpp` now creates a
+  non-blocking CUDA stream, binds it with `setGPUStream()`, records timing
+  events on that stream, and unbinds/destroys it on every exit path. A bounded
+  CUDA qwen36-core representative refresh,
+  `benchmark_results/native_vnni_dispatch/20260611T081007Z-cuda-qwen36-core-representative-stream-bound/`,
+  swept Q4_0, Q4_K, IQ2_XXS, and Q8_0 on the qwen36 FFN GateUp shape for
+  M=1..4, generated/validated a smoke include, and proved non-null stream
+  binding in the trainer log. The strict generator threshold correctly rejects
+  that partial CSV as a production table, so it is recorded as a smoke artifact
+  only. CUDA `qwen36-lm-head`, full `qwen36`/`all`, and model-level
+  parity/benchmarks remain pending before broad checked-in table replacement.
+  Focused follow-up gates passed `V2_Unit_Static_NoDefaultStreamInGPUCode`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, `V2_Unit_NativeVNNIDispatchRefreshScript`,
+  `V2_Unit_CUDAGemvDispatchGeneratorAliases`,
+  `V2_Unit_CUDAGemvDispatchBaseMerge`,
+  `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeVNNITrainerCsvValidator`, and
+  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`. The ROCm trainer
+  also gained an explicit `LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE` mode:
+  normal/core profiles keep the FP32 hipBLAS health reference, while
+  `qwen36-lm-head` defaults to `native-auto` so the giant LM-head shape can
+  compare candidates against a reset-AUTO native output without materializing a
+  multi-GB FP32 weight mirror. A one-format LM-head smoke,
+  `benchmark_results/native_vnni_dispatch/20260611T075534Z-rocm-qwen36-lm-head-native-auto-smoke/`,
+  passed for Q4_0/M=1 and generated one validated entry. The trainer now treats
+  already-uploaded packed weights as valid, because first-use upload clears host
+  packing buffers while keeping the device upload cache authoritative.
+  CUDA LM-head smoke
+  `benchmark_results/native_vnni_dispatch/20260611T081631Z-cuda-qwen36-lm-head-smoke/`
+  passed for Q4_0/M=1 with the stream-bound trainer and generated one
+  validated entry. This proves the huge LM-head shape is tractable in the
+  staged pipeline, but all-format LM-head and model-level parity still gate any
+  checked-in CUDA table update. Follow-up inspection found the CUDA M=2..4
+  sweep path was labelling candidates while the specialized small-M dispatcher
+  still used the current generated runtime route. `CUDANativeVNNIGemvTuned.cu`
+  now consumes the sweep override for real KPAR small-M candidate launches, and
+  the perf harness filters out WIDE/DIRECT/ROWPAR for M=2..4 because the
+  VRAM-pool prepared harness can only execute KPAR verifier kernels today.
+  The standard CUDA refresh family set is therefore `wide,kpar,direct` for M=1
+  and executable KPAR rows for M=2..4; ROWPAR needs a future row-major-owner
+  trainer before it can appear in production generated tables. Focused smoke
+  `benchmark_results/native_vnni_dispatch/20260611T091538Z-cuda-smallm-real-candidate-smoke/`
+  proved the corrected path with Q4_0 Qwen3.6 GDN time projection M=2:
+  648 real KPAR rows, zero small-M failure logs, generated validation passed,
+  and best tile 128x1/waves4/mkg4 at 13.312 us. The CUDA sweep trainer now
+  uses deterministic valid packed tensors for dispatch sweeps instead of
+  per-element random quantized fixtures, prepares/uploads/repackages each
+  format+shape once before candidate timing, and sizes its
+  `DeviceWorkspaceManager` budget from declared `IWorkspaceConsumer`
+  requirements. This keeps giant LM-head refreshes practical while retaining
+  the production tensor classes and GPU preparation path. The CUDA overlay
+  generator fallback is also M-aware now, matching the base tree and exact
+  `(M,N,K)` overrides; `V2_Unit_CUDAGemvDispatchBaseMerge` includes a split-M
+  fixture where one LM-head shape wants WIDE/DIRECT at M=1 and KPAR at M=2..4
+  and an alias-conflict fixture proving Q4_1/Q4_K style source-format winners
+  collapse to one codebook-level runtime dispatch row before exact thresholds.
+  A strict CUDA Q4_0 LM-head refresh,
+  `benchmark_results/native_vnni_dispatch/20260611T094334Z-cuda-qwen36-lm-head-q4_0-full-candidates-maware/`,
+  swept the full candidate grid for M=1..4 in about 62 seconds, produced 2708
+  rows, passed generated validation, and reported 100% overall/fallback
+  family/exact hit rates. Full CUDA all-format LM-head refresh,
+  `benchmark_results/native_vnni_dispatch/20260611T094803Z-cuda-qwen36-lm-head-all-formats/`,
+  completed the full M=1..4 candidate grid in about 19.5 minutes, wrote 51,452
+  sweep rows, collapsed 76 source-format winners to 64 runtime dispatch keys,
+  reconciled 6 alias-conflict keys, and generated a validated include with
+  100% final family/exact/fallback hit rates. Full CUDA qwen36-core refresh,
+  `benchmark_results/native_vnni_dispatch/20260611T101337Z-cuda-qwen36-core-all-formats/`,
+  completed the six Qwen3.6 core FFN/GDN shapes across all CUDA decode formats
+  in about 10.8 minutes, wrote 308,712 sweep rows, observed KPAR as the best
+  family for all 456 source-format winners, collapsed them to 384 runtime
+  dispatch keys, reconciled 64 alias-conflict keys, and generated a validated
+  include with 100% final family/exact hit rates. Combined CUDA qwen36 artifact,
+  `benchmark_results/native_vnni_dispatch/20260611T102638Z-cuda-qwen36-combined-from-staged/`,
+  was generated from the staged core plus LM-head CSVs without rerunning GPU
+  sweeps. It covers 360,164 rows, 532 source-format winners, 448 runtime
+  dispatch keys, 70 alias-conflict keys, and validates with 100% final
+  family/exact hit rates. Full ROCm LM-head refresh
+  `benchmark_results/native_vnni_dispatch/20260611T082004Z-rocm-qwen36-lm-head-full/`
+  completed without installing tables. It ran all 18 ROCm text formats across
+  M=1..4, produced 72 best rows, collapsed aliases into 60 generated dispatch
+  entries across 15 codebook ids, and passed generated codebook validation.
+  Every completed row matched the `native-auto` reference with cosine 1.0.
+  IQ3_S/IQ3_XXS and IQ1_S/IQ1_M are correct but show weaker M>1 LM-head
+  speedups than the Q/K/IQ2 families, so they are follow-up tuning candidates
+  after model-level parity accepts any table promotion. Combined ROCm qwen36
+  artifact,
+  `benchmark_results/native_vnni_dispatch/20260611T102802Z-rocm-qwen36-combined-from-staged/`,
+  was generated from the staged ROCm core plus LM-head CSVs without rerunning
+  kernels. It covers 6048 candidate rows across 18 ROCm formats and 7 Qwen3.6
+  shapes, and emits 420 generated dispatch entries across 15 codebook ids. The
+  post-refresh
+  generated-dispatch gate passed
+  `V2_Unit_Static_NoDefaultStreamInGPUCode`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_NativeVNNIDispatchRefreshScript`,
+  `V2_Unit_CUDAGemvDispatchGeneratorAliases`,
+  `V2_Unit_CUDAGemvDispatchBaseMerge`,
+  `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeVNNITrainerCsvValidator`, and
+  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`.
+  The combined CUDA and ROCm generated tables are now installed in
+  `CUDANativeVNNIGemvDispatchHeuristicGenerated.inc` and
+  `ROCmNativeVNNIDecodeDispatchGenerated.inc`. Promotion evidence passed:
+  the generated-dispatch unit/static gate, `V2_Integration_ROCm_NativeVNNI_GEMV`,
+  `V2_Integration_ROCmQuantisedGemmSmallM`, and the symmetric dense Qwen3.6
+  CUDA/ROCm MTP parity gate covering fixed d1/d3, dynamic depth, forward-only
+  equivalence, stochastic verifier smoke, and benchmark-prompt known-window
+  diagnostics. The only failure found during promotion was not a generated-table
+  regression: ROCm teacher-forced benchmark-prompt parity hits a documented
+  PyTorch FP32 versus quantized ROCm near-tie at decode step 6, where ROCm ranks
+  token 4338 at 20.802 over PyTorch token 1092 at 20.793. The harness now keeps
+  exact PyTorch-token checks before that row, asserts the near-tie remains small,
+  and leaves long MTP checks comparing against the backend no-MTP baseline.
+  Installed-table benchmark matrix
+  `benchmark_results/mtp_vllm_style/20260611T-post-generated-dispatch-dense-cuda-rocm/`
+  covered dense CUDA/ROCm greedy and stochastic baseline,d1,d2,d3,dynamic rows
+  at 64 decode tokens. CUDA remains speed-positive: greedy d3 reaches
+  91.4 tok/s (2.08x over 44.0 baseline) and stochastic d3 reaches
+  65.7 tok/s (1.49x over 44.0 baseline). ROCm greedy is also speed-positive:
+  d3 reaches 65.0 tok/s (2.14x over 30.3 baseline). Follow-up perfstats first
+  exposed stochastic rejection-condition cost as the ROCm blocker; the later
+  `20260611T124556Z-rocm-dense-stochastic-refresh` matrix closes that bounded
+  lane with dynamic at 42.60 tok/s over 30.29 baseline (1.41x), 90%
+  acceptance, and zero rollbacks. Dense CUDA/ROCm relative speedup is now
+  accepted; future dense work should target ROCm absolute verifier/condition
+  throughput without weakening the shared sampler or parity gates.
+- ROCm default `family-smoke` now runs through the full supported decode
+  codebook inventory. The first all-format attempt exposed Q4_K/M=3 and Q2_K/M=1
+  as FP32 hipBLAS health-gate false negatives rather than dispatch mismatches:
+  Q4_K/M=3 is covered by an expanded Qwen3.6 GDN time-projection packed native
+  contract regression, and `V2_Integration_ROCm_NativeVNNI_GEMV` plus
+  `V2_Integration_ROCmQuantisedGemmSmallM` remain the exact dispatch-equivalence
+  gates. After documenting those ROCm trainer health gates, the all-format smoke
+  `benchmark_results/native_vnni_dispatch/20260611T070818Z-rocm-family-smoke-all-formats/`
+  generated 60 decode entries across 15 codebooks and passed validation.
+- CUDA default `family-smoke` also runs through its full decode inventory,
+  including the CUDA-only `Q8_0` codebook. The all-format smoke
+  `benchmark_results/native_vnni_dispatch/20260611T071116Z-cuda-family-smoke-all-formats/`
+  swept 58,235 candidate rows, trained the fallback tree, layered 76 exact
+  known-shape overrides across 16 codebooks, and passed generated codebook
+  validation. This exposed a policy issue rather than a kernel issue:
+  `family-smoke` now uses proxy hit-rate thresholds while `qwen36`/`all` keep
+  strict CUDA fallback-family/exact thresholds for production table acceptance.
+  After fixing the CUDA small-M relabel/fallthrough bug, the corrected
+  all-format smoke
+  `benchmark_results/native_vnni_dispatch/20260611T091656Z-cuda-family-smoke-all-formats-corrected-smallm/`
+  produced 51,452 executable rows, covered 16 codebook ids, generated 76
+  known-shape overrides, validated the generated include, and had zero
+  small-M failure logs. This corrected artifact supersedes the earlier CUDA
+  family-smoke evidence for M=2..4 trainer behavior.
+- Dynamic warm-start cleanup is accepted for the bounded dense stochastic lane.
+  `MTPDepthController` now resolves an unset dynamic initial depth to depth 2
+  when the configured range allows it, while preserving explicit depth-zero
+  bypass. `scripts/run_mtp_iteration_benchmark_matrix.sh` no longer hard-pins
+  dynamic rows to `--mtp-initial-draft-tokens 1`, so the matrix measures the
+  runtime policy default. Runtime-default checks:
+  `20260611T-rocm-dense-stochastic-dynamic-runtime-default-d2/` reports ROCm
+  dynamic at 34.34 tok/s, 1.10x, 80% acceptance, zero updates; and
+  `20260611T-cuda-dense-stochastic-dynamic-runtime-default-d2/` reports CUDA
+  dynamic at 54.20 tok/s, 1.21x, 80% acceptance, zero updates.
+- Deepest-lane dynamic policy is now generated-table only. Handwritten fallback
+  promotion still handles shallow probes, but it no longer enters the maximum
+  draft depth on perfect or ambiguous lower-depth windows. This keeps the
+  default stochastic prompt on the proven fixed-d2 lane instead of paying d3
+  probes, while preserving generated greedy d2-to-d3 promotion where the table
+  has evidence.
+- Prefix/MTP full-hit restore regression is fixed. Prefix harvest now refreshes
+  the terminal hidden row from the just-finished prefill before storing a
+  terminal MTP block, so a stored block no longer advertises MTP state while
+  lacking the terminal hidden needed by the sidecar. Focused CUDA/ROCm
+  Qwen3.6 dense `PrefixCacheMTPRestore` and
+  `PrefixCacheMTPDynamicDepthRestore` parity tests pass.
 
 Exit gate:
 
@@ -1015,6 +1619,10 @@ Exit gate:
 - CUDA and ROCm post comparable speedup classes versus their no-MTP baselines;
   if one backend lags, it gets a tuning pass before acceptance.
 - Dynamic approaches the best fixed depth for the prompt class after warmup.
+- The generated dynamic-depth policy trainer has unit coverage for CSV parsing,
+  holdout evaluation, and generated `.inc` output; controller unit tests prove
+  generated recommendations are bounded by min/max depth and do not affect fixed
+  policy mode.
 
 ### Phase 8: MoE SingleDevice Parity With Dense Contract
 
@@ -1029,6 +1637,127 @@ Work:
 - Persist only continuation state; expert routing payloads, histograms, and
   sparse scratch remain transient.
 - Ensure CUDA and ROCm use the same MoE strategy before backend-specific tuning.
+
+Status:
+
+- First ROCm MoE tuning slice landed a backend parity fix with direct perf
+  impact. ROCm `softmax_topk` now mirrors CUDA's block-wide parallel top-k
+  selection instead of scanning all experts on thread 0 after softmax. The
+  kernel preserves the previous ascending expert-id tie order, leaves router
+  probability rows intact for diagnostics, rejects null/default streams and
+  unsupported bounds, and is covered by
+  `Test__ROCmMoEKernel.SoftmaxTopKParallelSelectionPreservesTieOrder` plus the
+  existing verifier-shaped small-M router regression.
+- Evidence: `20260611T-rocm-moe-parallel-topk/` reduced ROCm MoE stochastic
+  fixed-d2 verifier router time from 291.8 ms to 51.9 ms and verifier total
+  from 951.8 ms to 768.4 ms in the profiled lane. The non-profiled bounded
+  matrix `20260611T-rocm-moe-parallel-topk-matrix/` moved fixed d2 from the
+  previous 33.3 tok/s to 43.2 tok/s against a same-run 68.1 tok/s baseline.
+  ROCm Qwen3.6 MoE stochastic verifier parity passed after the change.
+- Full-ownership SingleDevice GPU MoE now advertises sidecar main-state
+  preservation, matching the dense transaction contract. The predicate is
+  intentionally ownership-based rather than enum-based: CUDA/ROCm SingleDevice
+  production graphs may use the `ExpertParallel` label while still owning the
+  full expert set (`local_expert_count < 0`, no overlay plan). CPU and sparse
+  ExpertParallel overlays remain conservative. The focused unit
+  `Test__DeviceGraphOrchestrator.SidecarMainStatePreservationIsInitializedAndTopologyBounded`
+  covers this boundary, and CUDA/ROCm Qwen3.6 MoE stochastic parity passed with
+  `LLAMINAR_MTP_VERIFY_SIDECAR_PRESERVES_MAIN_STATE=1`.
+- Evidence: `20260611T-rocm-moe-sidecar-preserve-fullowner-d2/` removes
+  `all_position_verifier_base_restores`, records
+  `all_position_verifier_base_restore_skipped_sidecar_preserved`, and lets
+  `main_verifier` reach segmented replay. ROCm stochastic fixed d2 moved to
+  46.1 tok/s. The matching CUDA lane
+  `20260611T-cuda-moe-sidecar-preserve-fullowner-d2/` also skips restore and
+  reaches verifier replay, with fixed d2 at 62.5 tok/s.
+- Long-lane MoE evidence is now the sprint steering signal:
+  `20260611T144241Z-moe-cuda-rocm-longlane` shows CUDA MoE remains
+  speed-negative in greedy and stochastic even at d2/d3, while ROCm greedy can
+  barely exceed baseline only through dynamic policy and ROCm stochastic remains
+  negative. A backend-neutral attempt to force ROCm shared-expert verifier rows
+  onto grouped prefill was benchmark-rejected:
+  `20260611T145646Z-moe-rocm-shared-grouped` regressed ROCm greedy d2/d3/dynamic
+  to 69.1/64.7/60.5 tok/s. The CUDA tile_m sweep also found no stable default
+  promotion.
+- Focused verifier-prefill perf/parity coverage now exists as
+  `V2_Perf_MoEVerifierPrefill`. It exercises CUDA and ROCm M=1/2/3/4 routed
+  top-k and shared expert rows at the production Qwen3.6 MoE shape
+  (`d_model=2048`, `intermediate=512`, 256 routed experts), compares grouped
+  verifier prefill against row-wise decode-equivalent rows, and times eager plus
+  graph-replay execution. The release CTest gate passed with reduced iteration
+  counts for sprint use, and the short CSV run showed graph replay is already
+  sub-millisecond for these kernels: CUDA routed M1/M2/M3/M4 =
+  0.154/0.168/0.183/0.192 ms, CUDA shared = 0.099/0.105/0.114/0.118 ms,
+  ROCm routed = 0.242/0.266/0.337/0.339 ms, ROCm shared =
+  0.144/0.158/0.212/0.227 ms, all with cosine 1.0 against decode-equivalent
+  output. That shifts the next Phase 8 tuning target away from isolated
+  grouped prefill itself and toward full verifier economics: routed/shared FFN
+  cost across all layers, rejection condition replay, and sidecar LM-head /
+  sampling work.
+- Fresh clean MoE depth sweep with perfstats:
+  `20260611T_moe_perfstats_depth_sprint`. CUDA greedy baseline/d1/d2/d3/dynamic
+  = 136.5/83.6/97.0/106.1/81.8 tok/s; CUDA stochastic =
+  137.1/79.8/84.3/85.4/78.4. ROCm greedy =
+  76.5/75.6/78.2/83.1/81.0; ROCm stochastic =
+  76.4/59.1/59.0/61.6/56.4. Acceptance is healthy enough that draft quality is
+  not the primary blocker: CUDA greedy d3 is 84.4%, ROCm greedy d3 is 85.3%,
+  and ROCm stochastic d2 is 86.3%.
+- ROCm exact combined shared-gate verifier prefill now uses an IQ4_NL byte-pair
+  decode table for the Qwen3.6 shared expert path. The production-shaped
+  speedometer improved ROCm graph replay from about 0.702 ms to 0.506 ms with
+  cosine 1.0 against the split routed+shared reference; CUDA on the same shape
+  is about 0.350 ms. `V2_Integration_ROCmMoEKernel` and focused CUDA/ROCm exact
+  verifier perf gates pass after the change.
+- The production-shaped combined shared-gate verifier speedometer now covers
+  the fixed-depth target-row counts M=2/3/4 instead of only the depth-3 M=4
+  case. Reduced direct run evidence: CUDA graph replay 0.308/0.330/0.351 ms,
+  ROCm graph replay 0.444/0.462/0.509 ms, all cosine 1.0 against the split
+  routed+shared reference. The full `V2_Perf_MoEVerifierPrefill` CTest passed,
+  so future MoE tuning can use this curve as the per-depth kernel baseline.
+- Fresh post-IQ4 full MoE GPU matrix:
+  `20260612T_moe_gpu_post_iq4pair_matrix`. CUDA remains speed-negative in every
+  MoE lane despite high acceptance: greedy baseline/d1/d2/d3/dynamic =
+  139.2/84.2/98.9/107.2/106.3 tok/s and stochastic =
+  139.6/81.3/90.8/96.9/105.5. ROCm greedy dynamic is the first barely
+  speed-positive GPU MoE lane at 81.6 tok/s versus 77.7 baseline, but fixed
+  depths remain negative; ROCm stochastic remains negative at
+  49.0/48.9/38.8/50.8 versus 77.4 baseline. Perfstats show CUDA is limited by
+  verifier plus condition-forward economics, while ROCm still attributes large
+  time to the compact greedy/stochastic outcome sync boundary.
+- Correction-replay small-M routing was tested and rejected in
+  `20260611T_moe_correction_replay_sprint`. Splitting the one-token rejected
+  correction condition forward into a distinct graph signature and forcing the
+  verifier-prefill MoE route regressed the same-run full matrix: CUDA greedy d3
+  moved from 106.1 to 97.8 tok/s and ROCm greedy d3 from 83.1 to 71.4 tok/s.
+  The experiment has been removed so future tuning does not inherit a dead-end
+  graph mode.
+- Stage attribution from `20260611T_moe_stage_timing_probe` shows the next
+  optimization should stay on full graph economics rather than per-expert
+  correctness. CUDA main-verifier d3 is dominated by routed FFN (~46 ms over
+  the short probe) plus shared FFN (~43 ms), with GDN/router support work next.
+  ROCm main verifier is dominated by routed FFN (~78-80 ms), then shared FFN,
+  router, GDN, GEMM, and attention. Sidecar attribution shows LM head as the
+  largest sidecar stage, so sidecar LM-head/sampling fusion is the next
+  second-order target once verifier FFN economics are improved.
+- MoE remains speed-negative, so Phase 8 is not accepted. The next bottleneck
+  is verifier/condition/sidecar transaction cost, not publication, router
+  correctness, isolated grouped prefill, or verifier-base restore churn. For
+  stochastic MoE specifically, the vLLM processed-logit/one-hot-q verifier is
+  functionally green on CUDA and ROCm, but the same-run matrix is still
+  speed-negative. Continue from profiler evidence on verifier, condition, and
+  queued GPU sampling work rather than reviving compact-table or full-prob row
+  verifier variants.
+- Post-cleanup d1 smoke
+  `20260612T181004Z-moe-stochastic-debug-d2h-gated-smoke` confirms the current
+  shape: CUDA d1 is 79.0 versus 115.0 tok/s and ROCm d1 is 50.7 versus
+  69.6 tok/s, both at 75% acceptance. Debug-only stochastic row copies are now
+  gated behind validation/debug mode and covered by
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, but the ROCm D2H sync bucket remains
+  about 408 ms. A short `rocprof` run shows actual GPU time is dominated by
+  GDN, routed/shared MoE GEMMs, native GEMM, and LM head; the first D2H bucket
+  is a synchronization boundary draining queued verifier/model work, not proof
+  that sampling kernels are the primary target. The next Phase 8 slice should
+  keep moving toward the vLLM transaction shape before deeper sampler tuning.
 
 Exit gate:
 
@@ -1051,6 +1780,70 @@ Work:
   token counts.
 - ExpertParallel participants execute sparse no-op/dispatch/return stages in a
   symmetric sequence, with placement fingerprints included in prefix/MTP state.
+
+Status:
+
+- First CPU/unit slice landed the shared common-prefix contract:
+  `coordinateMTPSpecCommonAcceptedPrefix()` clamps participant-local
+  `MTPSpecStepPlan` publication to the minimum accepted state count and marks
+  divergent participants as requiring common fallback replay. This gives
+  LocalTP, GlobalTP/NodeLocalTP, LocalPP, and ExpertParallel one reusable rule:
+  no participant may publish verifier state past the common accepted prefix.
+  Focused gate: `V2_Unit_MTPSpecStateContract`.
+- LocalTP runtime fan-out now exists for accepted spec-state publication.
+  `RankOrchestrator::supportsMTPSpecStatePublication()` only advertises the
+  capability when every child runner supports it, and
+  `publishAcceptedMTPSpecState()` coordinates the plan through the shared
+  common-prefix helper before publishing on every child via the TP worker pool.
+  A failed or unsupported participant fails the rank operation instead of
+  silently publishing a partial topology. Focused gate:
+  `V2_Unit_RankOrchestrator`; bounded MTP gate:
+  `V2_Unit_(RankOrchestrator|MTPSpecStateContract|MTPSpecDecodeMetadata|MTPSpecDecodeTransaction|MTPDecodeCatchup|MTPRejectionSampler|MTPVerifierPolicy|GpuWorkspaceAllocationPolicy|PrefillDecodeTransition)`.
+- LocalTP chained sidecar drafts are no longer single-child only.
+  `RankOrchestrator::supportsChainedMTPDrafts()` now requires every child to
+  support depth-2/3 sidecar chaining, and `forwardMTPFromLastDraft()` fans the
+  same draft token plus shifted-cache position to every participant through the
+  TP worker pool. This makes fixed d2/d3 LocalTP MTP reachable under the same
+  all-child hard-fail contract as rank-level publication. Focused gate:
+  `V2_Unit_RankOrchestrator`; bounded MTP gate same as above.
+- LocalTP shifted-prefill MTP embedding now follows the vocab-parallel contract
+  on CUDA/ROCm. `EmbeddingStage` passes both the local vocab range and the
+  "out-of-shard rows may be zero" permission to the GPU embedding kernels, so
+  device-token validation no longer mistakes an in-process LocalTP shard for a
+  broken single-device embedding. This also makes FP32 GPU embedding launches
+  respect explicit vocab offsets. Focused gates:
+  `V2_Unit_VocabParallelEmbeddingSharding`,
+  `V2_Unit_EmbeddingStage_GraphCapture`, and
+  `V2_Integration_Parity_Qwen36_LocalTP_Qwen36LocalTPPrefixMTPParity_MTPGreedyMatchesPyTorchDecodeTokens`.
+- LocalTP dynamic depth is now enabled through the same rank-wide
+  `OrchestrationRunner` controller used by SingleDevice. The controller chooses
+  one draft depth for the request step and `RankOrchestrator` fans that depth
+  out to every child, so participants do not adapt independently. PP and
+  GlobalTP/MPI remain hard-gated until they have explicit scalar depth
+  coordination. Focused gates: `V2_Unit_PrefillDecodeTransition`,
+  `V2_Integration_Parity_Qwen36_LocalTP_Qwen36LocalTPPrefixMTPParity_MTPGreedyDepth3MatchesPyTorchDecodeTokens`,
+  and
+  `V2_Integration_Parity_Qwen36_LocalTP_Qwen36LocalTPPrefixMTPParity_MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens`.
+- NodeLocalTP fixed d2/d3 MTP now uses the same all-participant chained
+  sidecar contract. `GlobalOrchestrator` advertises chained draft support only
+  when every stage runner supports it, and `forwardMTPFromLastDraft()` fans the
+  same draft token plus shifted position to every rank-local participant.
+  Dynamic depth remains gated for GlobalTP/MPI until rank-wide scalar depth
+  coordination exists. Focused gates: `V2_Unit_PrefillDecodeTransition`,
+  `V2_Integration_Parity_Qwen36_NodeLocalTP_Qwen36NodeLocalTPPrefixParity_MTPGreedyDepth3MatchesPyTorchDecodeTokens`,
+  and full `V2_Integration_Parity_Qwen36_NodeLocalTP_`.
+- LocalTP all-position verifier sampling now consumes the verifier graph replay
+  stream exactly once per child runner and reuses that handoff for every sampled
+  verifier row. This closes the race where LocalTP could sample row logits on a
+  child default stream before a graph-captured verifier replay had completed.
+  Focused gate: `V2_Unit_RankOrchestrator`.
+- ExpertOverlay Qwen3.6 MoE parity now covers ROCm2TP-hot plus CPU2LocalTP-cold
+  greedy MTP and prefix-restore MTP. The fixed causes were missing ROCm
+  local-expert nested workspace declarations and GPU MoE parity not enabling the
+  deterministic reduction-order mode on ROCm near-tie prompts. Focused gates:
+  `V2_Unit_MoELocalExpertStage_PreparedWeights`,
+  `V2_Unit_RankOrchestrator`, and full
+  `^V2_Integration_Parity_Qwen36MoE_ExpertOverlay_`.
 
 Exit gate:
 
@@ -1106,6 +1899,21 @@ ctest --test-dir build_v2_integration \
   --output-on-failure --parallel
 ```
 
+### Generated Dispatch Gate
+
+Run after touching NativeVNNI sweep, trainer, generated include, or CUDA/ROCm
+decode dispatch code:
+
+```bash
+ctest --test-dir build_v2_integration \
+  -R "V2_Unit_Static_NoDefaultStreamInGPUCode|V2_Unit_GpuWorkspaceAllocationPolicy|V2_Unit_NativeVNNIDispatchRefreshScript|V2_Unit_CUDAGemvDispatchGeneratorAliases|V2_Unit_CUDAGemvDispatchBaseMerge|V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator|V2_Unit_ROCmNativeVNNITrainerCsvValidator|V2_Unit_NativeVNNIGeneratedDispatchCodebooks" \
+  --output-on-failure --parallel
+```
+
+Use `scripts/refresh_native_vnni_dispatch_tables.sh --backend both --profile qwen36`
+for table refreshes. Install generated tables only after model-level parity and
+benchmark acceptance for the affected backend/model lanes.
+
 ### Functional/Parity Gate
 
 Run the relevant available lanes for any touched backend:
@@ -1122,6 +1930,7 @@ This must cover, as applicable:
 - Dense CPU/CUDA/ROCm stochastic MTP. CPU may use host kernels, but it must use
   the same batched verifier/rejection contract; CUDA/ROCm must use
   device-resident stochastic verification.
+- Dense CPU/CUDA/ROCm layer-by-layer math prefill/decode parity.
 - Seeded stochastic sampler parity for saved real-model logits must be symmetric
   across CPU/CUDA/ROCm so backend drift cannot hide behind aggregate counters.
 - Dense CUDA/ROCm GPU graph smokes.
