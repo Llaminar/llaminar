@@ -429,6 +429,7 @@ fi
 mkdir -p "${output_dir}"
 
 summary_path="${output_dir}/summary.tsv"
+stage_summary_path="${output_dir}/stage_summary.tsv"
 commands_path="${output_dir}/commands.txt"
 metadata_path="${output_dir}/metadata.txt"
 
@@ -460,6 +461,7 @@ if [[ ! -x "${perf_summary_script}" ]]; then
 fi
 
 printf 'topology\tdevice\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\tdepth_updates\tdepth_promotions\tdepth_demotions\tdepth_windows\tlast_depth_reason\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tsampling_enqueue_ms\tstochastic_batch_outcome_ms\tstochastic_batch_d2h_sync_ms\tgreedy_summary_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
+printf 'topology\tdevice\tmodel\tmode\tvariant\tdomain\tphase\tcontext\tname\ttotal_ms\tcount\tavg_us\tstage_count\tsource\tperfstats\n' > "${stage_summary_path}"
 : > "${commands_path}"
 
 zero_perf_summary() {
@@ -521,6 +523,55 @@ append_summary() {
       (.mtp.verifier_token_count // 0)
     ] | @tsv' "${json_path}")"
   printf '%s\t%s\t%s\t%s\n' "${base_summary}" "${perf_summary}" "${json_path}" "${perf_path}" >> "${summary_path}"
+}
+
+append_stage_summary() {
+  local topology="$1"
+  local device="$2"
+  local model="$3"
+  local mode="$4"
+  local variant="$5"
+  local perf_path="$6"
+
+  if [[ -z "${perf_path}" || ! -f "${perf_path}" ]]; then
+    return
+  fi
+
+  jq -r \
+    --arg topology "${topology}" \
+    --arg device "${device}" \
+    --arg model "${model}" \
+    --arg mode "${mode}" \
+    --arg variant "${variant}" \
+    --arg perfstats "${perf_path}" \
+    '
+      (.records // [])
+      | map(select(
+          (.kind // "") == "timer"
+          and ((.domain // "") == "mtp" or (.domain // "") == "stage_gpu")
+          and ((.phase // "") == "decode")
+          and ((.total_ms // 0) > 0)
+        ))
+      | sort_by((.total_ms // 0)) | reverse | .[:40]
+      | .[]
+      | [
+          $topology,
+          $device,
+          $model,
+          $mode,
+          $variant,
+          (.domain // ""),
+          (.phase // ""),
+          (.tags.context // ""),
+          (.name // ""),
+          (.total_ms // 0),
+          (.count // 0),
+          (.avg_us // 0),
+          (.tags.stage_count // ""),
+          (.tags.source // ""),
+          $perfstats
+        ] | @tsv
+    ' "${perf_path}" >> "${stage_summary_path}"
 }
 
 log_level="${LLAMINAR_LOG_LEVEL:-ERROR}"
@@ -638,6 +689,7 @@ for model in $(split_csv "${models}"); do
         fi
 
         append_summary "${topology}" "${device}" "${model}" "${mode}" "${variant}" "${json_path}" "${perf_path}" "${baseline_decode_tps}" "${perf_summary}"
+        append_stage_summary "${topology}" "${device}" "${model}" "${mode}" "${variant}" "${perf_path}"
         tail -n 8 "${log_path}" || true
       done
     done
@@ -646,4 +698,5 @@ for model in $(split_csv "${models}"); do
 done
 
 echo "summary: ${summary_path}"
+echo "stage summary: ${stage_summary_path}"
 echo "commands: ${commands_path}"

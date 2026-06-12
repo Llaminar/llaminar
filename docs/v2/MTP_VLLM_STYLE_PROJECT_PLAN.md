@@ -1747,17 +1747,15 @@ Status:
   speed-negative. Continue from profiler evidence on verifier, condition, and
   queued GPU sampling work rather than reviving compact-table or full-prob row
   verifier variants.
-- Post-cleanup d1 smoke
-  `20260612T181004Z-moe-stochastic-debug-d2h-gated-smoke` confirms the current
-  shape: CUDA d1 is 79.0 versus 115.0 tok/s and ROCm d1 is 50.7 versus
-  69.6 tok/s, both at 75% acceptance. Debug-only stochastic row copies are now
-  gated behind validation/debug mode and covered by
-  `V2_Unit_GpuWorkspaceAllocationPolicy`, but the ROCm D2H sync bucket remains
-  about 408 ms. A short `rocprof` run shows actual GPU time is dominated by
-  GDN, routed/shared MoE GEMMs, native GEMM, and LM head; the first D2H bucket
-  is a synchronization boundary draining queued verifier/model work, not proof
-  that sampling kernels are the primary target. The next Phase 8 slice should
-  keep moving toward the vLLM transaction shape before deeper sampler tuning.
+- Fresh GPU stage-timing probe
+  `20260612T225841Z-moe-stochastic-gpu-stage-timing` keeps the conclusion
+  sharp: CUDA best dynamic is 81.6 versus 114.4 tok/s baseline, and ROCm best
+  d1 is 51.5 versus 68.7 tok/s baseline. The new `--gpu-stage-timing` evidence
+  shows routed expert FFN dominates both main-decode condition rows and
+  main-verifier rows. The stochastic D2H bucket is mostly the host-visible
+  synchronization boundary draining queued model work, not the primary kernel
+  target. The next Phase 8 slice should therefore reduce repeated full MoE
+  condition/verifier transaction work before deeper sampler tuning.
 
 Exit gate:
 
@@ -1877,8 +1875,11 @@ Status:
 - The matrix runner now exposes `--gpu-stage-timing`, which requires
   `--perfstats` and sets `LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1` for MTP
   perfstats rows. Use this for bounded diagnostics when CUDA/ROCm MoE aggregate
-  timers hide graph-stage GPU work behind deferred sync points. Regression:
-  `V2_Unit_MTPIterationBenchmarkMatrix`.
+  timers hide graph-stage GPU work behind deferred sync points. Runs now also
+  emit `stage_summary.tsv`, ranking decode-domain `mtp` and `stage_gpu` timers
+  per topology/device/model/mode/variant so Phase 8 and Phase 9 tuning evidence
+  stays comparable across SingleDevice, TP, PP, and ExpertOverlay lanes.
+  Regression: `V2_Unit_MTPIterationBenchmarkMatrix`.
 
 Exit gate:
 

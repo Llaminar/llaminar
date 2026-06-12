@@ -18,11 +18,11 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
   d2 52.6 vs 44.7 tok/s (1.18x), ROCm best d1 37.0 vs 31.3 tok/s (1.18x).
   Dynamic starts at d3 on CUDA and d1 on ROCm; `n=16` is too short for
   hysteresis updates.
-- MoE stochastic is functionally green but speed-red on both GPUs. Same-run
-  baselines beat every MTP depth: CUDA best d3 79.0 vs 115.3 tok/s; ROCm best
-  d1 51.8 vs 69.1 tok/s.
-- `rocprof` on ROCm MoE d1 shows true GPU time dominated by GDN, routed/shared
-  MoE GEMMs, native GEMM, and LM head. Sampling kernels are secondary.
+- MoE stochastic remains speed-red in the fresh GPU stage-timing probe
+  `20260612T225841Z-moe-stochastic-gpu-stage-timing`: CUDA best dynamic 81.6
+  vs 114.4 tok/s, ROCm best d1 51.5 vs 68.7 tok/s. Stage timers show routed
+  expert FFN dominates both main-decode condition rows and main-verifier rows;
+  sampler/D2H is mostly the host-visible drain boundary.
 - Phase 9 ExpertOverlay mixed parity is now green for ROCm2TP-hot plus
   CPU2LocalTP-cold. Fixes: ROCm MoE local-expert nested workspace declarations,
   LocalTP all-position verifier stream consumption, and deterministic ROCm MoE
@@ -40,8 +40,8 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
   non-final stages publish main verifier state only; the final stage owns
   logits, sampling, terminal hidden, and shifted sidecar KV. Gate:
   full `^V2_Integration_Parity_Qwen36_LocalPP_` passed 7/7.
-- Matrix runner has `topology` presets plus `--gpu-stage-timing` perfstats for
-  graph-stage evidence when aggregate MTP timers hide deferred-sync work.
+- Matrix runner has `topology` presets plus `--gpu-stage-timing` perfstats and
+  `stage_summary.tsv` for ranked decode-stage evidence.
 - Stage-owned CUDA side-stream workspace declarations still hold the dense VRAM
   win: one-token d3 stochastic graph workspace is about 784 MB instead of the
   stale LM-head-sized 1827 MB plan.
@@ -90,5 +90,5 @@ d1 54.9, d3 52.5 tok/s; MoE no-MTP 118.26, d1 142.0, d3 132.8 tok/s.
 1. Run selected Phase 9 topology preset benchmarks as hardware allows.
 2. Continue Phase 8 transaction-level vLLM alignment for MoE; reduce verifier,
    condition, and sidecar graph economics before deeper sampler/kernel tuning.
-3. Re-run the bounded GPU MoE stochastic matrix after the next verifier/condition
-   tuning slice, then refresh this table from same-run baselines.
+3. Re-run the bounded GPU MoE stochastic matrix after the next transaction-cost
+   slice, then refresh this table from same-run baselines.

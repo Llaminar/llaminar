@@ -255,6 +255,119 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             self.assertEqual(row[header.index("last_depth_reason")], "")
             self.assertEqual(row[header.index("generated_policy")], "false")
 
+    def test_perfstats_rows_emit_ranked_stage_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dense = tmp_path / "dense.gguf"
+            dense.write_text("dense fixture\n", encoding="utf-8")
+            fake_binary = tmp_path / "fake_llaminar2"
+            fake_binary.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -euo pipefail
+                    out=""
+                    while [[ $# -gt 0 ]]; do
+                      if [[ "$1" == "--benchmark-json-output" ]]; then
+                        out="$2"
+                        shift 2
+                      else
+                        shift
+                      fi
+                    done
+                    cat > "${out}" <<'JSON'
+                    {"success":true,"throughput_tokens_per_sec":{"decode":10.0,"overall":20.0},"tokens":{"prefill":1,"decode":1},"config":{"mtp_depth_policy":"fixed","mtp_draft_tokens":1},"mtp":{}}
+                    JSON
+                    if [[ -n "${LLAMINAR_PERF_STATS_JSON:-}" ]]; then
+                      cat > "${LLAMINAR_PERF_STATS_JSON}" <<'JSON'
+                    {
+                      "schema": "llaminar.perf_stats.v1",
+                      "records": [
+                        {
+                          "kind": "timer",
+                          "domain": "stage_gpu",
+                          "name": "type.MOE_EXPERT_FFN",
+                          "phase": "decode",
+                          "device": "CUDA:0",
+                          "tags": {
+                            "context": "main_verifier",
+                            "source": "stage_timeline",
+                            "stage_count": "40"
+                          },
+                          "count": 3,
+                          "total_ms": 12.5,
+                          "avg_us": 4166.6
+                        },
+                        {
+                          "kind": "timer",
+                          "domain": "mtp",
+                          "name": "condition_forward",
+                          "phase": "decode",
+                          "count": 2,
+                          "total_ms": 7.25,
+                          "avg_us": 3625.0
+                        },
+                        {
+                          "kind": "timer",
+                          "domain": "stage_gpu",
+                          "name": "type.MOE_ROUTER",
+                          "phase": "prefill",
+                          "count": 99,
+                          "total_ms": 99.0
+                        }
+                      ]
+                    }
+                    JSON
+                    fi
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_binary.chmod(0o755)
+            output_dir = tmp_path / "out"
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--binary",
+                    str(fake_binary),
+                    "--dense-model",
+                    str(dense),
+                    "--devices",
+                    "cpu:0",
+                    "--models",
+                    "dense",
+                    "--modes",
+                    "greedy",
+                    "--variants",
+                    "fixed_d1",
+                    "--perfstats",
+                    "--gpu-stage-timing",
+                    "--output-dir",
+                    str(output_dir),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = (output_dir / "stage_summary.tsv").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 3)
+            header = lines[0].split("\t")
+            first = lines[1].split("\t")
+            second = lines[2].split("\t")
+            self.assertEqual(header[:5], ["topology", "device", "model", "mode", "variant"])
+            self.assertEqual(first[header.index("name")], "type.MOE_EXPERT_FFN")
+            self.assertEqual(first[header.index("context")], "main_verifier")
+            self.assertEqual(first[header.index("total_ms")], "12.5")
+            self.assertEqual(first[header.index("stage_count")], "40")
+            self.assertEqual(first[header.index("source")], "stage_timeline")
+            self.assertEqual(second[header.index("name")], "condition_forward")
+            self.assertEqual(second[header.index("total_ms")], "7.25")
+            self.assertNotIn("type.MOE_ROUTER", "\n".join(lines))
+
 
 if __name__ == "__main__":
     unittest.main()
