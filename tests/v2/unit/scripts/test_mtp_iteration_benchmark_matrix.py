@@ -22,6 +22,8 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
         allow_partial: bool = False,
         topologies: str = "single",
         models: str = "dense",
+        perfstats: bool = False,
+        gpu_stage_timing: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -53,6 +55,10 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             ]
             if allow_partial:
                 cmd.append("--allow-partial-variants")
+            if perfstats:
+                cmd.append("--perfstats")
+            if gpu_stage_timing:
+                cmd.append("--gpu-stage-timing")
             return subprocess.run(
                 cmd,
                 cwd=REPO_ROOT,
@@ -149,6 +155,26 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("topology 'localpp_rocm2' is not supported for model 'moe'", result.stderr)
+
+    def test_gpu_stage_timing_requires_perfstats_output(self) -> None:
+        result = self.run_matrix(
+            "fixed_d1",
+            gpu_stage_timing=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--gpu-stage-timing requires --perfstats", result.stderr)
+
+    def test_gpu_stage_timing_sets_perfstats_env_for_mtp_rows(self) -> None:
+        result = self.run_matrix(
+            "fixed_d1",
+            perfstats=True,
+            gpu_stage_timing=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LLAMINAR_PERF_STATS_JSON=", result.stdout)
+        self.assertIn("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1", result.stdout)
 
     def test_baseline_summary_row_matches_header_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

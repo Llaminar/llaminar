@@ -1874,6 +1874,11 @@ Status:
   fails fast for unsupported model/topology pairings so multi-device evidence
   cannot accidentally mix dense-only and MoE-only lanes. Regression:
   `V2_Unit_MTPIterationBenchmarkMatrix`.
+- The matrix runner now exposes `--gpu-stage-timing`, which requires
+  `--perfstats` and sets `LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1` for MTP
+  perfstats rows. Use this for bounded diagnostics when CUDA/ROCm MoE aggregate
+  timers hide graph-stage GPU work behind deferred sync points. Regression:
+  `V2_Unit_MTPIterationBenchmarkMatrix`.
 
 Exit gate:
 
@@ -2021,6 +2026,14 @@ MoE lanes remain practical:
 ```bash
 scripts/run_mtp_iteration_benchmark_matrix.sh \
   --decode-tokens 16 --perfstats
+```
+
+When aggregate MTP timers are ambiguous, add graph-stage GPU event timing to the
+same bounded matrix shape:
+
+```bash
+scripts/run_mtp_iteration_benchmark_matrix.sh \
+  --decode-tokens 16 --perfstats --gpu-stage-timing
 ```
 
 For Phase 9 multi-device evidence, select the topology preset under active

@@ -39,6 +39,7 @@ Options:
   --decode-tokens N      Override benchmark decode tokens via --n-predict N
   --output-dir DIR       Output directory
   --perfstats            Capture LLAMINAR_PERF_STATS_JSON for MTP variants
+  --gpu-stage-timing     Include graph-captured GPU stage timings in perfstats
   --dry-run              Print commands only
   -h, --help             Show this help
 
@@ -55,6 +56,7 @@ Environment aliases:
   LLAMINAR_MTP_MATRIX_DECODE_TOKENS
   LLAMINAR_MTP_MATRIX_RESULTS_DIR
   LLAMINAR_MTP_MATRIX_ALLOW_PARTIAL_VARIANTS
+  LLAMINAR_MTP_MATRIX_GPU_STAGE_TIMING
 
 Do not use --no-mpi-bootstrap for this benchmark matrix.
 USAGE
@@ -75,6 +77,7 @@ seed="${LLAMINAR_MTP_MATRIX_SEED:-123}"
 decode_tokens="${LLAMINAR_MTP_MATRIX_DECODE_TOKENS:-}"
 output_dir="${LLAMINAR_MTP_MATRIX_RESULTS_DIR:-}"
 allow_partial_variants="${LLAMINAR_MTP_MATRIX_ALLOW_PARTIAL_VARIANTS:-0}"
+gpu_stage_timing="${LLAMINAR_MTP_MATRIX_GPU_STAGE_TIMING:-0}"
 perfstats=0
 dry_run=0
 extra_args=()
@@ -133,6 +136,10 @@ while [[ $# -gt 0 ]]; do
       perfstats=1
       shift
       ;;
+    --gpu-stage-timing)
+      gpu_stage_timing=1
+      shift
+      ;;
     --allow-partial-variants)
       allow_partial_variants=1
       shift
@@ -173,6 +180,16 @@ done
 
 if [[ -n "${decode_tokens}" && ! "${decode_tokens}" =~ ^[1-9][0-9]*$ ]]; then
   echo "error: --decode-tokens must be a positive integer, got: ${decode_tokens}" >&2
+  exit 2
+fi
+
+if [[ "${gpu_stage_timing}" != "0" && "${gpu_stage_timing}" != "1" ]]; then
+  echo "error: LLAMINAR_MTP_MATRIX_GPU_STAGE_TIMING must be 0 or 1, got: ${gpu_stage_timing}" >&2
+  exit 2
+fi
+
+if [[ "${gpu_stage_timing}" == "1" && "${perfstats}" != "1" ]]; then
+  echo "error: --gpu-stage-timing requires --perfstats so timing records have an output file" >&2
   exit 2
 fi
 
@@ -430,6 +447,7 @@ metadata_path="${output_dir}/metadata.txt"
   echo "seed=${seed}"
   echo "decode_tokens=${decode_tokens:-default}"
   echo "perfstats=${perfstats}"
+  echo "gpu_stage_timing=${gpu_stage_timing}"
   echo "allow_partial_variants=${allow_partial_variants}"
   echo "extra_args=${extra_args[*]:-}"
   echo
@@ -552,7 +570,14 @@ for model in $(split_csv "${models}"); do
 
         {
           if [[ -n "${perf_path}" ]]; then
-            printf '%q ' "LLAMINAR_LOG_LEVEL=${log_level}" "LLAMINAR_PERF_STATS_JSON=${perf_path}" "${cmd[@]}"
+            env_args=(
+              "LLAMINAR_LOG_LEVEL=${log_level}"
+              "LLAMINAR_PERF_STATS_JSON=${perf_path}"
+            )
+            if [[ "${gpu_stage_timing}" == "1" ]]; then
+              env_args+=("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1")
+            fi
+            printf '%q ' "${env_args[@]}" "${cmd[@]}"
           else
             printf '%q ' "LLAMINAR_LOG_LEVEL=${log_level}" "${cmd[@]}"
           fi
@@ -563,7 +588,14 @@ for model in $(split_csv "${models}"); do
         if [[ "${dry_run}" == "1" ]]; then
           printf 'dry-run: '
           if [[ -n "${perf_path}" ]]; then
-            printf '%q ' "LLAMINAR_LOG_LEVEL=${log_level}" "LLAMINAR_PERF_STATS_JSON=${perf_path}" "${cmd[@]}"
+            env_args=(
+              "LLAMINAR_LOG_LEVEL=${log_level}"
+              "LLAMINAR_PERF_STATS_JSON=${perf_path}"
+            )
+            if [[ "${gpu_stage_timing}" == "1" ]]; then
+              env_args+=("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1")
+            fi
+            printf '%q ' "${env_args[@]}" "${cmd[@]}"
           else
             printf '%q ' "LLAMINAR_LOG_LEVEL=${log_level}" "${cmd[@]}"
           fi
@@ -572,7 +604,14 @@ for model in $(split_csv "${models}"); do
         fi
 
         if [[ -n "${perf_path}" ]]; then
-          if ! LLAMINAR_LOG_LEVEL="${log_level}" LLAMINAR_PERF_STATS_JSON="${perf_path}" "${cmd[@]}" > "${log_path}" 2>&1; then
+          env_args=(
+            "LLAMINAR_LOG_LEVEL=${log_level}"
+            "LLAMINAR_PERF_STATS_JSON=${perf_path}"
+          )
+          if [[ "${gpu_stage_timing}" == "1" ]]; then
+            env_args+=("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1")
+          fi
+          if ! env "${env_args[@]}" "${cmd[@]}" > "${log_path}" 2>&1; then
             tail -n 80 "${log_path}" >&2 || true
             echo "error: benchmark failed for ${stem}; log: ${log_path}" >&2
             exit 1

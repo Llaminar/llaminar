@@ -40,8 +40,8 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
   non-final stages publish main verifier state only; the final stage owns
   logits, sampling, terminal hidden, and shifted sidecar KV. Gate:
   full `^V2_Integration_Parity_Qwen36_LocalPP_` passed 7/7.
-- Matrix runner now has a `topology` axis/summary column with opt-in presets for
-  LocalTP, LocalPP, NodeLocalTP, and ExpertOverlay; default remains SingleDevice.
+- Matrix runner has `topology` presets plus `--gpu-stage-timing` perfstats for
+  graph-stage evidence when aggregate MTP timers hide deferred-sync work.
 - Stage-owned CUDA side-stream workspace declarations still hold the dense VRAM
   win: one-token d3 stochastic graph workspace is about 784 MB instead of the
   stale LM-head-sized 1827 MB plan.
