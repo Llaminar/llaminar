@@ -32,19 +32,22 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
 - Fresh gate: full `^V2_Unit_` passed 502/502 after rebuilding, then
   `^V2_Integration_ROCmMoEKernel$|^V2_Integration_Parity_Qwen36MoE_ExpertOverlay_`
   passed 6/6.
+- NodeLocalTP dynamic-depth scalar coordination is green in the dense parity
+  lane: full `^V2_Integration_Parity_Qwen36_NodeLocalTP_` passed 5/5
+  real-model tests plus fixture.
 - Stage-owned CUDA side-stream workspace declarations still hold the dense VRAM
   win: one-token d3 stochastic graph workspace is about 784 MB instead of the
   stale LM-head-sized 1827 MB plan.
 
 ## Topology Matrix
 
-| Topology | Dense MTP | MoE MTP | Benchmark/Tuning Status |
+| Topology | Impl | Parity | Bench/Tuning |
 |---|---|---|---|
-| SingleDevice | Green CPU/CUDA/ROCm greedy+stochastic | Amber/Red by mode; correct, MoE speed weak | full device matrix active |
-| LocalTP | Green for dense fixed d3 + dynamic | Amber; rank stream handoff fixed, MoE needs more benches | touched units + Qwen3.6 parity |
-| LocalPP | Amber; contract planned, less benchmark evidence | Red/Unproven | next PP parity expansion |
-| NodeLocalTP | Green dense fixed d2/d3 | Amber/Unproven for MoE | scalar dynamic depth still gated |
-| ExpertOverlay | Amber dense, Green MoE parity for hot/mixed lanes | Amber; correct, speed not accepted | full ExpertOverlay parity green |
+| SingleDevice | Green dense/MoE greedy+stochastic on CPU/CUDA/ROCm | Green broad device matrix | Dense accepted; MoE speed weak |
+| LocalTP | Green dense fixed d1/d2/d3 + dynamic; rank-wide depth and stream handoff wired | Green Qwen3.6 dense parity | MoE bench sparse; keep in matrix |
+| LocalPP | Red for MTP: hard-fails before prefill; prefix restore only | Amber prefix-only parity exists | Needs PP sidecar split design |
+| NodeLocalTP | Green dense fixed d1/d2/d3 + dynamic scalar broadcast | Green full dense NodeLocalTP parity | MoE still unproven |
+| ExpertOverlay | Green MoE hot/mixed correctness path; dense not a separate target | Green ROCm2TP-hot + CPU2LocalTP-cold parity | Speed Amber/Red until MoE economics improve |
 
 ## Device Matrix
 

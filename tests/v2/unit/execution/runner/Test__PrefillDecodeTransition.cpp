@@ -5632,6 +5632,59 @@ namespace
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
     }
 
+    TEST_F(Test__PrefillDecodeTransition, MPIDynamicMTPDepthBroadcastsRankZeroDecision)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        depth_policy.min_depth = 1;
+        depth_policy.max_depth = 3;
+        depth_policy.initial_depth = 3;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 0;
+        depth_policy.use_generated_policy = false;
+
+        auto mpi = std::make_shared<test::MockMPIContext>(0, 2);
+        auto *mpi_raw = mpi.get();
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            std::move(mpi),
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true,
+            /*sidecar_sample_fusion=*/false,
+            depth_policy);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5})) << runner->lastError();
+        mpi_raw->reset_call_counts();
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+
+        /*
+         * Dynamic MPI/NodeLocalTP execution must coordinate the scalar draft
+         * depth before launching sidecars.  The mock broadcast is intentionally
+         * no-op for data, so this test verifies the structural contract: MTP no
+         * longer hard-fails under MPI and the broadcast hook is exercised.
+         */
+        EXPECT_GE(mpi_raw->broadcast_call_count(), 2u)
+            << "decodeStep() checks the requested depth once before entering MTP "
+               "and once inside the MTP transaction";
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 2);
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_FALSE(probe.mtp_bypassed) << probe.mtp_bypass_reason;
+        EXPECT_TRUE(probe.mtp_request.adaptive_depth_enabled);
+        EXPECT_EQ(probe.mtp_request.depth_policy_mode, "dynamic");
+        EXPECT_EQ(probe.mtp_draft_steps, 3u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 3u);
+    }
+
     TEST_F(Test__PrefillDecodeTransition, ROCmLocalTPMTPSegmentedCollectivesFailBeforeSidecarLaunch)
     {
         ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "1");

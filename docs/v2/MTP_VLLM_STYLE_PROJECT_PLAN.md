@@ -1828,10 +1828,13 @@ Status:
   sidecar contract. `GlobalOrchestrator` advertises chained draft support only
   when every stage runner supports it, and `forwardMTPFromLastDraft()` fans the
   same draft token plus shifted position to every rank-local participant.
-  Dynamic depth remains gated for GlobalTP/MPI until rank-wide scalar depth
-  coordination exists. Focused gates: `V2_Unit_PrefillDecodeTransition`,
+  Dynamic depth now broadcasts rank 0's scalar controller decision before each
+  step so all ranks execute the same sidecar/verifier shape. Focused gates:
+  `V2_Unit_PrefillDecodeTransition`,
   `V2_Integration_Parity_Qwen36_NodeLocalTP_Qwen36NodeLocalTPPrefixParity_MTPGreedyDepth3MatchesPyTorchDecodeTokens`,
-  and full `V2_Integration_Parity_Qwen36_NodeLocalTP_`.
+  `V2_Integration_Parity_Qwen36_NodeLocalTP_Qwen36NodeLocalTPPrefixParity_MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens`,
+  and full `V2_Integration_Parity_Qwen36_NodeLocalTP_`, which is green for
+  five real-model tests plus fixture after this slice.
 - LocalTP all-position verifier sampling now consumes the verifier graph replay
   stream exactly once per child runner and reuses that handoff for every sampled
   verifier row. This closes the race where LocalTP could sample row logits on a
@@ -1844,6 +1847,11 @@ Status:
   `V2_Unit_MoELocalExpertStage_PreparedWeights`,
   `V2_Unit_RankOrchestrator`, and full
   `^V2_Integration_Parity_Qwen36MoE_ExpertOverlay_`.
+- The tuning dashboard now tracks SingleDevice, LocalTP, LocalPP, NodeLocalTP,
+  and ExpertOverlay separately for implementation, parity, and benchmark state.
+  LocalPP is intentionally recorded as prefix-only plus MTP hard-fail until the
+  sidecar can be split across PP stage runners instead of using the TP fan-out
+  path.
 
 Exit gate:
 

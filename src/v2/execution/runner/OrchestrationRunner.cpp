@@ -1132,11 +1132,6 @@ namespace llaminar2
             {
                 return "MTP dynamic depth policy is not enabled for PP topologies";
             }
-            if (plan_.usesGlobalTP() ||
-                (mpi_ctx_ && mpi_ctx_->world_size() > 1))
-            {
-                return "MTP dynamic depth policy requires SingleDevice or LocalTP; GlobalTP/MPI depth coordination is not implemented yet";
-            }
         }
         if (mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
             !active_sampling_params_.is_greedy() &&
@@ -1269,7 +1264,38 @@ namespace llaminar2
         {
             return std::max(1, mtp.draft_tokens);
         }
-        return mtp_depth_controller_->requestedDepthForStep();
+
+        int depth = mtp_depth_controller_->requestedDepthForStep();
+
+        /*
+         * Dynamic depth is a request-level scheduling decision.  In NodeLocalTP /
+         * GlobalTP every rank must execute the same sidecar/verifier shape in the
+         * same order, so rank 0's controller decision is treated as the scalar
+         * source of truth and broadcast before the step begins.  This mirrors the
+         * vLLM-style contract: the speculative batch shape is coordinated once,
+         * while tensor data still moves through the graph and collective layers.
+         */
+        if (mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic &&
+            mpi_ctx_ &&
+            mpi_ctx_->world_size() > 1)
+        {
+            int32_t coordinated_depth =
+                mpi_ctx_->rank() == 0 ? static_cast<int32_t>(depth) : 0;
+            mpi_ctx_->broadcast_int32(&coordinated_depth, 1, 0);
+            depth = static_cast<int>(coordinated_depth);
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "depth_policy_mpi_depth_broadcasts",
+                1.0,
+                "decode",
+                {},
+                {{"depth", std::to_string(depth)},
+                 {"rank", std::to_string(mpi_ctx_->rank())},
+                 {"world_size", std::to_string(mpi_ctx_->world_size())}});
+        }
+
+        return depth;
     }
 
     void OrchestrationRunner::recordMTPDepthZeroBypass()
