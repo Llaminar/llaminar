@@ -5346,7 +5346,7 @@ namespace
         EXPECT_EQ(probe.mtp_transaction_rollbacks, 1u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPDynamicPPTopologyFailsBeforePrefillForward)
+    TEST_F(Test__PrefillDecodeTransition, MTPDynamicPPTopologyUsesCentralDepthController)
     {
         MTPDepthPolicyConfig dynamic_depth;
         dynamic_depth.mode = MTPDepthPolicyMode::Dynamic;
@@ -5370,17 +5370,23 @@ namespace
             /*local_pp_topology=*/true);
 
         std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
-        EXPECT_FALSE(runner->prefill(prompt));
-        EXPECT_NE(runner->lastError().find("MTP dynamic depth policy is not enabled for PP topologies"),
-                  std::string::npos);
-        EXPECT_EQ(mock->forwardCallCount(), 0)
-            << "Dynamic PP MTP must fail before shifted-prefill sidecar state is populated";
-        EXPECT_EQ(mock->forwardMTPCount(), 0);
+        ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+        EXPECT_EQ(mock->forwardCallCount(), 1)
+            << "The in-process OrchestrationRunner owns the dynamic-depth "
+               "decision before PP fan-out.";
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_GE(mock->forwardMTPCount(), 1)
+            << "Dynamic PP MTP should enter the same sidecar draft path as a "
+               "fixed-depth PP request once decode begins.";
 
         auto probe = runner->prefixStateProbe();
         EXPECT_TRUE(probe.mtp_config_enabled);
         EXPECT_FALSE(probe.mtp_bypassed);
         EXPECT_EQ(probe.mtp_bypasses, 0u);
+        EXPECT_TRUE(probe.mtp_request.adaptive_depth_enabled);
+        EXPECT_EQ(probe.mtp_request.depth_policy_mode, "dynamic");
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPBypassForRunnerTopologyReasonPreservesGreedyDecode)

@@ -1854,13 +1854,14 @@ Status:
   tokens, owns the MTP sidecar weights plus embedding table, and builds MTP KV
   append/attention with cache-local sidecar layer ids instead of subtracting
   the main PP offset. Non-terminal PP stages reject sidecar weights. Dynamic
-  depth, stochastic, and all-position publication remain hard-gated until they
-  have explicit PP scalar/outcome coordination. Focused gates:
+  depth is enabled through the same central `OrchestrationRunner` controller as
+  SingleDevice/LocalTP, so PP stages do not adapt independently. Stochastic and
+  all-position publication remain hard-gated until they have explicit PP
+  outcome coordination. Focused gates:
   `V2_Unit_WeightManagerPPSafety`, `V2_Unit_RankOrchestrator`,
-  `V2_Unit_PrefillDecodeTransition`,
-  `V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalPPDynamicHardFail`, and full
+  `V2_Unit_PrefillDecodeTransition`, and full
   `^V2_Integration_Parity_Qwen36_LocalPP_`, which is green for prefix restore,
-  fixed d1/d3 MTP, and prefix+MTP restore.
+  fixed d1/d3 MTP, dynamic MTP, and prefix+MTP restore.
 
 Exit gate:
 

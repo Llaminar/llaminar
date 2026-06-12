@@ -895,11 +895,6 @@ namespace llaminar2
                 return setError(
                     "MTP decode with --mtp-draft-tokens > 1 requires runner support for chained MTP sidecars");
             }
-            if (active_mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic &&
-                plan_.usesLocalPP())
-            {
-                return setError("MTP dynamic depth policy is not enabled for PP topologies");
-            }
         }
         else
         {
@@ -1117,21 +1112,13 @@ namespace llaminar2
         {
             return "MTP decode with --mtp-draft-tokens > 1 requires runner support for chained MTP sidecars";
         }
-        if (mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic)
-        {
-            /*
-             * The adaptive controller is intentionally owned by this
-             * OrchestrationRunner, not by child device runners. LocalTP is safe
-             * because one in-process runner chooses a single depth and then
-             * fans out that same request to every participant. Multi-process
-             * domains need an explicit scalar coordination step before we let
-             * ranks adapt independently.
-             */
-            if (plan_.usesLocalPP())
-            {
-                return "MTP dynamic depth policy is not enabled for PP topologies";
-            }
-        }
+        /*
+         * The adaptive controller is intentionally owned by this
+         * OrchestrationRunner, not by child device runners. LocalTP and LocalPP
+         * are safe because one in-process runner chooses a single depth and
+         * then fans out that same request to every participant or final-stage
+         * sidecar. Multi-process domains add their own scalar coordination.
+         */
         if (mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
             !active_sampling_params_.is_greedy() &&
             (plan_.usesLocalTP() ||
