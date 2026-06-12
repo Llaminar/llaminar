@@ -3339,6 +3339,25 @@ namespace llaminar2
         return false;
     }
 
+    bool RankOrchestrator::supportsGreedyAllPositionBatchOutcomeOnDevice() const
+    {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->supportsGreedyAllPositionBatchOutcomeOnDevice();
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->supportsGreedyAllPositionBatchOutcomeOnDevice();
+        }
+
+        /*
+         * Multi-child LocalTP owns sharded all-position logits.  It can sample
+         * verifier rows through sampleGreedyFromAllPositionLogitsOnDeviceRows(),
+         * but a compact all-device reducer has not been implemented yet.
+         */
+        return false;
+    }
+
     bool RankOrchestrator::supportsDeviceStochasticMTPVerification() const
     {
         if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())

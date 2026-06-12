@@ -755,6 +755,21 @@ namespace llaminar2
         }
 
         /**
+         * @brief True when greedy all-position verifier rows can be reduced into
+         *        a compact speculative-verify outcome on the producing device.
+         *
+         * This is stricter than "can sample verifier rows".  LocalTP can sample
+         * sharded verifier rows by gathering child-local argmax results at the
+         * rank level, but it cannot yet run one device-side reducer over all TP
+         * shards.  Callers must check this capability before invoking
+         * verifyGreedyAllPositionBatchOutcomeOnDevice().
+         */
+        virtual bool supportsGreedyAllPositionBatchOutcomeOnDevice() const
+        {
+            return false;
+        }
+
+        /**
          * @brief Summarize greedy all-position MTP verifier rows on device.
          *
          * This is the greedy counterpart to

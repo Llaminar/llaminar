@@ -463,6 +463,11 @@ public:
         return verify_greedy_all_position_batch_outcome_ok_;
     }
 
+    bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override
+    {
+        return supports_greedy_all_position_batch_outcome_;
+    }
+
     bool supportsDeviceStochasticMTPVerification() const override
     {
         return supports_device_stochastic_mtp_verification_;
@@ -925,6 +930,7 @@ private:
     bool forward_mtp_from_last_draft_ok_ = true;
     bool commit_mtp_shifted_rows_ok_ = true;
     bool supports_mtp_spec_state_publication_ = false;
+    bool supports_greedy_all_position_batch_outcome_ = true;
     bool publish_mtp_spec_state_ok_ = true;
     bool set_all_position_logits_ok_ = true;
     bool set_row_indexed_all_position_logits_ok_ = true;
@@ -2627,6 +2633,27 @@ TEST_F(Test__RankOrchestrator, LocalTPAllPositionRowBatchSamplingConsumesVerifie
     EXPECT_EQ(runner1_ptr->consume_all_position_logits_local_info_call_count(), 1u);
     EXPECT_EQ(runner0_ptr->get_all_position_logits_local_info_call_count(), 0u);
     EXPECT_EQ(runner1_ptr->get_all_position_logits_local_info_call_count(), 0u);
+}
+
+TEST_F(Test__RankOrchestrator, LocalTPDoesNotAdvertiseCompactGreedyVerifierOutcome)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_FALSE(orchestrator->supportsGreedyAllPositionBatchOutcomeOnDevice())
+        << "LocalTP verifier logits are sharded. The rank may sample rows "
+           "from child-local shards, but it must not advertise one compact "
+           "device reducer until a true cross-participant reducer exists.";
 }
 
 TEST_F(Test__RankOrchestrator, SpecStatePublicationRequiresEveryLocalTPChildSupport)

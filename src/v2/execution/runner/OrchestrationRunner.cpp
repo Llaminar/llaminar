@@ -3976,6 +3976,7 @@ namespace llaminar2
             {
                 const bool use_greedy_device_batch_outcome =
                     runner_->primaryDeviceId().is_gpu() &&
+                    runner_->supportsGreedyAllPositionBatchOutcomeOnDevice() &&
                     first_token != kDeferredMTPFirstTokenShadow &&
                     stop_tokens_.size() <=
                         static_cast<size_t>(

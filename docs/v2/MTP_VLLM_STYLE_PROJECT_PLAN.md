@@ -1880,6 +1880,17 @@ Status:
   per topology/device/model/mode/variant so Phase 8 and Phase 9 tuning evidence
   stays comparable across SingleDevice, TP, PP, and ExpertOverlay lanes.
   Regression: `V2_Unit_MTPIterationBenchmarkMatrix`.
+- Greedy compact device-outcome verification is now an explicit runner
+  capability rather than a GPU-wide assumption. Single-device and final-stage
+  PP runners may use the compact path; multi-child LocalTP uses the existing
+  sharded verifier-row sampler until a true cross-participant compact reducer
+  exists. This keeps LocalTP from hard-failing inside an unsupported compact
+  verifier while preserving the topology-hard-fail contract for genuinely
+  advertised capabilities. Focused gates: `V2_Unit_PrefillDecodeTransition`
+  and `V2_Unit_RankOrchestrator`. Fresh ROCm topology smoke
+  `20260612T232547Z-rocm-topology-dense-greedy-smoke-capability-fix` is green:
+  LocalTP d1 accepted 12/12 at 34.4 vs 36.7 tok/s, and LocalPP d1 accepted
+  12/12 at 40.9 vs 31.4 tok/s.
 
 Exit gate:
 

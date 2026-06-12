@@ -42,6 +42,9 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
   full `^V2_Integration_Parity_Qwen36_LocalPP_` passed 7/7.
 - Matrix runner has `topology` presets plus `--gpu-stage-timing` perfstats and
   `stage_summary.tsv` for ranked decode-stage evidence.
+- ROCm topology smoke `20260612T232547Z-rocm-topology...` is green after the
+  compact verifier capability gate: LocalTP d1 34.4 vs 36.7 tok/s (0.94x),
+  LocalPP d1 40.9 vs 31.4 tok/s (1.30x), both 12/12 accepted.
 - Stage-owned CUDA side-stream workspace declarations still hold the dense VRAM
   win: one-token d3 stochastic graph workspace is about 784 MB instead of the
   stale LM-head-sized 1827 MB plan.
@@ -51,8 +54,8 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
 | Topology | Impl | Parity | Bench/Tuning |
 |---|---|---|---|
 | SingleDevice | Green dense/MoE greedy+stochastic on CPU/CUDA/ROCm | Green broad device matrix | Dense accepted; MoE speed weak |
-| LocalTP | Green dense fixed d1/d2/d3 + dynamic; rank-wide depth/stream handoff | Green Qwen3.6 dense parity | Topology preset ready; MoE sparse |
-| LocalPP | Green dense final-stage sidecar + all-stage publication; PP device-token handoff gated | Green dense prefix+d1/d3/dyn/stoch+prefix-MTP restore | Topology preset ready; bench pending |
+| LocalTP | Green dense fixed d1/d2/d3 + dynamic; rank-wide depth/stream handoff | Green Qwen3.6 dense parity | ROCm dense d1 green but slow: 34.4 vs 36.7 tok/s |
+| LocalPP | Green dense final-stage sidecar + all-stage publication; PP device-token handoff gated | Green dense prefix+d1/d3/dyn/stoch+prefix-MTP restore | ROCm dense d1 positive: 40.9 vs 31.4 tok/s |
 | NodeLocalTP | Green dense fixed d1/d2/d3 + dynamic scalar broadcast | Green full dense NodeLocalTP parity | Topology preset ready; MoE unproven |
 | ExpertOverlay | Green MoE hot/mixed correctness path; dense not a separate target | Green ROCm2TP-hot + CPU2LocalTP-cold parity | Preset ready; speed Amber/Red |
 

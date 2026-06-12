@@ -506,6 +506,11 @@ namespace
             return supports_mtp_token_coordination_;
         }
 
+        bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override
+        {
+            return primary_device_.is_gpu() && supports_mtp_token_coordination_;
+        }
+
         bool supportsMTPSidecarSampleFusion() const override
         {
             return supports_mtp_sidecar_sample_fusion_;
@@ -717,6 +722,7 @@ namespace
             DeviceSpeculativeVerifyBatchOutcome *out) override
         {
             using namespace sampling_math;
+            ++verify_greedy_all_position_batch_outcome_count_;
             if (!out || !draft_tokens || draft_token_count <= 0 ||
                 draft_token_count > kSpeculativeBatchMaxOutputTokens ||
                 stop_token_count < 0 ||
@@ -1547,6 +1553,10 @@ namespace
         int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
         int sampleAllPositionLogitsCount() const { return sample_all_position_logits_count_; }
         int sampleAllPositionLogitsBatchedCount() const { return sample_all_position_logits_batched_count_; }
+        int verifyGreedyAllPositionBatchOutcomeCount() const
+        {
+            return verify_greedy_all_position_batch_outcome_count_;
+        }
         int applyMainPenaltiesCount() const { return apply_main_penalties_count_; }
         int applyMTPPenaltiesCount() const { return apply_mtp_penalties_count_; }
         int applyAllPositionPenaltiesCount() const { return apply_all_position_penalties_count_; }
@@ -2059,6 +2069,7 @@ namespace
         int sample_mtp_logits_count_{0};
         int sample_all_position_logits_count_{0};
         int sample_all_position_logits_batched_count_{0};
+        int verify_greedy_all_position_batch_outcome_count_{0};
         int apply_main_penalties_count_{0};
         int apply_mtp_penalties_count_{0};
         int apply_all_position_penalties_count_{0};
@@ -5666,6 +5677,44 @@ namespace
         EXPECT_EQ(probe.mtp_draft_steps, 3u);
         EXPECT_EQ(probe.mtp_accepted_tokens, 3u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, LocalTPGPUAllPositionPublicationUsesShardedRowSampler)
+    {
+        auto harness = createLocalTPRunner(
+            /*mtp_accept=*/true,
+            /*column_parallel_logits=*/true,
+            {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+            /*mtp_draft_tokens=*/1,
+            {},
+            /*spec_state_publication=*/true);
+        harness.child0->enableMTPSidecarPreservesMainState();
+        harness.child1->enableMTPSidecarPreservesMainState();
+        harness.child0->requireMTPDecodeEquivalentReplay();
+        harness.child1->requireMTPDecodeEquivalentReplay();
+        harness.child0->setVerifierAcceptedPrefixScript({1});
+        harness.child1->setVerifierAcceptedPrefixScript({1});
+
+        ASSERT_TRUE(harness.runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step = harness.runner->decodeStep();
+        ASSERT_TRUE(step.success()) << step.error;
+        EXPECT_THAT(step.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 0);
+        EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 0)
+            << "LocalTP shards verifier logits, so the rank must not call a "
+               "single-child compact device reducer.";
+        EXPECT_EQ(harness.child0->sampleAllPositionLogitsBatchedCount(), 0);
+        EXPECT_EQ(harness.child1->sampleAllPositionLogitsBatchedCount(), 0)
+            << "Rank-level LocalTP sampling consumes child LogitsLocalInfo "
+               "directly instead of asking one child to sample all rows.";
+        EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 1);
+        EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 1);
+        EXPECT_EQ(harness.child0->setAllPositionCount(), 2);
+        EXPECT_EQ(harness.child1->setAllPositionCount(), 2);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MPIDynamicMTPDepthBroadcastsRankZeroDecision)

@@ -1687,6 +1687,7 @@ namespace llaminar2
             int start_row,
             int row_count,
             int32_t *out_tokens) override;
+        bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
         bool verifyGreedyAllPositionBatchOutcomeOnDevice(
             const int32_t *draft_tokens,
             int draft_token_count,

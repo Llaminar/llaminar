@@ -508,6 +508,7 @@ namespace llaminar2
         bool supportsMTPSidecarLogitsStreamHandoff() const override;
         bool supportsMTPDeviceDraftTokenInput() const override;
         bool supportsMTPSidecarPreservesMainState() const override;
+        bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
         bool applyPenaltiesOnDevice(
             const std::vector<LogitPenalty> &penalties,
             int vocab_size) override;

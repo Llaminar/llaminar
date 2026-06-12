@@ -8562,6 +8562,16 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::supportsGreedyAllPositionBatchOutcomeOnDevice() const
+    {
+        /*
+         * The compact reducer consumes one device's all-position logits tensor.
+         * CPU runners and rank-level sharded TP need different reduction
+         * contracts, so only a concrete GPU device runner advertises this path.
+         */
+        return state_.device_id.is_gpu();
+    }
+
     PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const
     {
         PrefixRuntimeStateSnapshot snapshot;
