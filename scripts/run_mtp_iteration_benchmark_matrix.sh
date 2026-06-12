@@ -10,10 +10,11 @@ Runs the standard MTP iteration benchmark matrix and writes one benchmark JSON/l
 per lane plus summary.tsv.
 
 Default matrix:
-  devices:  cuda:0,rocm:0,cpu:0
-  models:   dense,moe
-  modes:    greedy,stochastic
-  variants: baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
+  topologies: single
+  devices:    cuda:0,rocm:0,cpu:0
+  models:     dense,moe
+  modes:      greedy,stochastic
+  variants:   baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
 
 The dynamic variant starts at depth 1, keeps depth 1 as the normal adaptive
 floor, and may probe/promote back up to the configured max depth 3.
@@ -22,7 +23,12 @@ Options:
   --binary PATH          llaminar2 binary (default: build_v2_release/llaminar2)
   --dense-model PATH     Dense Qwen3.6 GGUF
   --moe-model PATH       MoE Qwen3.6 GGUF
+  --topologies LIST      Comma list: single,localtp_rocm2,localtp_cuda2,
+                         localpp_rocm2,nodelocaltp_cpu2,
+                         expert_overlay_rocm2_hot,
+                         expert_overlay_rocm2_cpu2
   --devices LIST         Comma list, e.g. cuda:0,rocm:0,cpu:0
+                         Used only by the single topology.
   --models LIST          Comma list: dense,moe
   --modes LIST           Comma list: greedy,stochastic
   --variants LIST        Comma list: baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
@@ -40,6 +46,7 @@ Environment aliases:
   LLAMINAR_LL2_BIN
   LLAMINAR_MTP_MATRIX_DENSE_MODEL
   LLAMINAR_MTP_MATRIX_MOE_MODEL
+  LLAMINAR_MTP_MATRIX_TOPOLOGIES
   LLAMINAR_MTP_MATRIX_DEVICES
   LLAMINAR_MTP_MATRIX_MODELS
   LLAMINAR_MTP_MATRIX_MODES
@@ -59,6 +66,7 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 binary_path="${LLAMINAR_LL2_BIN:-${repo_root}/build_v2_release/llaminar2}"
 dense_model="${LLAMINAR_MTP_MATRIX_DENSE_MODEL:-/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf}"
 moe_model="${LLAMINAR_MTP_MATRIX_MOE_MODEL:-/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf}"
+topologies="${LLAMINAR_MTP_MATRIX_TOPOLOGIES:-single}"
 devices="${LLAMINAR_MTP_MATRIX_DEVICES:-cuda:0,rocm:0,cpu:0}"
 models="${LLAMINAR_MTP_MATRIX_MODELS:-dense,moe}"
 modes="${LLAMINAR_MTP_MATRIX_MODES:-greedy,stochastic}"
@@ -91,6 +99,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --devices)
       devices="${2:-}"
+      shift 2
+      ;;
+    --topologies)
+      topologies="${2:-}"
       shift 2
       ;;
     --models)
@@ -204,6 +216,128 @@ model_path_for() {
   esac
 }
 
+topology_model_supported() {
+  local topology="$1"
+  local model="$2"
+  case "${topology}" in
+    single)
+      return 0
+      ;;
+    localtp_rocm2|localtp_cuda2|localpp_rocm2|nodelocaltp_cpu2)
+      [[ "${model}" == "dense" ]]
+      return
+      ;;
+    expert_overlay_rocm2_hot|expert_overlay_rocm2_cpu2)
+      [[ "${model}" == "moe" ]]
+      return
+      ;;
+    *)
+      echo "error: unknown topology '${topology}'" >&2
+      exit 2
+      ;;
+  esac
+}
+
+topology_lane_devices() {
+  local topology="$1"
+  case "${topology}" in
+    single)
+      split_csv "${devices}"
+      ;;
+    localtp_rocm2|localtp_cuda2|localpp_rocm2|nodelocaltp_cpu2|expert_overlay_rocm2_hot|expert_overlay_rocm2_cpu2)
+      echo "${topology}"
+      ;;
+    *)
+      echo "error: unknown topology '${topology}'" >&2
+      exit 2
+      ;;
+  esac
+}
+
+topology_args=()
+topology_device_label=""
+describe_topology() {
+  local topology="$1"
+  local lane_device="$2"
+  topology_args=()
+  topology_device_label="${lane_device}"
+
+  case "${topology}" in
+    single)
+      topology_args=(-d "${lane_device}")
+      ;;
+    localtp_rocm2)
+      topology_device_label="rocm:0+rocm:1"
+      topology_args=(
+        --tp-devices "rocm:0,rocm:1"
+        --tensor-parallelism-degree 2
+        --tp-scope local
+        --backend rccl
+      )
+      ;;
+    localtp_cuda2)
+      topology_device_label="cuda:0+cuda:1"
+      topology_args=(
+        --tp-devices "cuda:0,cuda:1"
+        --tensor-parallelism-degree 2
+        --tp-scope local
+        --backend nccl
+      )
+      ;;
+    localpp_rocm2)
+      topology_device_label="rocm:0|rocm:1"
+      topology_args=(
+        --pipeline-parallelism-degree 2
+        --pp-split manual
+        --define-domain "stage0=rocm:0;scope=local;owner=0"
+        --define-domain "stage1=rocm:1;scope=local;owner=0"
+        --pp-stage "0=stage0:0-31"
+        --pp-stage "1=stage1:32-63"
+      )
+      ;;
+    nodelocaltp_cpu2)
+      topology_device_label="cpu:0+cpu:1"
+      topology_args=(
+        --mpi-procs 2
+        --device-map "0=cpu:0,1=cpu:1"
+        --tensor-parallelism-degree 2
+        --tp-scope node_local
+        --backend mpi
+      )
+      ;;
+    expert_overlay_rocm2_hot)
+      topology_device_label="rocm:0+rocm:1"
+      topology_args=(
+        --moe-expert-overlay tiered
+        --moe-expert-overlay-continuation qwen36_moe_rocm_hot
+        --moe-expert-overlay-base-domain qwen36_moe_rocm_hot
+        --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot
+        --moe-expert-overlay-residency static-by-id
+        --moe-expert-overlay-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=replicated_experts"
+        --moe-expert-overlay-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
+      )
+      ;;
+    expert_overlay_rocm2_cpu2)
+      topology_device_label="rocm:0+rocm:1+cpu:0+cpu:1"
+      topology_args=(
+        --moe-expert-overlay tiered
+        --moe-expert-overlay-continuation qwen36_moe_rocm_hot
+        --moe-expert-overlay-base-domain qwen36_moe_rocm_hot
+        --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot
+        --moe-expert-overlay-residency static-by-id
+        --moe-expert-overlay-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=replicated_experts"
+        --moe-expert-overlay-domain "qwen36_moe_cpu_cold=cpu:0,cpu:1;scope=local;backend=upi;compute=replicated_experts"
+        --moe-expert-overlay-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096"
+        --moe-expert-overlay-tier "cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
+      )
+      ;;
+    *)
+      echo "error: unknown topology '${topology}'" >&2
+      exit 2
+      ;;
+  esac
+}
+
 mode_args=()
 describe_mode() {
   local mode="$1"
@@ -288,6 +422,7 @@ metadata_path="${output_dir}/metadata.txt"
   echo "binary=${binary_path}"
   echo "dense_model=${dense_model}"
   echo "moe_model=${moe_model}"
+  echo "topologies=${topologies}"
   echo "devices=${devices}"
   echo "models=${models}"
   echo "modes=${modes}"
@@ -306,7 +441,7 @@ if [[ ! -x "${perf_summary_script}" ]]; then
   chmod +x "${perf_summary_script}" 2>/dev/null || true
 fi
 
-printf 'device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\tdepth_updates\tdepth_promotions\tdepth_demotions\tdepth_windows\tlast_depth_reason\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tsampling_enqueue_ms\tstochastic_batch_outcome_ms\tstochastic_batch_d2h_sync_ms\tgreedy_summary_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
+printf 'topology\tdevice\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\tdepth_updates\tdepth_promotions\tdepth_demotions\tdepth_windows\tlast_depth_reason\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tsampling_enqueue_ms\tstochastic_batch_outcome_ms\tstochastic_batch_d2h_sync_ms\tgreedy_summary_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
 : > "${commands_path}"
 
 zero_perf_summary() {
@@ -320,22 +455,25 @@ zero_perf_summary() {
 }
 
 append_summary() {
-  local device="$1"
-  local model="$2"
-  local mode="$3"
-  local variant="$4"
-  local json_path="$5"
-  local perf_path="$6"
-  local baseline_decode_tps="${7:-0}"
-  local perf_summary="${8:-$(zero_perf_summary)}"
+  local topology="$1"
+  local device="$2"
+  local model="$3"
+  local mode="$4"
+  local variant="$5"
+  local json_path="$6"
+  local perf_path="$7"
+  local baseline_decode_tps="${8:-0}"
+  local perf_summary="${9:-$(zero_perf_summary)}"
   local base_summary
   base_summary="$(jq -r \
+    --arg topology "${topology}" \
     --arg device "${device}" \
     --arg model "${model}" \
     --arg mode "${mode}" \
     --arg variant "${variant}" \
     --argjson baseline_decode_tps "${baseline_decode_tps}" \
     '[
+      $topology,
       $device,
       $model,
       $mode,
@@ -377,13 +515,21 @@ for model in $(split_csv "${models}"); do
     exit 2
   fi
 
-  for device in $(split_csv "${devices}"); do
-    device_slug="$(sanitize "${device}")"
+  for topology in $(split_csv "${topologies}"); do
+    if ! topology_model_supported "${topology}" "${model}"; then
+      echo "error: topology '${topology}' is not supported for model '${model}' in this matrix script" >&2
+      exit 2
+    fi
+    topology_slug="$(sanitize "${topology}")"
+    for lane_device in $(topology_lane_devices "${topology}"); do
+      describe_topology "${topology}" "${lane_device}"
+      device="${topology_device_label}"
+      device_slug="$(sanitize "${device}")"
     for mode in $(split_csv "${modes}"); do
       describe_mode "${mode}"
       for variant in $(split_csv "${variants}"); do
         describe_variant "${mode}" "${variant}"
-        stem="${device_slug}-${model}-${mode}-${variant}"
+        stem="${topology_slug}-${device_slug}-${model}-${mode}-${variant}"
         json_path="${output_dir}/${stem}.json"
         log_path="${output_dir}/${stem}.log"
         perf_path=""
@@ -394,9 +540,9 @@ for model in $(split_csv "${models}"); do
         cmd=(
           "${binary_path}" benchmark
           -m "${model_path}"
-          -d "${device}"
           --benchmark-json-output "${json_path}"
         )
+        cmd+=("${topology_args[@]}")
         if [[ -n "${decode_tokens}" ]]; then
           cmd+=(--n-predict "${decode_tokens}")
         fi
@@ -439,7 +585,7 @@ for model in $(split_csv "${models}"); do
           fi
         fi
 
-        lane_key="${device}|${model}|${mode}"
+        lane_key="${topology}|${device}|${model}|${mode}"
         decode_tps="$(jq -r '(.throughput_tokens_per_sec.decode // 0)' "${json_path}")"
         baseline_decode_tps="${baseline_decode_tps_by_lane[${lane_key}]:-0}"
         if [[ "${variant}" == "baseline" ]]; then
@@ -452,9 +598,10 @@ for model in $(split_csv "${models}"); do
           perf_summary="$("${perf_summary_script}" "${perf_path}")"
         fi
 
-        append_summary "${device}" "${model}" "${mode}" "${variant}" "${json_path}" "${perf_path}" "${baseline_decode_tps}" "${perf_summary}"
+        append_summary "${topology}" "${device}" "${model}" "${mode}" "${variant}" "${json_path}" "${perf_path}" "${baseline_decode_tps}" "${perf_summary}"
         tail -n 8 "${log_path}" || true
       done
+    done
     done
   done
 done

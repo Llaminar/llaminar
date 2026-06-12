@@ -15,7 +15,14 @@ SCRIPT = REPO_ROOT / "scripts" / "run_mtp_iteration_benchmark_matrix.sh"
 
 
 class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
-    def run_matrix(self, variants: str, *, allow_partial: bool = False) -> subprocess.CompletedProcess[str]:
+    def run_matrix(
+        self,
+        variants: str,
+        *,
+        allow_partial: bool = False,
+        topologies: str = "single",
+        models: str = "dense",
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             dense = tmp_path / "dense.gguf"
@@ -31,10 +38,12 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
                 str(dense),
                 "--moe-model",
                 str(moe),
+                "--topologies",
+                topologies,
                 "--devices",
                 "cpu:0",
                 "--models",
-                "dense",
+                models,
                 "--modes",
                 "greedy",
                 "--variants",
@@ -75,6 +84,71 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
         self.assertIn("--mtp-depth-policy dynamic", result.stdout)
         self.assertIn("--mtp-min-draft-tokens 1", result.stdout)
         self.assertNotIn("--mtp-initial-draft-tokens", result.stdout)
+
+    def test_localtp_rocm_topology_uses_tp_devices_without_single_device_flag(self) -> None:
+        result = self.run_matrix(
+            "baseline",
+            topologies="localtp_rocm2",
+            models="dense",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--tp-devices rocm:0\\,rocm:1", result.stdout)
+        self.assertIn("--tp-scope local", result.stdout)
+        self.assertIn("--backend rccl", result.stdout)
+        self.assertNotIn(" -d ", result.stdout)
+
+    def test_localpp_rocm_topology_uses_named_domains(self) -> None:
+        result = self.run_matrix(
+            "baseline",
+            topologies="localpp_rocm2",
+            models="dense",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--pipeline-parallelism-degree 2", result.stdout)
+        self.assertIn("--define-domain stage0=rocm:0\\;scope=local\\;owner=0", result.stdout)
+        self.assertIn("--pp-stage 0=stage0:0-31", result.stdout)
+        self.assertIn("--pp-stage 1=stage1:32-63", result.stdout)
+        self.assertNotIn(" -d ", result.stdout)
+
+    def test_nodelocaltp_topology_uses_mpi_device_map(self) -> None:
+        result = self.run_matrix(
+            "baseline",
+            topologies="nodelocaltp_cpu2",
+            models="dense",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--mpi-procs 2", result.stdout)
+        self.assertIn("--device-map 0=cpu:0\\,1=cpu:1", result.stdout)
+        self.assertIn("--tp-scope node_local", result.stdout)
+        self.assertNotIn(" -d ", result.stdout)
+
+    def test_expert_overlay_topology_uses_moe_overlay_flags(self) -> None:
+        result = self.run_matrix(
+            "baseline",
+            topologies="expert_overlay_rocm2_cpu2",
+            models="moe",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--moe-expert-overlay tiered", result.stdout)
+        self.assertIn("--moe-expert-overlay-continuation qwen36_moe_rocm_hot", result.stdout)
+        self.assertIn("qwen36_moe_rocm_hot=rocm:0\\,rocm:1", result.stdout)
+        self.assertIn("qwen36_moe_cpu_cold=cpu:0\\,cpu:1", result.stdout)
+        self.assertIn("cold@qwen36_moe_cpu_cold\\;priority=1", result.stdout)
+        self.assertNotIn(" -d ", result.stdout)
+
+    def test_topology_model_mismatch_fails_fast(self) -> None:
+        result = self.run_matrix(
+            "baseline",
+            topologies="localpp_rocm2",
+            models="moe",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("topology 'localpp_rocm2' is not supported for model 'moe'", result.stderr)
 
     def test_baseline_summary_row_matches_header_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,7 +210,10 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             header = lines[0].split("\t")
             row = lines[1].split("\t")
             self.assertEqual(len(header), len(row))
-            self.assertEqual(len(header), 73)
+            self.assertEqual(len(header), 74)
+            self.assertIn("topology", header)
+            self.assertEqual(row[header.index("topology")], "single")
+            self.assertEqual(row[header.index("device")], "cpu:0")
             for required_column in (
                 "generated_policy",
                 "min_depth",

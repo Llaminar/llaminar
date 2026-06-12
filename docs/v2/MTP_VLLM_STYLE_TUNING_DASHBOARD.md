@@ -40,6 +40,8 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
   non-final stages publish main verifier state only; the final stage owns
   logits, sampling, terminal hidden, and shifted sidecar KV. Gate:
   full `^V2_Integration_Parity_Qwen36_LocalPP_` passed 7/7.
+- Matrix runner now has a `topology` axis/summary column with opt-in presets for
+  LocalTP, LocalPP, NodeLocalTP, and ExpertOverlay; default remains SingleDevice.
 - Stage-owned CUDA side-stream workspace declarations still hold the dense VRAM
   win: one-token d3 stochastic graph workspace is about 784 MB instead of the
   stale LM-head-sized 1827 MB plan.
@@ -49,10 +51,10 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
 | Topology | Impl | Parity | Bench/Tuning |
 |---|---|---|---|
 | SingleDevice | Green dense/MoE greedy+stochastic on CPU/CUDA/ROCm | Green broad device matrix | Dense accepted; MoE speed weak |
-| LocalTP | Green dense fixed d1/d2/d3 + dynamic; rank-wide depth and stream handoff wired | Green Qwen3.6 dense parity | MoE bench sparse; keep in matrix |
-| LocalPP | Green dense final-stage sidecar + all-stage publication; PP device-token handoff gated | Green dense prefix+d1/d3/dyn/stoch+prefix-MTP restore | Bench pending |
-| NodeLocalTP | Green dense fixed d1/d2/d3 + dynamic scalar broadcast | Green full dense NodeLocalTP parity | MoE still unproven |
-| ExpertOverlay | Green MoE hot/mixed correctness path; dense not a separate target | Green ROCm2TP-hot + CPU2LocalTP-cold parity | Speed Amber/Red until MoE economics improve |
+| LocalTP | Green dense fixed d1/d2/d3 + dynamic; rank-wide depth/stream handoff | Green Qwen3.6 dense parity | Topology preset ready; MoE sparse |
+| LocalPP | Green dense final-stage sidecar + all-stage publication; PP device-token handoff gated | Green dense prefix+d1/d3/dyn/stoch+prefix-MTP restore | Topology preset ready; bench pending |
+| NodeLocalTP | Green dense fixed d1/d2/d3 + dynamic scalar broadcast | Green full dense NodeLocalTP parity | Topology preset ready; MoE unproven |
+| ExpertOverlay | Green MoE hot/mixed correctness path; dense not a separate target | Green ROCm2TP-hot + CPU2LocalTP-cold parity | Preset ready; speed Amber/Red |
 
 ## Device Matrix
 
@@ -85,8 +87,7 @@ d1 54.9, d3 52.5 tok/s; MoE no-MTP 118.26, d1 142.0, d3 132.8 tok/s.
 
 ## Next
 
-1. Continue Phase 9 multi-device hardening, keeping LocalTP, LocalPP,
-   ExpertOverlay, and NodeLocalTP status updated beside SingleDevice.
+1. Run selected Phase 9 topology preset benchmarks as hardware allows.
 2. Continue Phase 8 transaction-level vLLM alignment for MoE; reduce verifier,
    condition, and sidecar graph economics before deeper sampler/kernel tuning.
 3. Re-run the bounded GPU MoE stochastic matrix after the next verifier/condition

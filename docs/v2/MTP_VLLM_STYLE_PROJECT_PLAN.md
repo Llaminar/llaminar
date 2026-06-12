@@ -1866,6 +1866,14 @@ Status:
   `V2_Unit_PrefillDecodeTransition`, and full
   `^V2_Integration_Parity_Qwen36_LocalPP_`, which is green for prefix restore,
   fixed d1/d3 MTP, dynamic MTP, stochastic MTP, and prefix+MTP restore.
+- The standard benchmark matrix runner now has an explicit topology axis and a
+  leading `topology` summary column. `single` remains the default; opt-in
+  presets generate the tested command shapes for `localtp_rocm2`,
+  `localtp_cuda2`, `localpp_rocm2`, `nodelocaltp_cpu2`,
+  `expert_overlay_rocm2_hot`, and `expert_overlay_rocm2_cpu2`. The script
+  fails fast for unsupported model/topology pairings so multi-device evidence
+  cannot accidentally mix dense-only and MoE-only lanes. Regression:
+  `V2_Unit_MTPIterationBenchmarkMatrix`.
 
 Exit gate:
 
@@ -1966,8 +1974,10 @@ This must cover, as applicable:
 
 Refresh JSON/perf evidence for the same SingleDevice device matrix on every
 tuning iteration: CUDA, ROCm, and CPU; dense and MoE; greedy and stochastic;
-no-MTP baseline, fixed d1, fixed d2, fixed d3, and dynamic depth. This matrix is
-the normal tuning instrument, not an occasional acceptance run. Greedy rows use
+no-MTP baseline, fixed d1, fixed d2, fixed d3, and dynamic depth. Multi-device
+Phase 9 lanes use the same script with `--topologies` presets so LocalTP,
+LocalPP, NodeLocalTP, and ExpertOverlay evidence lands in the same schema. This
+matrix is the normal tuning instrument, not an occasional acceptance run. Greedy rows use
 production runtime settings with `--temperature 0`, not `--deterministic`;
 stochastic rows use a pinned seed, default `123`, so acceptance and throughput
 can be compared across iterations. Dynamic depth must always be reported beside
@@ -2011,6 +2021,20 @@ MoE lanes remain practical:
 ```bash
 scripts/run_mtp_iteration_benchmark_matrix.sh \
   --decode-tokens 16 --perfstats
+```
+
+For Phase 9 multi-device evidence, select the topology preset under active
+work. These rows are intentionally opt-in because they require matching local
+hardware or MPI process availability:
+
+```bash
+scripts/run_mtp_iteration_benchmark_matrix.sh \
+  --topologies localtp_rocm2,localpp_rocm2,nodelocaltp_cpu2 \
+  --models dense --decode-tokens 16 --perfstats
+
+scripts/run_mtp_iteration_benchmark_matrix.sh \
+  --topologies expert_overlay_rocm2_cpu2 \
+  --models moe --modes greedy --decode-tokens 16 --perfstats
 ```
 
 For narrow diagnostic loops, keep the same variant shape while selecting the
