@@ -46,6 +46,18 @@ namespace llaminar2
             return plan;
         }
 
+        MTPSpecDecodeVerifierGraphForwardPlan verifierGraphForwardPlanFailure(
+            const MTPSpecDecodeVerifierInputPlan &input_plan,
+            std::string reason)
+        {
+            MTPSpecDecodeVerifierGraphForwardPlan plan;
+            plan.shape = input_plan.shape;
+            plan.request_count = input_plan.request_count;
+            plan.ok = false;
+            plan.error = std::move(reason);
+            return plan;
+        }
+
         MTPSpecDecodeStateCommitPlan statePlanFailure(
             const MTPSpecDecodeMetadataShape &shape,
             int request_count,
@@ -523,6 +535,136 @@ namespace llaminar2
         plan.compact_logit_row_count =
             static_cast<int>(plan.verifier_logit_rows.size());
         return plan;
+    }
+
+    MTPSpecDecodeVerifierGraphForwardPlan buildMTPSpecDecodeVerifierGraphForwardPlan(
+        const MTPSpecDecodeVerifierInputPlan &input_plan)
+    {
+        if (!input_plan.ok)
+        {
+            return verifierGraphForwardPlanFailure(
+                input_plan,
+                std::string("cannot materialize graph forward plan from invalid verifier input plan: ") +
+                    input_plan.error);
+        }
+        if (!input_plan.shape.valid())
+            return verifierGraphForwardPlanFailure(input_plan, "invalid verifier graph metadata shape");
+        if (input_plan.request_count <= 0 ||
+            input_plan.request_count > input_plan.shape.max_requests)
+        {
+            return verifierGraphForwardPlanFailure(input_plan, "request count exceeds verifier graph shape");
+        }
+        if (static_cast<int>(input_plan.query_start_locs.size()) <
+            input_plan.request_count + 1)
+        {
+            return verifierGraphForwardPlanFailure(input_plan, "verifier query_start_locs are undersized");
+        }
+        if (input_plan.total_verifier_input_tokens < 0 ||
+            static_cast<int>(input_plan.verifier_input_tokens.size()) <
+                input_plan.total_verifier_input_tokens)
+        {
+            return verifierGraphForwardPlanFailure(input_plan, "verifier input tokens are undersized");
+        }
+        if (input_plan.compact_logit_row_count < 0 ||
+            static_cast<int>(input_plan.verifier_logit_rows.size()) <
+                input_plan.compact_logit_row_count)
+        {
+            return verifierGraphForwardPlanFailure(input_plan, "verifier logit rows are undersized");
+        }
+
+        MTPSpecDecodeVerifierGraphForwardPlan graph_plan;
+        graph_plan.ok = true;
+        graph_plan.shape = input_plan.shape;
+        graph_plan.request_count = input_plan.request_count;
+        graph_plan.token_batches.reserve(static_cast<size_t>(input_plan.request_count));
+        graph_plan.sequence_lengths.reserve(static_cast<size_t>(input_plan.request_count));
+        graph_plan.verifier_logit_rows.reserve(
+            static_cast<size_t>(input_plan.compact_logit_row_count));
+        fillInvalid(graph_plan.bonus_logit_rows, input_plan.shape.max_requests);
+
+        int max_request_len = 0;
+        for (int request = 0; request < input_plan.request_count; ++request)
+        {
+            const int start = input_plan.query_start_locs[static_cast<size_t>(request)];
+            const int end = input_plan.query_start_locs[static_cast<size_t>(request + 1)];
+            if (start < 0 || end < start ||
+                end > input_plan.total_verifier_input_tokens)
+            {
+                return verifierGraphForwardPlanFailure(input_plan, "verifier query_start_locs are not monotonic");
+            }
+            const int len = end - start;
+            if (len <= 0 || len > input_plan.shape.maxTargetQueryLen())
+            {
+                return verifierGraphForwardPlanFailure(input_plan, "verifier request length is outside shape");
+            }
+
+            std::vector<int> tokens;
+            tokens.reserve(static_cast<size_t>(len));
+            for (int row = start; row < end; ++row)
+            {
+                tokens.push_back(
+                    static_cast<int>(
+                        input_plan.verifier_input_tokens[static_cast<size_t>(row)]));
+            }
+            graph_plan.sequence_lengths.push_back(len);
+            graph_plan.token_batches.push_back(std::move(tokens));
+            max_request_len = std::max(max_request_len, len);
+        }
+        if (input_plan.query_start_locs[static_cast<size_t>(input_plan.request_count)] !=
+            input_plan.total_verifier_input_tokens)
+        {
+            return verifierGraphForwardPlanFailure(input_plan, "verifier query_start_locs final value does not match input token count");
+        }
+        graph_plan.padded_seq_len = max_request_len;
+        graph_plan.total_graph_tokens = input_plan.request_count * max_request_len;
+
+        auto map_logical_row_to_graph_row = [&](int32_t logical_row)
+            -> std::optional<int32_t>
+        {
+            if (logical_row < 0 ||
+                logical_row >= input_plan.total_verifier_input_tokens)
+            {
+                return std::nullopt;
+            }
+            for (int request = 0; request < input_plan.request_count; ++request)
+            {
+                const int start = input_plan.query_start_locs[static_cast<size_t>(request)];
+                const int end = input_plan.query_start_locs[static_cast<size_t>(request + 1)];
+                if (logical_row >= start && logical_row < end)
+                {
+                    const int row_in_request = static_cast<int>(logical_row) - start;
+                    return static_cast<int32_t>(
+                        request * graph_plan.padded_seq_len + row_in_request);
+                }
+            }
+            return std::nullopt;
+        };
+
+        for (int row = 0; row < input_plan.compact_logit_row_count; ++row)
+        {
+            const auto mapped = map_logical_row_to_graph_row(
+                input_plan.verifier_logit_rows[static_cast<size_t>(row)]);
+            if (!mapped)
+                return verifierGraphForwardPlanFailure(input_plan, "verifier logit row is outside query ranges");
+            graph_plan.verifier_logit_rows.push_back(*mapped);
+        }
+
+        const int bonus_count = std::min<int>(
+            input_plan.request_count,
+            static_cast<int>(input_plan.bonus_logit_rows.size()));
+        for (int request = 0; request < bonus_count; ++request)
+        {
+            const int32_t logical_bonus =
+                input_plan.bonus_logit_rows[static_cast<size_t>(request)];
+            if (logical_bonus == kMTPSpecDecodeInvalidToken)
+                continue;
+            const auto mapped = map_logical_row_to_graph_row(logical_bonus);
+            if (!mapped)
+                return verifierGraphForwardPlanFailure(input_plan, "bonus logit row is outside query ranges");
+            graph_plan.bonus_logit_rows[static_cast<size_t>(request)] = *mapped;
+        }
+
+        return graph_plan;
     }
 
     MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatch(
@@ -1461,6 +1603,20 @@ namespace llaminar2
             result.error = "MTP verifier row plan is outside metadata shape";
             return result;
         }
+        const MTPSpecDecodeVerifierGraphForwardPlan graph_plan =
+            buildMTPSpecDecodeVerifierGraphForwardPlan(plan);
+        if (!graph_plan.ok)
+        {
+            result.error = std::string("MTP verifier row graph materialization failed: ") +
+                           graph_plan.error;
+            return result;
+        }
+        if (static_cast<int>(graph_plan.verifier_logit_rows.size()) <
+            plan.compact_logit_row_count)
+        {
+            result.error = "MTP verifier graph row plan is undersized";
+            return result;
+        }
         if (device.is_gpu())
         {
             if (!stream)
@@ -1496,7 +1652,7 @@ namespace llaminar2
         {
             ok = backend->hostToDeviceOnStream(
                 ptrs.verifier_logit_rows,
-                plan.verifier_logit_rows.data(),
+                graph_plan.verifier_logit_rows.data(),
                 bytes,
                 device.ordinal,
                 stream);
@@ -1505,7 +1661,7 @@ namespace llaminar2
         {
             std::memcpy(
                 ptrs.verifier_logit_rows,
-                plan.verifier_logit_rows.data(),
+                graph_plan.verifier_logit_rows.data(),
                 bytes);
         }
 

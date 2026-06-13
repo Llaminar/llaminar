@@ -3694,9 +3694,9 @@ namespace llaminar2
             size_t rows = static_cast<size_t>(total_tokens);
             if (compute_row_indexed_all_position_logits_)
             {
-                if (batch_size != 1)
+                if (batch_size > 1 && !pending_mtp_spec_verifier_input_plan_)
                 {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Row-indexed all-position logits require batch_size=1");
+                    LOG_ERROR("[DeviceGraphOrchestrator] Batched row-indexed all-position logits require an explicit MTP verifier row plan");
                     return nullptr;
                 }
                 if (row_indexed_all_position_logits_row_count_ <= 0 ||
@@ -4268,7 +4268,8 @@ namespace llaminar2
         const char *node_name,
         int row_start,
         int row_count,
-        int seq_len)
+        int seq_len,
+        void *stream)
     {
         if (row_start < 0 || row_count <= 0 || row_start + row_count > seq_len)
         {
@@ -4371,14 +4372,17 @@ namespace llaminar2
         void *owned_rows_select_stream = nullptr;
         if (state_.device_id.is_gpu())
         {
-            owned_rows_select_stream =
-                explicitGPUStreamForOperation("mtp_hidden_rows_select");
-            if (!owned_rows_select_stream)
+            void *rows_select_stream = stream
+                                           ? stream
+                                           : explicitGPUStreamForOperation("mtp_hidden_rows_select");
+            if (!rows_select_stream)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] MTP hidden rows-select requires an explicit GPU stream");
                 return false;
             }
-            cache.stage->setGPUStream(owned_rows_select_stream);
+            cache.stage->setGPUStream(rows_select_stream);
+            if (!stream)
+                owned_rows_select_stream = rows_select_stream;
         }
 
         IDeviceContext *ctx = getDeviceContext(state_.device_id);
@@ -4402,7 +4406,8 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::selectMTPTerminalHiddenRows(
         int row_start,
         int row_count,
-        int seq_len)
+        int seq_len,
+        void *stream)
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
@@ -4433,7 +4438,8 @@ namespace llaminar2
             "mtp_terminal_hidden_rows_select",
             row_start,
             row_count,
-            seq_len);
+            seq_len,
+            stream);
     }
 
     void DeviceGraphOrchestrator::noteMainForwardHiddenProducedForMTP(int seq_len, int batch_size)
@@ -4484,10 +4490,32 @@ namespace llaminar2
 
         if (state_.last_forward_batch_size > 1)
         {
+            if (state_.last_forward_seq_len == 1)
+            {
+                if (!refreshMTPTerminalHiddenState(
+                        state_.last_forward_seq_len,
+                        state_.last_forward_batch_size))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to refresh batched terminal hidden for "
+                              << (operation ? operation : "MTP sidecar"));
+                    return false;
+                }
+                if (!state_.prefix_terminal_hidden || !state_.mtp_terminal_hidden_current)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP terminal hidden refresh did not publish"
+                              << " a current prefix buffer for "
+                              << (operation ? operation : "MTP sidecar"));
+                    return false;
+                }
+                *terminal_hidden = state_.prefix_terminal_hidden.get();
+                *terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
+                return true;
+            }
             LOG_ERROR("[DeviceGraphOrchestrator] "
                       << (operation ? operation : "MTP sidecar")
-                      << " requires a single-sequence terminal hidden row; last batch_size="
-                      << state_.last_forward_batch_size);
+                      << " requires one terminal hidden row per request; last batch_size="
+                      << state_.last_forward_batch_size
+                      << " seq_len=" << state_.last_forward_seq_len);
             return false;
         }
 
@@ -4546,9 +4574,17 @@ namespace llaminar2
             state_.device_id.toString());
         if (seq_len <= 0 || batch_size <= 0)
             return false;
-        if (batch_size != 1)
+        const int total_rows = seq_len * batch_size;
+        if (batch_size > 1 && seq_len != 1)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] MTP terminal hidden capture currently supports batch_size=1 only");
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP terminal hidden capture supports only seq_len=1, got batch_size="
+                      << batch_size << " seq_len=" << seq_len);
+            return false;
+        }
+        if (batch_size > 4)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP terminal hidden capture supports at most four rows, got "
+                      << batch_size);
             return false;
         }
 
@@ -4556,8 +4592,25 @@ namespace llaminar2
         if (state_.device_id.is_gpu())
             producer_stream = peekPendingLogitsStream(PendingLogitsStreamRole::MainDecode);
 
-        if (!executeMTPTerminalHiddenRowSelect(seq_len - 1, seq_len, producer_stream))
-            return false;
+        if (batch_size == 1)
+        {
+            if (!executeMTPTerminalHiddenRowSelect(seq_len - 1, seq_len, producer_stream))
+                return false;
+        }
+        else
+        {
+            // A one-token request batch is flattened as rows [0, batch_size).
+            // Copy every row into the stable sidecar input buffer so a batched
+            // MTP graph sees one terminal hidden state per request.
+            if (!selectMTPTerminalHiddenRows(
+                    /*row_start=*/0,
+                    /*row_count=*/batch_size,
+                    /*seq_len=*/total_rows,
+                    producer_stream))
+            {
+                return false;
+            }
+        }
 
         if (producer_stream &&
             !synchronizeOwnedGPUHelperStream(
@@ -7117,18 +7170,17 @@ namespace llaminar2
                       << " max_rows=" << max_compact_rows);
             return false;
         }
-        for (int i = 0; i < plan.compact_logit_row_count; ++i)
+        const MTPSpecDecodeVerifierGraphForwardPlan graph_forward_plan =
+            buildMTPSpecDecodeVerifierGraphForwardPlan(plan);
+        if (!graph_forward_plan.ok)
         {
-            if (plan.verifier_logit_rows[static_cast<size_t>(i)] < 0)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Refusing negative MTP verifier row plan entry at "
-                          << i);
-                return false;
-            }
+            LOG_ERROR("[DeviceGraphOrchestrator] Refusing MTP verifier row plan that cannot be materialized for graph execution: "
+                      << graph_forward_plan.error);
+            return false;
         }
         std::vector<int> selected_rows(
-            plan.verifier_logit_rows.begin(),
-            plan.verifier_logit_rows.begin() + plan.compact_logit_row_count);
+            graph_forward_plan.verifier_logit_rows.begin(),
+            graph_forward_plan.verifier_logit_rows.begin() + plan.compact_logit_row_count);
         if (!graph_builder_->setRowIndexedAllPositionLogitRows(selected_rows))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Graph builder rejected MTP verifier row plan");
@@ -13082,11 +13134,21 @@ namespace llaminar2
         }
         padded_seq_len_ = max_len;
 
-        // Store actual lengths BEFORE calling forward (forward() will overwrite with padded len)
+        // Store actual lengths BEFORE calling forward and publish them through
+        // state_.sequence_lengths so attention masks see request-local lengths
+        // during the padded graph execution. forward() increments positions and
+        // sequence lengths by padded_seq_len; we restore old+actual below.
         std::vector<int> actual_lengths(batch_size);
         for (int i = 0; i < batch_size; ++i)
         {
             actual_lengths[i] = static_cast<int>(token_batches[i].size());
+        }
+        std::vector<int> old_positions = state_.positions;
+        std::vector<int> old_sequence_lengths = state_.sequence_lengths;
+        state_.sequence_lengths.resize(batch_size);
+        for (int i = 0; i < batch_size; ++i)
+        {
+            state_.sequence_lengths[i] = actual_lengths[i];
         }
 
         // Create flattened, padded token array [batch_size * padded_seq_len]
@@ -13104,15 +13166,21 @@ namespace llaminar2
         // Note: forward() will set sequence_lengths[b] = padded_seq_len for all b
         const float *result = forward(flat_tokens.data(), padded_seq_len_, batch_size);
 
-        // Restore actual sequence lengths (forward() set them to padded_seq_len)
+        // Restore actual request progress after the padded graph execution.
         // This is important for:
         // 1. Proper logits extraction (only extract non-padded logits)
         // 2. Snapshot comparison (shapes should match actual token count)
         // 3. KV cache position tracking (only actual tokens contribute to cache)
+        state_.positions.resize(batch_size);
         state_.sequence_lengths.resize(batch_size);
         for (int i = 0; i < batch_size; ++i)
         {
-            state_.sequence_lengths[i] = actual_lengths[i];
+            const int old_pos =
+                i < static_cast<int>(old_positions.size()) ? old_positions[i] : 0;
+            const int old_len =
+                i < static_cast<int>(old_sequence_lengths.size()) ? old_sequence_lengths[i] : old_pos;
+            state_.positions[i] = old_pos + actual_lengths[i];
+            state_.sequence_lengths[i] = old_len + actual_lengths[i];
         }
 
         return result != nullptr;

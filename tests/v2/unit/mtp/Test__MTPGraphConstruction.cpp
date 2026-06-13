@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include "backends/ComputeBackend.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -1327,6 +1328,34 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     EXPECT_TRUE(hasDependency(graph, "mtp0_lm_head", "mtp0_final_norm"));
 }
 
+TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraphForRequestBatch)
+{
+    DenseMTPGraphFixture fixture;
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    std::vector<int> draft_tokens = {17, 18};
+    std::vector<int> position_ids = {5, 5};
+
+    auto weights = fixture.mtpWeights();
+    auto input = fixture.input();
+    input.batch_size = 2;
+    input.seq_len = 1;
+    input.draft_token_ids = draft_tokens.data();
+    input.position_ids = position_ids.data();
+    auto output = fixture.output();
+
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+
+    ASSERT_GT(graph.size(), 0u);
+    EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head");
+    ASSERT_NE(graph.getNode("mtp0_embedding"), nullptr);
+    ASSERT_NE(graph.getNode("mtp0_fc"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_attention"), nullptr);
+    ASSERT_NE(graph.getNode("layer64_ffn_residual"), nullptr);
+    ASSERT_NE(graph.getNode("mtp0_lm_head"), nullptr);
+}
+
 TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCatchup)
 {
     DenseMTPGraphFixture fixture;
@@ -1415,6 +1444,82 @@ TEST(Test__MTPGraphConstruction, BuildsMultiRowKVOnlyQwen35SidecarGraphForShifte
     EXPECT_EQ(graph.getNode("mtp0_lm_head"), nullptr);
 }
 
+TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesOneRowPerRequest)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwen35MTPForwardFixture fixture;
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    ASSERT_GE(hidden->rows(), 2u);
+    float *hidden_data = hidden->mutable_data();
+    ASSERT_NE(hidden_data, nullptr);
+
+    const int d = fixture.config.d_model;
+    for (int row = 0; row < 2; ++row)
+    {
+        for (int col = 0; col < d; ++col)
+        {
+            hidden_data[static_cast<size_t>(row) * d + col] =
+                100.0f * static_cast<float>(row + 1) + static_cast<float>(col);
+        }
+    }
+
+    orchestrator.markMainForwardHiddenProducedForTesting(
+        /*seq_len=*/1,
+        /*batch_size=*/2);
+    ASSERT_TRUE(orchestrator.refreshMTPTerminalHiddenForTesting(
+        /*seq_len=*/1,
+        /*batch_size=*/2));
+
+    const TensorBase *terminal_hidden =
+        orchestrator.mtpTerminalHiddenForTesting();
+    ASSERT_NE(terminal_hidden, nullptr);
+    ASSERT_GE(terminal_hidden->rows(), 2u);
+    const float *terminal_data = terminal_hidden->data();
+    ASSERT_NE(terminal_data, nullptr);
+
+    for (int row = 0; row < 2; ++row)
+    {
+        for (int col = 0; col < d; ++col)
+        {
+            const size_t idx = static_cast<size_t>(row) * d + col;
+            EXPECT_FLOAT_EQ(terminal_data[idx], hidden_data[idx])
+                << "terminal hidden mismatch at row " << row
+                << " col " << col;
+        }
+    }
+}
+
+TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshRejectsMultiTokenRequests)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwen35MTPForwardFixture fixture;
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    orchestrator.markMainForwardHiddenProducedForTesting(
+        /*seq_len=*/2,
+        /*batch_size=*/2);
+
+    EXPECT_FALSE(orchestrator.refreshMTPTerminalHiddenForTesting(
+        /*seq_len=*/2,
+        /*batch_size=*/2));
+}
+
 TEST(Test__MTPGraphConstruction, RejectsMultiRowFullQwen35SidecarGraph)
 {
     DenseMTPGraphFixture fixture;
@@ -1430,6 +1535,28 @@ TEST(Test__MTPGraphConstruction, RejectsMultiRowFullQwen35SidecarGraph)
     input.position_ids = positions.data();
     input.seq_len = static_cast<int>(draft_tokens.size());
     input.kv_cache_only = false;
+    auto output = fixture.output();
+
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+
+    EXPECT_EQ(graph.size(), 0u);
+}
+
+TEST(Test__MTPGraphConstruction, RejectsOversizedRequestBatchQwen35SidecarGraph)
+{
+    DenseMTPGraphFixture fixture;
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    const std::array<int, 5> draft_tokens = {17, 18, 19, 20, 21};
+    const std::array<int, 5> positions = {5, 5, 5, 5, 5};
+
+    auto weights = fixture.mtpWeights();
+    auto input = fixture.input();
+    input.batch_size = static_cast<int>(draft_tokens.size());
+    input.seq_len = 1;
+    input.draft_token_ids = draft_tokens.data();
+    input.position_ids = positions.data();
     auto output = fixture.output();
 
     ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
@@ -3800,7 +3927,7 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectExplicitVerif
     MTPSpecDecodeVerifierInputPlan row_plan;
     row_plan.ok = true;
     row_plan.shape.max_requests = 1;
-    row_plan.shape.max_draft_tokens = compact_rows - 1;
+    row_plan.shape.max_draft_tokens = static_cast<int>(tokens.size()) - 1;
     row_plan.request_count = 1;
     row_plan.total_verifier_input_tokens = static_cast<int>(tokens.size());
     row_plan.compact_logit_row_count = compact_rows;
@@ -3833,6 +3960,98 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectExplicitVerif
         EXPECT_NEAR(compact_logits[i], expected_compact[i], 1e-5f)
             << "explicit-row compact verifier mismatch at flat index " << i;
     }
+
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
+    ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(false, 0));
+    orchestrator.clearMTPSpecVerifierInputPlan();
+}
+
+TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectPaddedVerifierBatchRowsOnCPU)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.max_request_batch = 2;
+    fixture.config.mtp.draft_tokens = 3;
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    orchestrator.setWeights(fixture.modelWeights());
+    PreparedWeightStore prepared_store;
+    ASSERT_NO_THROW(prepareDenseForwardWeights(orchestrator, *graph_builder, prepared_store, DeviceId::cpu()));
+
+    const std::vector<std::vector<int>> token_batches = {
+        {1, 2},
+        {3, 4, 5}};
+    const size_t vocab = static_cast<size_t>(fixture.config.vocab_size);
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeVerifierDraftRequest request0;
+    request0.request_id = 0;
+    request0.draft_tokens = {1, 2};
+
+    MTPSpecDecodeVerifierDraftRequest request1;
+    request1.request_id = 1;
+    request1.draft_tokens = {3, 4, 5};
+
+    MTPSpecDecodeVerifierInputPlan logical_plan =
+        buildMTPSpecDecodeVerifierInputPlan(shape, {request0, request1});
+    ASSERT_TRUE(logical_plan.ok) << logical_plan.error;
+    MTPSpecDecodeVerifierGraphForwardPlan graph_plan =
+        buildMTPSpecDecodeVerifierGraphForwardPlan(logical_plan);
+    ASSERT_TRUE(graph_plan.ok) << graph_plan.error;
+    ASSERT_THAT(graph_plan.verifier_logit_rows, ::testing::ElementsAre(0, 1, 3, 4, 5));
+    ASSERT_EQ(graph_plan.padded_seq_len, 3);
+
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+    ASSERT_TRUE(orchestrator.forward_batch(token_batches));
+    const float *full_logits = orchestrator.getAllPositionLogits();
+    ASSERT_NE(full_logits, nullptr);
+
+    std::vector<float> expected_compact(
+        static_cast<size_t>(logical_plan.compact_logit_row_count) * vocab);
+    for (int compact_row = 0; compact_row < logical_plan.compact_logit_row_count; ++compact_row)
+    {
+        const size_t src =
+            static_cast<size_t>(graph_plan.verifier_logit_rows[static_cast<size_t>(compact_row)]) *
+            vocab;
+        const size_t dst = static_cast<size_t>(compact_row) * vocab;
+        std::copy(
+            full_logits + src,
+            full_logits + src + vocab,
+            expected_compact.begin() + static_cast<std::ptrdiff_t>(dst));
+    }
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
+
+    orchestrator.clearInferenceState();
+
+    ASSERT_TRUE(orchestrator.setMTPSpecVerifierInputPlan(logical_plan));
+    ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(
+        true,
+        logical_plan.compact_logit_row_count));
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+    ASSERT_TRUE(orchestrator.forward_batch(token_batches));
+
+    const float *compact_logits = orchestrator.getAllPositionLogits();
+    ASSERT_NE(compact_logits, nullptr);
+    for (size_t i = 0; i < expected_compact.size(); ++i)
+    {
+        ASSERT_TRUE(std::isfinite(compact_logits[i]))
+            << "non-finite padded-batch compact verifier logit at " << i;
+        EXPECT_NEAR(compact_logits[i], expected_compact[i], 1e-5f)
+            << "padded-batch compact verifier mismatch at flat index " << i;
+    }
+
+    const auto state = orchestrator.prefixStateProbe();
+    ASSERT_THAT(state.positions, ::testing::ElementsAre(2, 3));
+    ASSERT_THAT(state.sequence_lengths, ::testing::ElementsAre(2, 3));
 
     ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
     ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(false, 0));

@@ -128,6 +128,33 @@ namespace llaminar2
         std::vector<int32_t> bonus_logit_rows;
     };
 
+    /**
+     * @brief Verifier input materialized in graph execution coordinates.
+     *
+     * `MTPSpecDecodeVerifierInputPlan` stores a compact logical sequence where
+     * requests are concatenated without padding. Batched graph execution pads
+     * each request to the maximum target length, so row-select stages must read
+     * padded graph row indices instead of logical flat row indices. This result
+     * keeps both concepts explicit: `token_batches` are suitable for the
+     * existing `forward_batch()` path, while `verifier_logit_rows` and
+     * `bonus_logit_rows` are the row coordinates seen by graph stages.
+     */
+    struct MTPSpecDecodeVerifierGraphForwardPlan
+    {
+        bool ok = false;
+        std::string error;
+
+        MTPSpecDecodeMetadataShape shape;
+        int request_count = 0;
+        int padded_seq_len = 0;
+        int total_graph_tokens = 0;
+
+        std::vector<std::vector<int>> token_batches;
+        std::vector<int> sequence_lengths;
+        std::vector<int32_t> verifier_logit_rows;
+        std::vector<int32_t> bonus_logit_rows;
+    };
+
     struct MTPSpecDecodeStateCommitPlan
     {
         bool ok = false;
@@ -209,6 +236,9 @@ namespace llaminar2
     MTPSpecDecodeVerifierInputPlan buildMTPSpecDecodeVerifierInputPlan(
         const MTPSpecDecodeMetadataShape &shape,
         const std::vector<MTPSpecDecodeVerifierDraftRequest> &requests);
+
+    MTPSpecDecodeVerifierGraphForwardPlan buildMTPSpecDecodeVerifierGraphForwardPlan(
+        const MTPSpecDecodeVerifierInputPlan &plan);
 
     MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
         const MTPSpecDecodeMetadataShape &shape,

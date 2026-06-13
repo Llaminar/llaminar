@@ -1418,6 +1418,26 @@ namespace llaminar2
             noteMainForwardHiddenProducedForMTP(seq_len, batch_size);
         }
 
+        /**
+         * @brief Refresh the stable MTP terminal-hidden buffer for tests.
+         *
+         * This exposes the same production helper used by MTP sidecar
+         * resolution, allowing unit tests to verify row selection and batch
+         * shape guards without constructing a full speculative scheduler.
+         */
+        bool refreshMTPTerminalHiddenForTesting(int seq_len, int batch_size)
+        {
+            return refreshMTPTerminalHiddenState(seq_len, batch_size);
+        }
+
+        /**
+         * @brief Inspect the stable MTP terminal-hidden buffer published by tests.
+         */
+        const TensorBase *mtpTerminalHiddenForTesting() const
+        {
+            return state_.prefix_terminal_hidden.get();
+        }
+
         // =====================================================================
         // IInferenceRunner: Device & Logits Local API overrides
         // =====================================================================
@@ -3624,10 +3644,15 @@ namespace llaminar2
             const char *node_name,
             int row_start,
             int row_count,
-            int seq_len);
+            int seq_len,
+            void *stream = nullptr);
 
         /// Copy a contiguous verifier/prefill row range into the stable MTP input buffer.
-        bool selectMTPTerminalHiddenRows(int row_start, int row_count, int seq_len);
+        bool selectMTPTerminalHiddenRows(
+            int row_start,
+            int row_count,
+            int seq_len,
+            void *stream = nullptr);
 
         /// Copy the latest forward pass terminal hidden row into the stable MTP input buffer.
         bool refreshMTPTerminalHiddenState(int seq_len, int batch_size);

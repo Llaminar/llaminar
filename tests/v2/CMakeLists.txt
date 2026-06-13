@@ -6481,6 +6481,18 @@ add_v2_test(V2_Unit_MTPSpecDecodeMetadata
     MPI_PROCS 1
 )
 
+# Test: vLLM-style MTP verifier graph-forward execution routing
+add_executable(v2_test_mtp_verifier_forward_executor unit/mtp/Test__MTPVerifierForwardExecutor.cpp)
+target_link_libraries(v2_test_mtp_verifier_forward_executor llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
+target_include_directories(v2_test_mtp_verifier_forward_executor PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPVerifierForwardExecutor
+    COMMAND $<TARGET_FILE:v2_test_mtp_verifier_forward_executor>
+    LABELS "V2;Unit;MTP;SpecDecode;Graph"
+    MPI_PROCS 1
+)
+
 # Test: vLLM-style MTP spec-step state publication contract
 add_executable(v2_test_mtp_spec_state_contract unit/mtp/Test__MTPSpecStateContract.cpp)
 target_link_libraries(v2_test_mtp_spec_state_contract llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)

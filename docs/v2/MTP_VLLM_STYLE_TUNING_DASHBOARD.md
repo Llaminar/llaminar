@@ -27,6 +27,11 @@ Before a WiP commit, broad units plus touched parity must pass.
   Compact verifier LM-head scratch now scales above four rows for request-batch
   capacity and is covered by CPU row-indexed graph tests.
   Explicit non-leading verifier row plans are now builder-owned on CPU too.
+  Padded batched verifier graph rows and actual per-request lengths are now
+  materialized and unit-proven; a shared verifier-forward helper now routes
+  single, device-row, and host-batched graph execution.
+  Qwen35/Qwen36 sidecar graph construction now accepts bounded one-token
+  request batches, with matching batched terminal-hidden publication.
   `--mtp-max-request-batch` records intent but still hard-fails above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.

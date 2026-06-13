@@ -1803,6 +1803,32 @@ Status:
   from metadata workspace, while CPU graph construction gets the same logical
   plan through the builder. Focused gate:
   `V2_Unit_MTPGraphConstruction.RowIndexedAllPositionLogitsRespectExplicitVerifierRowsOnCPU`.
+- Verifier graph execution now has an explicit logical-to-padded materializer.
+  `MTPSpecDecodeVerifierGraphForwardPlan` splits flattened request verifier
+  tokens into `forward_batch()` input batches, maps compact verifier and bonus
+  rows into padded graph-row coordinates, and feeds those rows into both
+  metadata upload and CPU graph construction. `DeviceGraphOrchestrator`
+  forwards actual per-request sequence lengths during padded batch execution
+  and restores cumulative request state afterwards. Focused gates:
+  `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPGraphConstruction`, and the
+  bounded MTP/schema unit gate.
+- Runner verifier forwards now go through `MTPVerifierForwardExecutor`.
+  The helper materializes graph coordinates once, routes single-request host
+  tokens through `forward()`, single-request device-token rows through
+  `forwardWithDeviceTokenIds()`, and multi-request host tokens through
+  `forward_batch()`. It hard-fails batched device-token input until that path
+  has an explicit workspace contract. Focused gates:
+  `V2_Unit_MTPVerifierForwardExecutor` and the bounded MTP/schema unit gate.
+- Qwen35/Qwen36 MTP sidecar graph construction now allows bounded one-token
+  request batches. The graph still rejects more than four total MTP rows,
+  non-KV full sidecars with `seq_len != 1`, and multi-token catchup shapes
+  that are not single-request. Focused gate: `V2_Unit_MTPGraphConstruction`.
+- `DeviceGraphOrchestrator` can now publish one terminal-hidden row per
+  request for a one-token batch. The multi-row row-select helper accepts the
+  producer stream just like the single-row selector, preventing GPU stream
+  races when this path is wired into graph-captured request batching. It still
+  rejects multi-token per-request batches. Focused gate:
+  `V2_Unit_MTPGraphConstruction`.
 
 Exit gate:
 

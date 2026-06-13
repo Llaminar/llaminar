@@ -7,6 +7,7 @@
  */
 
 #include "OrchestrationRunner.h"
+#include "MTPVerifierForwardExecutor.h"
 #include "../../app/StartupBanner.h"
 #include "../../config/OrchestrationConfigParser.h"
 #include "../../config/TPPPValidator.h"
@@ -2747,9 +2748,11 @@ namespace llaminar2
                     runner_->setComputeRowIndexedAllPositionLogits(false, 0);
                     return std::nullopt;
                 }
-                if (!runner_->forward(
-                        verifier_input_plan.verifier_input_tokens.data(),
-                        verifier_input_plan.total_verifier_input_tokens))
+                const MTPVerifierForwardExecutionResult forward_result =
+                    executeMTPSpecVerifierForward(
+                        *runner_,
+                        verifier_input_plan);
+                if (!forward_result.ok)
                 {
                     runner_->setComputeAllPositionLogits(false);
                     runner_->setComputeRowIndexedAllPositionLogits(false, 0);
@@ -3384,21 +3387,21 @@ namespace llaminar2
                               verifier_input_plan.total_verifier_input_tokens)}});
                 }
 
-                const bool verifier_forward_ok =
-                    verifier_input_tokens_device
-                        ? runner_->forwardWithDeviceTokenIds(
-                              verifier_input_plan.verifier_input_tokens.data(),
-                              verifier_input_tokens_device,
-                              verifier_input_plan.total_verifier_input_tokens)
-                        : runner_->forward(
-                              verifier_input_plan.verifier_input_tokens.data(),
-                              verifier_input_plan.total_verifier_input_tokens);
-                if (!verifier_forward_ok)
+                MTPVerifierForwardExecutionOptions verifier_forward_options;
+                verifier_forward_options.device_token_ids =
+                    verifier_input_tokens_device;
+                const MTPVerifierForwardExecutionResult verifier_forward =
+                    executeMTPSpecVerifierForward(
+                        *runner_,
+                        verifier_input_plan,
+                        verifier_forward_options);
+                if (!verifier_forward.ok)
                 {
                     runner_->setComputeAllPositionLogits(false);
                     runner_->setComputeRowIndexedAllPositionLogits(false, 0);
                     return fail_after_checkpoint(
-                        "All-position MTP verifier forward failed");
+                        std::string("All-position MTP verifier forward failed: ") +
+                        verifier_forward.error);
                 }
                 if (!runner_->setComputeAllPositionLogits(false))
                 {

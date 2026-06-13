@@ -630,6 +630,87 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsVerifierInputPlanForCurrentRowIndexedCon
     EXPECT_THAT(plan.bonus_logit_rows, ElementsAre(2, 4));
 }
 
+TEST(Test__MTPSpecDecodeMetadata, MaterializesVerifierGraphRowsForPaddedRequestBatch)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeVerifierDraftRequest request0;
+    request0.request_id = 0;
+    request0.draft_tokens = {7, 9};
+
+    MTPSpecDecodeVerifierDraftRequest request1;
+    request1.request_id = 1;
+    request1.draft_tokens = {11, 12, 13};
+
+    MTPSpecDecodeVerifierInputPlan logical_plan =
+        buildMTPSpecDecodeVerifierInputPlan(shape, {request0, request1});
+    ASSERT_TRUE(logical_plan.ok) << logical_plan.error;
+    ASSERT_THAT(logical_plan.query_start_locs, ElementsAre(0, 2, 5));
+    ASSERT_THAT(logical_plan.verifier_logit_rows, ElementsAre(0, 1, 2, 3, 4));
+
+    MTPSpecDecodeVerifierGraphForwardPlan graph_plan =
+        buildMTPSpecDecodeVerifierGraphForwardPlan(logical_plan);
+
+    ASSERT_TRUE(graph_plan.ok) << graph_plan.error;
+    EXPECT_EQ(graph_plan.request_count, 2);
+    EXPECT_EQ(graph_plan.padded_seq_len, 3);
+    EXPECT_EQ(graph_plan.total_graph_tokens, 6);
+    ASSERT_THAT(graph_plan.token_batches, SizeIs(2));
+    EXPECT_THAT(graph_plan.token_batches[0], ElementsAre(7, 9));
+    EXPECT_THAT(graph_plan.token_batches[1], ElementsAre(11, 12, 13));
+    EXPECT_THAT(graph_plan.sequence_lengths, ElementsAre(2, 3));
+    EXPECT_THAT(graph_plan.verifier_logit_rows, ElementsAre(0, 1, 3, 4, 5));
+    EXPECT_THAT(graph_plan.bonus_logit_rows, ElementsAre(1, 5));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanCopiesPaddedGraphRows)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeVerifierDraftRequest request0;
+    request0.request_id = 0;
+    request0.draft_tokens = {7, 9};
+
+    MTPSpecDecodeVerifierDraftRequest request1;
+    request1.request_id = 1;
+    request1.draft_tokens = {11, 12, 13};
+
+    MTPSpecDecodeVerifierInputPlan logical_plan =
+        buildMTPSpecDecodeVerifierInputPlan(shape, {request0, request1});
+    ASSERT_TRUE(logical_plan.ok) << logical_plan.error;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(shape);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+
+    MTPSpecDecodeMetadataUploadResult upload =
+        uploadMTPSpecDecodeVerifierInputPlan(
+            logical_plan,
+            binding,
+            DeviceId::cpu(),
+            /*backend=*/nullptr,
+            /*stream=*/nullptr);
+    ASSERT_TRUE(upload.ok) << upload.error;
+    EXPECT_EQ(upload.bytes_uploaded, 5u * sizeof(int32_t));
+
+    const auto &ptrs = binding.devicePointers();
+    EXPECT_THAT(std::vector<int32_t>(
+                    ptrs.verifier_logit_rows,
+                    ptrs.verifier_logit_rows + 5),
+                ElementsAre(0, 1, 3, 4, 5));
+}
+
 TEST(Test__MTPSpecDecodeMetadata, RejectsInvalidVerifierInputPlanShapes)
 {
     MTPSpecDecodeMetadataShape shape;
