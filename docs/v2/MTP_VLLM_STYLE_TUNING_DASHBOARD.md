@@ -29,6 +29,8 @@ Before a WiP commit, broad units plus touched parity must pass.
   shared greedy batch executor now runs row-indexed verifier forward, samples
   compact rows, cleans up graph mode, and returns that plan. The executor is
   CPU-DGO proven, including all-position/row-indexed mode pairing.
+  Device stochastic outcomes now convert into the same batched transaction
+  plan, and the live GPU path uses it for request-1 accepted-count publication.
   Compact verifier scratch, explicit graph rows, padded forward lengths,
   verifier-forward routing, bounded one-token Qwen35/Qwen36 sidecar batches,
   and batched terminal-hidden publication are unit-proven.

@@ -3427,6 +3427,8 @@ namespace llaminar2
 
             Sampler all_position_stochastic_penalty_sampler = sampler_;
             MTPDecodeCatchupGreedyResult catchup;
+            std::optional<DeviceSpeculativeVerifyBatchOutcome>
+                device_batch_outcome_for_transaction;
             if (stochastic_verify)
             {
                 if (!stochastic_device_verify && !stochastic_host_verify)
@@ -3710,6 +3712,7 @@ namespace llaminar2
                             device_outcome);
                     if (!catchup.ok)
                         return fail_after_checkpoint(catchup.error);
+                    device_batch_outcome_for_transaction = device_outcome;
 
                     for (size_t i = 0;
                          i < catchup.verifier_tokens.size() &&
@@ -4132,19 +4135,50 @@ namespace llaminar2
             }
             const int32_t verifier_base_cached_tokens =
                 static_cast<int32_t>(verifier_base_checkpoint.cached_tokens);
-            MTPSpecTransactionBatchPlan transaction_plan =
-                deferred_accepted_outcome.has_value()
-                    ? buildMTPSpecTransactionBatchPlanFromAcceptedOutcome(
-                          metadata_shape,
-                          *deferred_accepted_outcome,
-                          verifier_base_cached_tokens)
-                    : buildMTPSpecTransactionBatchPlanFromGreedyCatchup(
-                          metadata_shape,
-                          /*request_id=*/0,
-                          vocab,
-                          catchup_request,
-                          catchup,
-                          verifier_base_cached_tokens);
+            MTPSpecTransactionBatchPlan transaction_plan;
+            if (device_batch_outcome_for_transaction.has_value())
+            {
+                /*
+                 * Device stochastic verification has already reduced the row
+                 * decisions into accepted counts and committed tokens.  Route
+                 * that compact outcome through the same batched transaction
+                 * driver that future request scheduling will use.
+                 */
+                const std::vector<int> request_ids{0};
+                const std::vector<MTPDecodeCatchupGreedyRequest> requests{
+                    catchup_request};
+                const std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes{
+                    *device_batch_outcome_for_transaction};
+                const std::vector<int32_t> base_cached_tokens{
+                    verifier_base_cached_tokens};
+                transaction_plan =
+                    buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+                        metadata_shape,
+                        request_ids,
+                        vocab,
+                        requests,
+                        device_outcomes,
+                        base_cached_tokens);
+            }
+            else if (deferred_accepted_outcome.has_value())
+            {
+                transaction_plan =
+                    buildMTPSpecTransactionBatchPlanFromAcceptedOutcome(
+                        metadata_shape,
+                        *deferred_accepted_outcome,
+                        verifier_base_cached_tokens);
+            }
+            else
+            {
+                transaction_plan =
+                    buildMTPSpecTransactionBatchPlanFromGreedyCatchup(
+                        metadata_shape,
+                        /*request_id=*/0,
+                        vocab,
+                        catchup_request,
+                        catchup,
+                        verifier_base_cached_tokens);
+            }
             if (!transaction_plan.ok)
             {
                 return fail_after_checkpoint(

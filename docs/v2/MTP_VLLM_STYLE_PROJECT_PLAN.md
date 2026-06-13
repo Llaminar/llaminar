@@ -1836,6 +1836,17 @@ Status:
   the real CPU `DeviceGraphOrchestrator` verifier graph, including paired
   all-position/row-indexed mode ownership. Focused gate:
   `V2_Unit_MTPGraphConstruction`.
+- Device-reduced stochastic outcomes now feed the same request-batched
+  transaction driver. `buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes()`
+  validates compact CUDA/ROCm-style outcomes against request shapes, converts
+  them to accepted-count metadata, and produces the same flattened
+  commit/publication/step plans as greedy catch-up. Focused gate:
+  `V2_Unit_MTPSpecStateContract`.
+- The live single-request GPU stochastic path now consumes that device-outcome
+  transaction helper instead of rebuilding accepted outcomes locally. This
+  keeps today's request-1 publication semantics on the same code path future
+  request-batched scheduling will use. Focused gate:
+  `V2_Unit_PrefillDecodeTransition`.
 - Qwen35/Qwen36 MTP sidecar graph construction now allows bounded one-token
   request batches. The graph still rejects more than four total MTP rows,
   non-KV full sidecars with `seq_len != 1`, and multi-token catchup shapes

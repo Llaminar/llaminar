@@ -441,6 +441,110 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedAcceptedOutcomePl
     EXPECT_TRUE(second.requiresCorrectionReplay());
 }
 
+TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedDeviceRejectionOutcomePlan)
+{
+    MTPDecodeCatchupGreedyRequest accept_all_request;
+    accept_all_request.draft_tokens = {7, 9, 8};
+
+    MTPDeviceRejectionBatchOutcome accept_all;
+    accept_all.ok = true;
+    accept_all.output_tokens[0] = 7;
+    accept_all.output_tokens[1] = 9;
+    accept_all.output_tokens[2] = 8;
+    accept_all.output_token_count = 3;
+    accept_all.accepted_speculative_prefix = 2;
+    accept_all.target_verifier_state_commit_count = 3;
+    accept_all.ready_token = 4;
+    accept_all.all_speculative_accepted = true;
+    accept_all.consumed_verifier_rows = 2;
+    accept_all.sampled_terminal = true;
+
+    MTPDecodeCatchupGreedyRequest reject_after_first_request;
+    reject_after_first_request.draft_tokens = {11, 12, 13};
+
+    MTPDeviceRejectionBatchOutcome reject_after_first;
+    reject_after_first.ok = true;
+    reject_after_first.output_tokens[0] = 11;
+    reject_after_first.output_tokens[1] = 77;
+    reject_after_first.output_token_count = 2;
+    reject_after_first.accepted_speculative_prefix = 0;
+    reject_after_first.target_verifier_state_commit_count = 1;
+    reject_after_first.ready_token = -1;
+    reject_after_first.rejected_verified_token = 77;
+    reject_after_first.all_speculative_accepted = false;
+    reject_after_first.consumed_verifier_rows = 1;
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+            shape,
+            /*request_ids=*/{10, 11},
+            /*vocab_size=*/100,
+            {accept_all_request, reject_after_first_request},
+            {accept_all, reject_after_first},
+            /*base_cached_tokens=*/{100, 200});
+
+    ASSERT_TRUE(plan.ok) << plan.error;
+    EXPECT_EQ(plan.request_count, 2);
+    EXPECT_EQ(plan.metadata.total_target_query_tokens, 8)
+        << "both requests keep padded draft+bonus rows in one verifier batch";
+    EXPECT_THAT(plan.metadata.valid_sampled_counts, ElementsAre(4, 2));
+    EXPECT_THAT(plan.metadata.accepted_draft_prefixes, ElementsAre(3, 1));
+    EXPECT_THAT(plan.metadata.committed_output_counts, ElementsAre(3, 2));
+    EXPECT_THAT(plan.metadata.target_verifier_state_commit_counts,
+                ElementsAre(3, 1));
+    EXPECT_THAT(plan.metadata.next_condition_tokens, ElementsAre(4, 77));
+    EXPECT_THAT(plan.publication_plan.target_cached_tokens,
+                ElementsAre(103, 201));
+    ASSERT_THAT(plan.step_plans.steps, SizeIs(2));
+
+    const MTPSpecStepPlan &first = plan.step_plans.steps[0];
+    EXPECT_EQ(first.request_id, 10);
+    EXPECT_EQ(first.accepted_count, 3);
+    EXPECT_EQ(first.accepted_state_slot_index, 2);
+    EXPECT_EQ(first.bonus_ready_state_slot_index, 3);
+    EXPECT_TRUE(first.all_drafts_accepted);
+    EXPECT_FALSE(first.requiresCorrectionReplay());
+
+    const MTPSpecStepPlan &second = plan.step_plans.steps[1];
+    EXPECT_EQ(second.request_id, 11);
+    EXPECT_EQ(second.accepted_count, 1);
+    EXPECT_EQ(second.accepted_state_slot_index, 4);
+    EXPECT_EQ(second.correction_replay_start_index, 1);
+    EXPECT_EQ(second.correction_replay_count, 1);
+    EXPECT_TRUE(second.requiresCorrectionReplay());
+}
+
+TEST(Test__MTPSpecStateContract, TransactionDriverRejectsInvalidDeviceRejectionOutcome)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9};
+
+    MTPDeviceRejectionBatchOutcome invalid;
+    invalid.ok = true;
+    invalid.output_token_count = 0;
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 2;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+            shape,
+            /*request_ids=*/{10},
+            /*vocab_size=*/100,
+            {request},
+            {invalid},
+            /*base_cached_tokens=*/{100});
+
+    EXPECT_FALSE(plan.ok);
+    EXPECT_THAT(plan.error, HasSubstr("outcome 0 failed"));
+    EXPECT_THAT(plan.error, HasSubstr("token count"));
+}
+
 TEST(Test__MTPSpecStateContract, TransactionDriverRejectsBaseCacheCountMismatch)
 {
     MTPSpecDecodeAcceptedOutcome outcome;

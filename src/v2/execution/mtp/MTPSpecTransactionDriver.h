@@ -1,6 +1,7 @@
 #pragma once
 
 #include "MTPDecodeCatchup.h"
+#include "MTPRejectionSampler.h"
 #include "MTPSpecDecodeMetadata.h"
 #include "MTPSpecStateContract.h"
 
@@ -57,6 +58,24 @@ namespace llaminar2
         const MTPSpecDecodeMetadataShape &shape,
         const MTPSpecDecodeAcceptedOutcome &outcome,
         int32_t base_cached_tokens);
+
+    /**
+     * @brief Build a transaction plan from device-reduced stochastic outcomes.
+     *
+     * GPU stochastic verification should reduce each request to an accepted
+     * count, committed output tokens, and an optional bonus-ready token before
+     * the host sees the result.  This helper validates those compact outcomes
+     * against the original request shapes, converts them to
+     * `MTPSpecDecodeAcceptedOutcome`, and then uses the same padded
+     * metadata/publication planner as every other vLLM-style path.
+     */
+    MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<int> &request_ids,
+        int vocab_size,
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<MTPDeviceRejectionBatchOutcome> &device_outcomes,
+        const std::vector<int32_t> &base_cached_tokens);
 
     /**
      * @brief Build a publication-ready transaction plan from greedy catch-up.

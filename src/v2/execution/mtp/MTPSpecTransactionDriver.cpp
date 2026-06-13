@@ -1,5 +1,6 @@
 #include "MTPSpecTransactionDriver.h"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -72,6 +73,14 @@ namespace llaminar2
             plan.ok = true;
             return plan;
         }
+
+        MTPSpecTransactionBatchPlan transactionPlanFailure(std::string reason)
+        {
+            MTPSpecTransactionBatchPlan plan;
+            plan.ok = false;
+            plan.error = std::move(reason);
+            return plan;
+        }
     } // namespace
 
     MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromAcceptedOutcomes(
@@ -93,6 +102,96 @@ namespace llaminar2
             shape,
             std::vector<MTPSpecDecodeAcceptedOutcome>{outcome},
             std::vector<int32_t>{base_cached_tokens});
+    }
+
+    MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<int> &request_ids,
+        int vocab_size,
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<MTPDeviceRejectionBatchOutcome> &device_outcomes,
+        const std::vector<int32_t> &base_cached_tokens)
+    {
+        if (!shape.valid())
+            return transactionPlanFailure(
+                "MTP device rejection transaction has invalid metadata shape");
+        if (requests.empty())
+            return transactionPlanFailure(
+                "MTP device rejection transaction has no requests");
+        if (request_ids.size() != requests.size())
+            return transactionPlanFailure(
+                "MTP device rejection transaction request-id vector mismatch");
+        if (device_outcomes.size() != requests.size())
+            return transactionPlanFailure(
+                "MTP device rejection transaction outcome vector mismatch");
+        if (base_cached_tokens.size() != requests.size())
+            return transactionPlanFailure(
+                "MTP device rejection transaction base-cache vector mismatch");
+        if (static_cast<int>(requests.size()) > shape.max_requests)
+            return transactionPlanFailure(
+                "MTP device rejection transaction exceeds max_requests");
+
+        std::vector<MTPSpecDecodeAcceptedOutcome> accepted_outcomes;
+        accepted_outcomes.reserve(requests.size());
+        for (size_t i = 0; i < requests.size(); ++i)
+        {
+            const MTPDecodeCatchupGreedyRequest &request = requests[i];
+            if (request.draft_tokens.empty())
+            {
+                return transactionPlanFailure(
+                    "MTP device rejection transaction request has no draft tokens");
+            }
+            if (static_cast<int>(request.draft_tokens.size()) >
+                shape.max_draft_tokens)
+            {
+                return transactionPlanFailure(
+                    "MTP device rejection transaction request exceeds max_draft_tokens");
+            }
+
+            /*
+             * Device kernels already decide the stochastic rows.  Re-summarize
+             * the compact result on the host so every backend gets the same
+             * bounds checks before live state publication is planned.
+             */
+            MTPRejectionBatchOutcome outcome =
+                summarizeDeviceMTPRejectionBatchOutcome(
+                    request,
+                    device_outcomes[i]);
+            if (!outcome.ok)
+            {
+                return transactionPlanFailure(
+                    std::string("MTP device rejection outcome ") +
+                    std::to_string(i) + " failed: " + outcome.error);
+            }
+
+            const int draft_count =
+                static_cast<int>(request.draft_tokens.size());
+            MTPSpecDecodeAcceptedOutcome accepted;
+            accepted.request_id = request_ids[i];
+            accepted.vocab_size = vocab_size;
+            accepted.draft_count = draft_count;
+            accepted.committed_output_tokens = std::move(outcome.output_tokens);
+            if (!outcome.stopped_on_output &&
+                outcome.all_speculative_accepted &&
+                outcome.ready_token >= 0)
+            {
+                accepted.bonus_ready_token = outcome.ready_token;
+            }
+            accepted.accepted_verifier_input_prefix =
+                std::min(
+                    draft_count,
+                    std::max(0, outcome.accepted_speculative_prefix) + 1);
+            accepted.target_verifier_state_commit_count =
+                outcome.target_verifier_state_commit_count;
+            accepted.all_drafts_accepted = outcome.all_speculative_accepted;
+            accepted.stopped_on_output = outcome.stopped_on_output;
+            accepted_outcomes.push_back(std::move(accepted));
+        }
+
+        return buildMTPSpecTransactionBatchPlanFromAcceptedOutcomes(
+            shape,
+            accepted_outcomes,
+            base_cached_tokens);
     }
 
     MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromGreedyCatchup(
