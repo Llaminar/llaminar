@@ -513,10 +513,41 @@ namespace llaminar2
 
         auto start = std::chrono::high_resolution_clock::now();
 
-        bool success = runner_->forward(tokens.data(), tokens.size());
+        bool success = false;
+        if (decode_request_batch_ > 1)
+        {
+            const int request_batch = decode_request_batch_;
+            if (!runner_->supportsPrefillBatchForBenchmark(request_batch))
+            {
+                last_failure_reason_ =
+                    "request-batched benchmark prefill unsupported by runner; "
+                    "real Phase 8 MTP batching must initialize every request slot";
+            }
+            else
+            {
+                /*
+                 * Benchmark mode intentionally uses the same prompt for every
+                 * logical request. The point of this lane is not prompt mix
+                 * realism yet; it is to prove that request-batched MTP measures
+                 * real independent request slots rather than silently reusing
+                 * request 0 state.
+                 */
+                std::vector<std::vector<int>> token_batches(
+                    static_cast<size_t>(request_batch), tokens);
+                success = runner_->prefillBatchForBenchmark(token_batches);
+                if (!success && last_failure_reason_.empty())
+                    last_failure_reason_ = "request-batched benchmark prefill failed";
+            }
 
-        // Synchronize after forward and propagate failures to every rank.
-        success = synchronizeSuccess(success, "prefill");
+            success = synchronizeSuccess(success, "request-batched prefill");
+        }
+        else
+        {
+            success = runner_->forward(tokens.data(), tokens.size());
+
+            // Synchronize after forward and propagate failures to every rank.
+            success = synchronizeSuccess(success, "prefill");
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();

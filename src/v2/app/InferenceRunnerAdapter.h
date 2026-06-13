@@ -28,6 +28,9 @@ namespace llaminar2
 
         // Core inference
         bool forward(const int *tokens, int seq_len) override;
+        bool supportsPrefillBatchForBenchmark(int request_batch) const override;
+        bool prefillBatchForBenchmark(
+            const std::vector<std::vector<int>> &token_batches) override;
         const float *logits() const override;
         int vocab_size() const override;
         void clear_cache() override;

@@ -878,6 +878,34 @@ namespace llaminar2
         }
 
         /**
+         * @brief Whether this runner can initialize a benchmark request batch.
+         *
+         * Request-batched MTP decode requires every logical request slot to own
+         * valid prompt KV/state before decode begins. BenchmarkRunner checks
+         * this capability before using `prefillBatchForBenchmark()` so a
+         * request-batched lane cannot accidentally measure request 0 only.
+         */
+        virtual bool supportsPrefillBatchForBenchmark(int request_batch) const
+        {
+            (void)request_batch;
+            return false;
+        }
+
+        /**
+         * @brief Initialize a benchmark request batch with padded prefill.
+         *
+         * `token_batches[i]` is the prompt for logical request `i`. The default
+         * implementation is unsupported because high-level request ownership
+         * must opt in explicitly.
+         */
+        virtual bool prefillBatchForBenchmark(
+            const std::vector<std::vector<int>> &token_batches)
+        {
+            (void)token_batches;
+            return false;
+        }
+
+        /**
          * @brief Get logits for a specific sequence in batch
          *
          * Returns logits for the specified sequence index.

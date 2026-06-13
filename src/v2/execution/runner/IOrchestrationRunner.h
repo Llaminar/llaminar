@@ -148,6 +148,34 @@ namespace llaminar2
         virtual bool prefill(const std::vector<int32_t> &tokens) = 0;
 
         /**
+         * @brief Whether prefillBatch() is implemented for this runner.
+         *
+         * A request-batched decode lane is valid only if every request slot has
+         * been initialized through the same ownership layer. This capability is
+         * intentionally separate from prefill() to avoid loops that mutate a
+         * single live request repeatedly.
+         */
+        virtual bool supportsPrefillBatch(int request_batch) const
+        {
+            (void)request_batch;
+            return false;
+        }
+
+        /**
+         * @brief Prefill a logical request batch.
+         *
+         * `token_batches[i]` is the prompt for logical request `i`.
+         * Implementations must initialize independent KV/state slots and leave
+         * all requests ready for a later decodeStepBatch() call.
+         */
+        virtual bool prefillBatch(
+            const std::vector<std::vector<int32_t>> &token_batches)
+        {
+            (void)token_batches;
+            return false;
+        }
+
+        /**
          * @brief Decode step: generate next token
          *
          * Generates a single token using the current KV cache state.

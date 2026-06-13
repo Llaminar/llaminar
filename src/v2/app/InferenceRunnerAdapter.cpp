@@ -22,6 +22,37 @@ namespace llaminar2
         return result;
     }
 
+    bool InferenceRunnerAdapter::supportsPrefillBatchForBenchmark(int request_batch) const
+    {
+        return orch_runner_ != nullptr && orch_runner_->supportsPrefillBatch(request_batch);
+    }
+
+    bool InferenceRunnerAdapter::prefillBatchForBenchmark(
+        const std::vector<std::vector<int>> &token_batches)
+    {
+        if (!orch_runner_)
+            return false;
+
+        std::vector<std::vector<int32_t>> converted;
+        converted.reserve(token_batches.size());
+        for (const std::vector<int> &tokens : token_batches)
+        {
+            converted.emplace_back(tokens.begin(), tokens.end());
+        }
+
+        const bool result = orch_runner_->prefillBatch(converted);
+        if (result && !converted.empty())
+        {
+            /*
+             * BenchmarkRunner does not use get_position() for request-batched
+             * decode accounting, but keep the adapter position meaningful for
+             * request 0 diagnostics.
+             */
+            position_ += static_cast<int>(converted.front().size());
+        }
+        return result;
+    }
+
     const float *InferenceRunnerAdapter::logits() const
     {
         return orch_runner_->lastLogits();

@@ -25,6 +25,7 @@
 using namespace llaminar2;
 using namespace llaminar2::test;
 using ::testing::_;
+using ::testing::Invoke;
 using ::testing::Return;
 
 namespace
@@ -225,6 +226,19 @@ namespace
     public:
         bool supportsDecodeStep() const override { return true; }
 
+        bool supportsPrefillBatchForBenchmark(int request_batch) const override
+        {
+            return request_batch > 1 && request_batch <= max_request_batch_;
+        }
+
+        bool prefillBatchForBenchmark(
+            const std::vector<std::vector<int>> &token_batches) override
+        {
+            ++batch_prefill_calls_;
+            last_prefill_batch_ = static_cast<int>(token_batches.size());
+            return !token_batches.empty();
+        }
+
         bool supportsDecodeStepBatchForBenchmark(int request_batch) const override
         {
             return request_batch > 1 && request_batch <= max_request_batch_;
@@ -287,8 +301,10 @@ namespace
         }
 
         int singleDecodeStepCalls() const { return single_decode_step_calls_; }
+        int batchPrefillCalls() const { return batch_prefill_calls_; }
         int batchDecodeStepCalls() const { return batch_decode_step_calls_; }
         int maintenanceCalls() const { return maintenance_calls_; }
+        int lastPrefillBatch() const { return last_prefill_batch_; }
         int lastRequestBatch() const { return last_request_batch_; }
         bool samplingParamsSet() const { return sampling_params_set_; }
         const SamplingParams &lastSamplingParams() const { return last_sampling_params_; }
@@ -296,13 +312,40 @@ namespace
     private:
         static constexpr int max_request_batch_ = 8;
         int decode_step_budget_ = 0;
+        int batch_prefill_calls_ = 0;
         int single_decode_step_calls_ = 0;
         int batch_decode_step_calls_ = 0;
         int maintenance_calls_ = 0;
+        int last_prefill_batch_ = 0;
         int last_request_batch_ = 0;
         std::vector<int> emitted_by_request_;
         bool sampling_params_set_ = false;
         SamplingParams last_sampling_params_;
+    };
+
+    class MockBatchPrefillOnlyRunner : public MockOrchestratedDecodeRunner
+    {
+    public:
+        bool supportsPrefillBatchForBenchmark(int request_batch) const override
+        {
+            return request_batch > 1 && request_batch <= max_request_batch_;
+        }
+
+        bool prefillBatchForBenchmark(
+            const std::vector<std::vector<int>> &token_batches) override
+        {
+            ++batch_prefill_calls_;
+            last_prefill_batch_ = static_cast<int>(token_batches.size());
+            return !token_batches.empty();
+        }
+
+        int batchPrefillCalls() const { return batch_prefill_calls_; }
+        int lastPrefillBatch() const { return last_prefill_batch_; }
+
+    private:
+        static constexpr int max_request_batch_ = 8;
+        int batch_prefill_calls_ = 0;
+        int last_prefill_batch_ = 0;
     };
 
     class MockMeasuredMTPStatsRunner : public MockOrchestratedDecodeRunner
@@ -629,9 +672,13 @@ TEST(Test__BenchmarkRunnerCPU, UsesRequestBatchedDecodeStepWhenMTPBatchRequested
         << "Request-batched decode reports aggregate generated tokens across requests";
     EXPECT_THAT(result.generated_token_ids, ::testing::ElementsAre(100, 101, 102))
         << "Human-readable generated tokens stay request-0 only";
+    EXPECT_EQ(runner->lastPrefillBatch(), 2);
     EXPECT_EQ(runner->lastRequestBatch(), 2);
+    EXPECT_GT(runner->batchPrefillCalls(), 0);
     EXPECT_GT(runner->batchDecodeStepCalls(), 0);
     EXPECT_GT(runner->maintenanceCalls(), 0);
+    EXPECT_EQ(runner->forwardCount(), 0)
+        << "Request-batched benchmark must not prefill only request 0";
     EXPECT_EQ(runner->singleDecodeStepCalls(), 0)
         << "max_request_batch > 1 must not silently fall through to single-request decode";
     ASSERT_TRUE(runner->samplingParamsSet());
@@ -640,9 +687,36 @@ TEST(Test__BenchmarkRunnerCPU, UsesRequestBatchedDecodeStepWhenMTPBatchRequested
     EXPECT_EQ(runner->lastSamplingParams().top_p, 0.9f);
 }
 
-TEST(Test__BenchmarkRunnerCPU, FailsRequestBatchedDecodeWhenRunnerDoesNotOptIn)
+TEST(Test__BenchmarkRunnerCPU, FailsRequestBatchedPrefillWhenRunnerDoesNotOptIn)
 {
     auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 2;
+    config.mtp.enabled = true;
+    config.mtp.max_request_batch = 2;
+
+    auto result = bench.run(config);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_FALSE(result.prefill_success);
+    EXPECT_FALSE(result.decode_success);
+    EXPECT_NE(result.failure_reason.find("request-batched benchmark prefill unsupported"),
+              std::string::npos);
+    EXPECT_EQ(runner->forwardCount(), 0)
+        << "Unsupported request batching must hard-fail before single-request prefill";
+    EXPECT_EQ(runner->decodeStepCalls(), 0)
+        << "Unsupported request batching must fail before decode starts";
+}
+
+TEST(Test__BenchmarkRunnerCPU, FailsRequestBatchedDecodeWhenRunnerDoesNotOptIn)
+{
+    auto runner = std::make_shared<MockBatchPrefillOnlyRunner>();
     auto tokenizer = createMockTokenizer();
     auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
@@ -660,6 +734,8 @@ TEST(Test__BenchmarkRunnerCPU, FailsRequestBatchedDecodeWhenRunnerDoesNotOptIn)
     EXPECT_FALSE(result.decode_success);
     EXPECT_NE(result.failure_reason.find("request-batched benchmark decode unsupported"),
               std::string::npos);
+    EXPECT_GT(runner->batchPrefillCalls(), 0);
+    EXPECT_EQ(runner->lastPrefillBatch(), 2);
     EXPECT_EQ(runner->decodeStepCalls(), 0)
         << "Unsupported request batching must hard-fail instead of measuring request-count one";
 }
@@ -672,6 +748,19 @@ TEST(Test__BenchmarkRunnerCPU, AdapterForwardsRequestBatchedDecodeContract)
     EXPECT_CALL(orch, supportsDecodeStepBatch(3))
         .WillOnce(::testing::Return(true));
     EXPECT_TRUE(adapter.supportsDecodeStepBatchForBenchmark(3));
+
+    EXPECT_CALL(orch, supportsPrefillBatch(2))
+        .WillOnce(::testing::Return(true));
+    EXPECT_TRUE(adapter.supportsPrefillBatchForBenchmark(2));
+
+    EXPECT_CALL(orch, prefillBatch(_))
+        .WillOnce(Invoke([](const std::vector<std::vector<int32_t>> &token_batches) {
+            EXPECT_THAT(token_batches, ::testing::ElementsAre(
+                                          ::testing::ElementsAre(1, 2),
+                                          ::testing::ElementsAre(3, 4)));
+            return true;
+        }));
+    EXPECT_TRUE(adapter.prefillBatchForBenchmark({{1, 2}, {3, 4}}));
 
     GenerationResult first;
     first.tokens = {11, 12};

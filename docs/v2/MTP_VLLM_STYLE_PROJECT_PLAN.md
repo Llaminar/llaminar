@@ -1942,22 +1942,23 @@ Status:
   Live decode still hard-fails `max_request_batch > 1` until the request owner
   is wired, but graph/state capacity can no longer be silently under-sized.
   Focused gate: `V2_Unit_PrefixMTPConfig`.
-- Benchmark decode now has an explicit request-batched runner contract.
-  `IInferenceRunner` exposes `supportsDecodeStepBatchForBenchmark()` and
-  `decodeBatchStepForBenchmark()`, and `BenchmarkRunner` uses that path whenever
-  enabled MTP requests `max_request_batch > 1`. The benchmark treats
+- Benchmark prefill/decode now has an explicit request-batched runner contract.
+  `IInferenceRunner` exposes `supportsPrefillBatchForBenchmark()`,
+  `prefillBatchForBenchmark()`, `supportsDecodeStepBatchForBenchmark()`, and
+  `decodeBatchStepForBenchmark()`, and `BenchmarkRunner` uses those paths
+  whenever enabled MTP requests `max_request_batch > 1`. The benchmark treats
   `n_predict` as a per-request target, reports aggregate emitted tokens across
   the admitted batch, and keeps request-0 text/tokens only for compact human
-  inspection. Runners that only support single-request decode hard-fail instead
-  of producing fake batched measurements. Focused gate:
-  `V2_Unit_BenchmarkRunnerCPU`.
-- The request-batched benchmark path now has a matching orchestration-level
-  landing zone. `IOrchestrationRunner` exposes `supportsDecodeStepBatch()` and
-  `decodeStepBatch()`, and `InferenceRunnerAdapter` forwards those results into
-  the benchmark contract. The default remains an explicit unsupported result
-  until `OrchestrationRunner` wires the request owner, scheduler, verifier, and
-  publication callbacks into live state. Focused gate:
-  `V2_Unit_BenchmarkRunnerCPU`.
+  inspection. Runners that only support request-0 prefill or single-request
+  decode hard-fail instead of producing fake batched measurements. Focused
+  gate: `V2_Unit_BenchmarkRunnerCPU`.
+- The request-batched benchmark path now has matching orchestration-level
+  landing zones. `IOrchestrationRunner` exposes `supportsPrefillBatch()`,
+  `prefillBatch()`, `supportsDecodeStepBatch()`, and `decodeStepBatch()`, and
+  `InferenceRunnerAdapter` forwards those results into the benchmark contract.
+  The default remains an explicit unsupported result until `OrchestrationRunner`
+  wires the request owner, scheduler, verifier, and publication callbacks into
+  live state. Focused gate: `V2_Unit_BenchmarkRunnerCPU`.
 
 Exit gate:
 

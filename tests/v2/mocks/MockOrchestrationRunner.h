@@ -45,6 +45,8 @@ namespace llaminar2::test
             ON_CALL(*this, lastError()).WillByDefault(testing::ReturnRef(empty_error_));
             ON_CALL(*this, executionPlan()).WillByDefault(testing::ReturnRef(default_plan_));
             ON_CALL(*this, config()).WillByDefault(testing::ReturnRef(default_config_));
+            ON_CALL(*this, supportsPrefillBatch(testing::_)).WillByDefault(testing::Return(false));
+            ON_CALL(*this, prefillBatch(testing::_)).WillByDefault(testing::Return(false));
             ON_CALL(*this, supportsDecodeStepBatch(testing::_)).WillByDefault(testing::Return(false));
             ON_CALL(*this, decodeStepBatch(testing::_))
                 .WillByDefault(testing::Return(GenerationBatchResult{{}, "decodeStepBatch unsupported"}));
@@ -59,6 +61,9 @@ namespace llaminar2::test
 
         // Inference
         MOCK_METHOD(bool, prefill, (const std::vector<int32_t> &tokens), (override));
+        MOCK_METHOD(bool, supportsPrefillBatch, (int request_batch), (const, override));
+        MOCK_METHOD(bool, prefillBatch,
+                    (const std::vector<std::vector<int32_t>> &token_batches), (override));
         MOCK_METHOD(GenerationResult, decodeStep, (), (override));
         MOCK_METHOD(bool, supportsDecodeStepBatch, (int request_batch), (const, override));
         MOCK_METHOD(GenerationBatchResult, decodeStepBatch, (int request_batch), (override));
