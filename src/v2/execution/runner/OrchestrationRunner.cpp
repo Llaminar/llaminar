@@ -4237,8 +4237,8 @@ namespace llaminar2
                     "mtp",
                     "all_position_publish_accepted_state",
                     "decode");
-                if (!runner_->publishAcceptedMTPSpecState(
-                        step,
+                if (!runner_->publishAcceptedMTPSpecStateBatch(
+                        step_plans,
                         &publication_error))
                 {
                     return fail_after_checkpoint(

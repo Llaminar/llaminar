@@ -4210,6 +4210,367 @@ namespace llaminar2
         return true;
     }
 
+    bool RankOrchestrator::publishAcceptedMTPSpecStateBatch(
+        const MTPSpecStepPlanBatch &plans,
+        std::string *error)
+    {
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            if (error)
+                *error = reason;
+            LOG_ERROR("[RankOrchestrator] " << reason);
+            return false;
+        };
+
+        const size_t participant_count =
+            !pp_stage_runners_.empty()
+                ? pp_stage_runners_.size()
+                : device_runners_.size();
+
+        PerfStatsCollector::ScopedTimer total_timer(
+            "mtp",
+            "rank_mtp_spec_state_batch_publication_total",
+            "decode",
+            "rank",
+            {{"participants", std::to_string(participant_count)},
+             {"request_count", std::to_string(plans.request_count)}});
+
+        if (!plans.ok)
+        {
+            return fail("MTP spec-state batch publication received an invalid plan batch: " +
+                        plans.error);
+        }
+        if (plans.request_count <= 0 ||
+            static_cast<int>(plans.steps.size()) != plans.request_count)
+        {
+            return fail("MTP spec-state batch publication received inconsistent request count");
+        }
+
+        auto build_common_batches =
+            [&](size_t count,
+                bool local_pp,
+                std::vector<MTPSpecStepPlanBatch> &out_batches) -> bool
+        {
+            out_batches.assign(count, plans);
+
+            /*
+             * Clamp each logical request independently.  Every participant sees
+             * the same request batch today, but keeping the per-request
+             * common-prefix step here prevents future per-participant state
+             * availability from mutating live state divergently.
+             */
+            for (size_t step_idx = 0; step_idx < plans.steps.size(); ++step_idx)
+            {
+                std::vector<MTPSpecStepPlan> participant_steps(
+                    count,
+                    plans.steps[step_idx]);
+                MTPSpecCommonStepPlan common_plan =
+                    coordinateMTPSpecCommonAcceptedPrefix(participant_steps);
+                if (!common_plan.ok ||
+                    common_plan.clamped_steps.size() != count)
+                {
+                    return fail(
+                        std::string("MTP spec-state batch common-prefix coordination failed: ") +
+                        (common_plan.ok
+                             ? std::string("missing clamped participant plans")
+                             : common_plan.error));
+                }
+                if (common_plan.requires_common_fallback_replay)
+                {
+                    return fail("MTP spec-state batch publication cannot publish divergent participants directly");
+                }
+
+                for (size_t participant = 0; participant < count; ++participant)
+                {
+                    MTPSpecStepPlan clamped_step =
+                        common_plan.clamped_steps[participant];
+                    if (local_pp)
+                    {
+                        /*
+                         * Non-final PP stages own main per-layer state only.
+                         * The final stage owns the sidecar shifted KV cache.
+                         */
+                        clamped_step.publish_mtp_shifted_kv =
+                            participant + 1 == count;
+                    }
+                    out_batches[participant].steps[step_idx] = clamped_step;
+                }
+            }
+            return true;
+        };
+
+        if (!pp_stage_runners_.empty())
+        {
+            std::vector<MTPSpecStepPlanBatch> stage_batches;
+            if (!build_common_batches(
+                    pp_stage_runners_.size(),
+                    /*local_pp=*/true,
+                    stage_batches))
+            {
+                return false;
+            }
+
+            bool all_success = true;
+            std::vector<std::string> child_errors(pp_stage_runners_.size());
+            for (size_t i = 0; i < pp_stage_runners_.size(); ++i)
+            {
+                if (!pp_stage_runners_[i])
+                {
+                    child_errors[i] = "stage runner is unavailable";
+                    all_success = false;
+                    continue;
+                }
+                if (!pp_stage_runners_[i]->supportsMTPSpecStatePublication())
+                {
+                    child_errors[i] =
+                        "stage does not support verifier-state publication";
+                    all_success = false;
+                    continue;
+                }
+                if (!pp_stage_runners_[i]->publishAcceptedMTPSpecStateBatch(
+                        stage_batches[i],
+                        &child_errors[i]))
+                {
+                    all_success = false;
+                }
+            }
+
+            if (!all_success)
+            {
+                for (size_t i = 0; i < child_errors.size(); ++i)
+                {
+                    if (!child_errors[i].empty())
+                    {
+                        std::ostringstream msg;
+                        msg << "PP MTP spec-state batch publication failed on stage "
+                            << i << ": " << child_errors[i];
+                        return fail(msg.str());
+                    }
+                }
+                return fail("PP MTP spec-state batch publication failed on at least one stage");
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mtp_spec_state_batch_publications",
+                1.0,
+                "decode",
+                "rank",
+                {{"topology", "local_pp"},
+                 {"participants", std::to_string(pp_stage_runners_.size())},
+                 {"request_count", std::to_string(plans.request_count)}});
+            return true;
+        }
+
+        if (device_runners_.empty())
+        {
+            return fail("MTP spec-state batch publication requires at least one rank participant");
+        }
+
+        std::vector<MTPSpecStepPlanBatch> participant_batches;
+        if (!build_common_batches(
+                device_runners_.size(),
+                /*local_pp=*/false,
+                participant_batches))
+        {
+            return false;
+        }
+
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            if (!device_runners_[i])
+            {
+                std::ostringstream msg;
+                msg << "MTP spec-state batch publication participant " << i
+                    << " is unavailable";
+                return fail(msg.str());
+            }
+            if (!device_runners_[i]->supportsMTPSpecStatePublication())
+            {
+                std::ostringstream msg;
+                msg << "MTP spec-state batch publication participant " << i
+                    << " does not support verifier-state publication";
+                return fail(msg.str());
+            }
+        }
+
+        if (device_runners_.size() == 1)
+        {
+            return device_runners_[0]->publishAcceptedMTPSpecStateBatch(
+                participant_batches.front(),
+                error);
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            if (tp_ctx_)
+            {
+                tp_worker_pool_->setFailureCallback([this]()
+                                                    {
+                    LOG_WARN("[TPWorkerPool] MTP spec-state batch publication failure detected - aborting collective backend");
+                    tp_ctx_->requestAbort(); });
+            }
+        }
+
+        std::vector<std::string> child_errors(device_runners_.size());
+        auto kernel_phase = KernelProfiler::getCurrentPhase();
+        auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        auto executor_phase = GraphExecutorStats::currentPhase();
+
+        {
+            PerfStatsCollector::ScopedTimer dispatch_timer(
+                "mtp",
+                "rank_mtp_spec_state_batch_publication_dispatch",
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"request_count", std::to_string(plans.request_count)}});
+            tp_worker_pool_->dispatch(
+                [this, &participant_batches, &child_errors, kernel_phase,
+                 rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
+                {
+                    KernelProfiler::setCurrentPhase(kernel_phase);
+                    ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                    CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                    KVCacheProfiler::setCurrentPhase(kv_phase);
+                    GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                    auto device_id = device_runners_[i]->primaryDeviceId();
+                    ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                    CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+
+                    if (debugEnv().tp_collective_contract_trace)
+                    {
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=mtp_spec_state_batch_publication_enter"
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " request_count="
+                                  << participant_batches[i].request_count);
+                    }
+
+                    const bool ok =
+                        device_runners_[i] &&
+                        device_runners_[i]->publishAcceptedMTPSpecStateBatch(
+                            participant_batches[i],
+                            &child_errors[i]);
+
+                    if (debugEnv().tp_collective_contract_trace)
+                    {
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=mtp_spec_state_batch_publication_leave"
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " success=" << (ok ? 1 : 0));
+                    }
+                    return ok;
+                });
+        }
+
+        bool all_success = true;
+        std::exception_ptr first_exception = nullptr;
+        size_t first_exception_device = 0;
+        std::vector<TPWorkerPool::WorkerResult> results;
+        {
+            PerfStatsCollector::ScopedTimer collect_timer(
+                "mtp",
+                "rank_mtp_spec_state_batch_publication_collect",
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"request_count", std::to_string(plans.request_count)}});
+            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+        }
+
+        bool worker_timeout = false;
+        for (auto &r : results)
+        {
+            if (!r.completed)
+            {
+                LOG_ERROR("RankOrchestrator::publishAcceptedMTPSpecStateBatch: Device "
+                          << r.worker_index << " did not complete (stuck)");
+                worker_timeout = true;
+                all_success = false;
+                if (debugEnv().tp_collect_timeout_ms > 0)
+                {
+                    abortAfterTPWorkerTimeout(
+                        "publishAcceptedMTPSpecStateBatch",
+                        debugEnv().tp_collect_timeout_ms,
+                        tp_worker_pool_->completedCount(),
+                        tp_worker_pool_->numWorkers());
+                }
+                if (tp_ctx_)
+                {
+                    LOG_WARN("RankOrchestrator::publishAcceptedMTPSpecStateBatch: requesting TP context abort after worker timeout");
+                    tp_ctx_->requestAbort();
+                }
+                continue;
+            }
+
+            if (r.exception)
+            {
+                all_success = false;
+                if (!first_exception)
+                {
+                    first_exception = r.exception;
+                    first_exception_device = r.worker_index;
+                }
+                continue;
+            }
+
+            if (!r.success)
+            {
+                LOG_ERROR("RankOrchestrator::publishAcceptedMTPSpecStateBatch: Device "
+                          << r.worker_index << " publication failed: "
+                          << child_errors[static_cast<size_t>(r.worker_index)]);
+                all_success = false;
+            }
+        }
+
+        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        {
+            abortAfterTPWorkerTimeout(
+                "publishAcceptedMTPSpecStateBatch",
+                debugEnv().tp_collect_timeout_ms,
+                tp_worker_pool_->completedCount(),
+                tp_worker_pool_->numWorkers());
+        }
+
+        if (first_exception)
+        {
+            LOG_ERROR("RankOrchestrator::publishAcceptedMTPSpecStateBatch: Re-throwing primary exception from device "
+                      << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+
+        if (!all_success)
+        {
+            for (size_t i = 0; i < child_errors.size(); ++i)
+            {
+                if (!child_errors[i].empty())
+                {
+                    std::ostringstream msg;
+                    msg << "MTP spec-state batch publication failed on participant "
+                        << i << ": " << child_errors[i];
+                    return fail(msg.str());
+                }
+            }
+            return fail("MTP spec-state batch publication failed on at least one participant");
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mtp_spec_state_batch_publications",
+            1.0,
+            "decode",
+            "rank",
+            {{"topology", "local_tp"},
+             {"participants", std::to_string(device_runners_.size())},
+             {"request_count", std::to_string(plans.request_count)}});
+        return true;
+    }
+
     const float *RankOrchestrator::getAllPositionLogits() const
     {
         if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())

@@ -1867,6 +1867,15 @@ Status:
   shifted-KV batches still hard-fail before mutation until the scheduler owns
   correction replay for those lanes. Focused gates:
   `V2_Unit_MTPGraphConstruction` and the bounded Phase 8 unit cluster.
+- Live all-position publication now goes through the batch contract end to
+  end for request-count one. `OrchestrationRunner` calls
+  `publishAcceptedMTPSpecStateBatch()`, and `RankOrchestrator` clamps each
+  request through the common-prefix helper before publishing the batch on
+  every LocalTP or LocalPP participant. This removes the side-door single-step
+  publication dependency from the vLLM-style path while keeping unsupported
+  participants as hard failures. Focused gates:
+  `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`, and the
+  bounded Phase 8 unit cluster.
 
 Exit gate:
 

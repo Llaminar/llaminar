@@ -21,19 +21,13 @@ Before a WiP commit, broad units plus touched parity must pass.
   one-hot-q path is structurally aligned. The remaining GPU MoE stochastic
   blocker is single-request target/condition transaction cost, not compact
   sampler table math or bonus deferral.
-- Phase 8 groundwork: accepted outcomes build padded multi-request metadata;
-  a shared batch transaction planner now produces commit/publication step
-  plans and the live runner uses it for the current single-request path.
-  Greedy catch-up now also consumes compact sampled-row request batches and
-  produces one padded publication plan for mixed accept/reject requests; a
-  shared greedy batch executor now runs row-indexed verifier forward, samples
-  compact rows, cleans up graph mode, and returns that plan. The executor is
-  CPU-DGO proven, including all-position/row-indexed mode pairing.
-  Device stochastic outcomes now convert into the same batched transaction
-  plan, and the live GPU path uses it for request-1 accepted-count publication.
-  Compact verifier scratch, explicit graph rows, padded verifier-decode
-  caching, bounded one-token Qwen35/Qwen36 sidecar batches, and padded-row
-  batched spec-state/terminal-hidden publication are unit-proven.
+- Phase 8 groundwork: accepted outcomes build padded request-batch metadata;
+  greedy and stochastic paths share one transaction/publication planner; live
+  request-1 publication now calls the batch publisher through SingleDevice,
+  LocalTP, and LocalPP rank fan-out. Compact verifier scratch, explicit graph
+  rows, padded verifier-decode caching, bounded one-token Qwen35/Qwen36
+  sidecar batches, and padded-row spec-state/terminal-hidden publication are
+  unit-proven.
   `--mtp-max-request-batch` records intent but still hard-fails above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.

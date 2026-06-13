@@ -12,6 +12,7 @@
  * once the implementation is added to the build.
  */
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
@@ -218,6 +219,67 @@ public:
             return false;
         }
         position_ = plan.target_cached_tokens;
+        return true;
+    }
+
+    bool publishAcceptedMTPSpecStateBatch(
+        const MTPSpecStepPlanBatch &plans,
+        std::string *error = nullptr) override
+    {
+        publish_mtp_spec_state_batch_calls_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        last_mtp_spec_state_batch_ = plans;
+        if (mtp_publication_rendezvous_)
+        {
+            std::unique_lock<std::mutex> lock(mtp_publication_rendezvous_->mutex);
+            mtp_publication_rendezvous_->arrivals.fetch_add(1, std::memory_order_acq_rel);
+            mtp_publication_rendezvous_->cv.notify_all();
+            const bool all_arrived = mtp_publication_rendezvous_->cv.wait_for(
+                lock,
+                std::chrono::milliseconds(500),
+                [barrier = mtp_publication_rendezvous_]()
+                {
+                    return barrier->arrivals.load(std::memory_order_acquire) >= barrier->expected;
+                });
+            if (!all_arrived)
+            {
+                if (error)
+                    *error = "mock MTP spec-state batch publication rendezvous timed out";
+                return false;
+            }
+        }
+        if (!supports_mtp_spec_state_publication_)
+        {
+            if (error)
+                *error = "mock MTP spec-state batch publication disabled";
+            return false;
+        }
+        if (!publish_mtp_spec_state_ok_)
+        {
+            if (error)
+                *error = "mock MTP spec-state batch publication failed";
+            return false;
+        }
+        if (!plans.ok ||
+            plans.request_count <= 0 ||
+            static_cast<int>(plans.steps.size()) != plans.request_count)
+        {
+            if (error)
+                *error = "mock MTP spec-state batch publication received invalid plans";
+            return false;
+        }
+
+        /*
+         * The mock owns one scalar position rather than per-request state.
+         * Store the highest target count so tests can still tell that the
+         * published batch, not the stale single-step path, mutated state.
+         */
+        int max_target_cached_tokens = 0;
+        for (const MTPSpecStepPlan &step : plans.steps)
+            max_target_cached_tokens =
+                std::max(max_target_cached_tokens, step.target_cached_tokens);
+        position_ = max_target_cached_tokens;
         return true;
     }
 
@@ -858,6 +920,7 @@ public:
     size_t sample_mtp_logits_call_count() const { return sample_mtp_logits_calls_; }
     size_t commit_mtp_shifted_rows_call_count() const { return commit_mtp_shifted_rows_calls_; }
     size_t publish_mtp_spec_state_call_count() const { return publish_mtp_spec_state_calls_.load(std::memory_order_relaxed); }
+    size_t publish_mtp_spec_state_batch_call_count() const { return publish_mtp_spec_state_batch_calls_.load(std::memory_order_relaxed); }
     int32_t last_mtp_condition_token() const { return last_mtp_condition_token_; }
     int32_t last_chained_mtp_condition_token() const { return last_chained_mtp_condition_token_; }
     int last_chained_mtp_position_id() const { return last_chained_mtp_position_id_; }
@@ -867,6 +930,7 @@ public:
     int last_commit_mtp_position_offset_override() const { return last_commit_mtp_position_offset_override_; }
     const std::vector<int32_t> &last_commit_mtp_tokens() const { return last_commit_mtp_tokens_; }
     const MTPSpecStepPlan &last_mtp_spec_state_plan() const { return last_mtp_spec_state_plan_; }
+    const MTPSpecStepPlanBatch &last_mtp_spec_state_batch() const { return last_mtp_spec_state_batch_; }
     size_t set_all_position_logits_call_count() const { return set_all_position_logits_calls_.load(std::memory_order_relaxed); }
     size_t set_row_indexed_all_position_logits_call_count() const { return set_row_indexed_all_position_logits_calls_.load(std::memory_order_relaxed); }
     size_t set_mtp_spec_verifier_input_plan_call_count() const { return set_mtp_spec_verifier_input_plan_calls_.load(std::memory_order_relaxed); }
@@ -962,6 +1026,7 @@ private:
     int last_commit_mtp_position_offset_override_ = -1;
     bool last_commit_mtp_allow_speculative_discard_ = false;
     MTPSpecStepPlan last_mtp_spec_state_plan_;
+    MTPSpecStepPlanBatch last_mtp_spec_state_batch_;
     MTPSpecDecodeVerifierInputPlan last_mtp_spec_verifier_input_plan_;
     size_t sample_mtp_logits_calls_ = 0;
     size_t commit_mtp_shifted_rows_calls_ = 0;
@@ -1000,6 +1065,7 @@ private:
     mutable std::atomic<size_t> forward_mtp_calls_{0};
     mutable std::atomic<size_t> forward_mtp_from_last_draft_calls_{0};
     mutable std::atomic<size_t> publish_mtp_spec_state_calls_{0};
+    mutable std::atomic<size_t> publish_mtp_spec_state_batch_calls_{0};
     mutable std::atomic<size_t> set_all_position_logits_calls_{0};
     mutable std::atomic<size_t> set_row_indexed_all_position_logits_calls_{0};
     mutable std::atomic<size_t> set_mtp_spec_verifier_input_plan_calls_{0};
@@ -1435,6 +1501,34 @@ static MTPSpecStepPlan makeMTPSpecPublicationPlan(
         plan.bonus_ready_state_slot_index = draft_count;
     }
     return plan;
+}
+
+static MTPSpecStepPlanBatch makeMTPSpecPublicationBatch()
+{
+    MTPSpecStepPlanBatch batch;
+    batch.ok = true;
+    batch.shape.max_requests = 2;
+    batch.shape.max_draft_tokens = 3;
+    batch.request_count = 2;
+
+    MTPSpecStepPlan first =
+        makeMTPSpecPublicationPlan(/*accepted_count=*/2, /*draft_count=*/3);
+    first.request_index = 0;
+    first.request_id = 101;
+    first.base_cached_tokens = 64;
+    first.target_cached_tokens = 66;
+    first.accepted_state_slot_index = 1;
+
+    MTPSpecStepPlan second =
+        makeMTPSpecPublicationPlan(/*accepted_count=*/1, /*draft_count=*/2);
+    second.request_index = 1;
+    second.request_id = 102;
+    second.base_cached_tokens = 80;
+    second.target_cached_tokens = 81;
+    second.accepted_state_slot_index = 4;
+
+    batch.steps = {first, second};
+    return batch;
 }
 
 // =============================================================================
@@ -2328,6 +2422,45 @@ TEST_F(Test__RankOrchestrator, LocalPPAllPositionPublicationRunsOnEveryStage)
     EXPECT_FLOAT_EQ(orchestrator->getAllPositionLogits()[1], 3.0f);
 }
 
+TEST_F(Test__RankOrchestrator, LocalPPBatchPublicationRunsOnEveryStageWithFinalShiftedKV)
+{
+    auto stage0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage0_ptr = stage0.get();
+    stage0_ptr->set_supports_mtp_spec_state_publication(true);
+
+    auto stage1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage1_ptr = stage1.get();
+    stage1_ptr->set_supports_mtp_spec_state_publication(true);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    stages.push_back(std::move(stage0));
+    stages.push_back(std::move(stage1));
+
+    auto orchestrator = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(stages),
+        makeRankConfigForRunnerCount(2));
+
+    MTPSpecStepPlanBatch batch = makeMTPSpecPublicationBatch();
+    std::string error;
+    EXPECT_TRUE(orchestrator->publishAcceptedMTPSpecStateBatch(batch, &error))
+        << error;
+
+    ASSERT_THAT(stage0_ptr->last_mtp_spec_state_batch().steps, ::testing::SizeIs(2));
+    ASSERT_THAT(stage1_ptr->last_mtp_spec_state_batch().steps, ::testing::SizeIs(2));
+    EXPECT_EQ(stage0_ptr->publish_mtp_spec_state_batch_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->publish_mtp_spec_state_batch_call_count(), 1u);
+
+    /*
+     * Pipeline stages all publish their local verifier-captured state, but
+     * only the final stage owns the shifted MTP sidecar KV cache.
+     */
+    EXPECT_FALSE(stage0_ptr->last_mtp_spec_state_batch().steps[0].publish_mtp_shifted_kv);
+    EXPECT_FALSE(stage0_ptr->last_mtp_spec_state_batch().steps[1].publish_mtp_shifted_kv);
+    EXPECT_TRUE(stage1_ptr->last_mtp_spec_state_batch().steps[0].publish_mtp_shifted_kv);
+    EXPECT_TRUE(stage1_ptr->last_mtp_spec_state_batch().steps[1].publish_mtp_shifted_kv);
+}
+
 TEST_F(Test__RankOrchestrator, LocalPPStochasticDeviceHooksDelegateOnlyToFinalStage)
 {
     auto stage0 = std::make_unique<MockDeviceGraphOrchestrator>();
@@ -2753,6 +2886,110 @@ TEST_F(Test__RankOrchestrator, SpecStatePublicationFailureStillAttemptsEveryLoca
     EXPECT_NE(error.find("participant 0"), std::string::npos);
     EXPECT_EQ(runner0_ptr->publish_mtp_spec_state_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->publish_mtp_spec_state_call_count(), 1u);
+}
+
+TEST_F(Test__RankOrchestrator, SpecStateBatchPublicationRequiresEveryLocalTPChildSupport)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_mtp_spec_state_publication(true);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    std::string error;
+    EXPECT_FALSE(orchestrator->publishAcceptedMTPSpecStateBatch(
+        makeMTPSpecPublicationBatch(),
+        &error));
+    EXPECT_NE(error.find("participant 1"), std::string::npos);
+    EXPECT_EQ(runner0_ptr->publish_mtp_spec_state_batch_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->publish_mtp_spec_state_batch_call_count(), 0u);
+}
+
+TEST_F(Test__RankOrchestrator, SpecStateBatchPublicationRunsOnEveryLocalTPChild)
+{
+    auto rendezvous = std::make_shared<MTPPublicationRendezvous>(2);
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_mtp_spec_state_publication(true);
+    runner0_ptr->set_mtp_publication_rendezvous(rendezvous);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_supports_mtp_spec_state_publication(true);
+    runner1_ptr->set_mtp_publication_rendezvous(rendezvous);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    MTPSpecStepPlanBatch batch = makeMTPSpecPublicationBatch();
+    std::string error;
+    EXPECT_TRUE(orchestrator->publishAcceptedMTPSpecStateBatch(batch, &error))
+        << error;
+
+    EXPECT_EQ(rendezvous->arrivals.load(std::memory_order_acquire), 2);
+    EXPECT_EQ(runner0_ptr->publish_mtp_spec_state_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->publish_mtp_spec_state_call_count(), 0u);
+    EXPECT_EQ(runner0_ptr->publish_mtp_spec_state_batch_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->publish_mtp_spec_state_batch_call_count(), 1u);
+    ASSERT_THAT(runner0_ptr->last_mtp_spec_state_batch().steps, ::testing::SizeIs(2));
+    ASSERT_THAT(runner1_ptr->last_mtp_spec_state_batch().steps, ::testing::SizeIs(2));
+    EXPECT_EQ(runner0_ptr->last_mtp_spec_state_batch().request_count, 2);
+    EXPECT_EQ(runner1_ptr->last_mtp_spec_state_batch().request_count, 2);
+    EXPECT_EQ(runner0_ptr->last_mtp_spec_state_batch().steps[0].request_id, 101);
+    EXPECT_EQ(runner0_ptr->last_mtp_spec_state_batch().steps[1].request_id, 102);
+    EXPECT_EQ(runner1_ptr->last_mtp_spec_state_batch().steps[0].accepted_count, 2);
+    EXPECT_EQ(runner1_ptr->last_mtp_spec_state_batch().steps[1].accepted_count, 1);
+    EXPECT_EQ(runner0_ptr->get_position(), 81);
+    EXPECT_EQ(runner1_ptr->get_position(), 81);
+}
+
+TEST_F(Test__RankOrchestrator, SpecStateBatchPublicationFailureStillAttemptsEveryLocalTPChild)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_mtp_spec_state_publication(true);
+    runner0_ptr->set_publish_mtp_spec_state_ok(false);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_supports_mtp_spec_state_publication(true);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    std::string error;
+    EXPECT_FALSE(orchestrator->publishAcceptedMTPSpecStateBatch(
+        makeMTPSpecPublicationBatch(),
+        &error));
+    EXPECT_NE(error.find("participant 0"), std::string::npos);
+    EXPECT_EQ(runner0_ptr->publish_mtp_spec_state_batch_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->publish_mtp_spec_state_batch_call_count(), 1u);
 }
 
 TEST_F(Test__RankOrchestrator, AllPositionLogitToggleRunsOnEveryLocalTPChild)

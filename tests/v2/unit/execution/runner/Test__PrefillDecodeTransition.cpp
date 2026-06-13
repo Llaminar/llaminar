@@ -566,6 +566,42 @@ namespace
             return true;
         }
 
+        bool publishAcceptedMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override
+        {
+            ++publish_mtp_spec_state_batch_count_;
+            last_published_mtp_spec_batch_ = plans;
+            if (!supports_mtp_spec_state_publication_)
+            {
+                if (error)
+                    *error = "mock MTP spec-state publication is disabled";
+                return false;
+            }
+            if (!publish_mtp_spec_state_ok_)
+            {
+                if (error)
+                    *error = "mock MTP spec-state publication failed";
+                return false;
+            }
+            if (!plans.ok || plans.steps.empty())
+            {
+                if (error)
+                    *error = plans.ok
+                                 ? "mock MTP spec-state batch has no steps"
+                                 : plans.error;
+                return false;
+            }
+
+            ++publish_mtp_spec_state_count_;
+            last_published_mtp_spec_step_ = plans.steps.front();
+            position_ = plans.steps.front().target_cached_tokens;
+            all_position_logits_enabled_ = false;
+            row_indexed_all_position_logits_enabled_ = false;
+            row_indexed_all_position_logits_row_count_ = 0;
+            return true;
+        }
+
         bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override
         {
             ++forward_mtp_and_sample_count_;
@@ -1766,9 +1802,17 @@ namespace
         {
             return publish_mtp_spec_state_count_;
         }
+        int publishMTPSpecStateBatchCount() const
+        {
+            return publish_mtp_spec_state_batch_count_;
+        }
         const MTPSpecStepPlan &lastPublishedMTPSpecStep() const
         {
             return last_published_mtp_spec_step_;
+        }
+        const MTPSpecStepPlanBatch &lastPublishedMTPSpecBatch() const
+        {
+            return last_published_mtp_spec_batch_;
         }
 
     private:
@@ -2137,6 +2181,7 @@ namespace
         PrefixStateSnapshot captured_snapshot_;
         PrefixStateSnapshot last_restored_snapshot_;
         MTPSpecStepPlan last_published_mtp_spec_step_;
+        MTPSpecStepPlanBatch last_published_mtp_spec_batch_;
         std::vector<int> last_forward_tokens_;
         std::vector<std::vector<int>> forward_history_;
         std::vector<int> last_commit_mtp_tokens_;
@@ -2157,6 +2202,7 @@ namespace
         mutable size_t captured_checkpoint_script_index_{0};
         int last_forward_seq_len_{0};
         int publish_mtp_spec_state_count_{0};
+        int publish_mtp_spec_state_batch_count_{0};
         int position_{0};
     };
 
@@ -3354,6 +3400,8 @@ namespace
             EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
             EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 3);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 1);
+            EXPECT_EQ(mock->lastPublishedMTPSpecBatch().request_count, 1);
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
                 << "a main-state-preserving sidecar already appended the first shifted MTP row";
             EXPECT_EQ(mock->commitMTPShiftedCount(), 1)

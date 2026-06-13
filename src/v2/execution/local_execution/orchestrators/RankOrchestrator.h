@@ -503,6 +503,18 @@ namespace llaminar2
         bool publishAcceptedMTPSpecState(
             const MTPSpecStepPlan &plan,
             std::string *error = nullptr) override;
+        /**
+         * @brief Publish accepted MTP verifier state for a request batch on
+         *        every LocalTP or LocalPP participant.
+         *
+         * The batch form is the canonical vLLM-style publication contract.  A
+         * rank-level runner must clamp every request to a common accepted
+         * prefix across the topology before any child mutates live KV,
+         * recurrent state, or terminal hidden buffers.
+         */
+        bool publishAcceptedMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
         const float *getAllPositionLogits() const override;
         std::string mtpDecodeUnsupportedReason() const override;
         bool supportsMTPSidecarLogitsStreamHandoff() const override;
