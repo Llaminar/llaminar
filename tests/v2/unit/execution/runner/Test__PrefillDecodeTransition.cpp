@@ -1901,6 +1901,84 @@ namespace
             return true;
         }
 
+        bool verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+            const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override
+        {
+            ++device_distribution_request_batch_outcome_count_;
+            last_request_batch_outcome_request_ids_.clear();
+            last_request_batch_outcome_row_counts_.clear();
+            last_request_batch_outcome_first_target_slots_.clear();
+            last_request_batch_outcome_first_draft_slots_.clear();
+            last_request_batch_outcome_bonus_target_slots_.clear();
+            last_request_batch_outcome_first_tokens_.clear();
+            last_request_batch_outcome_draft_tokens_.clear();
+            last_request_batch_outcome_accept_thresholds_.clear();
+            last_request_batch_outcome_residual_thresholds_.clear();
+            last_request_batch_outcome_bonus_thresholds_.clear();
+            last_request_batch_outcome_inverse_sample_seeds_.clear();
+            last_request_batch_outcome_inverse_sample_first_positions_.clear();
+            if (!requests || request_count <= 0 || !out_handle)
+                return false;
+
+            for (int i = 0; i < request_count; ++i)
+            {
+                last_request_batch_outcome_request_ids_.push_back(
+                    requests[i].request_id);
+                last_request_batch_outcome_row_counts_.push_back(
+                    requests[i].row_count);
+                last_request_batch_outcome_first_target_slots_.push_back(
+                    requests[i].first_target_slot);
+                last_request_batch_outcome_first_draft_slots_.push_back(
+                    requests[i].first_draft_slot);
+                last_request_batch_outcome_bonus_target_slots_.push_back(
+                    requests[i].bonus_target_slot);
+                last_request_batch_outcome_first_tokens_.push_back(
+                    requests[i].first_token);
+                last_request_batch_outcome_bonus_thresholds_.push_back(
+                    requests[i].bonus_threshold);
+                last_request_batch_outcome_inverse_sample_seeds_.push_back(
+                    requests[i].inverse_sample_seed);
+                last_request_batch_outcome_inverse_sample_first_positions_.push_back(
+                    requests[i].inverse_sample_first_logical_position);
+
+                std::vector<int32_t> draft_tokens;
+                std::vector<float> accept_thresholds;
+                std::vector<float> residual_thresholds;
+                draft_tokens.reserve(static_cast<size_t>(requests[i].row_count));
+                accept_thresholds.reserve(static_cast<size_t>(requests[i].row_count));
+                residual_thresholds.reserve(static_cast<size_t>(requests[i].row_count));
+                for (int row = 0; row < requests[i].row_count; ++row)
+                {
+                    draft_tokens.push_back(
+                        requests[i].draft_tokens[static_cast<size_t>(row)]);
+                    accept_thresholds.push_back(
+                        requests[i].accept_thresholds[static_cast<size_t>(row)]);
+                    residual_thresholds.push_back(
+                        requests[i].residual_thresholds[static_cast<size_t>(row)]);
+                }
+                last_request_batch_outcome_draft_tokens_.push_back(
+                    std::move(draft_tokens));
+                last_request_batch_outcome_accept_thresholds_.push_back(
+                    std::move(accept_thresholds));
+                last_request_batch_outcome_residual_thresholds_.push_back(
+                    std::move(residual_thresholds));
+            }
+
+            out_handle->output_tokens_device =
+                resident_output_tokens_.data();
+            out_handle->meta_device = resident_meta_.data();
+            out_handle->request_count = request_count;
+            out_handle->output_token_stride =
+                sampling_math::kSpeculativeBatchMaxOutputTokens;
+            out_handle->meta_stride =
+                sampling_math::kSpeculativeBatchMetaCount;
+            out_handle->device = primary_device_;
+            out_handle->stream = &resident_stream_token_;
+            return out_handle->valid();
+        }
+
         // =====================================================================
         // Test inspection methods
         // =====================================================================
@@ -2882,6 +2960,11 @@ namespace
         std::array<int32_t, 8> device_target_sample_tokens_ = {-1, -1, -1, -1, -1, -1, -1, -1};
         std::array<int32_t, 6> device_draft_sample_tokens_ = {-1, -1, -1, -1, -1, -1};
         std::array<int32_t, 8> device_verifier_input_tokens_ = {-1, -1, -1, -1, -1, -1, -1, -1};
+        std::array<int32_t, sampling_math::kSpeculativeBatchMaxOutputTokens>
+            resident_output_tokens_{};
+        std::array<int, sampling_math::kSpeculativeBatchMetaCount>
+            resident_meta_{};
+        int resident_stream_token_{0};
         const void *last_forward_device_token_ids_{nullptr};
         std::vector<SamplingDistributionEntry> invalid_distribution_;
         size_t verifier_accepted_prefix_script_index_{0};
@@ -3327,6 +3410,102 @@ namespace
         handle.stream = &stream_token;
         handle.meta_stride = sampling_math::kSpeculativeBatchMetaCount - 1;
         EXPECT_FALSE(handle.valid());
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, ScalarResidentOutcomeBuildsOneRequestDescriptor)
+    {
+        MockInferenceRunner runner;
+        runner.setPrimaryDevice(DeviceId::cuda(0));
+        const int32_t draft_tokens[] = {11, 12};
+        const float accept_thresholds[] = {0.25f, 0.50f};
+        const float residual_thresholds[] = {0.75f, 0.90f};
+        const int32_t stop_tokens[] = {2, 3};
+
+        DeviceSpeculativeOutcomeHandle handle;
+        ASSERT_TRUE(runner.verifyStochasticDistributionsBatchOutcomeOnDeviceResident(
+            /*first_target_slot=*/4,
+            /*first_draft_slot=*/7,
+            draft_tokens,
+            accept_thresholds,
+            residual_thresholds,
+            /*row_count=*/2,
+            /*first_token=*/9,
+            stop_tokens,
+            /*stop_token_count=*/2,
+            /*bonus_target_slot=*/6,
+            /*bonus_threshold=*/0.42f,
+            &handle,
+            /*inverse_sample_seed=*/1234,
+            /*inverse_sample_first_logical_position=*/56,
+            /*use_vllm_probability_rejection=*/true));
+
+        EXPECT_TRUE(handle.valid());
+        EXPECT_EQ(handle.device, DeviceId::cuda(0));
+        EXPECT_EQ(handle.request_count, 1);
+        EXPECT_EQ(runner.verifyStochasticRequestBatchOutcomeCount(), 1);
+        EXPECT_THAT(runner.lastRequestBatchOutcomeRequestIds(), ElementsAre(0));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeRowCounts(), ElementsAre(2));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeFirstTargetSlots(), ElementsAre(4));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeFirstDraftSlots(), ElementsAre(7));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeBonusTargetSlots(), ElementsAre(6));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeFirstTokens(), ElementsAre(9));
+        ASSERT_EQ(runner.lastRequestBatchOutcomeDraftTokens().size(), 1u);
+        EXPECT_THAT(runner.lastRequestBatchOutcomeDraftTokens()[0],
+                    ElementsAre(11, 12));
+        ASSERT_EQ(runner.lastRequestBatchOutcomeAcceptThresholds().size(), 1u);
+        EXPECT_THAT(runner.lastRequestBatchOutcomeAcceptThresholds()[0],
+                    ElementsAre(FloatEq(0.25f), FloatEq(0.50f)));
+        ASSERT_EQ(runner.lastRequestBatchOutcomeResidualThresholds().size(), 1u);
+        EXPECT_THAT(runner.lastRequestBatchOutcomeResidualThresholds()[0],
+                    ElementsAre(FloatEq(0.75f), FloatEq(0.90f)));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeBonusThresholds(),
+                    ElementsAre(FloatEq(0.42f)));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeInverseSampleSeeds(),
+                    ElementsAre(1234u));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeInverseSampleFirstPositions(),
+                    ElementsAre(56));
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, DeviceFirstScalarResidentOutcomeBuildsDeviceTokenDescriptor)
+    {
+        MockInferenceRunner runner;
+        runner.setPrimaryDevice(DeviceId::cuda(0));
+        const float accept_thresholds[] = {0.1f};
+        const float residual_thresholds[] = {0.2f};
+
+        DeviceSpeculativeOutcomeHandle handle;
+        ASSERT_TRUE(runner.verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident(
+            /*first_target_slot=*/1,
+            /*first_draft_slot=*/2,
+            /*draft_tokens=*/nullptr,
+            accept_thresholds,
+            residual_thresholds,
+            /*row_count=*/1,
+            /*first_target_sample_slot=*/3,
+            /*stop_tokens=*/nullptr,
+            /*stop_token_count=*/0,
+            /*bonus_target_slot=*/4,
+            /*bonus_threshold=*/0.8f,
+            &handle,
+            /*inverse_sample_seed=*/99,
+            /*inverse_sample_first_logical_position=*/12,
+            /*use_vllm_probability_rejection=*/true));
+
+        EXPECT_TRUE(handle.valid());
+        EXPECT_EQ(runner.verifyStochasticRequestBatchOutcomeCount(), 1);
+        EXPECT_THAT(runner.lastRequestBatchOutcomeFirstTargetSlots(), ElementsAre(1));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeFirstDraftSlots(), ElementsAre(2));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeFirstTokens(), ElementsAre(-1));
+        ASSERT_EQ(runner.lastRequestBatchOutcomeDraftTokens().size(), 1u);
+        EXPECT_THAT(runner.lastRequestBatchOutcomeDraftTokens()[0],
+                    ElementsAre(-1));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeBonusTargetSlots(), ElementsAre(4));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeBonusThresholds(),
+                    ElementsAre(FloatEq(0.8f)));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeInverseSampleSeeds(),
+                    ElementsAre(99u));
+        EXPECT_THAT(runner.lastRequestBatchOutcomeInverseSampleFirstPositions(),
+                    ElementsAre(12));
     }
 
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedMTPContinuationSupportsDepthThree)

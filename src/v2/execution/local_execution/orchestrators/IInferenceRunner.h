@@ -1646,6 +1646,162 @@ namespace llaminar2
         }
 
         /**
+         * @brief Enqueue a single stochastic MTP outcome and keep it device-resident.
+         *
+         * This scalar convenience wrapper preserves the legacy call shape while
+         * routing through the same request-batch resident contract used by the
+         * scheduler-oriented path.  Future publication code can consume the
+         * returned handle directly; compatibility callers should immediately
+         * bridge it with copyDeviceSpeculativeOutcomesToHost().
+         */
+        virtual bool verifyStochasticDistributionsBatchOutcomeOnDeviceResident(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeOutcomeHandle *out_handle,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false)
+        {
+            using namespace sampling_math;
+            if (!accept_thresholds || !residual_thresholds ||
+                row_count <= 0 ||
+                row_count > kSpeculativeBatchMaxRows ||
+                stop_token_count < 0 ||
+                stop_token_count > kSpeculativeBatchMaxStopTokens ||
+                (stop_token_count > 0 && !stop_tokens) ||
+                !out_handle)
+            {
+                return false;
+            }
+
+            DeviceStochasticBatchOutcomeRequest request;
+            request.request_id = 0;
+            request.first_target_slot = first_target_slot;
+            request.first_draft_slot = first_draft_slot;
+            request.row_count = row_count;
+            request.first_token = first_token;
+            request.first_token_from_device = false;
+            request.bonus_target_slot = bonus_target_slot;
+            request.bonus_threshold = bonus_threshold;
+            request.inverse_sample_seed = inverse_sample_seed;
+            request.inverse_sample_first_logical_position =
+                inverse_sample_first_logical_position;
+            request.use_vllm_probability_rejection =
+                use_vllm_probability_rejection;
+            request.use_device_draft_tokens = draft_tokens == nullptr;
+
+            for (int row = 0; row < row_count; ++row)
+            {
+                request.accept_thresholds[static_cast<size_t>(row)] =
+                    accept_thresholds[row];
+                request.residual_thresholds[static_cast<size_t>(row)] =
+                    residual_thresholds[row];
+                if (draft_tokens)
+                {
+                    request.draft_tokens[static_cast<size_t>(row)] =
+                        draft_tokens[row];
+                }
+            }
+            request.stop_token_count = stop_token_count;
+            for (int i = 0; i < stop_token_count; ++i)
+            {
+                request.stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
+            }
+
+            return verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+                &request,
+                /*request_count=*/1,
+                out_handle);
+        }
+
+        /**
+         * @brief Device-first-token resident variant of scalar stochastic MTP outcome.
+         *
+         * The first main-model token remains in a device sample slot.  The
+         * compact summary kernel reads it on the verifier stream and leaves the
+         * accepted-count/output metadata device-resident.
+         */
+        virtual bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeOutcomeHandle *out_handle,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false)
+        {
+            using namespace sampling_math;
+            if (!accept_thresholds || !residual_thresholds ||
+                row_count <= 0 ||
+                row_count > kSpeculativeBatchMaxRows ||
+                first_target_sample_slot < 0 ||
+                stop_token_count < 0 ||
+                stop_token_count > kSpeculativeBatchMaxStopTokens ||
+                (stop_token_count > 0 && !stop_tokens) ||
+                !out_handle)
+            {
+                return false;
+            }
+
+            DeviceStochasticBatchOutcomeRequest request;
+            request.request_id = 0;
+            request.first_target_slot = first_target_slot;
+            request.first_draft_slot = first_draft_slot;
+            request.row_count = row_count;
+            request.first_token = -1;
+            request.first_token_from_device = true;
+            request.first_target_sample_slot = first_target_sample_slot;
+            request.bonus_target_slot = bonus_target_slot;
+            request.bonus_threshold = bonus_threshold;
+            request.inverse_sample_seed = inverse_sample_seed;
+            request.inverse_sample_first_logical_position =
+                inverse_sample_first_logical_position;
+            request.use_vllm_probability_rejection =
+                use_vllm_probability_rejection;
+            request.use_device_draft_tokens = draft_tokens == nullptr;
+
+            for (int row = 0; row < row_count; ++row)
+            {
+                request.accept_thresholds[static_cast<size_t>(row)] =
+                    accept_thresholds[row];
+                request.residual_thresholds[static_cast<size_t>(row)] =
+                    residual_thresholds[row];
+                if (draft_tokens)
+                {
+                    request.draft_tokens[static_cast<size_t>(row)] =
+                        draft_tokens[row];
+                }
+            }
+            request.stop_token_count = stop_token_count;
+            for (int i = 0; i < stop_token_count; ++i)
+            {
+                request.stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
+            }
+
+            return verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+                &request,
+                /*request_count=*/1,
+                out_handle);
+        }
+
+        /**
          * @brief Verify and summarize a logical request batch in one runner call.
          *
          * This is the orchestration-level contract for vLLM-style stochastic

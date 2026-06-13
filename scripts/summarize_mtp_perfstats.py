@@ -247,10 +247,13 @@ def summarize(path: Path | None) -> dict[str, float | int]:
         "all_position_stochastic_device_batch_outcome",
         phase="decode",
     )
-    stochastic_batch_d2h_sync_ms = _sum_total_ms(
+    stochastic_batch_d2h_sync_ms = _sum_total_ms_many(
         records,
         "mtp",
-        "stochastic_batch_summary_d2h_sync",
+        (
+            "stochastic_batch_summary_d2h_sync",
+            "stochastic_request_batch_summary_d2h_sync",
+        ),
         phase="decode",
     )
     greedy_summary_ms = _sum_total_ms(

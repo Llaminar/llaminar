@@ -13660,27 +13660,33 @@ namespace llaminar2
         int inverse_sample_first_logical_position,
         bool use_vllm_probability_rejection)
     {
-        return verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(
-            first_target_slot,
-            first_draft_slot,
-            draft_tokens,
-            accept_thresholds,
-            residual_thresholds,
-            row_count,
-            first_token,
-            /*first_target_sample_slot=*/-1,
-            /*first_token_from_device=*/false,
-            stop_tokens,
-            stop_token_count,
-            bonus_target_slot,
-            bonus_threshold,
-            out,
-            inverse_sample_seed,
-            inverse_sample_first_logical_position,
-            use_vllm_probability_rejection,
-            /*output_request_slot=*/0,
-            /*stream_override=*/nullptr,
-            /*copy_summary_to_host=*/true);
+        /*
+         * Keep the old host-visible scalar API as a compatibility bridge over
+         * the resident outcome contract.  This makes single-request decode and
+         * request-batched decode use one ordering/stream path, and gives Phase
+         * 10 publication work a single device-handle interface to consume.
+         */
+        DeviceSpeculativeOutcomeHandle handle;
+        if (!verifyStochasticDistributionsBatchOutcomeOnDeviceResident(
+                first_target_slot,
+                first_draft_slot,
+                draft_tokens,
+                accept_thresholds,
+                residual_thresholds,
+                row_count,
+                first_token,
+                stop_tokens,
+                stop_token_count,
+                bonus_target_slot,
+                bonus_threshold,
+                &handle,
+                inverse_sample_seed,
+                inverse_sample_first_logical_position,
+                use_vllm_probability_rejection))
+        {
+            return false;
+        }
+        return copyDeviceSpeculativeOutcomesToHost(handle, out);
     }
 
     bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
@@ -13700,27 +13706,27 @@ namespace llaminar2
         int inverse_sample_first_logical_position,
         bool use_vllm_probability_rejection)
     {
-        return verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(
-            first_target_slot,
-            first_draft_slot,
-            draft_tokens,
-            accept_thresholds,
-            residual_thresholds,
-            row_count,
-            /*first_token=*/-1,
-            first_target_sample_slot,
-            /*first_token_from_device=*/true,
-            stop_tokens,
-            stop_token_count,
-            bonus_target_slot,
-            bonus_threshold,
-            out,
-            inverse_sample_seed,
-            inverse_sample_first_logical_position,
-            use_vllm_probability_rejection,
-            /*output_request_slot=*/0,
-            /*stream_override=*/nullptr,
-            /*copy_summary_to_host=*/true);
+        DeviceSpeculativeOutcomeHandle handle;
+        if (!verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident(
+                first_target_slot,
+                first_draft_slot,
+                draft_tokens,
+                accept_thresholds,
+                residual_thresholds,
+                row_count,
+                first_target_sample_slot,
+                stop_tokens,
+                stop_token_count,
+                bonus_target_slot,
+                bonus_threshold,
+                &handle,
+                inverse_sample_seed,
+                inverse_sample_first_logical_position,
+                use_vllm_probability_rejection))
+        {
+            return false;
+        }
+        return copyDeviceSpeculativeOutcomesToHost(handle, out);
     }
 
     bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDevice(

@@ -45,8 +45,10 @@ summary/D2H sync rather than bonus-row work.
 2026-06-13 resident-outcome slice: `DeviceSpeculativeOutcomeHandle` now exposes
 runner-owned compact summary rows on the verifier stream, and the legacy
 request-batch host API is a wrapper over resident enqueue plus explicit copy.
-Current hot-path scalar decode still copies; the next structural win is
-publishing accepted state and feeding the next token from this handle directly.
+Scalar host APIs now use the same one-request resident bridge before copying, so
+all stochastic verifier outcomes have one stream/ownership contract. The next
+structural win is publishing accepted state and feeding the next token from this
+handle directly.
 
 ## Device And Topology Matrix
 

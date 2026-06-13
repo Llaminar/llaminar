@@ -233,6 +233,13 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "stochastic_request_batch_summary_d2h_sync",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 3.0,
+                },
+                {
+                    "domain": "mtp",
                     "name": "all_position_verifier_greedy_device_summary",
                     "phase": "decode",
                     "count": 1,
@@ -401,7 +408,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["sampling_ms"], 41.5)
         self.assertEqual(summary["sampling_enqueue_ms"], 0.5)
         self.assertEqual(summary["stochastic_batch_outcome_ms"], 10.0)
-        self.assertEqual(summary["stochastic_batch_d2h_sync_ms"], 20.0)
+        self.assertEqual(summary["stochastic_batch_d2h_sync_ms"], 23.0)
         self.assertEqual(summary["greedy_summary_ms"], 30.0)
         self.assertEqual(summary["checkpoint_ms"], 6.0)
         self.assertEqual(summary["sidecar_graph_hits"], 7)

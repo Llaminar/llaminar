@@ -2435,9 +2435,12 @@ Current status:
   verifier stream without copying metadata to host. The existing
   `verifyStochasticDistributionsRequestBatchOutcomesOnDevice()` method is now a
   compatibility wrapper over resident enqueue plus
-  `copyDeviceSpeculativeOutcomesToHost()`. This does not yet remove the scalar
-  hot-path D2H boundary; it gives the next publication slice a concrete handle
-  to consume for accepted-state publish and next-token staging.
+  `copyDeviceSpeculativeOutcomesToHost()`. The scalar host-returning stochastic
+  APIs now build a one-request descriptor, enqueue the resident handle, and use
+  the same explicit host bridge, with `V2_Unit_PrefillDecodeTransition` pinning
+  host-first and device-first descriptor construction. This does not yet remove
+  the scalar hot-path D2H boundary; it gives the next publication slice a
+  concrete handle to consume for accepted-state publish and next-token staging.
 - The tuning dashboard has been reshaped into an explicit device/topology
   matrix covering SingleDevice, LocalTP CUDA2, LocalTP ROCm2/ROCm4, LocalPP,
   NodeLocalTP, and ExpertOverlay with RAG columns for dense/MoE and
