@@ -14,9 +14,10 @@ Before a WiP commit, broad units plus touched parity must pass.
 - SingleDevice GPU stochastic matrix:
   `benchmark_results/mtp_vllm_style/20260612T170149Z-gpu-stochastic-vllm-greedyq-c4096-post-moe-workspace/`.
   Dense is speed-positive: CUDA d2 52.6 vs 44.7 tok/s (1.18x), ROCm d1
-  37.0 vs 31.3 tok/s (1.18x). MoE stochastic is speed-red: CUDA best 81.6
-  vs 114.4 tok/s, ROCm best 51.5 vs 68.7 tok/s in
-  `20260612T225841Z-moe-stochastic-gpu-stage-timing`.
+  37.0 vs 31.3 tok/s (1.18x). MoE stochastic is still not accepted. Fresh
+  stage-timed RB=1 (`20260613T_phase10_moe_stochastic_gpu_stage_deep`) has
+  CUDA d3 137.1 vs 138.6 and ROCm d3 84.6 vs 77.7 tok/s, diagnostic only;
+  verifier+condition dominates.
 - vLLM check: bonus sampling is upfront there too; our processed-target,
   one-hot-q path is aligned. The remaining GPU MoE stochastic
   blocker is target/condition transaction cost, not compact
@@ -31,11 +32,10 @@ Before a WiP commit, broad units plus touched parity must pass.
   115.32/69.79. RoPE explicit row metadata is now graph-capture safe on
   CUDA/ROCm; ROCm MoE RB=2 greedy `-n16` passes without segmented-capture
   fallback at 69.29 tok/s. Phase 8 is correctness-green but perf-red.
-- Phase 10 MoE stochastic remains Red. Short RB=2 is rejected; long RB=1 is
-  closer but not accepted: CUDA d3 136.4 vs 138.6 tok/s, ROCm d2 77.0 vs 77.0
-  while dynamic stays 62.0. A generated-policy refresh probe
-  `20260613T_phase10_depth_policy_refresh_rocm_moe_stoch` was rejected too:
-  ROCm dynamic 60.3 vs 77.7 and demoted back to d1. Keep the table unchanged.
+- Phase 10 MoE stochastic remains Red/Amber. RB=2 tests pass, and
+  `RequestBatchedStochasticDepthThreeUsesLogicalPositionDraws` pins scalar RNG
+  positions for batched accept/residual/bonus draws. Poor RB=2 acceptance is now
+  economics/model behavior, not obvious descriptor drift.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.
   LocalTP best d3 55.4 vs 34.1 tok/s (1.62x), dynamic 54.2 (1.59x). LocalPP
@@ -69,9 +69,9 @@ Before a WiP commit, broad units plus touched parity must pass.
 | CPU | Dense 27B | greedy | Green | base 4.7; 5.9/6.0/9.3/6.1 | dynamic shallow |
 | CPU | Dense 27B | stochastic | Green | base 4.46; 5.06/5.78/4.85/5.41 | verifier/condition |
 | CUDA | MoE 35B | greedy | Amber | base 139.2; d1/d2/d3/dyn 129.6/136.6/139.1/146.1 | weak win |
-| CUDA | MoE 35B | stochastic | Red | long base 138.6; 113.2/124.8/136.4/134.1; RB2 best 70.2 | verifier+condition cost |
+| CUDA | MoE 35B | stochastic | Red | diag base 138.6; d2 126.5; d3 137.1; RB2 best 70.2 | verifier+condition cost |
 | ROCm | MoE 35B | greedy | Amber | base 77.0; 79.0/91.5/90.3/86.1 | below dense-class win |
-| ROCm | MoE 35B | stochastic | Red | long base 77.0; 59.9/77.0/74.5/62.0; refresh dyn 60.3 | verifier+condition cost |
+| ROCm | MoE 35B | stochastic | Amber | diag base 77.7; d2 72.2; d3 84.6; refresh dyn 60.3 | verifier+condition cost |
 | CPU | MoE 35B | greedy | Amber | base 17.7; 13.5/13.9/12.4/13.3 | host verifier cost |
 | CPU | MoE 35B | stochastic | Amber | base 17.6; 14.5/13.3/14.1/14.0 | host verifier cost |
 

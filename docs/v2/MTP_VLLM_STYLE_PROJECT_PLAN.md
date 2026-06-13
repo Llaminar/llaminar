@@ -2393,6 +2393,18 @@ Current status:
   demoted back to d1 and reached only 60.3 versus 77.7 tok/s baseline. The
   checked-in generated table therefore remains unchanged; the promoted slice is
   only the trainer grouping/interval regression.
+- Fresh GPU-stage timing for MoE stochastic RB=1
+  (`20260613T_phase10_moe_stochastic_gpu_stage_deep`) shows the remaining
+  economics clearly: CUDA fixed d3 reaches 137.1 versus 138.6 tok/s baseline
+  with 808 ms verifier and 255 ms condition time; ROCm fixed d3 reaches 84.6
+  versus 77.7 tok/s baseline in the instrumented run, but still spends 1287 ms
+  in verifier, 357 ms in condition, and 265 ms in device outcome/D2H summary.
+  This evidence is useful for attribution, not default acceptance, because the
+  run enabled GPU stage timing. The focused unit regression
+  `RequestBatchedStochasticDepthThreeUsesLogicalPositionDraws` now pins RB=2
+  stochastic accept/residual/bonus RNG positions against the scalar contract, so
+  poor request-batch acceptance is no longer treated as an obvious descriptor
+  drift bug.
 - No default-enable proposal is allowed until the active dashboard matrix has
   same-run parity and benchmark evidence for the exact backend/model/sampling
   lanes under consideration.

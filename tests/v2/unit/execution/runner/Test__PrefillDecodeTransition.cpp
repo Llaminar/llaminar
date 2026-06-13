@@ -1773,6 +1773,13 @@ namespace
             last_request_batch_outcome_first_target_slots_.clear();
             last_request_batch_outcome_first_draft_slots_.clear();
             last_request_batch_outcome_bonus_target_slots_.clear();
+            last_request_batch_outcome_first_tokens_.clear();
+            last_request_batch_outcome_draft_tokens_.clear();
+            last_request_batch_outcome_accept_thresholds_.clear();
+            last_request_batch_outcome_residual_thresholds_.clear();
+            last_request_batch_outcome_bonus_thresholds_.clear();
+            last_request_batch_outcome_inverse_sample_seeds_.clear();
+            last_request_batch_outcome_inverse_sample_first_positions_.clear();
             if (!requests || request_count <= 0 || !outcomes)
                 return false;
 
@@ -1788,6 +1795,36 @@ namespace
                     requests[i].first_draft_slot);
                 last_request_batch_outcome_bonus_target_slots_.push_back(
                     requests[i].bonus_target_slot);
+                last_request_batch_outcome_first_tokens_.push_back(
+                    requests[i].first_token);
+                last_request_batch_outcome_bonus_thresholds_.push_back(
+                    requests[i].bonus_threshold);
+                last_request_batch_outcome_inverse_sample_seeds_.push_back(
+                    requests[i].inverse_sample_seed);
+                last_request_batch_outcome_inverse_sample_first_positions_.push_back(
+                    requests[i].inverse_sample_first_logical_position);
+
+                std::vector<int32_t> draft_tokens;
+                std::vector<float> accept_thresholds;
+                std::vector<float> residual_thresholds;
+                draft_tokens.reserve(static_cast<size_t>(requests[i].row_count));
+                accept_thresholds.reserve(static_cast<size_t>(requests[i].row_count));
+                residual_thresholds.reserve(static_cast<size_t>(requests[i].row_count));
+                for (int row = 0; row < requests[i].row_count; ++row)
+                {
+                    draft_tokens.push_back(
+                        requests[i].draft_tokens[static_cast<size_t>(row)]);
+                    accept_thresholds.push_back(
+                        requests[i].accept_thresholds[static_cast<size_t>(row)]);
+                    residual_thresholds.push_back(
+                        requests[i].residual_thresholds[static_cast<size_t>(row)]);
+                }
+                last_request_batch_outcome_draft_tokens_.push_back(
+                    std::move(draft_tokens));
+                last_request_batch_outcome_accept_thresholds_.push_back(
+                    std::move(accept_thresholds));
+                last_request_batch_outcome_residual_thresholds_.push_back(
+                    std::move(residual_thresholds));
             }
 
             if (!IInferenceRunner::
@@ -1972,6 +2009,34 @@ namespace
         const std::vector<int> &lastRequestBatchOutcomeBonusTargetSlots() const
         {
             return last_request_batch_outcome_bonus_target_slots_;
+        }
+        const std::vector<int32_t> &lastRequestBatchOutcomeFirstTokens() const
+        {
+            return last_request_batch_outcome_first_tokens_;
+        }
+        const std::vector<std::vector<int32_t>> &lastRequestBatchOutcomeDraftTokens() const
+        {
+            return last_request_batch_outcome_draft_tokens_;
+        }
+        const std::vector<std::vector<float>> &lastRequestBatchOutcomeAcceptThresholds() const
+        {
+            return last_request_batch_outcome_accept_thresholds_;
+        }
+        const std::vector<std::vector<float>> &lastRequestBatchOutcomeResidualThresholds() const
+        {
+            return last_request_batch_outcome_residual_thresholds_;
+        }
+        const std::vector<float> &lastRequestBatchOutcomeBonusThresholds() const
+        {
+            return last_request_batch_outcome_bonus_thresholds_;
+        }
+        const std::vector<uint64_t> &lastRequestBatchOutcomeInverseSampleSeeds() const
+        {
+            return last_request_batch_outcome_inverse_sample_seeds_;
+        }
+        const std::vector<int> &lastRequestBatchOutcomeInverseSampleFirstPositions() const
+        {
+            return last_request_batch_outcome_inverse_sample_first_positions_;
         }
         int forwardMTPAndSampleCount() const { return forward_mtp_and_sample_count_; }
         int forwardMTPBatchAndSampleCount() const
@@ -2801,6 +2866,13 @@ namespace
         std::vector<int> last_request_batch_outcome_first_target_slots_;
         std::vector<int> last_request_batch_outcome_first_draft_slots_;
         std::vector<int> last_request_batch_outcome_bonus_target_slots_;
+        std::vector<int32_t> last_request_batch_outcome_first_tokens_;
+        std::vector<std::vector<int32_t>> last_request_batch_outcome_draft_tokens_;
+        std::vector<std::vector<float>> last_request_batch_outcome_accept_thresholds_;
+        std::vector<std::vector<float>> last_request_batch_outcome_residual_thresholds_;
+        std::vector<float> last_request_batch_outcome_bonus_thresholds_;
+        std::vector<uint64_t> last_request_batch_outcome_inverse_sample_seeds_;
+        std::vector<int> last_request_batch_outcome_inverse_sample_first_positions_;
         std::vector<std::pair<int, int>> forced_request_batch_rejections_;
         std::vector<int> verifier_accepted_prefix_script_;
         std::vector<int> decode_argmax_script_;
@@ -3384,6 +3456,104 @@ namespace
         EXPECT_EQ(mock->forwardBatchCallCount(), 2)
             << "Ready stochastic bonus tokens should be consumed without "
                "another verifier forward";
+    }
+
+    /**
+     * @brief Pins the scalar-equivalent RNG contract for batched stochastic MTP.
+     *
+     * Request batching must not key accept, residual, or bonus draws by compact
+     * batch row.  Each descriptor handed to the device verifier uses the same
+     * logical-token positions that a standalone request would use, otherwise
+     * RB=2 can pass functional tests while silently changing acceptance rates.
+     */
+    TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticDepthThreeUsesLogicalPositionDraws)
+    {
+        auto [runner, mock] =
+            createSingleDeviceRequestBatchRunner(
+                /*max_request_batch=*/2,
+                /*mtp_draft_tokens=*/3,
+                MTPVerifyMode::SpeculativeSampling);
+        mock->enableStochasticDeviceSampling();
+
+        SamplingParams sampling;
+        sampling.temperature = 0.1f;
+        sampling.top_k = 5;
+        sampling.top_p = 1.0f;
+        sampling.seed = 1234;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefillBatch({{1, 2, 3}, {4, 5}}))
+            << runner->lastError();
+        GenerationBatchResult first = runner->decodeStepBatch(2);
+        ASSERT_TRUE(first.error.empty()) << first.error;
+
+        GenerationBatchResult second = runner->decodeStepBatch(2);
+        ASSERT_TRUE(second.error.empty()) << second.error;
+
+        ASSERT_THAT(mock->lastRequestBatchOutcomeRequestIds(), ElementsAre(0, 1));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeRowCounts(), ElementsAre(3, 3));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTargetSlots(),
+                    ElementsAre(0, 4));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstDraftSlots(),
+                    ElementsAre(0, 3));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeBonusTargetSlots(),
+                    ElementsAre(3, 7));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
+        ASSERT_THAT(mock->lastRequestBatchOutcomeDraftTokens(), SizeIs(2));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeDraftTokens()[0],
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeDraftTokens()[1],
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleSeeds(),
+                    ElementsAre(static_cast<uint64_t>(sampling.seed),
+                                static_cast<uint64_t>(sampling.seed)));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(),
+                    ElementsAre(4, 3));
+
+        auto threshold = [&](int logical_position, int purpose) {
+            return sampling_math::uniform01(
+                static_cast<uint64_t>(sampling.seed),
+                static_cast<uint64_t>(logical_position) * 8u +
+                    static_cast<uint64_t>(purpose));
+        };
+
+        ASSERT_THAT(mock->lastRequestBatchOutcomeAcceptThresholds(), SizeIs(2));
+        ASSERT_THAT(mock->lastRequestBatchOutcomeResidualThresholds(), SizeIs(2));
+        ASSERT_THAT(mock->lastRequestBatchOutcomeBonusThresholds(), SizeIs(2));
+
+        const std::array<int, 3> request0_positions = {4, 5, 6};
+        const std::array<int, 3> request1_positions = {3, 4, 5};
+        for (int row = 0; row < 3; ++row)
+        {
+            EXPECT_NEAR(mock->lastRequestBatchOutcomeAcceptThresholds()[0][row],
+                        threshold(request0_positions[static_cast<size_t>(row)],
+                                  1 /* MTPSpecStochasticDrawPurpose::Accept */),
+                        1e-7f);
+            EXPECT_NEAR(mock->lastRequestBatchOutcomeResidualThresholds()[0][row],
+                        threshold(request0_positions[static_cast<size_t>(row)],
+                                  2 /* MTPSpecStochasticDrawPurpose::Residual */),
+                        1e-7f);
+            EXPECT_NEAR(mock->lastRequestBatchOutcomeAcceptThresholds()[1][row],
+                        threshold(request1_positions[static_cast<size_t>(row)],
+                                  1 /* MTPSpecStochasticDrawPurpose::Accept */),
+                        1e-7f);
+            EXPECT_NEAR(mock->lastRequestBatchOutcomeResidualThresholds()[1][row],
+                        threshold(request1_positions[static_cast<size_t>(row)],
+                                  2 /* MTPSpecStochasticDrawPurpose::Residual */),
+                        1e-7f);
+        }
+        EXPECT_NEAR(mock->lastRequestBatchOutcomeBonusThresholds()[0],
+                    threshold(7, 0 /* MTPSpecStochasticDrawPurpose::Sample */),
+                    1e-7f);
+        EXPECT_NEAR(mock->lastRequestBatchOutcomeBonusThresholds()[1],
+                    threshold(6, 0 /* MTPSpecStochasticDrawPurpose::Sample */),
+                    1e-7f);
     }
 
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticMixedReadyAndRejectStaysLockstep)
