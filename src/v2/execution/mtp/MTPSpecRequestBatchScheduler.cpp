@@ -42,10 +42,12 @@ namespace llaminar2
         bool compatibleWithSeed(
             const MTPSpecSchedulableRequest &request,
             const std::string &seed_key,
-            int seed_vocab)
+            int seed_vocab,
+            MTPSpecVerifierInputPlacement seed_input)
         {
             return request.compatibility_key == seed_key &&
-                   request.vocab_size == seed_vocab;
+                   request.vocab_size == seed_vocab &&
+                   request.verifier_input == seed_input;
         }
 
         const char *modeName(MTPSpecRequestBatchMode mode)
@@ -120,16 +122,6 @@ namespace llaminar2
                 continue;
             }
 
-            if (request.verifier_input !=
-                MTPSpecVerifierInputPlacement::HOST_TOKENS)
-            {
-                admissions.push_back(
-                    admission(request,
-                              MTPSpecRequestBatchAdmissionStatus::REJECTED,
-                              "request-batched verifier execution requires host verifier tokens until device-token workspace support lands"));
-                continue;
-            }
-
             const int token_count = verifierTokenCount(request);
             if (token_count <= 0)
             {
@@ -152,17 +144,19 @@ namespace llaminar2
             {
                 batch.compatibility_key = request.compatibility_key;
                 batch.vocab_size = request.vocab_size;
+                batch.verifier_input = request.verifier_input;
                 seeded = true;
             }
             else if (!compatibleWithSeed(
                          request,
                          batch.compatibility_key,
-                         batch.vocab_size))
+                         batch.vocab_size,
+                         batch.verifier_input))
             {
                 admissions.push_back(
                     admission(request,
                               MTPSpecRequestBatchAdmissionStatus::DEFERRED,
-                              "request compatibility key or vocabulary differs from the current batch seed"));
+                              "request compatibility key, vocabulary, or verifier input placement differs from the current batch seed"));
                 continue;
             }
 

@@ -267,6 +267,18 @@ namespace llaminar2
             return fail("scheduled MTP batch is not greedy");
         if (scheduled_batch.request_count <= 0)
             return fail("scheduled MTP batch has no admitted requests");
+        if (scheduled_batch.verifier_input ==
+                MTPSpecVerifierInputPlacement::DEVICE_TOKEN_ROW &&
+            forward_options.device_token_ids == nullptr)
+        {
+            return fail("scheduled MTP device-token batch requires device_token_ids");
+        }
+        if (scheduled_batch.verifier_input ==
+                MTPSpecVerifierInputPlacement::HOST_TOKENS &&
+            forward_options.device_token_ids != nullptr)
+        {
+            return fail("scheduled MTP host-token batch received device_token_ids");
+        }
 
         const size_t request_count =
             static_cast<size_t>(scheduled_batch.request_count);

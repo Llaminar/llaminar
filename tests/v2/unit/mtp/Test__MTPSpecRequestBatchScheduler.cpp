@@ -159,22 +159,48 @@ TEST(Test__MTPSpecRequestBatchScheduler, RejectsInvalidRequestsBeforeTheySeedBat
     EXPECT_THAT(batch.admissions[2].reason, HasSubstr("max_draft_tokens"));
 }
 
-TEST(Test__MTPSpecRequestBatchScheduler, RejectsDeviceTokenRowsUntilWorkspaceContractExists)
+TEST(Test__MTPSpecRequestBatchScheduler, AdmitsHomogeneousDeviceTokenRows)
 {
     MTPSpecRequestBatchScheduler scheduler(configFor());
-    MTPSpecSchedulableRequest device_row =
-        requestFor(/*request_id=*/10, {1, 2});
-    device_row.verifier_input =
+    MTPSpecSchedulableRequest first = requestFor(/*request_id=*/10, {1, 2});
+    first.verifier_input =
+        MTPSpecVerifierInputPlacement::DEVICE_TOKEN_ROW;
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 11;
+    second.base_cached_tokens = 1011;
+    second.greedy_request.draft_tokens = {3, 4};
+
+    MTPSpecRequestBatch batch = scheduler.buildNextBatch({first, second});
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    EXPECT_EQ(batch.verifier_input,
+              MTPSpecVerifierInputPlacement::DEVICE_TOKEN_ROW);
+    EXPECT_THAT(batch.request_ids, ElementsAre(10, 11));
+    EXPECT_THAT(
+        statuses(batch),
+        ElementsAre(MTPSpecRequestBatchAdmissionStatus::ADMITTED,
+                    MTPSpecRequestBatchAdmissionStatus::ADMITTED));
+}
+
+TEST(Test__MTPSpecRequestBatchScheduler, DefersMixedVerifierInputPlacement)
+{
+    MTPSpecRequestBatchScheduler scheduler(configFor(/*max_requests=*/3));
+    MTPSpecSchedulableRequest host = requestFor(/*request_id=*/12, {1, 2});
+    MTPSpecSchedulableRequest device = requestFor(/*request_id=*/13, {3, 4});
+    device.verifier_input =
         MTPSpecVerifierInputPlacement::DEVICE_TOKEN_ROW;
 
-    MTPSpecRequestBatch batch = scheduler.buildNextBatch({device_row});
+    MTPSpecRequestBatch batch = scheduler.buildNextBatch({host, device});
 
-    EXPECT_FALSE(batch.ok);
-    EXPECT_THAT(batch.error, HasSubstr("no admissible"));
-    ASSERT_EQ(batch.admissions.size(), 1u);
-    EXPECT_EQ(batch.admissions[0].status,
-              MTPSpecRequestBatchAdmissionStatus::REJECTED);
-    EXPECT_THAT(batch.admissions[0].reason, HasSubstr("workspace"));
+    ASSERT_TRUE(batch.ok) << batch.error;
+    EXPECT_EQ(batch.verifier_input,
+              MTPSpecVerifierInputPlacement::HOST_TOKENS);
+    EXPECT_THAT(batch.request_ids, ElementsAre(12));
+    EXPECT_THAT(
+        statuses(batch),
+        ElementsAre(MTPSpecRequestBatchAdmissionStatus::ADMITTED,
+                    MTPSpecRequestBatchAdmissionStatus::DEFERRED));
+    EXPECT_THAT(batch.admissions[1].reason, HasSubstr("verifier input"));
 }
 
 TEST(Test__MTPSpecRequestBatchScheduler, SeparatesGreedyAndStochasticBatches)

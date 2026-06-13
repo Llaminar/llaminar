@@ -29,9 +29,10 @@ namespace llaminar2
     /**
      * @brief Where a request's compact verifier tokens currently live.
      *
-     * Multi-request verifier execution only has a host-token contract today.
-     * Device-token rows need a declared workspace binding before they can enter
-     * request-batched graph capture.
+     * Request-batched verifier execution may consume either CPU-owned logical
+     * tokens or a caller-owned padded device token matrix.  A single scheduled
+     * batch is homogeneous: mixing placements would make it ambiguous which
+     * runner entrypoint owns the verifier input.
      */
     enum class MTPSpecVerifierInputPlacement
     {
@@ -102,6 +103,8 @@ namespace llaminar2
         MTPSpecDecodeMetadataShape shape;
         int request_count = 0;
         MTPSpecRequestBatchMode mode = MTPSpecRequestBatchMode::GREEDY;
+        MTPSpecVerifierInputPlacement verifier_input =
+            MTPSpecVerifierInputPlacement::HOST_TOKENS;
         std::string compatibility_key;
         int vocab_size = 0;
         bool requires_shifted_kv_publication = false;

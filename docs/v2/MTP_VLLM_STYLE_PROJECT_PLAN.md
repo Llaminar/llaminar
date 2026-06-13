@@ -1902,6 +1902,12 @@ Status:
   `MTPVerifierForwardExecutionOptions`, so scheduled request batches can select
   the padded device-token runner contract instead of being stuck on host-token
   `forward_batch()`. Focused gate: `V2_Unit_MTPVerifierForwardExecutor`.
+- Request-batch scheduler admission now treats verifier input placement as part
+  of the batch shape. Homogeneous host-token and device-token batches are
+  admitted, mixed placement is deferred before mutation, and the scheduled
+  executor hard-fails if placement and `device_token_ids` disagree. Focused
+  gates: `V2_Unit_MTPSpecRequestBatchScheduler` and
+  `V2_Unit_MTPVerifierForwardExecutor`.
 
 Exit gate:
 

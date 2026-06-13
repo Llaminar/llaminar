@@ -481,6 +481,8 @@ TEST(Test__MTPVerifierForwardExecutor, ScheduledGreedyBatchCanUseForwardOptions)
     first.vocab_size = 100;
     first.base_cached_tokens = 100;
     first.greedy_request.draft_tokens = {7, 9};
+    first.verifier_input =
+        MTPSpecVerifierInputPlacement::DEVICE_TOKEN_ROW;
 
     MTPSpecSchedulableRequest second = first;
     second.request_id = 11;
@@ -508,6 +510,83 @@ TEST(Test__MTPVerifierForwardExecutor, ScheduledGreedyBatchCanUseForwardOptions)
     EXPECT_EQ(runner.last_device_token_ids, &fake_device_tokens);
     EXPECT_EQ(runner.last_token_batches,
               (std::vector<std::vector<int>>{{7, 9}, {11, 12}}));
+}
+
+TEST(Test__MTPVerifierForwardExecutor, ScheduledDeviceTokenBatchRequiresDevicePointer)
+{
+    RecordingInferenceRunner runner;
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/2,
+            MTPSpecRequestBatchMode::GREEDY});
+
+    MTPSpecSchedulableRequest first;
+    first.request_id = 10;
+    first.compatibility_key = "qwen36-moe-cuda0";
+    first.vocab_size = 100;
+    first.base_cached_tokens = 100;
+    first.greedy_request.draft_tokens = {7, 9};
+    first.verifier_input =
+        MTPSpecVerifierInputPlacement::DEVICE_TOKEN_ROW;
+
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 11;
+    second.base_cached_tokens = 200;
+    second.greedy_request.draft_tokens = {11, 12};
+
+    MTPSpecRequestBatch scheduled =
+        scheduler.buildNextBatch({first, second});
+    ASSERT_TRUE(scheduled.ok) << scheduled.error;
+
+    MTPGreedyVerifierBatchTransactionResult result =
+        executeMTPGreedyVerifierScheduledBatchTransaction(runner, scheduled);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, testing::HasSubstr("device_token_ids"));
+    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.batch_device_forward_count, 0);
+}
+
+TEST(Test__MTPVerifierForwardExecutor, ScheduledHostTokenBatchRejectsDevicePointer)
+{
+    RecordingInferenceRunner runner;
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/2,
+            MTPSpecRequestBatchMode::GREEDY});
+
+    MTPSpecSchedulableRequest first;
+    first.request_id = 10;
+    first.compatibility_key = "qwen36-moe-cuda0";
+    first.vocab_size = 100;
+    first.base_cached_tokens = 100;
+    first.greedy_request.draft_tokens = {7, 9};
+
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 11;
+    second.base_cached_tokens = 200;
+    second.greedy_request.draft_tokens = {11, 12};
+
+    MTPSpecRequestBatch scheduled =
+        scheduler.buildNextBatch({first, second});
+    ASSERT_TRUE(scheduled.ok) << scheduled.error;
+
+    const int fake_device_tokens = 888;
+    MTPVerifierForwardExecutionOptions forward_options;
+    forward_options.device_token_ids = &fake_device_tokens;
+
+    MTPGreedyVerifierBatchTransactionResult result =
+        executeMTPGreedyVerifierScheduledBatchTransaction(
+            runner,
+            scheduled,
+            forward_options);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, testing::HasSubstr("host-token"));
+    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.batch_device_forward_count, 0);
 }
 
 TEST(Test__MTPVerifierForwardExecutor, ScheduledTransactionRejectsNonGreedyBatch)
