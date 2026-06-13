@@ -661,6 +661,151 @@ TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionCommitsOnSuccess
     ASSERT_EQ(result.transaction.transaction_plan.step_plans.steps.size(), 2u);
 }
 
+TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionAndPublishCommitsAfterPublication)
+{
+    RecordingInferenceRunner runner;
+    runner.scripted_verifier_samples = {9, 8, 4, 77};
+
+    MTPSpecRequestBatchOwner owner;
+    MTPSpecSchedulableRequest first;
+    first.request_id = 30;
+    first.compatibility_key = "qwen36-moe-cuda0";
+    first.vocab_size = 100;
+    first.base_cached_tokens = 100;
+    first.greedy_request.draft_tokens = {7, 9};
+    ASSERT_TRUE(owner.enqueueRequest(first));
+
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 31;
+    second.base_cached_tokens = 200;
+    second.greedy_request.draft_tokens = {11, 12};
+    ASSERT_TRUE(owner.enqueueRequest(second));
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/2,
+            MTPSpecRequestBatchMode::GREEDY});
+
+    bool publisher_called = false;
+    MTPOwnedGreedyVerifierBatchTransactionResult result =
+        executeOwnedMTPGreedyVerifierScheduledBatchTransactionAndPublish(
+            runner,
+            owner,
+            scheduler,
+            [&](const MTPSpecTransactionBatchPlan &plan,
+                std::string *error) -> bool
+            {
+                publisher_called = true;
+                if (!plan.ok)
+                {
+                    if (error)
+                        *error = plan.error;
+                    return false;
+                }
+                return plan.step_plans.steps.size() == 2u &&
+                       plan.step_plans.steps[0].request_id == 30 &&
+                       plan.step_plans.steps[1].request_id == 31;
+            });
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(publisher_called);
+    EXPECT_TRUE(result.published);
+    EXPECT_TRUE(result.committed);
+    EXPECT_FALSE(result.released);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    EXPECT_EQ(owner.pendingCount(), 0u);
+}
+
+TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionAndPublishReleasesOnPublicationFailure)
+{
+    RecordingInferenceRunner runner;
+    runner.scripted_verifier_samples = {9, 8, 4, 77};
+
+    MTPSpecRequestBatchOwner owner;
+    MTPSpecSchedulableRequest first;
+    first.request_id = 40;
+    first.compatibility_key = "qwen36-moe-cuda0";
+    first.vocab_size = 100;
+    first.base_cached_tokens = 100;
+    first.greedy_request.draft_tokens = {7, 9};
+    ASSERT_TRUE(owner.enqueueRequest(first));
+
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 41;
+    second.base_cached_tokens = 200;
+    second.greedy_request.draft_tokens = {11, 12};
+    ASSERT_TRUE(owner.enqueueRequest(second));
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/2,
+            MTPSpecRequestBatchMode::GREEDY});
+
+    bool publisher_called = false;
+    MTPOwnedGreedyVerifierBatchTransactionResult result =
+        executeOwnedMTPGreedyVerifierScheduledBatchTransactionAndPublish(
+            runner,
+            owner,
+            scheduler,
+            [&](const MTPSpecTransactionBatchPlan &,
+                std::string *error) -> bool
+            {
+                publisher_called = true;
+                if (error)
+                    *error = "synthetic publication failure";
+                return false;
+            });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_TRUE(publisher_called);
+    EXPECT_FALSE(result.published);
+    EXPECT_FALSE(result.committed);
+    EXPECT_TRUE(result.released);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    EXPECT_EQ(owner.pendingCount(), 2u);
+    EXPECT_THAT(result.error, testing::HasSubstr("publication failed"));
+    EXPECT_THAT(result.error, testing::HasSubstr("synthetic publication failure"));
+}
+
+TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionAndPublishRejectsMissingPublisher)
+{
+    RecordingInferenceRunner runner;
+
+    MTPSpecRequestBatchOwner owner;
+    MTPSpecSchedulableRequest request;
+    request.request_id = 50;
+    request.compatibility_key = "qwen36-moe-cuda0";
+    request.vocab_size = 100;
+    request.base_cached_tokens = 100;
+    request.greedy_request.draft_tokens = {7, 9};
+    ASSERT_TRUE(owner.enqueueRequest(request));
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/1,
+            /*max_draft_tokens=*/2,
+            MTPSpecRequestBatchMode::GREEDY});
+
+    MTPOwnedGreedyVerifierBatchTransactionResult result =
+        executeOwnedMTPGreedyVerifierScheduledBatchTransactionAndPublish(
+            runner,
+            owner,
+            scheduler,
+            {});
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_FALSE(result.published);
+    EXPECT_FALSE(result.committed);
+    EXPECT_FALSE(result.released);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    EXPECT_EQ(owner.pendingCount(), 1u);
+    EXPECT_EQ(runner.forward_count, 0);
+    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_THAT(result.error, testing::HasSubstr("publication callback is required"));
+}
+
 TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionReleasesOnForwardFailure)
 {
     RecordingInferenceRunner runner;

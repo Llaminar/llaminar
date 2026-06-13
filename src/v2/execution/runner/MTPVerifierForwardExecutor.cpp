@@ -355,4 +355,91 @@ namespace llaminar2
         return result;
     }
 
+    MTPOwnedGreedyVerifierBatchTransactionResult
+    executeOwnedMTPGreedyVerifierScheduledBatchTransactionAndPublish(
+        IInferenceRunner &runner,
+        MTPSpecRequestBatchOwner &owner,
+        const MTPSpecRequestBatchScheduler &scheduler,
+        MTPGreedyVerifierBatchPublicationFn publish,
+        MTPVerifierForwardExecutionOptions forward_options)
+    {
+        MTPOwnedGreedyVerifierBatchTransactionResult result;
+
+        if (!publish)
+        {
+            result.ok = false;
+            result.error =
+                "owned MTP verifier publication callback is required";
+            return result;
+        }
+
+        result.scheduled_batch = owner.scheduleNextBatch(scheduler);
+        if (!result.scheduled_batch.ok)
+        {
+            result.ok = false;
+            result.error =
+                std::string("owned MTP verifier scheduling failed: ") +
+                result.scheduled_batch.error;
+            return result;
+        }
+
+        result.transaction =
+            executeMTPGreedyVerifierScheduledBatchTransaction(
+                runner,
+                result.scheduled_batch,
+                forward_options);
+
+        if (!result.transaction.ok)
+        {
+            std::string release_error;
+            result.released = owner.releaseInFlightBatch(&release_error);
+            result.ok = false;
+            result.error =
+                std::string("owned MTP verifier transaction failed: ") +
+                result.transaction.error;
+            if (!result.released)
+            {
+                result.error += "; release failed: ";
+                result.error += release_error;
+            }
+            return result;
+        }
+
+        std::string publish_error;
+        result.published =
+            publish(result.transaction.transaction_plan, &publish_error);
+        if (!result.published)
+        {
+            std::string release_error;
+            result.released = owner.releaseInFlightBatch(&release_error);
+            result.ok = false;
+            result.error = "owned MTP verifier publication failed";
+            if (!publish_error.empty())
+            {
+                result.error += ": ";
+                result.error += publish_error;
+            }
+            if (!result.released)
+            {
+                result.error += "; release failed: ";
+                result.error += release_error;
+            }
+            return result;
+        }
+
+        std::string commit_error;
+        result.committed = owner.commitInFlightBatch(&commit_error);
+        if (!result.committed)
+        {
+            result.ok = false;
+            result.error =
+                std::string("owned MTP verifier publication succeeded but commit failed: ") +
+                commit_error;
+            return result;
+        }
+
+        result.ok = true;
+        return result;
+    }
+
 } // namespace llaminar2

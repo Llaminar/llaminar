@@ -1917,10 +1917,13 @@ Status:
   live requests. Focused gate: `V2_Unit_MTPSpecRequestBatchOwner`.
 - Owned greedy request-batched verifier execution now has a single helper that
   schedules through the owner, executes the existing padded verifier
-  transaction, commits admitted requests on success, and releases the
-  reservation unchanged on forward/sampling/transaction failure. This proves
-  the next benchmark/server batch lane can use scheduler output without
-  reimplementing ownership cleanup. Focused gate:
+  transaction, commits admitted requests on verifier-only success, and releases
+  the reservation unchanged on forward/sampling/transaction failure. A
+  publication-aware variant now takes a caller-supplied accepted-state publisher
+  and commits only after that publisher succeeds; publication failure releases
+  the reservation without dropping pending requests. This proves the next
+  benchmark/server batch lane can use scheduler output without reimplementing
+  ownership cleanup or committing before live-state publication. Focused gate:
   `V2_Unit_MTPVerifierForwardExecutor`.
 - Request-batch intent now reserves runner capacity before runner construction.
   `RuntimeConfig::fromOrchestrationConfig()` resolves effective `batch_size`

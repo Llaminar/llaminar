@@ -6,6 +6,7 @@
 #include "../mtp/MTPSpecRequestBatchScheduler.h"
 #include "../mtp/MTPSpecTransactionDriver.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -131,6 +132,7 @@ namespace llaminar2
 
         MTPSpecRequestBatch scheduled_batch;
         MTPGreedyVerifierBatchTransactionResult transaction;
+        bool published = false;
         bool committed = false;
         bool released = false;
     };
@@ -151,6 +153,34 @@ namespace llaminar2
         IInferenceRunner &runner,
         MTPSpecRequestBatchOwner &owner,
         const MTPSpecRequestBatchScheduler &scheduler,
+        MTPVerifierForwardExecutionOptions forward_options = {});
+
+    /**
+     * @brief Callback used to publish accepted verifier state before commit.
+     *
+     * The publisher receives the fully validated transaction plan. It should
+     * apply KV, terminal hidden/logits, GDN, short-conv, and shifted MTP state
+     * through the normal runner/backend publication path. Returning false keeps
+     * ownership pending so the caller can retry or replay safely.
+     */
+    using MTPGreedyVerifierBatchPublicationFn =
+        std::function<bool(const MTPSpecTransactionBatchPlan &, std::string *)>;
+
+    /**
+     * @brief Schedule, verify, publish, and commit one owned greedy batch.
+     *
+     * This is the ownership contract intended for benchmark/server request
+     * batching. Requests are reserved while the verifier graph runs. The
+     * reservation commits only after `publish` succeeds, and it is released
+     * unchanged after verifier, sampling, transaction-planning, or publication
+     * failure.
+     */
+    MTPOwnedGreedyVerifierBatchTransactionResult
+    executeOwnedMTPGreedyVerifierScheduledBatchTransactionAndPublish(
+        IInferenceRunner &runner,
+        MTPSpecRequestBatchOwner &owner,
+        const MTPSpecRequestBatchScheduler &scheduler,
+        MTPGreedyVerifierBatchPublicationFn publish,
         MTPVerifierForwardExecutionOptions forward_options = {});
 
 } // namespace llaminar2
