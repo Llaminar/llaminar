@@ -743,6 +743,7 @@ namespace llaminar2
         // Runtime config: parse once from OrchestrationConfig raw strings
         plan.runtime = RuntimeConfig::fromOrchestrationConfig(
             config.max_seq_len,
+            config.batch_size,
             config.activation_precision,
             config.kv_cache_precision,
             config.fused_attention_backend,
@@ -1014,6 +1015,7 @@ namespace llaminar2
         // Runtime config: parse once from OrchestrationConfig raw strings
         plan.runtime = RuntimeConfig::fromOrchestrationConfig(
             config.max_seq_len,
+            config.batch_size,
             config.activation_precision,
             config.kv_cache_precision,
             config.fused_attention_backend,

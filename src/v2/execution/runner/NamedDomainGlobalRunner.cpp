@@ -247,6 +247,7 @@ namespace llaminar2
             // Build InferenceRunnerConfig base
             auto runtime_cfg = RuntimeConfig::fromOrchestrationConfig(
                 config_.max_seq_len,
+                config_.batch_size,
                 config_.activation_precision,
                 config_.kv_cache_precision,
                 config_.fused_attention_backend,
@@ -257,7 +258,7 @@ namespace llaminar2
                 config_.mtp);
             InferenceRunnerConfig base_runner_cfg;
             base_runner_cfg.max_seq_len = runtime_cfg.max_seq_len;
-            base_runner_cfg.batch_size = config_.batch_size;
+            base_runner_cfg.batch_size = runtime_cfg.batch_size;
             base_runner_cfg.activation_precision = runtime_cfg.activation_precision;
             base_runner_cfg.kv_cache_precision = runtime_cfg.kv_cache_precision;
             base_runner_cfg.fused_attention_backend = runtime_cfg.fused_attention_backend;

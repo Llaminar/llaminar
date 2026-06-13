@@ -1908,6 +1908,13 @@ Status:
   executor hard-fails if placement and `device_token_ids` disagree. Focused
   gates: `V2_Unit_MTPSpecRequestBatchScheduler` and
   `V2_Unit_MTPVerifierForwardExecutor`.
+- Request-batch intent now reserves runner capacity before runner construction.
+  `RuntimeConfig::fromOrchestrationConfig()` resolves effective `batch_size`
+  from the larger of `--batch-size` and enabled `--mtp-max-request-batch`, and
+  named-domain runners consume the resolved value instead of the raw CLI value.
+  Live decode still hard-fails `max_request_batch > 1` until the request owner
+  is wired, but graph/state capacity can no longer be silently under-sized.
+  Focused gate: `V2_Unit_PrefixMTPConfig`.
 
 Exit gate:
 

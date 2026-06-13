@@ -233,6 +233,22 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.60);
 }
 
+TEST(Test__PrefixMTPConfig, MTPRequestBatchCapacityResolvesRunnerBatchSize)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.max_request_batch = 4;
+
+    EXPECT_EQ(resolveRuntimeBatchSizeForMTP(/*configured_batch_size=*/1, mtp), 4)
+        << "MTP request batching must reserve enough runner-owned per-request state.";
+    EXPECT_EQ(resolveRuntimeBatchSizeForMTP(/*configured_batch_size=*/8, mtp), 8)
+        << "The general runner batch-size knob still wins when it is larger.";
+
+    mtp.enabled = false;
+    EXPECT_EQ(resolveRuntimeBatchSizeForMTP(/*configured_batch_size=*/1, mtp), 1)
+        << "Disabled MTP must not quietly inflate normal runner capacity.";
+}
+
 TEST(Test__PrefixMTPConfig, ParserRejectsInvalidPrefixAndMTPEnums)
 {
     {
@@ -384,6 +400,7 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
 
     RuntimeConfig runtime = RuntimeConfig::fromOrchestrationConfig(
         source.max_seq_len,
+        source.batch_size,
         source.activation_precision,
         source.kv_cache_precision,
         source.fused_attention_backend,
@@ -418,6 +435,8 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     EXPECT_EQ(graph_config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
     EXPECT_EQ(graph_config.mtp.depth_policy.max_depth, 3);
     EXPECT_EQ(graph_config.mtp.depth_policy.window_size, 8);
+    EXPECT_EQ(runtime.batch_size, 4);
+    EXPECT_EQ(runner_config.batch_size, 4);
 }
 
 TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings)

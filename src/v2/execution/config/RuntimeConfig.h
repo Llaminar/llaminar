@@ -578,10 +578,11 @@ namespace llaminar2
          *
          * vLLM-style production MTP batches target verification rows across
          * requests so tiny per-request verifier/condition forwards do not
-         * dominate MoE decode. Llaminar currently executes one request per
-         * runner transaction; values greater than one are accepted by config
-         * parsing so benchmark plans can declare intent, but the runner must
-         * hard-fail until Phase 8 wires true request-batched execution.
+         * dominate MoE decode. Values greater than one are a real runner
+         * capacity request: planning must size request-local state and graph
+         * buffers for at least this many active verifier rows. Live decode may
+         * still hard-fail unsupported batched transaction paths until Phase 8
+         * wires the corresponding scheduler execution.
          */
         int max_request_batch = 1;
         MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
@@ -603,6 +604,23 @@ namespace llaminar2
         const int request_count = std::max(1, config.max_request_batch);
         const int draft_count = std::max(1, config.draft_tokens);
         return std::max(4, request_count * (draft_count + 1));
+    }
+
+    /**
+     * @brief Resolve the runner batch capacity required by MTP request batching.
+     *
+     * `batch_size` is the general runner capacity knob. `max_request_batch` is
+     * the MTP-specific request batching knob. When MTP is enabled, both knobs
+     * describe real capacity that must exist before speculative verification
+     * can publish per-request KV/GDN/hidden state without racing or
+     * over-indexing runner-owned buffers.
+     */
+    inline int resolveRuntimeBatchSizeForMTP(int configured_batch_size, const MTPRuntimeConfig &config)
+    {
+        const int base_batch_size = std::max(1, configured_batch_size);
+        if (!config.enabled)
+            return base_batch_size;
+        return std::max(base_batch_size, std::max(1, config.max_request_batch));
     }
 
     /**
@@ -865,7 +883,7 @@ namespace llaminar2
         /// Maximum sequence length (buffer allocation sizing)
         int max_seq_len = 4096;
 
-        /// Batch size (currently must be 1)
+        /// Maximum active request batch size for runner-owned state.
         int batch_size = 1;
 
         /// Activation buffer precision
@@ -905,6 +923,7 @@ namespace llaminar2
          */
         static RuntimeConfig fromOrchestrationConfig(
             int max_seq_len,
+            int batch_size,
             const std::string &activation_precision_str,
             const std::string &kv_cache_precision_str,
             FusedAttentionBackend fused_backend = FusedAttentionBackend::JIT,
@@ -916,6 +935,7 @@ namespace llaminar2
         {
             RuntimeConfig rc;
             rc.max_seq_len = max_seq_len;
+            rc.batch_size = resolveRuntimeBatchSizeForMTP(batch_size, mtp);
             rc.activation_precision = parseActivationPrecision(activation_precision_str);
             rc.kv_cache_precision = parseKVCachePrecision(kv_cache_precision_str);
             rc.fused_attention_backend = fused_backend;

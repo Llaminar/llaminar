@@ -26,10 +26,8 @@ Before a WiP commit, broad units plus touched parity must pass.
   request-1 publication now calls the batch publisher through SingleDevice,
   LocalTP, and LocalPP rank fan-out. Compact verifier scratch, explicit graph
   rows, padded verifier-decode caching, bounded one-token Qwen35/Qwen36
-  sidecar batches, padded-row publication, and scheduler-to-executor greedy
-  request-batch admission are unit-proven. Batched SingleDevice device-token
-  verifier rows now have scheduler admission, a named runner contract, and
-  transaction routing.
+  sidecar batches, padded-row publication, scheduler admission, device-token
+  transaction routing, and runner-capacity reservation are unit-proven.
   `--mtp-max-request-batch` records intent but still hard-fails above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.
