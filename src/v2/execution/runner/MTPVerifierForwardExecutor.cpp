@@ -299,4 +299,60 @@ namespace llaminar2
         return executeMTPGreedyVerifierBatchTransaction(runner, request);
     }
 
+    MTPOwnedGreedyVerifierBatchTransactionResult
+    executeOwnedMTPGreedyVerifierScheduledBatchTransaction(
+        IInferenceRunner &runner,
+        MTPSpecRequestBatchOwner &owner,
+        const MTPSpecRequestBatchScheduler &scheduler,
+        MTPVerifierForwardExecutionOptions forward_options)
+    {
+        MTPOwnedGreedyVerifierBatchTransactionResult result;
+
+        result.scheduled_batch = owner.scheduleNextBatch(scheduler);
+        if (!result.scheduled_batch.ok)
+        {
+            result.ok = false;
+            result.error =
+                std::string("owned MTP verifier scheduling failed: ") +
+                result.scheduled_batch.error;
+            return result;
+        }
+
+        result.transaction =
+            executeMTPGreedyVerifierScheduledBatchTransaction(
+                runner,
+                result.scheduled_batch,
+                forward_options);
+
+        if (!result.transaction.ok)
+        {
+            std::string release_error;
+            result.released = owner.releaseInFlightBatch(&release_error);
+            result.ok = false;
+            result.error =
+                std::string("owned MTP verifier transaction failed: ") +
+                result.transaction.error;
+            if (!result.released)
+            {
+                result.error += "; release failed: ";
+                result.error += release_error;
+            }
+            return result;
+        }
+
+        std::string commit_error;
+        result.committed = owner.commitInFlightBatch(&commit_error);
+        if (!result.committed)
+        {
+            result.ok = false;
+            result.error =
+                std::string("owned MTP verifier transaction succeeded but commit failed: ") +
+                commit_error;
+            return result;
+        }
+
+        result.ok = true;
+        return result;
+    }
+
 } // namespace llaminar2

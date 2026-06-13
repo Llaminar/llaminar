@@ -1915,6 +1915,13 @@ Status:
   failed verifier/publication transaction. This gives benchmark/server batching
   a concrete handoff point instead of letting scheduler output silently drop
   live requests. Focused gate: `V2_Unit_MTPSpecRequestBatchOwner`.
+- Owned greedy request-batched verifier execution now has a single helper that
+  schedules through the owner, executes the existing padded verifier
+  transaction, commits admitted requests on success, and releases the
+  reservation unchanged on forward/sampling/transaction failure. This proves
+  the next benchmark/server batch lane can use scheduler output without
+  reimplementing ownership cleanup. Focused gate:
+  `V2_Unit_MTPVerifierForwardExecutor`.
 - Request-batch intent now reserves runner capacity before runner construction.
   `RuntimeConfig::fromOrchestrationConfig()` resolves effective `batch_size`
   from the larger of `--batch-size` and enabled `--mtp-max-request-batch`, and

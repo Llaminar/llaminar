@@ -614,6 +614,122 @@ TEST(Test__MTPVerifierForwardExecutor, ScheduledTransactionRejectsNonGreedyBatch
     EXPECT_EQ(runner.batch_forward_count, 0);
 }
 
+TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionCommitsOnSuccess)
+{
+    RecordingInferenceRunner runner;
+    runner.scripted_verifier_samples = {9, 8, 4, 77, 123, 123};
+
+    MTPSpecRequestBatchOwner owner;
+    MTPSpecSchedulableRequest first;
+    first.request_id = 10;
+    first.compatibility_key = "qwen36-moe-cuda0";
+    first.vocab_size = 100;
+    first.base_cached_tokens = 100;
+    first.greedy_request.draft_tokens = {7, 9, 8};
+    ASSERT_TRUE(owner.enqueueRequest(first));
+
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 11;
+    second.base_cached_tokens = 200;
+    second.greedy_request.draft_tokens = {11, 12, 13};
+    ASSERT_TRUE(owner.enqueueRequest(second));
+
+    MTPSpecSchedulableRequest deferred = first;
+    deferred.request_id = 12;
+    deferred.compatibility_key = "qwen36-moe-rocm0";
+    ASSERT_TRUE(owner.enqueueRequest(deferred));
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/3,
+            MTPSpecRequestBatchMode::GREEDY});
+
+    MTPOwnedGreedyVerifierBatchTransactionResult result =
+        executeOwnedMTPGreedyVerifierScheduledBatchTransaction(
+            runner,
+            owner,
+            scheduler);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.committed);
+    EXPECT_FALSE(result.released);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    ASSERT_EQ(owner.pendingCount(), 1u);
+    EXPECT_EQ(owner.pendingRequests()[0].request_id, 12);
+    EXPECT_THAT(result.scheduled_batch.request_ids, testing::ElementsAre(10, 11));
+    ASSERT_EQ(result.transaction.transaction_plan.step_plans.steps.size(), 2u);
+}
+
+TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionReleasesOnForwardFailure)
+{
+    RecordingInferenceRunner runner;
+    runner.batch_forward_success = false;
+
+    MTPSpecRequestBatchOwner owner;
+    MTPSpecSchedulableRequest first;
+    first.request_id = 20;
+    first.compatibility_key = "qwen36-moe-cuda0";
+    first.vocab_size = 100;
+    first.base_cached_tokens = 100;
+    first.greedy_request.draft_tokens = {7, 9};
+    ASSERT_TRUE(owner.enqueueRequest(first));
+
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 21;
+    second.base_cached_tokens = 200;
+    second.greedy_request.draft_tokens = {11, 12};
+    ASSERT_TRUE(owner.enqueueRequest(second));
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/2,
+            MTPSpecRequestBatchMode::GREEDY});
+
+    MTPOwnedGreedyVerifierBatchTransactionResult result =
+        executeOwnedMTPGreedyVerifierScheduledBatchTransaction(
+            runner,
+            owner,
+            scheduler);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_TRUE(result.released);
+    EXPECT_FALSE(result.committed);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    EXPECT_EQ(owner.pendingCount(), 2u);
+    EXPECT_THAT(result.error, testing::HasSubstr("forward failed"));
+    EXPECT_EQ(runner.row_indexed_enable_count, 1);
+    EXPECT_EQ(runner.row_indexed_disable_count, 1);
+    EXPECT_EQ(runner.all_position_enable_count, 1);
+    EXPECT_EQ(runner.all_position_disable_count, 1);
+    EXPECT_EQ(runner.clear_plan_count, 1);
+}
+
+TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionReportsScheduleFailure)
+{
+    RecordingInferenceRunner runner;
+    MTPSpecRequestBatchOwner owner;
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/2,
+            MTPSpecRequestBatchMode::GREEDY});
+
+    MTPOwnedGreedyVerifierBatchTransactionResult result =
+        executeOwnedMTPGreedyVerifierScheduledBatchTransaction(
+            runner,
+            owner,
+            scheduler);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_FALSE(result.committed);
+    EXPECT_FALSE(result.released);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    EXPECT_THAT(result.error, testing::HasSubstr("scheduling failed"));
+    EXPECT_EQ(runner.batch_forward_count, 0);
+}
+
 TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionCleansUpAfterForwardFailure)
 {
     RecordingInferenceRunner runner;

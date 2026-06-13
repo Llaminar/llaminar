@@ -27,7 +27,7 @@ Before a WiP commit, broad units plus touched parity must pass.
   LocalTP, and LocalPP rank fan-out. Compact verifier scratch, explicit graph
   rows, padded verifier-decode caching, bounded one-token Qwen35/Qwen36
   sidecar batches, padded-row publication, scheduler admission, device-token
-  routing, two-phase batch ownership, and runner-capacity reservation are
+  routing, owned transaction handoff, and runner-capacity reservation are
   unit-proven. `--mtp-max-request-batch` records intent but still hard-fails
   above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:

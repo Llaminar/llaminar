@@ -2,6 +2,7 @@
 
 #include "../mtp/MTPDecodeCatchup.h"
 #include "../mtp/MTPSpecDecodeMetadata.h"
+#include "../mtp/MTPSpecRequestBatchOwner.h"
 #include "../mtp/MTPSpecRequestBatchScheduler.h"
 #include "../mtp/MTPSpecTransactionDriver.h"
 
@@ -118,6 +119,38 @@ namespace llaminar2
     MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierScheduledBatchTransaction(
         IInferenceRunner &runner,
         const MTPSpecRequestBatch &scheduled_batch,
+        MTPVerifierForwardExecutionOptions forward_options = {});
+
+    /**
+     * @brief Result of scheduling and executing an owned greedy verifier batch.
+     */
+    struct MTPOwnedGreedyVerifierBatchTransactionResult
+    {
+        bool ok = false;
+        std::string error;
+
+        MTPSpecRequestBatch scheduled_batch;
+        MTPGreedyVerifierBatchTransactionResult transaction;
+        bool committed = false;
+        bool released = false;
+    };
+
+    /**
+     * @brief Schedule, execute, and complete one owned greedy verifier batch.
+     *
+     * This is the first executable handoff above raw scheduler admission. It
+     * reserves a compatible batch through `MTPSpecRequestBatchOwner`, executes
+     * the existing verifier transaction helper, commits admitted request ids on
+     * success, and releases the reservation unchanged on failure. The helper
+     * deliberately does not perform live state publication; callers still apply
+     * the returned transaction plan atomically before considering the request
+     * complete.
+     */
+    MTPOwnedGreedyVerifierBatchTransactionResult
+    executeOwnedMTPGreedyVerifierScheduledBatchTransaction(
+        IInferenceRunner &runner,
+        MTPSpecRequestBatchOwner &owner,
+        const MTPSpecRequestBatchScheduler &scheduler,
         MTPVerifierForwardExecutionOptions forward_options = {});
 
 } // namespace llaminar2
