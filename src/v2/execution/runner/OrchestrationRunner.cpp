@@ -2183,6 +2183,39 @@ namespace llaminar2
                         sampled_terminal_samplers[static_cast<size_t>(request_id)] =
                             bonus_samplers[static_cast<size_t>(request_id)];
                     }
+
+                    const int physical_rows =
+                        std::max(0, outcome_requests[i].row_count);
+                    const int semantic_rows =
+                        std::min(
+                            physical_rows,
+                            std::max(0, (*outcomes)[i].consumed_verifier_rows));
+                    const int post_reject_rows =
+                        std::max(0, physical_rows - semantic_rows);
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_device_physical_verify_rows",
+                        static_cast<double>(physical_rows),
+                        "decode",
+                        {},
+                        {{"implementation", "request_batch_device_outcome"},
+                         {"request_batch", "true"}});
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_device_semantic_verify_rows",
+                        static_cast<double>(semantic_rows),
+                        "decode",
+                        {},
+                        {{"implementation", "request_batch_device_outcome"},
+                         {"request_batch", "true"}});
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_device_post_reject_rows",
+                        static_cast<double>(post_reject_rows),
+                        "decode",
+                        {},
+                        {{"implementation", "request_batch_device_outcome"},
+                         {"request_batch", "true"}});
                 }
                 return true;
             };
@@ -5000,6 +5033,40 @@ namespace llaminar2
                     mtp_stats_.stochastic_accepts +=
                         static_cast<uint64_t>(
                             std::max(0, device_outcome.accepted_speculative_prefix));
+                    const int physical_rows = compare_rows;
+                    const int semantic_rows =
+                        std::min(
+                            physical_rows,
+                            std::max(0, device_outcome.consumed_verifier_rows));
+                    const int post_reject_rows =
+                        std::max(0, physical_rows - semantic_rows);
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_device_physical_verify_rows",
+                        static_cast<double>(physical_rows),
+                        "decode",
+                        {},
+                        {{"verifier_path", "all_position_state_publication"},
+                         {"implementation", "device_batch_outcome"},
+                         {"request_batch", "false"}});
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_device_semantic_verify_rows",
+                        static_cast<double>(semantic_rows),
+                        "decode",
+                        {},
+                        {{"verifier_path", "all_position_state_publication"},
+                         {"implementation", "device_batch_outcome"},
+                         {"request_batch", "false"}});
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_device_post_reject_rows",
+                        static_cast<double>(post_reject_rows),
+                        "decode",
+                        {},
+                        {{"verifier_path", "all_position_state_publication"},
+                         {"implementation", "device_batch_outcome"},
+                         {"request_batch", "false"}});
                     if (!device_outcome.all_speculative_accepted &&
                         device_outcome.rejected_verified_token >= 0)
                     {

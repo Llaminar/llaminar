@@ -36,6 +36,34 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "stochastic_device_physical_verify_rows",
+                    "phase": "decode",
+                    "count": 2,
+                    "value": 6,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_device_physical_verify_rows",
+                    "phase": "decode",
+                    "count": 1,
+                    "value": 3,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_device_semantic_verify_rows",
+                    "phase": "decode",
+                    "count": 3,
+                    "value": 7,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_device_post_reject_rows",
+                    "phase": "decode",
+                    "count": 3,
+                    "value": 2,
+                },
+                {
+                    "domain": "mtp",
                     "name": "condition_forward",
                     "phase": "decode",
                     "count": 2,
@@ -346,6 +374,9 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         summary = json.loads(result.stdout)
         self.assertEqual(summary["decode_step_ms"], 30.5)
         self.assertEqual(summary["verifier_ms"], 18.25)
+        self.assertEqual(summary["stochastic_physical_verify_rows"], 9.0)
+        self.assertEqual(summary["stochastic_semantic_verify_rows"], 7.0)
+        self.assertEqual(summary["stochastic_post_reject_rows"], 2.0)
         self.assertEqual(summary["condition_ms"], 9.75)
         self.assertEqual(summary["condition_count"], 2)
         self.assertEqual(summary["condition_skipped_ready"], 5)
@@ -397,7 +428,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
             capture_output=True,
         )
         values = result.stdout.strip().split("\t")
-        self.assertEqual(len(values), 44)
+        self.assertEqual(len(values), 47)
         self.assertTrue(all(value in ("0", "0.0") for value in values))
 
     def test_multiple_paths_emit_table_for_matrix_comparison(self) -> None:

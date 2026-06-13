@@ -3306,6 +3306,29 @@ namespace
                "distribution path instead of falling back to host logits";
     }
 
+    TEST_F(Test__PrefillDecodeTransition, DeviceSpeculativeOutcomeHandleRequiresStreamAndBuffers)
+    {
+        DeviceSpeculativeOutcomeHandle handle;
+        EXPECT_FALSE(handle.valid());
+
+        int32_t output_tokens[sampling_math::kSpeculativeBatchMaxOutputTokens] = {};
+        int meta[sampling_math::kSpeculativeBatchMetaCount] = {};
+        int stream_token = 0;
+
+        handle.output_tokens_device = output_tokens;
+        handle.meta_device = meta;
+        handle.request_count = 1;
+        handle.stream = &stream_token;
+        EXPECT_TRUE(handle.valid());
+
+        handle.stream = nullptr;
+        EXPECT_FALSE(handle.valid());
+
+        handle.stream = &stream_token;
+        handle.meta_stride = sampling_math::kSpeculativeBatchMetaCount - 1;
+        EXPECT_FALSE(handle.valid());
+    }
+
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedMTPContinuationSupportsDepthThree)
     {
         auto [runner, mock] =
@@ -3468,12 +3491,16 @@ namespace
      */
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticDepthThreeUsesLogicalPositionDraws)
     {
+        ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+        PerfStatsCollector::reset();
         auto [runner, mock] =
             createSingleDeviceRequestBatchRunner(
                 /*max_request_batch=*/2,
                 /*mtp_draft_tokens=*/3,
                 MTPVerifyMode::SpeculativeSampling);
         mock->enableStochasticDeviceSampling();
+        mock->forceStochasticRequestBatchReject(/*request_id=*/1,
+                                                /*correction_token=*/4);
 
         SamplingParams sampling;
         sampling.temperature = 0.1f;
@@ -3554,6 +3581,36 @@ namespace
         EXPECT_NEAR(mock->lastRequestBatchOutcomeBonusThresholds()[1],
                     threshold(6, 0 /* MTPSpecStochasticDrawPurpose::Sample */),
                     1e-7f);
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        const PerfStatsCollector::Tags batch_tags{
+            {"implementation", "request_batch_device_outcome"},
+            {"request_batch", "true"}};
+        const PerfStatRecord *physical_rows =
+            findPerfRecordWithTags(records,
+                                   PerfStatRecord::Kind::Counter,
+                                   "stochastic_device_physical_verify_rows",
+                                   batch_tags);
+        ASSERT_NE(physical_rows, nullptr);
+        EXPECT_DOUBLE_EQ(physical_rows->value, 6.0);
+        const PerfStatRecord *semantic_rows =
+            findPerfRecordWithTags(records,
+                                   PerfStatRecord::Kind::Counter,
+                                   "stochastic_device_semantic_verify_rows",
+                                   batch_tags);
+        ASSERT_NE(semantic_rows, nullptr);
+        EXPECT_DOUBLE_EQ(semantic_rows->value, 4.0);
+        const PerfStatRecord *post_reject_rows =
+            findPerfRecordWithTags(records,
+                                   PerfStatRecord::Kind::Counter,
+                                   "stochastic_device_post_reject_rows",
+                                   batch_tags);
+        ASSERT_NE(post_reject_rows, nullptr);
+        EXPECT_DOUBLE_EQ(post_reject_rows->value, 2.0)
+            << "Only request 1 rejects at row zero; its two later verifier "
+               "rows are physical work that the next Phase 10 optimization "
+               "should try to avoid.";
+        PerfStatsCollector::reset();
     }
 
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticMixedReadyAndRejectStaysLockstep)

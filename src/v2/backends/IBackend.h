@@ -955,6 +955,54 @@ namespace llaminar2
         }
 
         /**
+         * @brief Lazily sample a processed bonus row only when a batch needs it.
+         *
+         * Stochastic MTP only consumes the bonus ready token when the first
+         * target token does not stop and every verified speculative row
+         * accepts. This graph-capturable primitive checks the compact verifier
+         * outputs on device, returns `-1` immediately when the bonus is not
+         * semantically needed, and otherwise samples @p logits_device exactly
+         * like enqueueSampleProcessedLogitsF32Device().
+         *
+         * Backends must use the explicit non-null @p stream only. They must not
+         * allocate, synchronize, or fall back to a default/null GPU stream.
+         */
+        virtual bool enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
+            const void *logits_device,
+            int vocab_size,
+            int row_stride,
+            float threshold,
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            int row_count,
+            int first_token,
+            const void *first_token_device,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_probability_device = nullptr)
+        {
+            (void)logits_device;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)threshold;
+            (void)verify_tokens_device;
+            (void)verify_accepted_device;
+            (void)row_count;
+            (void)first_token;
+            (void)first_token_device;
+            (void)stop_tokens_host;
+            (void)stop_token_count;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_probability_device;
+            return false;
+        }
+
+        /**
          * @brief Enqueue vLLM-style draft proposal from raw logits.
          *
          * Draft proposal deliberately uses only temperature-scaled raw logits:

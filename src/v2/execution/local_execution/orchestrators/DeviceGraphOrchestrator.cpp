@@ -13728,8 +13728,26 @@ namespace llaminar2
         int request_count,
         DeviceSpeculativeVerifyBatchOutcome *outcomes)
     {
+        DeviceSpeculativeOutcomeHandle handle;
+        if (!verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+                requests,
+                request_count,
+                &handle))
+        {
+            return false;
+        }
+        return copyDeviceSpeculativeOutcomesToHost(handle, outcomes);
+    }
+
+    bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+        const DeviceStochasticBatchOutcomeRequest *requests,
+        int request_count,
+        DeviceSpeculativeOutcomeHandle *out_handle)
+    {
         using namespace sampling_math;
-        if (!requests || !outcomes ||
+        if (out_handle)
+            *out_handle = DeviceSpeculativeOutcomeHandle{};
+        if (!requests || !out_handle ||
             request_count <= 0 ||
             request_count > stochastic_batch_output_request_capacity_ ||
             !supportsDeviceStochasticMTPVerification() ||
@@ -13762,7 +13780,6 @@ namespace llaminar2
 
         for (int request_idx = 0; request_idx < request_count; ++request_idx)
         {
-            outcomes[request_idx] = DeviceSpeculativeVerifyBatchOutcome{};
             const DeviceStochasticBatchOutcomeRequest &request =
                 requests[request_idx];
             if (request.row_count <= 0 ||
@@ -13778,6 +13795,7 @@ namespace llaminar2
                     ? request.stop_tokens.data()
                     : nullptr;
             const int32_t *draft_tokens = request.hostDraftTokensOrNull();
+            DeviceSpeculativeVerifyBatchOutcome ignored_host_outcome;
 
             const bool ok =
                 verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(
@@ -13794,7 +13812,7 @@ namespace llaminar2
                     request.stop_token_count,
                     request.bonus_target_slot,
                     request.bonus_threshold,
-                    outcomes + request_idx,
+                    &ignored_host_outcome,
                     request.inverse_sample_seed,
                     request.inverse_sample_first_logical_position,
                     request.use_vllm_probability_rejection,
@@ -13805,13 +13823,43 @@ namespace llaminar2
                 return false;
         }
 
+        out_handle->output_tokens_device =
+            static_cast<const int32_t *>(stochastic_batch_output_tokens_dev_);
+        out_handle->meta_device =
+            static_cast<const int *>(stochastic_batch_output_meta_dev_);
+        out_handle->request_count = request_count;
+        out_handle->output_token_stride = kSpeculativeBatchMaxOutputTokens;
+        out_handle->meta_stride = kSpeculativeBatchMetaCount;
+        out_handle->device = state_.device_id;
+        out_handle->stream = stream;
+        return out_handle->valid();
+    }
+
+    bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(
+        const DeviceSpeculativeOutcomeHandle &handle,
+        DeviceSpeculativeVerifyBatchOutcome *outcomes)
+    {
+        using namespace sampling_math;
+        if (!handle.valid() ||
+            !outcomes ||
+            handle.device != state_.device_id ||
+            handle.request_count > stochastic_batch_output_request_capacity_)
+        {
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const int request_count = handle.request_count;
         std::vector<int32_t> output_tokens(
             static_cast<size_t>(request_count) *
-            kSpeculativeBatchMaxOutputTokens,
+            static_cast<size_t>(handle.output_token_stride),
             -1);
         std::vector<int> meta(
             static_cast<size_t>(request_count) *
-            kSpeculativeBatchMetaCount,
+            static_cast<size_t>(handle.meta_stride),
             0);
         {
             PerfStatsCollector::ScopedTimer timer(
@@ -13822,16 +13870,16 @@ namespace llaminar2
                 {{"requests", std::to_string(request_count)}});
             if (!backend->deviceToHostFast(
                     output_tokens.data(),
-                    stochastic_batch_output_tokens_dev_,
+                    handle.output_tokens_device,
                     sizeof(int32_t) * output_tokens.size(),
                     state_.device_id.gpu_ordinal(),
-                    stream) ||
+                    handle.stream) ||
                 !backend->deviceToHostFast(
                     meta.data(),
-                    stochastic_batch_output_meta_dev_,
+                    handle.meta_device,
                     sizeof(int) * meta.size(),
                     state_.device_id.gpu_ordinal(),
-                    stream))
+                    handle.stream))
             {
                 return false;
             }
@@ -13841,10 +13889,10 @@ namespace llaminar2
         {
             const auto token_base =
                 static_cast<size_t>(request_idx) *
-                kSpeculativeBatchMaxOutputTokens;
+                static_cast<size_t>(handle.output_token_stride);
             const auto meta_base =
                 static_cast<size_t>(request_idx) *
-                kSpeculativeBatchMetaCount;
+                static_cast<size_t>(handle.meta_stride);
             const int *request_meta = meta.data() + meta_base;
             if (request_meta[kSpecBatchMetaOk] == 0 ||
                 request_meta[kSpecBatchMetaOutputCount] < 0 ||
@@ -14204,11 +14252,30 @@ namespace llaminar2
             }
         }
 
+        std::array<int, kSpeculativeBatchMaxStopTokens> packed_stop_tokens =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            packed_stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
+
+        const int *first_token_dev = nullptr;
+        if (first_token_from_device)
+        {
+            first_token_dev =
+                static_cast<const int *>(stochastic_target_sample_tokens_dev_) +
+                first_target_sample_slot;
+            if (!waitForRequiredStochasticTargetSampleReady(
+                    first_target_sample_slot,
+                    stream,
+                    "stochastic_batch_summary_first_token"))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to order stochastic batch summary after deferred target sample");
+                return false;
+            }
+        }
+
         const int *bonus_token_dev = nullptr;
         if (has_bonus)
         {
-            // Bonus-ready sampling is unconditional in the batched lane. The
-            // summary kernel exposes it only when every row accepts.
             auto *bonus_out =
                 static_cast<int *>(stochastic_verify_tokens_dev_) + bonus_target_slot;
             bool bonus_enqueued = false;
@@ -14218,23 +14285,38 @@ namespace llaminar2
                     "stochastic_batch_bonus_sample_enqueue",
                     "decode",
                     state_.device_id.toString(),
-                    {{"top_k", std::to_string(target_top_k)}});
+                    {{"top_k", std::to_string(target_top_k)},
+                     {"lazy", use_vllm_probability_rejection ? "true" : "false"}});
                 if (use_vllm_probability_rejection)
                 {
                     auto *bonus_logits =
                         static_cast<float *>(stochastic_processed_logits_dev_) +
                         static_cast<size_t>(bonus_target_slot) * full_vocab_size;
-                    bonus_enqueued = backend->enqueueSampleProcessedLogitsF32Device(
-                        bonus_logits,
-                        full_vocab_size,
-                        full_vocab_size,
-                        bonus_threshold,
-                        state_.device_id.gpu_ordinal(),
-                        stream,
-                        bonus_out);
+                    bonus_enqueued =
+                        backend->enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
+                            bonus_logits,
+                            full_vocab_size,
+                            full_vocab_size,
+                            bonus_threshold,
+                            out_token_dev,
+                            out_accepted_dev,
+                            row_count,
+                            first_token_from_device ? -1 : first_token,
+                            first_token_dev,
+                            packed_stop_tokens.data(),
+                            stop_token_count,
+                            state_.device_id.gpu_ordinal(),
+                            stream,
+                            bonus_out);
                 }
                 else
                 {
+                    /*
+                     * Compact top-k/top-p distributions do not have a guarded
+                     * bonus sampler yet. Keep the legacy eager behavior here;
+                     * the vLLM processed-logit path above is the production
+                     * stochastic MTP path for GPU backends.
+                     */
                     auto *bonus_ids =
                         static_cast<int *>(stochastic_target_token_ids_dev_) +
                         static_cast<size_t>(bonus_target_slot) * kStochasticDistributionMaxK;
@@ -14256,27 +14338,6 @@ namespace llaminar2
                 return false;
             }
             bonus_token_dev = bonus_out;
-        }
-
-        std::array<int, kSpeculativeBatchMaxStopTokens> packed_stop_tokens =
-            {-1, -1, -1, -1, -1, -1, -1, -1};
-        for (int i = 0; i < stop_token_count; ++i)
-            packed_stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
-
-        const int *first_token_dev = nullptr;
-        if (first_token_from_device)
-        {
-            first_token_dev =
-                static_cast<const int *>(stochastic_target_sample_tokens_dev_) +
-                first_target_sample_slot;
-            if (!waitForRequiredStochasticTargetSampleReady(
-                    first_target_sample_slot,
-                    stream,
-                    "stochastic_batch_summary_first_token"))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to order stochastic batch summary after deferred target sample");
-                return false;
-            }
         }
 
         bool summary_enqueued = false;

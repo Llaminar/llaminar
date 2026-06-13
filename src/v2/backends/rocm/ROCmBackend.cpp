@@ -563,6 +563,29 @@ namespace llaminar2
         float *out_probability,
         int device_idx,
         void *stream);
+    extern "C" bool rocmOps_sample_processed_logits_if_speculative_batch_needs_bonus_f32(
+        const float *logits,
+        int vocab_size,
+        int row_stride,
+        float threshold,
+        const int *verify_tokens,
+        const int *verify_accepted,
+        int row_count,
+        int first_token,
+        const int *first_token_device,
+        int stop_token0,
+        int stop_token1,
+        int stop_token2,
+        int stop_token3,
+        int stop_token4,
+        int stop_token5,
+        int stop_token6,
+        int stop_token7,
+        int stop_token_count,
+        int *out_token,
+        float *out_probability,
+        int device_idx,
+        void *stream);
     extern "C" bool rocmOps_softmax_processed_logits_f32(
         const float *logits,
         int row_count,
@@ -1145,6 +1168,68 @@ namespace llaminar2
             vocab_size,
             row_stride,
             threshold,
+            static_cast<int *>(out_token_device),
+            static_cast<float *>(out_probability_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
+        const void *logits_device,
+        int vocab_size,
+        int row_stride,
+        float threshold,
+        const void *verify_tokens_device,
+        const void *verify_accepted_device,
+        int row_count,
+        int first_token,
+        const void *first_token_device,
+        const int *stop_tokens_host,
+        int stop_token_count,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_probability_device)
+    {
+        using namespace sampling_math;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !logits_device || vocab_size <= 0 || row_stride < vocab_size ||
+            !verify_tokens_device || !verify_accepted_device ||
+            row_count < 0 || row_count > kSpeculativeBatchMaxRows ||
+            (first_token < 0 && !first_token_device) ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens_host) ||
+            !stream || !out_token_device)
+        {
+            return false;
+        }
+
+        int stop_tokens[kSpeculativeBatchMaxStopTokens] =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            stop_tokens[i] = stop_tokens_host[i];
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_sample_processed_logits_if_speculative_batch_needs_bonus_f32(
+            static_cast<const float *>(logits_device),
+            vocab_size,
+            row_stride,
+            threshold,
+            static_cast<const int *>(verify_tokens_device),
+            static_cast<const int *>(verify_accepted_device),
+            row_count,
+            first_token,
+            static_cast<const int *>(first_token_device),
+            stop_tokens[0],
+            stop_tokens[1],
+            stop_tokens[2],
+            stop_tokens[3],
+            stop_tokens[4],
+            stop_tokens[5],
+            stop_tokens[6],
+            stop_tokens[7],
+            stop_token_count,
             static_cast<int *>(out_token_device),
             static_cast<float *>(out_probability_device),
             device_id,

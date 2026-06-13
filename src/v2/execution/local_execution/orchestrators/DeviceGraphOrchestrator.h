@@ -2213,6 +2213,23 @@ namespace llaminar2
             const DeviceStochasticBatchOutcomeRequest *requests,
             int request_count,
             DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
+        /**
+         * @brief Enqueue request-batch stochastic verification without host copy.
+         *
+         * The returned handle references runner-owned compact output rows in the
+         * activation arena.  It is valid until another stochastic outcome batch
+         * is staged on this runner.
+         */
+        bool verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+            const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
+        /**
+         * @brief Legacy host bridge for a device-resident stochastic outcome.
+         */
+        bool copyDeviceSpeculativeOutcomesToHost(
+            const DeviceSpeculativeOutcomeHandle &handle,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
 
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)

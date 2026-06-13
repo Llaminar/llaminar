@@ -257,7 +257,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             header = lines[0].split("\t")
             row = lines[1].split("\t")
             self.assertEqual(len(header), len(row))
-            self.assertEqual(len(header), 75)
+            self.assertEqual(len(header), 78)
             self.assertIn("topology", header)
             self.assertEqual(row[header.index("topology")], "single")
             self.assertEqual(row[header.index("device")], "cpu:0")
@@ -271,6 +271,9 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
                 "depth_demotions",
                 "depth_windows",
                 "last_depth_reason",
+                "stochastic_physical_verify_rows",
+                "stochastic_semantic_verify_rows",
+                "stochastic_post_reject_rows",
             ):
                 self.assertIn(required_column, header)
             self.assertEqual(row[header.index("depth_updates")], "0")

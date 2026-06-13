@@ -146,6 +146,22 @@ namespace llaminar2
             void *stream,
             void *out_token_device,
             void *out_probability_device = nullptr) override;
+        bool enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
+            const void *logits_device,
+            int vocab_size,
+            int row_stride,
+            float threshold,
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            int row_count,
+            int first_token,
+            const void *first_token_device,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_probability_device = nullptr) override;
         bool enqueueSoftmaxAndSampleTemperatureLogitsF32Device(
             const void *logits_device,
             int vocab_size,

@@ -88,6 +88,37 @@ namespace llaminar2
         MTPDeviceRejectionBatchOutcome;
 
     /**
+     * @brief Device-resident compact outcome buffers for stochastic MTP.
+     *
+     * This is the first-class handoff object for the vLLM-style path where the
+     * verifier summary remains on GPU.  The pointed-to buffers are owned by the
+     * runner and are valid until the runner stages another stochastic outcome
+     * request.  Future publication code can consume these buffers directly and
+     * avoid the per-step D2H boundary; current compatibility callers can pass
+     * the handle to copyDeviceSpeculativeOutcomesToHost().
+     */
+    struct DeviceSpeculativeOutcomeHandle
+    {
+        const int32_t *output_tokens_device = nullptr;
+        const int *meta_device = nullptr;
+        int request_count = 0;
+        int output_token_stride = sampling_math::kSpeculativeBatchMaxOutputTokens;
+        int meta_stride = sampling_math::kSpeculativeBatchMetaCount;
+        DeviceId device;
+        void *stream = nullptr;
+
+        bool valid() const
+        {
+            return output_tokens_device != nullptr &&
+                   meta_device != nullptr &&
+                   request_count > 0 &&
+                   output_token_stride >= sampling_math::kSpeculativeBatchMaxOutputTokens &&
+                   meta_stride >= sampling_math::kSpeculativeBatchMetaCount &&
+                   stream != nullptr;
+        }
+    };
+
+    /**
      * @brief One logical request inside a device-side stochastic MTP batch.
      *
      * The descriptor is intentionally value-owned: thresholds and stop tokens
@@ -1697,6 +1728,41 @@ namespace llaminar2
             }
 
             return true;
+        }
+
+        /**
+         * @brief Enqueue request-batch verification and leave compact outcome on device.
+         *
+         * Implementations should enqueue all per-request verify/bonus/summary
+         * kernels on one explicit stream and return a handle to compact device
+         * output rows.  This is the GPU-resident Phase 10 contract; callers that
+         * still need host metadata should call copyDeviceSpeculativeOutcomesToHost().
+         */
+        virtual bool verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+            const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle)
+        {
+            (void)requests;
+            (void)request_count;
+            (void)out_handle;
+            return false;
+        }
+
+        /**
+         * @brief Compatibility bridge from a device-resident outcome to host structs.
+         *
+         * This method intentionally represents the legacy host-visible boundary.
+         * New state-publication code should consume DeviceSpeculativeOutcomeHandle
+         * directly instead of calling this bridge in the decode hot path.
+         */
+        virtual bool copyDeviceSpeculativeOutcomesToHost(
+            const DeviceSpeculativeOutcomeHandle &handle,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes)
+        {
+            (void)handle;
+            (void)outcomes;
+            return false;
         }
 
         /**

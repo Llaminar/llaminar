@@ -2177,6 +2177,115 @@ __global__ void rocm_sample_processed_logits_f32_kernel(
     }
 }
 
+/**
+ * @brief Lazily sample a processed bonus row only if the verifier needs it.
+ *
+ * ROCm mirrors the CUDA guarded bonus contract: rejected or stopped batches
+ * write `-1` and skip the full-vocabulary processed-logit scan, while
+ * all-accepted batches sample exactly like the eager bonus sampler.
+ */
+__global__ void rocm_sample_processed_logits_if_speculative_batch_needs_bonus_f32_kernel(
+    const float *__restrict__ logits,
+    int vocab_size,
+    int row_stride,
+    float threshold,
+    const int *__restrict__ verify_tokens,
+    const int *__restrict__ verify_accepted,
+    int row_count,
+    int first_token,
+    const int *__restrict__ first_token_device,
+    int stop_token0,
+    int stop_token1,
+    int stop_token2,
+    int stop_token3,
+    int stop_token4,
+    int stop_token5,
+    int stop_token6,
+    int stop_token7,
+    int stop_token_count,
+    int *__restrict__ out_token,
+    float *__restrict__ out_probability)
+{
+    (void)row_stride;
+    __shared__ int should_sample_bonus;
+    __shared__ float scratch_vals[PROCESSED_LOGIT_VERIFY_THREADS];
+    __shared__ int scratch_idxs[PROCESSED_LOGIT_VERIFY_THREADS];
+    __shared__ float max_logit;
+    __shared__ float exp_sum;
+    __shared__ int argmax_token;
+    __shared__ int selected_token;
+
+    if (blockIdx.x != 0 || blockDim.x != PROCESSED_LOGIT_VERIFY_THREADS)
+        return;
+
+    if (threadIdx.x == 0)
+    {
+        int stop_tokens[llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens] = {
+            stop_token0,
+            stop_token1,
+            stop_token2,
+            stop_token3,
+            stop_token4,
+            stop_token5,
+            stop_token6,
+            stop_token7};
+        const int sampled_first_token =
+            first_token_device ? *first_token_device : first_token;
+        should_sample_bonus =
+            llaminar2::sampling_math::speculative_batch_needs_bonus_ready_token(
+                sampled_first_token,
+                verify_tokens,
+                verify_accepted,
+                row_count,
+                stop_tokens,
+                stop_token_count)
+                ? 1
+                : 0;
+        if (!should_sample_bonus)
+        {
+            *out_token = -1;
+            if (out_probability)
+                *out_probability = 0.0f;
+        }
+    }
+    __syncthreads();
+    if (!should_sample_bonus)
+        return;
+
+    rocm_processed_logit_row_stats_block<PROCESSED_LOGIT_VERIFY_THREADS>(
+        logits,
+        vocab_size,
+        scratch_vals,
+        scratch_idxs,
+        &max_logit,
+        &exp_sum,
+        &argmax_token);
+
+    rocm_sample_processed_logit_row_block<PROCESSED_LOGIT_VERIFY_THREADS>(
+        logits,
+        vocab_size,
+        max_logit,
+        exp_sum,
+        argmax_token,
+        threshold,
+        scratch_vals,
+        &selected_token);
+
+    if (threadIdx.x == 0)
+    {
+        *out_token = selected_token;
+        if (out_probability)
+        {
+            *out_probability = rocm_processed_logit_probability(
+                logits,
+                vocab_size,
+                max_logit,
+                exp_sum,
+                selected_token);
+        }
+    }
+}
+
 __global__ void rocm_softmax_sample_temperature_logits_f32_kernel(
     const float *__restrict__ logits,
     int vocab_size,
@@ -3777,6 +3886,80 @@ bool rocmOps_sample_processed_logits_f32(
     if (err != hipSuccess)
     {
         fprintf(stderr, "ROCm Processed-Logit Sample kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_sample_processed_logits_if_speculative_batch_needs_bonus_f32(
+    const float *logits,
+    int vocab_size,
+    int row_stride,
+    float threshold,
+    const int *verify_tokens,
+    const int *verify_accepted,
+    int row_count,
+    int first_token,
+    const int *first_token_device,
+    int stop_token0,
+    int stop_token1,
+    int stop_token2,
+    int stop_token3,
+    int stop_token4,
+    int stop_token5,
+    int stop_token6,
+    int stop_token7,
+    int stop_token_count,
+    int *out_token,
+    float *out_probability,
+    int device_idx,
+    void *stream)
+{
+    if (!logits || !verify_tokens || !verify_accepted || !out_token ||
+        !stream || vocab_size <= 0 || row_stride < vocab_size ||
+        row_count < 0 ||
+        row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+        (first_token < 0 && !first_token_device) ||
+        stop_token_count < 0 ||
+        stop_token_count >
+            llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_sample_processed_logits_if_speculative_batch_needs_bonus_f32_kernel,
+        dim3(1),
+        dim3(PROCESSED_LOGIT_VERIFY_THREADS),
+        0,
+        static_cast<hipStream_t>(stream),
+        logits,
+        vocab_size,
+        row_stride,
+        threshold,
+        verify_tokens,
+        verify_accepted,
+        row_count,
+        first_token,
+        first_token_device,
+        stop_token0,
+        stop_token1,
+        stop_token2,
+        stop_token3,
+        stop_token4,
+        stop_token5,
+        stop_token6,
+        stop_token7,
+        stop_token_count,
+        out_token,
+        out_probability);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Lazy Processed-Logit Bonus Sample kernel launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }

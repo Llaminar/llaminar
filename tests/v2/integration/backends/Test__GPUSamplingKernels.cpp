@@ -5363,10 +5363,16 @@ namespace
                     bonus_row.size() * sizeof(float), device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
-                EXPECT_FALSE(backend_->enqueueSampleProcessedLogitsF32Device(
-                    d_bonus, vocab_size, vocab_size, bonus_threshold,
-                    device_id_, nullptr, d_bonus_token))
-                    << "processed-logit bonus sampler must reject the legacy default/null stream";
+                EXPECT_FALSE(
+                    backend_->enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
+                        d_bonus, vocab_size, vocab_size, bonus_threshold,
+                        d_verify_tokens, d_verify_accepted, row_count,
+                        request_tokens[0],
+                        /*first_token_device=*/nullptr,
+                        /*stop_tokens_host=*/nullptr,
+                        /*stop_token_count=*/0,
+                        device_id_, nullptr, d_bonus_token))
+                    << "lazy processed-logit bonus sampler must reject the legacy default/null stream";
 
                 auto capture = ctx.createGraphCapture(stream);
                 ASSERT_NE(capture, nullptr);
@@ -5378,9 +5384,15 @@ namespace
                         residual_thresholds.data(), device_id_, stream,
                         d_verify_tokens, d_verify_accepted,
                         nullptr, nullptr, d_draft_token_probs));
-                ASSERT_TRUE(backend_->enqueueSampleProcessedLogitsF32Device(
-                    d_bonus, vocab_size, vocab_size, bonus_threshold,
-                    device_id_, stream, d_bonus_token));
+                ASSERT_TRUE(
+                    backend_->enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
+                        d_bonus, vocab_size, vocab_size, bonus_threshold,
+                        d_verify_tokens, d_verify_accepted, row_count,
+                        request_tokens[0],
+                        /*first_token_device=*/nullptr,
+                        /*stop_tokens_host=*/nullptr,
+                        /*stop_token_count=*/0,
+                        device_id_, stream, d_bonus_token));
                 ASSERT_TRUE(backend_->enqueueSummarizeSpeculativeVerifyBatch(
                     d_verify_tokens,
                     d_verify_accepted,
@@ -5414,6 +5426,9 @@ namespace
 
         std::array<int, sampling_math::kSpeculativeBatchMaxOutputTokens> output_tokens{};
         std::array<int, sampling_math::kSpeculativeBatchMetaCount> output_meta{};
+        int bonus_token = -1;
+        ASSERT_TRUE(backend_->deviceToHost(
+            &bonus_token, d_bonus_token, sizeof(int), device_id_));
         ASSERT_TRUE(backend_->deviceToHost(
             output_tokens.data(), d_output_tokens,
             output_tokens.size() * sizeof(int), device_id_));
@@ -5424,6 +5439,7 @@ namespace
         cleanup();
 
         ASSERT_EQ(output_meta[sampling_math::kSpecBatchMetaOk], 1);
+        EXPECT_EQ(bonus_token, expected.ready_token);
         EXPECT_EQ(output_meta[sampling_math::kSpecBatchMetaOutputCount],
                   static_cast<int>(expected.output_tokens.size()));
         EXPECT_EQ(output_meta[sampling_math::kSpecBatchMetaAcceptedSpeculativePrefix],
@@ -5440,6 +5456,144 @@ namespace
             EXPECT_EQ(output_tokens[i], expected.output_tokens[i])
                 << "output token " << i;
         }
+    }
+
+    TEST_P(GPUSamplingTest, LazyProcessedBonusSamplerSkipsRejectedBatchAndCaptures)
+    {
+        constexpr int vocab_size = 16;
+        constexpr int row_count = 2;
+        constexpr float bonus_threshold = 0.5f;
+        const std::array<int, row_count> verify_tokens = {11, 42};
+        const std::array<int, row_count> verify_accepted = {1, 0};
+        const std::array<int, sampling_math::kSpeculativeBatchMaxStopTokens>
+            stop_tokens = {-1, -1, -1, -1, -1, -1, -1, -1};
+        const int first_token = 10;
+
+        std::vector<float> bonus_row(vocab_size, -std::numeric_limits<float>::infinity());
+        bonus_row[7] = 4.0f;
+        bonus_row[8] = 2.0f;
+
+        void *d_bonus = backend_->allocate(bonus_row.size() * sizeof(float), device_id_);
+        void *d_verify_tokens = backend_->allocate(verify_tokens.size() * sizeof(int), device_id_);
+        void *d_verify_accepted = backend_->allocate(verify_accepted.size() * sizeof(int), device_id_);
+        void *d_bonus_token = backend_->allocate(sizeof(int), device_id_);
+        void *d_output_tokens = backend_->allocate(
+            sampling_math::kSpeculativeBatchMaxOutputTokens * sizeof(int),
+            device_id_);
+        void *d_output_meta = backend_->allocate(
+            sampling_math::kSpeculativeBatchMetaCount * sizeof(int),
+            device_id_);
+
+        auto cleanup = [&]()
+        {
+            void *ptrs[] = {
+                d_bonus,
+                d_verify_tokens,
+                d_verify_accepted,
+                d_bonus_token,
+                d_output_tokens,
+                d_output_meta};
+            for (void *ptr : ptrs)
+            {
+                if (ptr)
+                    backend_->free(ptr, device_id_);
+            }
+        };
+
+        ASSERT_NE(d_bonus, nullptr);
+        ASSERT_NE(d_verify_tokens, nullptr);
+        ASSERT_NE(d_verify_accepted, nullptr);
+        ASSERT_NE(d_bonus_token, nullptr);
+        ASSERT_NE(d_output_tokens, nullptr);
+        ASSERT_NE(d_output_meta, nullptr);
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+                int stale_bonus_token = 12345;
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_bonus, bonus_row.data(),
+                    bonus_row.size() * sizeof(float), device_id_, stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_verify_tokens, verify_tokens.data(),
+                    verify_tokens.size() * sizeof(int), device_id_, stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_verify_accepted, verify_accepted.data(),
+                    verify_accepted.size() * sizeof(int), device_id_, stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_bonus_token, &stale_bonus_token, sizeof(int),
+                    device_id_, stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(
+                    backend_->enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
+                        d_bonus, vocab_size, vocab_size, bonus_threshold,
+                        d_verify_tokens, d_verify_accepted, row_count,
+                        first_token,
+                        /*first_token_device=*/nullptr,
+                        stop_tokens.data(),
+                        /*stop_token_count=*/0,
+                        device_id_, stream, d_bonus_token));
+                ASSERT_TRUE(backend_->enqueueSummarizeSpeculativeVerifyBatch(
+                    d_verify_tokens,
+                    d_verify_accepted,
+                    row_count,
+                    first_token,
+                    /*stop_tokens_host=*/nullptr,
+                    /*stop_token_count=*/0,
+                    d_bonus_token,
+                    /*has_bonus_token=*/true,
+                    device_id_,
+                    stream,
+                    d_output_tokens,
+                    d_output_meta));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        int bonus_token = 0;
+        std::array<int, sampling_math::kSpeculativeBatchMaxOutputTokens> output_tokens{};
+        std::array<int, sampling_math::kSpeculativeBatchMetaCount> output_meta{};
+        ASSERT_TRUE(backend_->deviceToHost(
+            &bonus_token, d_bonus_token, sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            output_tokens.data(), d_output_tokens,
+            output_tokens.size() * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            output_meta.data(), d_output_meta,
+            output_meta.size() * sizeof(int), device_id_));
+
+        cleanup();
+
+        EXPECT_EQ(bonus_token, -1);
+        ASSERT_EQ(output_meta[sampling_math::kSpecBatchMetaOk], 1);
+        EXPECT_EQ(output_meta[sampling_math::kSpecBatchMetaOutputCount], 3);
+        EXPECT_EQ(output_meta[sampling_math::kSpecBatchMetaAcceptedSpeculativePrefix], 1);
+        EXPECT_EQ(output_meta[sampling_math::kSpecBatchMetaReadyToken], -1);
+        EXPECT_EQ(output_meta[sampling_math::kSpecBatchMetaSampledTerminal], 0);
+        EXPECT_EQ(output_tokens[0], first_token);
+        EXPECT_EQ(output_tokens[1], verify_tokens[0]);
+        EXPECT_EQ(output_tokens[2], verify_tokens[1]);
     }
 
     TEST_P(GPUSamplingTest, SpeculativeVerifyDistributionsAreGraphCapturable)

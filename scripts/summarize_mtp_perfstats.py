@@ -12,6 +12,9 @@ from typing import Any, Iterable
 FIELDS = (
     "decode_step_ms",
     "verifier_ms",
+    "stochastic_physical_verify_rows",
+    "stochastic_semantic_verify_rows",
+    "stochastic_post_reject_rows",
     "condition_ms",
     "condition_count",
     "condition_skipped_ready",
@@ -144,6 +147,21 @@ def _sum_count(
     return total
 
 
+def _sum_value(
+    records: Iterable[dict[str, Any]],
+    domain: str,
+    name: str,
+    *,
+    phase: str | None = None,
+    tags: dict[str, str] | None = None,
+) -> float:
+    total = 0.0
+    for record in records:
+        if _matches(record, domain=domain, name=name, phase=phase, tags=tags):
+            total += float(record.get("value", 0.0) or 0.0)
+    return total
+
+
 def _sum_tagged_int(
     records: Iterable[dict[str, Any]],
     domain: str,
@@ -257,6 +275,24 @@ def summarize(path: Path | None) -> dict[str, float | int]:
     return {
         "decode_step_ms": _sum_total_ms(records, "mtp", "decode_step_total"),
         "verifier_ms": _sum_total_ms(records, "mtp", "verifier_forward"),
+        "stochastic_physical_verify_rows": _sum_value(
+            records,
+            "mtp",
+            "stochastic_device_physical_verify_rows",
+            phase="decode",
+        ),
+        "stochastic_semantic_verify_rows": _sum_value(
+            records,
+            "mtp",
+            "stochastic_device_semantic_verify_rows",
+            phase="decode",
+        ),
+        "stochastic_post_reject_rows": _sum_value(
+            records,
+            "mtp",
+            "stochastic_device_post_reject_rows",
+            phase="decode",
+        ),
         "condition_ms": _sum_total_ms(records, "mtp", "condition_forward"),
         "condition_count": _sum_count(records, "mtp", "condition_forward"),
         "condition_skipped_ready": _sum_count(

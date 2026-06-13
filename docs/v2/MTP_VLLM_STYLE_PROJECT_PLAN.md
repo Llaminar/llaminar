@@ -541,13 +541,19 @@ Done:
   accept-all are much worse (about 8.54 ms and 13.37 ms). If we pursue lazy
   target verification, it must be one fused GPU-side reducer that scans rows
   until rejection without per-row host-visible boundaries.
-- A production compact lazy-bonus A/B was also rejected and removed. Diagnostic
-  matrices `20260612T_lazy_bonus_off_moe_stochastic_diag` and
+- The old production compact lazy-bonus A/B was rejected and removed.
+  Diagnostic matrices `20260612T_lazy_bonus_off_moe_stochastic_diag` and
   `20260612T_lazy_bonus_on_moe_stochastic_diag` showed CUDA dynamic falling
   from 136.0 to 130.2 tok/s and ROCm dynamic from 61.7 to 59.6 tok/s; only ROCm
   fixed d3 moved from 43.9 to 44.8 tok/s, not enough to justify a branchy
-  env-only path. The next lazy attempt must be fused GPU-side, not
-  summarize-then-build-bonus on the host boundary.
+  env-only path. A later guarded bonus sampler is intentionally narrower:
+  `enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus()` keeps
+  the vLLM-style processed-logit GPU path, runs on the explicit capture stream,
+  and only writes the bonus token when the speculative batch actually reaches
+  the all-accepted bonus row. Focused CUDA/ROCm graph-capture regressions pass,
+  and `20260613T_phase10_lazy_bonus_moe_stochastic` shows CUDA MoE stochastic
+  d3 at 133.8 tok/s (0.96x) and ROCm d3 at 70.9 tok/s (0.92x). This is kept as
+  a cleanup and modest ROCm d3 improvement, but it does not close Phase 10.
 - Same-run stochastic accepted-prefix histograms explain why this is primarily
   a ROCm MoE target today. CUDA fixed d3 accepts all three drafts in about 54%
   of verifier steps and averages about 2.09 accepted drafts, so eager batched
@@ -2405,6 +2411,38 @@ Current status:
   stochastic accept/residual/bonus RNG positions against the scalar contract, so
   poor request-batch acceptance is no longer treated as an obvious descriptor
   drift bug.
+- Phase 10 now tracks `stochastic_device_physical_verify_rows`,
+  `stochastic_device_semantic_verify_rows`, and
+  `stochastic_device_post_reject_rows` for both scalar and request-batched
+  device stochastic outcome paths. `scripts/summarize_mtp_perfstats.py` and the
+  standard benchmark matrix now surface them as
+  `stochastic_physical_verify_rows`, `stochastic_semantic_verify_rows`, and
+  `stochastic_post_reject_rows`, so this signal is present in every future
+  `summary.tsv`. These counters make the next optimization decision observable:
+  if post-rejection verifier rows dominate, split accept-count discovery from
+  residual correction so only the first rejected row pays correction sampling;
+  if not, prioritize verifier graph and condition replay cost directly.
+- The first clean counter-bearing MoE stochastic pass
+  (`20260613T_phase10_moe_stochastic_row_counters`) keeps both CUDA and ROCm
+  below baseline: CUDA d2/d3 reaches 124.9/132.9 tok/s versus 138.4 baseline
+  with only 7/132 and 19/157 post-reject rows, while ROCm d2/d3 reaches
+  58.3/62.2 tok/s versus 77.0 baseline with 45/158 and 75/198 post-reject
+  rows. This moves the next slice away from generic sampler-table work and
+  toward ROCm outcome synchronization plus condition/rejection economics.
+- `DeviceSpeculativeOutcomeHandle` is now the Phase 10 resident-outcome
+  contract. `DeviceGraphOrchestrator` can enqueue a request-batched stochastic
+  verifier summary and return runner-owned device pointers plus the explicit
+  verifier stream without copying metadata to host. The existing
+  `verifyStochasticDistributionsRequestBatchOutcomesOnDevice()` method is now a
+  compatibility wrapper over resident enqueue plus
+  `copyDeviceSpeculativeOutcomesToHost()`. This does not yet remove the scalar
+  hot-path D2H boundary; it gives the next publication slice a concrete handle
+  to consume for accepted-state publish and next-token staging.
+- The tuning dashboard has been reshaped into an explicit device/topology
+  matrix covering SingleDevice, LocalTP CUDA2, LocalTP ROCm2/ROCm4, LocalPP,
+  NodeLocalTP, and ExpertOverlay with RAG columns for dense/MoE and
+  greedy/stochastic. Missing benchmark lanes must stay amber/red until a fresh
+  same-run matrix exists for that exact mode and degree.
 - No default-enable proposal is allowed until the active dashboard matrix has
   same-run parity and benchmark evidence for the exact backend/model/sampling
   lanes under consideration.
@@ -2494,8 +2532,10 @@ d1 and keeps d1 as the adaptive floor; d0 bypass must be run as an explicit
 diagnostic until it is proven faster than d1 on a matching benchmark. The
 generated `summary.tsv` includes
 `speedup_vs_baseline` for every MTP row plus perfstats-derived verifier health:
-`verifier_ms`, `condition_ms/count/skipped_ready`, `rejection_no_ready`,
-`correction_ms`, `publish_ms/count/avg_ms`,
+`verifier_ms`, `stochastic_physical_verify_rows`,
+`stochastic_semantic_verify_rows`, `stochastic_post_reject_rows`,
+`condition_ms/count/skipped_ready`, `rejection_no_ready`, `correction_ms`,
+`publish_ms/count/avg_ms`,
 `sidecar_ms`, `sidecar_depth0_decode_ms`, `shifted_*_ms`, `sampling_ms`,
 `shifted_kv_ready_events/waits/syncs_deferred`, `checkpoint_ms`,
 `sidecar_graph_hits/misses`,
