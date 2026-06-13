@@ -1876,6 +1876,18 @@ Status:
   participants as hard failures. Focused gates:
   `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`, and the
   bounded Phase 8 unit cluster.
+- Request-batch admission now has a first-class scheduler contract.
+  `MTPSpecRequestBatchScheduler` groups pending requests in stable order,
+  admits only matching mode/topology/vocab shapes, preserves variable verifier
+  token counts within the configured padded shape, and records deferred versus
+  rejected reasons before any runner state mutates. Device-token verifier rows
+  stay rejected for request batching until they have a declared workspace
+  contract. `MTPVerifierForwardExecutor` now accepts a scheduled greedy batch
+  through a narrow adapter and feeds the existing padded verifier transaction
+  helper, proving scheduler output is executable without teaching the
+  scheduler about runner entrypoints. Focused gates:
+  `V2_Unit_MTPSpecRequestBatchScheduler`, `V2_Unit_MTPVerifierForwardExecutor`,
+  and the bounded MTP metadata/transaction cluster.
 
 Exit gate:
 

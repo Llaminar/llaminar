@@ -6493,6 +6493,18 @@ add_v2_test(V2_Unit_MTPVerifierForwardExecutor
     MPI_PROCS 1
 )
 
+# Test: vLLM-style MTP request-batch scheduler admission
+add_executable(v2_test_mtp_spec_request_batch_scheduler unit/mtp/Test__MTPSpecRequestBatchScheduler.cpp)
+target_link_libraries(v2_test_mtp_spec_request_batch_scheduler llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
+target_include_directories(v2_test_mtp_spec_request_batch_scheduler PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPSpecRequestBatchScheduler
+    COMMAND $<TARGET_FILE:v2_test_mtp_spec_request_batch_scheduler>
+    LABELS "V2;Unit;MTP;SpecDecode;Scheduler"
+    MPI_PROCS 1
+)
+
 # Test: vLLM-style MTP spec-step state publication contract
 add_executable(v2_test_mtp_spec_state_contract unit/mtp/Test__MTPSpecStateContract.cpp)
 target_link_libraries(v2_test_mtp_spec_state_contract llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)

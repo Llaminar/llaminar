@@ -1231,6 +1231,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/mtp/MTPDecodeCatchup.cpp
     execution/mtp/MTPDepthController.cpp
     execution/mtp/MTPStateTransaction.cpp
+    execution/mtp/MTPSpecRequestBatchScheduler.cpp
     execution/mtp/MTPSpecDecodeMetadata.cpp
     execution/mtp/MTPSpecKVPublisher.cpp
     execution/mtp/MTPSpecStateContract.cpp

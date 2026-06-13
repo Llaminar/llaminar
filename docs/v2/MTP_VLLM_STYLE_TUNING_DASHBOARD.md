@@ -26,8 +26,8 @@ Before a WiP commit, broad units plus touched parity must pass.
   request-1 publication now calls the batch publisher through SingleDevice,
   LocalTP, and LocalPP rank fan-out. Compact verifier scratch, explicit graph
   rows, padded verifier-decode caching, bounded one-token Qwen35/Qwen36
-  sidecar batches, and padded-row spec-state/terminal-hidden publication are
-  unit-proven.
+  sidecar batches, padded-row publication, and scheduler-to-executor greedy
+  request-batch admission are unit-proven.
   `--mtp-max-request-batch` records intent but still hard-fails above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.
@@ -83,7 +83,7 @@ d1 54.9, d3 52.5 tok/s; MoE no-MTP 118.26, d1 142.0, d3 132.8 tok/s.
 
 ## Next
 
-1. Implement Phase 8 executable request-batched spec transactions for MoE.
+1. Wire Phase 8 scheduler batches into benchmark/server-side spec transactions.
 2. Promote matrix request-batch lanes from hard-fail diagnostics to benchmarks.
 3. Run Phase 9 NodeLocalTP CPU and ExpertOverlay benchmark presets when the
    active slice touches those topologies.

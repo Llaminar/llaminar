@@ -2,6 +2,7 @@
 
 #include "../mtp/MTPDecodeCatchup.h"
 #include "../mtp/MTPSpecDecodeMetadata.h"
+#include "../mtp/MTPSpecRequestBatchScheduler.h"
 #include "../mtp/MTPSpecTransactionDriver.h"
 
 #include <string>
@@ -102,5 +103,17 @@ namespace llaminar2
     MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierBatchTransaction(
         IInferenceRunner &runner,
         const MTPGreedyVerifierBatchTransactionRequest &request);
+
+    /**
+     * @brief Execute a scheduler-produced greedy verifier transaction batch.
+     *
+     * This is the narrow handoff between request admission and graph execution.
+     * Keeping the adapter here avoids teaching the scheduler about runner-layer
+     * entrypoints while still proving that scheduled batches are immediately
+     * consumable by the existing vLLM-style transaction helper.
+     */
+    MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierScheduledBatchTransaction(
+        IInferenceRunner &runner,
+        const MTPSpecRequestBatch &scheduled_batch);
 
 } // namespace llaminar2

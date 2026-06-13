@@ -2,6 +2,7 @@
 
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -339,6 +340,71 @@ TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionBuildsPublicationPl
     EXPECT_EQ(second.accepted_count, 1);
     EXPECT_EQ(second.target_cached_tokens, 201);
     EXPECT_TRUE(second.requiresCorrectionReplay());
+}
+
+TEST(Test__MTPVerifierForwardExecutor, ScheduledGreedyBatchFeedsTransactionExecutor)
+{
+    RecordingInferenceRunner runner;
+    runner.scripted_verifier_samples = {9, 8, 4, 77, 123, 123};
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/3,
+            MTPSpecRequestBatchMode::GREEDY});
+
+    MTPSpecSchedulableRequest first;
+    first.request_id = 10;
+    first.compatibility_key = "qwen36-moe-cuda0";
+    first.vocab_size = 100;
+    first.base_cached_tokens = 100;
+    first.greedy_request.draft_tokens = {7, 9, 8};
+
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 11;
+    second.base_cached_tokens = 200;
+    second.greedy_request.draft_tokens = {11, 12, 13};
+
+    MTPSpecRequestBatch scheduled =
+        scheduler.buildNextBatch({first, second});
+    ASSERT_TRUE(scheduled.ok) << scheduled.error;
+
+    MTPGreedyVerifierBatchTransactionResult result =
+        executeMTPGreedyVerifierScheduledBatchTransaction(runner, scheduled);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.forward.used_batch_forward);
+    EXPECT_EQ(runner.batch_forward_count, 1);
+    EXPECT_EQ(runner.last_token_batches,
+              (std::vector<std::vector<int>>{{7, 9, 8}, {11, 12, 13}}));
+    ASSERT_EQ(result.transaction_plan.step_plans.steps.size(), 2u);
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[0].request_id, 10);
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[1].request_id, 11);
+}
+
+TEST(Test__MTPVerifierForwardExecutor, ScheduledTransactionRejectsNonGreedyBatch)
+{
+    RecordingInferenceRunner runner;
+
+    MTPSpecRequestBatch scheduled;
+    scheduled.ok = true;
+    scheduled.mode = MTPSpecRequestBatchMode::STOCHASTIC;
+    scheduled.request_count = 1;
+    scheduled.shape.max_requests = 1;
+    scheduled.shape.max_draft_tokens = 2;
+    scheduled.request_ids = {12};
+    scheduled.vocab_size = 100;
+    scheduled.base_cached_tokens = {50};
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {1, 2};
+    scheduled.greedy_requests = {request};
+
+    MTPGreedyVerifierBatchTransactionResult result =
+        executeMTPGreedyVerifierScheduledBatchTransaction(runner, scheduled);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, testing::HasSubstr("not greedy"));
+    EXPECT_EQ(runner.batch_forward_count, 0);
 }
 
 TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionCleansUpAfterForwardFailure)

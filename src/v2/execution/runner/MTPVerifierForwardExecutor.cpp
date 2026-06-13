@@ -243,4 +243,46 @@ namespace llaminar2
         return result;
     }
 
+    MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierScheduledBatchTransaction(
+        IInferenceRunner &runner,
+        const MTPSpecRequestBatch &scheduled_batch)
+    {
+        MTPGreedyVerifierBatchTransactionResult result;
+
+        auto fail = [&](std::string error) -> MTPGreedyVerifierBatchTransactionResult
+        {
+            result.ok = false;
+            result.error = std::move(error);
+            return result;
+        };
+
+        if (!scheduled_batch.ok)
+        {
+            return fail(
+                std::string("cannot execute invalid scheduled MTP batch: ") +
+                scheduled_batch.error);
+        }
+        if (scheduled_batch.mode != MTPSpecRequestBatchMode::GREEDY)
+            return fail("scheduled MTP batch is not greedy");
+        if (scheduled_batch.request_count <= 0)
+            return fail("scheduled MTP batch has no admitted requests");
+
+        const size_t request_count =
+            static_cast<size_t>(scheduled_batch.request_count);
+        if (scheduled_batch.request_ids.size() != request_count ||
+            scheduled_batch.greedy_requests.size() != request_count ||
+            scheduled_batch.base_cached_tokens.size() != request_count)
+        {
+            return fail("scheduled MTP batch vectors do not match request_count");
+        }
+
+        MTPGreedyVerifierBatchTransactionRequest request;
+        request.shape = scheduled_batch.shape;
+        request.request_ids = scheduled_batch.request_ids;
+        request.vocab_size = scheduled_batch.vocab_size;
+        request.requests = scheduled_batch.greedy_requests;
+        request.base_cached_tokens = scheduled_batch.base_cached_tokens;
+        return executeMTPGreedyVerifierBatchTransaction(runner, request);
+    }
+
 } // namespace llaminar2
