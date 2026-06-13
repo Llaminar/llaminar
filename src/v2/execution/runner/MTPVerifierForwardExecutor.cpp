@@ -36,12 +36,6 @@ namespace llaminar2
         }
 
         const bool batched = graph_plan.request_count > 1;
-        if (batched && options.device_token_ids)
-        {
-            return verifierForwardFailure(
-                std::move(graph_plan),
-                "Batched MTP verifier forward cannot use the single-row device token input hook");
-        }
         if (batched && !options.allow_batched_host_forward)
         {
             return verifierForwardFailure(
@@ -57,7 +51,12 @@ namespace llaminar2
 
         if (batched)
         {
-            forward_ok = runner.forward_batch(result.graph_plan.token_batches);
+            forward_ok = options.device_token_ids
+                             ? runner.forwardBatchWithDeviceTokenIds(
+                                   result.graph_plan.token_batches,
+                                   options.device_token_ids,
+                                   result.graph_plan.padded_seq_len)
+                             : runner.forward_batch(result.graph_plan.token_batches);
         }
         else
         {

@@ -15,10 +15,11 @@ namespace llaminar2
     /**
      * @brief Optional execution knobs for a target-verifier graph forward.
      *
-     * The device-token pointer is intentionally single-request only today. It
-     * represents a runner-owned compact token row that GPU graph capture can
-     * read without a host-to-device copy. Request-batched device-token input
-     * needs a separate workspace contract, so this helper hard-fails that case.
+     * The device-token pointer represents either a runner-owned compact token
+     * row or a padded request-batch token matrix that GPU graph capture can
+     * read without a host-to-device copy. Batched callers must provide rows
+     * laid out as `[request_count, padded_seq_len]`, matching the graph
+     * forward plan.
      */
     struct MTPVerifierForwardExecutionOptions
     {
@@ -49,7 +50,8 @@ namespace llaminar2
      *
      * - one request + host tokens -> `forward()`
      * - one request + device token row -> `forwardWithDeviceTokenIds()`
-     * - multiple requests -> `forward_batch()`
+     * - multiple requests + host tokens -> `forward_batch()`
+     * - multiple requests + device token rows -> `forwardBatchWithDeviceTokenIds()`
      *
      * Keeping this as a single utility prevents future scheduler batching from
      * quietly diverging from the SingleDevice verifier path.

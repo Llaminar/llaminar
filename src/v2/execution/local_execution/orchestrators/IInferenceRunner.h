@@ -176,6 +176,37 @@ namespace llaminar2
         }
 
         /**
+         * @brief Run a padded batched forward pass from device-resident token IDs.
+         *
+         * `token_batches` is the logical host shadow for diagnostics and state
+         * bookkeeping. `token_ids_device` is the execution source of truth and
+         * must point at a caller-owned flat INT32 buffer laid out as
+         * `[request_count, padded_seq_len]`. Padding tokens in that device
+         * buffer must match the host shadow materialization performed by the
+         * caller so graph row indices and sequence-length masks stay aligned.
+         *
+         * The default hard-fails unsupported runners. Rank-level orchestrators
+         * need a per-participant pointer bundle rather than one raw pointer, so
+         * this contract is intentionally runner-local until that ownership is
+         * modeled explicitly.
+         *
+         * @param token_batches Logical per-request host shadow tokens.
+         * @param token_ids_device Stable flat device pointer for padded tokens.
+         * @param padded_seq_len Row width of `token_ids_device`.
+         * @return true when the batched forward pass succeeds.
+         */
+        virtual bool forwardBatchWithDeviceTokenIds(
+            const std::vector<std::vector<int>> &token_batches,
+            const void *token_ids_device,
+            int padded_seq_len)
+        {
+            (void)token_batches;
+            (void)token_ids_device;
+            (void)padded_seq_len;
+            return false;
+        }
+
+        /**
          * @brief Prepare the compact all-position verifier input token row on device.
          *
          * vLLM-style stochastic verification already has sampled draft tokens in a

@@ -1623,6 +1623,21 @@ namespace llaminar2
             const int *token_shadow,
             const void *token_ids_device,
             int seq_len) override;
+
+        /**
+         * @brief Batched verifier forward from a flat device token buffer.
+         *
+         * The host vectors are a logical shadow only; GPU embedding reads the
+         * padded `[batch, padded_seq_len]` INT32 rows from `token_ids_device`.
+         * This is the SingleDevice building block for request-batched MTP graph
+         * capture. Multi-participant topologies must provide participant-local
+         * device pointers before using the same contract.
+         */
+        bool forwardBatchWithDeviceTokenIds(
+            const std::vector<std::vector<int>> &token_batches,
+            const void *token_ids_device,
+            int padded_seq_len) override;
+
         const void *prepareMTPVerifierInputTokensOnDevice(
             int32_t first_token,
             int first_draft_slot,

@@ -3506,6 +3506,123 @@ namespace llaminar2
         return forwardImpl(token_shadow, token_ids_device, seq_len, /*batch_size=*/1) != nullptr;
     }
 
+    bool DeviceGraphOrchestrator::forwardBatchWithDeviceTokenIds(
+        const std::vector<std::vector<int>> &token_batches,
+        const void *token_ids_device,
+        int padded_seq_len)
+    {
+        ScopedDeviceLog device_log(state_.device_id);
+
+        if (token_batches.empty())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardBatchWithDeviceTokenIds called with empty batch");
+            return false;
+        }
+        if (!token_ids_device || padded_seq_len <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardBatchWithDeviceTokenIds requires a device token pointer "
+                      "and a positive padded sequence length");
+            return false;
+        }
+        if (!state_.device_id.is_gpu())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardBatchWithDeviceTokenIds is only valid for GPU runners");
+            return false;
+        }
+
+        const int batch_size = static_cast<int>(token_batches.size());
+        if (batch_size > state_.batch_size)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-token batch size " << batch_size
+                                                                           << " exceeds initialized batch size "
+                                                                           << state_.batch_size);
+            return false;
+        }
+
+        std::vector<int> actual_lengths(batch_size, 0);
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const int len = static_cast<int>(token_batches[request].size());
+            if (len <= 0 || len > padded_seq_len)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Invalid device-token batch row length for request "
+                          << request << ": len=" << len
+                          << " padded_seq_len=" << padded_seq_len);
+                return false;
+            }
+            actual_lengths[request] = len;
+        }
+
+        /*
+         * Build a flat host shadow with the same padded row layout as the
+         * device buffer. The graph does not read this memory when
+         * token_ids_device is set; it exists for diagnostics, cache metadata,
+         * and CPU-side row-coordinate bookkeeping.
+         */
+        std::vector<int> flat_shadow(
+            static_cast<size_t>(batch_size) * static_cast<size_t>(padded_seq_len),
+            0);
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const auto &tokens = token_batches[request];
+            for (int col = 0; col < actual_lengths[request]; ++col)
+            {
+                flat_shadow[static_cast<size_t>(request) *
+                                static_cast<size_t>(padded_seq_len) +
+                            static_cast<size_t>(col)] = tokens[static_cast<size_t>(col)];
+            }
+        }
+
+        padded_seq_len_ = padded_seq_len;
+        const std::vector<int> old_positions = state_.positions;
+        const std::vector<int> old_sequence_lengths = state_.sequence_lengths;
+
+        state_.sequence_lengths.resize(static_cast<size_t>(batch_size));
+        for (int request = 0; request < batch_size; ++request)
+        {
+            state_.sequence_lengths[static_cast<size_t>(request)] =
+                actual_lengths[request];
+        }
+
+        const float *result = forwardImpl(
+            flat_shadow.data(),
+            token_ids_device,
+            padded_seq_len,
+            batch_size);
+
+        if (!result)
+        {
+            state_.positions = old_positions;
+            state_.sequence_lengths = old_sequence_lengths;
+            return false;
+        }
+
+        state_.positions = old_positions;
+        state_.sequence_lengths = old_sequence_lengths;
+        state_.positions.resize(std::max(
+            state_.positions.size(),
+            static_cast<size_t>(batch_size)),
+            0);
+        state_.sequence_lengths.resize(std::max(
+            state_.sequence_lengths.size(),
+            static_cast<size_t>(batch_size)),
+            0);
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const int old_pos = state_.positions[static_cast<size_t>(request)];
+            const int old_len =
+                request < static_cast<int>(old_sequence_lengths.size())
+                    ? old_sequence_lengths[static_cast<size_t>(request)]
+                    : old_pos;
+            state_.positions[static_cast<size_t>(request)] =
+                old_pos + actual_lengths[request];
+            state_.sequence_lengths[static_cast<size_t>(request)] =
+                old_len + actual_lengths[request];
+        }
+
+        return true;
+    }
+
     const void *DeviceGraphOrchestrator::prepareMTPVerifierInputTokensOnDevice(
         int32_t first_token,
         int first_draft_slot,

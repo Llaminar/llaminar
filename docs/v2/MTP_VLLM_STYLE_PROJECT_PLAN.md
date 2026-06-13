@@ -1824,8 +1824,11 @@ Status:
   The helper materializes graph coordinates once, routes single-request host
   tokens through `forward()`, single-request device-token rows through
   `forwardWithDeviceTokenIds()`, and multi-request host tokens through
-  `forward_batch()`. It hard-fails batched device-token input until that path
-  has an explicit workspace contract. Focused gates:
+  `forward_batch()`. Multi-request device-token rows now use the explicit
+  runner-local `forwardBatchWithDeviceTokenIds()` contract: callers supply
+  logical host shadows plus a padded flat device buffer, and unsupported
+  topologies hard-fail rather than sharing one raw pointer across participants.
+  Focused gates:
   `V2_Unit_MTPVerifierForwardExecutor` and the bounded MTP/schema unit gate.
 - Greedy request-batched verifier transactions are now executable as a shared
   helper. `executeMTPGreedyVerifierBatchTransaction()` enables row-indexed
@@ -1880,14 +1883,21 @@ Status:
   `MTPSpecRequestBatchScheduler` groups pending requests in stable order,
   admits only matching mode/topology/vocab shapes, preserves variable verifier
   token counts within the configured padded shape, and records deferred versus
-  rejected reasons before any runner state mutates. Device-token verifier rows
-  stay rejected for request batching until they have a declared workspace
-  contract. `MTPVerifierForwardExecutor` now accepts a scheduled greedy batch
+  rejected reasons before any runner state mutates. `MTPVerifierForwardExecutor`
+  now accepts a scheduled greedy batch
   through a narrow adapter and feeds the existing padded verifier transaction
   helper, proving scheduler output is executable without teaching the
   scheduler about runner entrypoints. Focused gates:
   `V2_Unit_MTPSpecRequestBatchScheduler`, `V2_Unit_MTPVerifierForwardExecutor`,
   and the bounded MTP metadata/transaction cluster.
+- Batched device-token verifier rows now have a named SingleDevice runner
+  contract. `DeviceGraphOrchestrator::forwardBatchWithDeviceTokenIds()` builds
+  a padded host shadow for bookkeeping, preserves per-request sequence lengths,
+  and routes embedding through the caller-owned flat device token buffer. This
+  removes the executor-layer single-row limitation, while Rank/TP/PP paths
+  still hard-fail until they own per-participant device-token buffers. Focused
+  gates: `V2_Unit_MTPVerifierForwardExecutor` and the bounded Phase 8 unit
+  cluster.
 
 Exit gate:
 

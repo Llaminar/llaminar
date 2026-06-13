@@ -54,6 +54,20 @@ namespace
             return batch_forward_success;
         }
 
+        bool forwardBatchWithDeviceTokenIds(
+            const std::vector<std::vector<int>> &token_batches,
+            const void *token_ids_device,
+            int padded_seq_len) override
+        {
+            ++batch_device_forward_count;
+            last_token_batches = token_batches;
+            last_device_token_ids = token_ids_device;
+            last_padded_seq_len = padded_seq_len;
+            return batch_device_forward_success &&
+                   token_ids_device != nullptr &&
+                   padded_seq_len > 0;
+        }
+
         bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override
         {
             if (enabled)
@@ -132,11 +146,14 @@ namespace
         int forward_count = 0;
         int device_forward_count = 0;
         int batch_forward_count = 0;
+        int batch_device_forward_count = 0;
         int last_forward_seq_len = 0;
+        int last_padded_seq_len = 0;
         const void *last_device_token_ids = nullptr;
         bool forward_success = true;
         bool device_forward_success = true;
         bool batch_forward_success = true;
+        bool batch_device_forward_success = true;
         bool row_indexed_enable_success = true;
         bool row_indexed_disable_success = true;
         bool all_position_enable_success = true;
@@ -258,7 +275,7 @@ TEST(Test__MTPVerifierForwardExecutor, RequestBatchUsesPaddedForwardBatch)
               (std::vector<int32_t>{0, 1, 3, 4, 5}));
 }
 
-TEST(Test__MTPVerifierForwardExecutor, RequestBatchRejectsSingleRowDeviceTokenHook)
+TEST(Test__MTPVerifierForwardExecutor, RequestBatchCanUsePaddedDeviceTokenRows)
 {
     RecordingInferenceRunner runner;
     MTPSpecDecodeVerifierInputPlan plan =
@@ -275,12 +292,43 @@ TEST(Test__MTPVerifierForwardExecutor, RequestBatchRejectsSingleRowDeviceTokenHo
     MTPVerifierForwardExecutionResult result =
         executeMTPSpecVerifierForward(runner, plan, options);
 
-    EXPECT_FALSE(result.ok);
-    EXPECT_NE(result.error.find("single-row device token input hook"),
-              std::string::npos);
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.used_batch_forward);
+    EXPECT_TRUE(result.used_device_token_ids);
     EXPECT_EQ(runner.forward_count, 0);
     EXPECT_EQ(runner.device_forward_count, 0);
     EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.batch_device_forward_count, 1);
+    EXPECT_EQ(runner.last_device_token_ids, &fake_device_tokens);
+    EXPECT_EQ(runner.last_padded_seq_len, 2);
+    EXPECT_EQ(runner.last_token_batches,
+              (std::vector<std::vector<int>>{{1, 2}, {3, 4}}));
+}
+
+TEST(Test__MTPVerifierForwardExecutor, RequestBatchDeviceTokenFailureIsReported)
+{
+    RecordingInferenceRunner runner;
+    runner.batch_device_forward_success = false;
+    MTPSpecDecodeVerifierInputPlan plan =
+        buildVerifierPlan(
+            /*max_requests=*/2,
+            /*max_draft_tokens=*/2,
+            {{1, 2}, {3, 4}});
+    ASSERT_TRUE(plan.ok) << plan.error;
+
+    const int fake_device_tokens = 9012;
+    MTPVerifierForwardExecutionOptions options;
+    options.device_token_ids = &fake_device_tokens;
+
+    MTPVerifierForwardExecutionResult result =
+        executeMTPSpecVerifierForward(runner, plan, options);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, testing::HasSubstr("batched forward failed"));
+    EXPECT_EQ(runner.forward_count, 0);
+    EXPECT_EQ(runner.device_forward_count, 0);
+    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.batch_device_forward_count, 1);
 }
 
 TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionBuildsPublicationPlan)
