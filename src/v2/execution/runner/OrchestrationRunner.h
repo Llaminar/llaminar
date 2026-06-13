@@ -162,6 +162,8 @@ namespace llaminar2
         bool prefillBatch(
             const std::vector<std::vector<int32_t>> &token_batches) override;
         GenerationResult decodeStep() override;
+        bool supportsDecodeStepBatch(int request_batch) const override;
+        GenerationBatchResult decodeStepBatch(int request_batch) override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,
             int max_new_tokens,

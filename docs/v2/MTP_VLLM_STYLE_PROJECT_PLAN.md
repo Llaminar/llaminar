@@ -1967,6 +1967,13 @@ Status:
   live state is active. `clearCache()` releases the batched state. Batched decode
   still hard-fails until the request owner consumes these slots through
   `decodeStepBatch()`. Focused gate: `V2_Unit_PrefillDecodeTransition`.
+- `OrchestrationRunner::decodeStepBatch()` now consumes the ready terminal
+  prefill logits for each live SingleDevice request slot without looping scalar
+  `decodeStep()` or re-feeding request 0. The bridge validates per-request
+  sequence metadata, samples each row's terminal logits, records generated token
+  state, and then refuses further batched advancement with a hard error until
+  the request-owner sidecar/verifier/publication transaction is wired. Focused
+  gate: `V2_Unit_PrefillDecodeTransition`.
 
 Exit gate:
 

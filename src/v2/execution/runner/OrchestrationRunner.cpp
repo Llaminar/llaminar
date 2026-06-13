@@ -1235,6 +1235,153 @@ namespace llaminar2
         return true;
     }
 
+    bool OrchestrationRunner::supportsDecodeStepBatch(int request_batch) const
+    {
+        if (!initialized_ || !runner_ || request_batch <= 1)
+            return false;
+        if (!batched_decode_active_)
+            return false;
+        if (static_cast<int>(batched_request_states_.size()) != request_batch)
+            return false;
+        if (runner_->vocab_size() <= 0)
+            return false;
+
+        /*
+         * This Phase 8 bridge can only consume terminal prefill logits that
+         * were created by prefillBatch().  Once every row has emitted that
+         * first token, decodeStepBatch() must switch to the request-owner MTP
+         * verifier transaction before it is allowed to advertise support.
+         */
+        for (const BatchedDecodeRequestState &state : batched_request_states_)
+        {
+            if (!state.is_complete && !state.prefill_logits_ready)
+                return false;
+        }
+        return true;
+    }
+
+    GenerationBatchResult OrchestrationRunner::decodeStepBatch(int request_batch)
+    {
+        GenerationBatchResult batch_result;
+
+        if (!initialized_)
+        {
+            batch_result.error = "Runner not initialized";
+            return batch_result;
+        }
+        if (!runner_)
+        {
+            batch_result.error = "Runner unavailable";
+            return batch_result;
+        }
+        if (request_batch <= 1)
+        {
+            batch_result.error =
+                "decodeStepBatch() requires at least two logical requests";
+            return batch_result;
+        }
+        if (!batched_decode_active_)
+        {
+            batch_result.error =
+                "decodeStepBatch() requires a preceding prefillBatch() call";
+            return batch_result;
+        }
+        if (static_cast<int>(batched_request_states_.size()) != request_batch)
+        {
+            batch_result.error =
+                "decodeStepBatch() request count does not match active "
+                "request-batched prefill state";
+            return batch_result;
+        }
+
+        const int vocab = vocabSize();
+        if (vocab <= 0)
+        {
+            batch_result.error = "decodeStepBatch() requires a positive vocabulary size";
+            return batch_result;
+        }
+
+        const std::vector<int> &sequence_lengths = runner_->sequence_lengths();
+        const int padded_seq_len = runner_->padded_seq_len();
+        if (static_cast<int>(sequence_lengths.size()) < request_batch ||
+            padded_seq_len <= 0)
+        {
+            batch_result.error =
+                "decodeStepBatch() requires per-request batch sequence metadata";
+            return batch_result;
+        }
+
+        batch_result.requests.resize(static_cast<size_t>(request_batch));
+
+        for (int request = 0; request < request_batch; ++request)
+        {
+            BatchedDecodeRequestState &state =
+                batched_request_states_[static_cast<size_t>(request)];
+            GenerationResult &request_result =
+                batch_result.requests[static_cast<size_t>(request)];
+
+            if (state.is_complete)
+            {
+                request_result.is_complete = true;
+                continue;
+            }
+            if (!state.prefill_logits_ready)
+            {
+                batch_result.error =
+                    "Batched MTP verifier decode is not implemented beyond "
+                    "the terminal prefill token";
+                return batch_result;
+            }
+
+            const int logical_length = sequence_lengths[static_cast<size_t>(request)];
+            if (logical_length <= 0 || logical_length > padded_seq_len)
+            {
+                batch_result.error =
+                    "decodeStepBatch() received invalid per-request sequence length";
+                return batch_result;
+            }
+
+            const float *sequence_logits = runner_->getLogits(request);
+            if (!sequence_logits)
+            {
+                batch_result.error =
+                    "decodeStepBatch() could not access per-request logits";
+                return batch_result;
+            }
+
+            const float *terminal_logits =
+                sequence_logits +
+                static_cast<size_t>(logical_length - 1) *
+                    static_cast<size_t>(vocab);
+            const int token = sampler_.sample(
+                terminal_logits,
+                static_cast<size_t>(vocab),
+                active_sampling_params_);
+
+            state.prefill_logits_ready = false;
+            state.ready_sampled_token.reset();
+            state.ready_sampled_params.reset();
+            state.last_token = token;
+
+            request_result.tokens.push_back(token);
+            request_result.is_complete =
+                std::find(stop_tokens_.begin(), stop_tokens_.end(), token) !=
+                stop_tokens_.end();
+            state.is_complete = request_result.is_complete;
+
+            /*
+             * Reuse the existing sampler history so penalties continue to see
+             * all generated tokens.  The current bridge is primarily for
+             * greedy request-batch handoff; Phase 8's owner transaction will
+             * replace this with per-request histories before stochastic
+             * server batching is accepted.
+             */
+            sampler_.record_token(token);
+        }
+
+        return batch_result;
+    }
+
     bool OrchestrationRunner::shouldUseMTPDecode() const
     {
         const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;

@@ -196,6 +196,7 @@ namespace
             }
             position_ += padded_seq_len_;
             setupPrefillLogits();
+            setupBatchPrefillLogits();
             is_first_forward_in_cycle_ = false;
             return !token_batches.empty();
         }
@@ -291,6 +292,24 @@ namespace
             if (column_parallel_logits_)
                 return nullptr;
             return logits_.data();
+        }
+
+        const float *getLogits(int seq_idx = 0) const override
+        {
+            if (!batch_logits_.empty())
+            {
+                if (seq_idx < 0 ||
+                    seq_idx >= static_cast<int>(sequence_lengths_.size()) ||
+                    padded_seq_len_ <= 0)
+                {
+                    return nullptr;
+                }
+                return batch_logits_.data() +
+                       static_cast<size_t>(seq_idx) *
+                           static_cast<size_t>(padded_seq_len_) *
+                           static_cast<size_t>(VOCAB_SIZE);
+            }
+            return logits();
         }
 
         bool forwardMTP(int32_t draft_condition_token) override
@@ -873,6 +892,7 @@ namespace
             setupPrefillLogits();              // Reset logits state
             position_ = 0;
             sequence_lengths_.clear();
+            batch_logits_.clear();
             padded_seq_len_ = 0;
             row_indexed_all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_row_count_ = 0;
@@ -2013,6 +2033,29 @@ namespace
             }
         }
 
+        void setupBatchPrefillLogits()
+        {
+            batch_logits_.assign(
+                static_cast<size_t>(sequence_lengths_.size()) *
+                    static_cast<size_t>(std::max(0, padded_seq_len_)) *
+                    static_cast<size_t>(VOCAB_SIZE),
+                -10.0f);
+            for (size_t seq = 0; seq < sequence_lengths_.size(); ++seq)
+            {
+                const int logical_length = sequence_lengths_[seq];
+                if (logical_length <= 0 || padded_seq_len_ <= 0)
+                    continue;
+
+                const int token =
+                    (PREFILL_ARGMAX_TOKEN + static_cast<int>(seq)) % VOCAB_SIZE;
+                const size_t offset =
+                    (seq * static_cast<size_t>(padded_seq_len_) +
+                     static_cast<size_t>(logical_length - 1)) *
+                    static_cast<size_t>(VOCAB_SIZE);
+                batch_logits_[offset + static_cast<size_t>(token)] = 10.0f;
+            }
+        }
+
         void setupDecodeLogits()
         {
             logits_.assign(VOCAB_SIZE, -10.0f);
@@ -2223,6 +2266,7 @@ namespace
         std::vector<std::vector<int>> forward_history_;
         std::vector<std::vector<int>> last_forward_batch_;
         std::vector<int> sequence_lengths_;
+        std::vector<float> batch_logits_;
         std::vector<int> last_commit_mtp_tokens_;
         std::vector<int32_t> last_mtp_spec_verifier_rows_;
         std::vector<int32_t> last_mtp_spec_verifier_tokens_;
@@ -2512,9 +2556,11 @@ namespace
     {
         auto [runner, mock] = createSingleDeviceRequestBatchRunner(/*max_request_batch=*/3);
 
+        EXPECT_FALSE(runner->supportsDecodeStepBatch(2));
         ASSERT_TRUE(runner->supportsPrefillBatch(2));
         ASSERT_TRUE(runner->prefillBatch({{1, 2, 3}, {4, 5}}))
             << runner->lastError();
+        EXPECT_TRUE(runner->supportsDecodeStepBatch(2));
 
         EXPECT_EQ(mock->forwardCallCount(), 0)
             << "Request-batched prefill must not initialize only request 0";
@@ -2528,6 +2574,21 @@ namespace
         EXPECT_THAT(scalar_decode.error, HasSubstr("decodeStep() cannot consume"));
         EXPECT_EQ(mock->forwardCallCount(), 0)
             << "Scalar decode must fail before mutating batched live state";
+
+        GenerationBatchResult batch_step = runner->decodeStepBatch(2);
+        ASSERT_TRUE(batch_step.error.empty()) << batch_step.error;
+        ASSERT_EQ(batch_step.requests.size(), 2u);
+        EXPECT_THAT(batch_step.requests[0].tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+        EXPECT_THAT(batch_step.requests[1].tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
+        EXPECT_EQ(mock->forwardCallCount(), 0)
+            << "Batched ready-token decode must consume terminal prefill logits";
+        EXPECT_FALSE(runner->supportsDecodeStepBatch(2));
+
+        GenerationBatchResult second_batch_step = runner->decodeStepBatch(2);
+        EXPECT_FALSE(second_batch_step.error.empty());
+        EXPECT_THAT(second_batch_step.error, HasSubstr("not implemented beyond"));
 
         runner->clearCache();
         ASSERT_TRUE(runner->prefill({9, 8}));
