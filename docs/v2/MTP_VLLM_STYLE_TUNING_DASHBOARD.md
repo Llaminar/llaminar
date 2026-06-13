@@ -28,7 +28,7 @@ Before a WiP commit, broad units plus touched parity must pass.
   rows, padded verifier-decode caching, bounded one-token Qwen35/Qwen36
   sidecar batches, padded-row publication, and scheduler-to-executor greedy
   request-batch admission are unit-proven. Batched SingleDevice device-token
-  verifier rows now have a named runner contract and executor routing.
+  verifier rows now have a named runner contract and transaction routing.
   `--mtp-max-request-batch` records intent but still hard-fails above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.

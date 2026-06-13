@@ -76,6 +76,7 @@ namespace llaminar2
         int vocab_size = 0;
         std::vector<MTPDecodeCatchupGreedyRequest> requests;
         std::vector<int32_t> base_cached_tokens;
+        MTPVerifierForwardExecutionOptions forward_options = {};
     };
 
     /**
@@ -116,6 +117,7 @@ namespace llaminar2
      */
     MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierScheduledBatchTransaction(
         IInferenceRunner &runner,
-        const MTPSpecRequestBatch &scheduled_batch);
+        const MTPSpecRequestBatch &scheduled_batch,
+        MTPVerifierForwardExecutionOptions forward_options = {});
 
 } // namespace llaminar2

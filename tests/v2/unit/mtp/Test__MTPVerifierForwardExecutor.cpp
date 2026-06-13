@@ -390,6 +390,40 @@ TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionBuildsPublicationPl
     EXPECT_TRUE(second.requiresCorrectionReplay());
 }
 
+TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionCanUsePaddedDeviceTokenRows)
+{
+    RecordingInferenceRunner runner;
+    runner.scripted_verifier_samples = {9, 8, 4, 77};
+
+    MTPDecodeCatchupGreedyRequest first;
+    first.draft_tokens = {7, 9};
+    MTPDecodeCatchupGreedyRequest second;
+    second.draft_tokens = {11, 12};
+
+    const int fake_device_tokens = 777;
+    MTPGreedyVerifierBatchTransactionRequest request;
+    request.shape.max_requests = 2;
+    request.shape.max_draft_tokens = 2;
+    request.request_ids = {10, 11};
+    request.vocab_size = 100;
+    request.requests = {first, second};
+    request.base_cached_tokens = {100, 200};
+    request.forward_options.device_token_ids = &fake_device_tokens;
+
+    MTPGreedyVerifierBatchTransactionResult result =
+        executeMTPGreedyVerifierBatchTransaction(runner, request);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.forward.used_batch_forward);
+    EXPECT_TRUE(result.forward.used_device_token_ids);
+    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.batch_device_forward_count, 1);
+    EXPECT_EQ(runner.last_device_token_ids, &fake_device_tokens);
+    EXPECT_EQ(runner.last_padded_seq_len, 2);
+    EXPECT_EQ(runner.last_token_batches,
+              (std::vector<std::vector<int>>{{7, 9}, {11, 12}}));
+}
+
 TEST(Test__MTPVerifierForwardExecutor, ScheduledGreedyBatchFeedsTransactionExecutor)
 {
     RecordingInferenceRunner runner;
@@ -428,6 +462,52 @@ TEST(Test__MTPVerifierForwardExecutor, ScheduledGreedyBatchFeedsTransactionExecu
     ASSERT_EQ(result.transaction_plan.step_plans.steps.size(), 2u);
     EXPECT_EQ(result.transaction_plan.step_plans.steps[0].request_id, 10);
     EXPECT_EQ(result.transaction_plan.step_plans.steps[1].request_id, 11);
+}
+
+TEST(Test__MTPVerifierForwardExecutor, ScheduledGreedyBatchCanUseForwardOptions)
+{
+    RecordingInferenceRunner runner;
+    runner.scripted_verifier_samples = {9, 8, 4, 77};
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/2,
+            MTPSpecRequestBatchMode::GREEDY});
+
+    MTPSpecSchedulableRequest first;
+    first.request_id = 10;
+    first.compatibility_key = "qwen36-moe-cuda0";
+    first.vocab_size = 100;
+    first.base_cached_tokens = 100;
+    first.greedy_request.draft_tokens = {7, 9};
+
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 11;
+    second.base_cached_tokens = 200;
+    second.greedy_request.draft_tokens = {11, 12};
+
+    MTPSpecRequestBatch scheduled =
+        scheduler.buildNextBatch({first, second});
+    ASSERT_TRUE(scheduled.ok) << scheduled.error;
+
+    const int fake_device_tokens = 888;
+    MTPVerifierForwardExecutionOptions forward_options;
+    forward_options.device_token_ids = &fake_device_tokens;
+
+    MTPGreedyVerifierBatchTransactionResult result =
+        executeMTPGreedyVerifierScheduledBatchTransaction(
+            runner,
+            scheduled,
+            forward_options);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.forward.used_device_token_ids);
+    EXPECT_EQ(runner.batch_forward_count, 0);
+    EXPECT_EQ(runner.batch_device_forward_count, 1);
+    EXPECT_EQ(runner.last_device_token_ids, &fake_device_tokens);
+    EXPECT_EQ(runner.last_token_batches,
+              (std::vector<std::vector<int>>{{7, 9}, {11, 12}}));
 }
 
 TEST(Test__MTPVerifierForwardExecutor, ScheduledTransactionRejectsNonGreedyBatch)

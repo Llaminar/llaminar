@@ -1898,6 +1898,10 @@ Status:
   still hard-fail until they own per-participant device-token buffers. Focused
   gates: `V2_Unit_MTPVerifierForwardExecutor` and the bounded Phase 8 unit
   cluster.
+- Greedy verifier transaction helpers now carry
+  `MTPVerifierForwardExecutionOptions`, so scheduled request batches can select
+  the padded device-token runner contract instead of being stuck on host-token
+  `forward_batch()`. Focused gate: `V2_Unit_MTPVerifierForwardExecutor`.
 
 Exit gate:
 

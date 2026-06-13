@@ -184,7 +184,8 @@ namespace llaminar2
         result.forward =
             executeMTPSpecVerifierForward(
                 runner,
-                result.verifier_input_plan);
+                result.verifier_input_plan,
+                request.forward_options);
         if (!result.forward.ok)
         {
             const bool cleanup_ok = cleanup_row_indexed();
@@ -244,7 +245,8 @@ namespace llaminar2
 
     MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierScheduledBatchTransaction(
         IInferenceRunner &runner,
-        const MTPSpecRequestBatch &scheduled_batch)
+        const MTPSpecRequestBatch &scheduled_batch,
+        MTPVerifierForwardExecutionOptions forward_options)
     {
         MTPGreedyVerifierBatchTransactionResult result;
 
@@ -281,6 +283,7 @@ namespace llaminar2
         request.vocab_size = scheduled_batch.vocab_size;
         request.requests = scheduled_batch.greedy_requests;
         request.base_cached_tokens = scheduled_batch.base_cached_tokens;
+        request.forward_options = forward_options;
         return executeMTPGreedyVerifierBatchTransaction(runner, request);
     }
 
