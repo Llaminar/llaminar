@@ -1795,6 +1795,14 @@ Status:
   against full all-position logits. Focused gates:
   `V2_Unit_MTPGraphConstruction`, `V2_Unit_QwenStandardGraphSchema`,
   `V2_Unit_Qwen3BufferSizes`, and `V2_Unit_Qwen35BufferSizes`.
+- Compact verifier row selection now consumes an explicit verifier row plan
+  instead of assuming leading rows. `GraphConfig` and `IGraphBuilder` carry the
+  selected-row vector, `DeviceGraphOrchestrator` installs it from the MTP
+  verifier input plan, and Qwen graph construction validates the rows against
+  the real verifier activation tensor. GPU cached graphs still read row indices
+  from metadata workspace, while CPU graph construction gets the same logical
+  plan through the builder. Focused gate:
+  `V2_Unit_MTPGraphConstruction.RowIndexedAllPositionLogitsRespectExplicitVerifierRowsOnCPU`.
 
 Exit gate:
 

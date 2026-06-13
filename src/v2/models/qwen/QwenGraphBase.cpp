@@ -145,6 +145,59 @@ namespace llaminar2
             layout.use_prefill_replay_row_offset = false;
             return layout;
         }
+
+        /**
+         * @brief Resolve and validate compact verifier source rows.
+         *
+         * The request-batched MTP verifier publishes a logical row plan that
+         * may skip over non-target rows in a flattened verifier sequence. Older
+         * single-request paths did not need to publish a plan because compact
+         * rows were always the leading rows. Keeping that default here lets
+         * existing tests and exact-shape graphs continue to behave the same,
+         * while non-empty plans fail loudly if they do not match the graph
+         * shape or the verifier activation tensor.
+         */
+        std::vector<int> resolveRowIndexedLogitRows(
+            const GraphConfig &config,
+            int row_count,
+            int total_tokens,
+            const char *context)
+        {
+            std::vector<int> selected_rows;
+            if (config.row_indexed_logits_selected_rows.empty())
+            {
+                selected_rows.reserve(static_cast<size_t>(row_count));
+                for (int row = 0; row < row_count; ++row)
+                    selected_rows.push_back(row);
+            }
+            else
+            {
+                selected_rows = config.row_indexed_logits_selected_rows;
+                if (static_cast<int>(selected_rows.size()) != row_count)
+                {
+                    LOG_ERROR("[QwenGraphBase] " << context
+                                                 << " row plan length "
+                                                 << selected_rows.size()
+                                                 << " does not match row_count="
+                                                 << row_count);
+                    throw std::runtime_error("row-indexed all-position logits row plan length mismatch");
+                }
+            }
+
+            for (int row : selected_rows)
+            {
+                if (row < 0 || row >= total_tokens)
+                {
+                    LOG_ERROR("[QwenGraphBase] " << context
+                                                 << " row plan selected row "
+                                                 << row
+                                                 << " outside verifier token range 0.."
+                                                 << (total_tokens - 1));
+                    throw std::runtime_error("row-indexed all-position logits row plan out of range");
+                }
+            }
+            return selected_rows;
+        }
     }
 
     // Import graph_utils for cleaner code
@@ -422,13 +475,11 @@ namespace llaminar2
                 throw std::runtime_error("invalid row-indexed all-position logits row count");
             }
 
-            // The verifier sequence starts at the current live position. Row i
-            // contains the main-model logits after consuming verifier token i,
-            // exactly the rows consumed by the greedy/stochastic verifier logic.
-            std::vector<int> selected_rows;
-            selected_rows.reserve(static_cast<size_t>(row_count));
-            for (int i = 0; i < row_count; ++i)
-                selected_rows.push_back(i);
+            std::vector<int> selected_rows = resolveRowIndexedLogitRows(
+                config_,
+                row_count,
+                total_tokens,
+                "LM-head row-select");
 
             HiddenStateRowsSelectStage::Params row_params;
             row_params.input = final_norm_output;
@@ -1762,10 +1813,11 @@ namespace llaminar2
                 throw std::runtime_error("invalid standalone row-indexed all-position logits row count");
             }
 
-            std::vector<int> selected_rows;
-            selected_rows.reserve(static_cast<size_t>(row_count));
-            for (int i = 0; i < row_count; ++i)
-                selected_rows.push_back(i);
+            std::vector<int> selected_rows = resolveRowIndexedLogitRows(
+                config_,
+                row_count,
+                total_tokens,
+                "standalone LM-head row-select");
 
             HiddenStateRowsSelectStage::Params row_params;
             row_params.input = hidden_states;

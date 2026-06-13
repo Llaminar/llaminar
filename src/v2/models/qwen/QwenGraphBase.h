@@ -173,8 +173,36 @@ namespace llaminar2
             const int max_rows = resolveMTPMaxTargetQueryRows(config_.mtp);
             if (enabled && (row_count <= 0 || row_count > max_rows))
                 return false;
+            if (enabled &&
+                !config_.row_indexed_logits_selected_rows.empty() &&
+                static_cast<int>(config_.row_indexed_logits_selected_rows.size()) != row_count)
+            {
+                return false;
+            }
             config_.compute_row_indexed_logits = enabled;
             config_.row_indexed_logits_row_count = enabled ? row_count : 0;
+            if (!enabled)
+                config_.row_indexed_logits_selected_rows.clear();
+            return true;
+        }
+
+        /**
+         * @brief Install explicit compact verifier source rows for the next graph.
+         *
+         * Empty keeps the legacy leading-row behavior. A non-empty row plan is
+         * accepted before or after row-indexed mode is enabled; when enabled,
+         * the size must match the fixed compact LM-head row count so graph
+         * capture cannot race against a changing output shape.
+         */
+        bool setRowIndexedAllPositionLogitRows(const std::vector<int> &selected_rows) override
+        {
+            if (!selected_rows.empty() &&
+                config_.compute_row_indexed_logits &&
+                static_cast<int>(selected_rows.size()) != config_.row_indexed_logits_row_count)
+            {
+                return false;
+            }
+            config_.row_indexed_logits_selected_rows = selected_rows;
             return true;
         }
 

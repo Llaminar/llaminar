@@ -152,6 +152,14 @@ namespace llaminar2
         /// compute_all_position_logits is enabled.
         bool compute_row_indexed_logits = false;
         int row_indexed_logits_row_count = 0;
+        /// Optional explicit source rows for compact verifier logits.
+        ///
+        /// Empty preserves the legacy leading-row contract (`0..row_count-1`).
+        /// When populated, the graph validates that the vector length matches
+        /// `row_indexed_logits_row_count` and selects these rows before the LM
+        /// head. This lets request-batched speculative verification publish a
+        /// stable row plan without changing the verifier forward sequence.
+        std::vector<int> row_indexed_logits_selected_rows;
 
         /// TurboQuant context for TQ4 KV cache quantization.
         /// Holds rotation matrix. Not owned by GraphConfig.

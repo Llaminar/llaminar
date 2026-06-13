@@ -188,14 +188,14 @@ namespace llaminar2
         }
 
         /**
-         * @brief Whether the Qwen row-select graph can consume this plan today.
+         * @brief Validate the compact verifier row metadata before graph install.
          *
-         * `HiddenStateRowsSelectStage` currently packs leading rows
-         * `0..row_count-1` for cached verifier graphs. Persistent arbitrary row
-         * buffers are a later migration step; this guard makes any accidental
-         * mismatch fail loudly instead of sampling the wrong verifier row.
+         * The graph builder now accepts arbitrary compact source rows. This
+         * helper only checks the metadata shape invariants that the sampler
+         * needs before handing the full plan to the runner for graph-specific
+         * row validation and, on GPU, workspace upload.
          */
-        bool verifierInputPlanUsesLeadingCompactRows(
+        bool verifierInputPlanHasCompactRows(
             const MTPSpecDecodeVerifierInputPlan &plan)
         {
             if (!plan.ok ||
@@ -206,7 +206,7 @@ namespace llaminar2
             }
             for (int row = 0; row < plan.compact_logit_row_count; ++row)
             {
-                if (plan.verifier_logit_rows[static_cast<size_t>(row)] != row)
+                if (plan.verifier_logit_rows[static_cast<size_t>(row)] < 0)
                     return false;
             }
             return true;
@@ -2731,7 +2731,7 @@ namespace llaminar2
             {
                 const MTPSpecDecodeVerifierInputPlan verifier_input_plan =
                     buildSingleRequestVerifierInputPlan(draft_tokens);
-                if (!verifierInputPlanUsesLeadingCompactRows(verifier_input_plan))
+                if (!verifierInputPlanHasCompactRows(verifier_input_plan))
                     return std::nullopt;
                 const int verifier_row_count =
                     verifier_input_plan.compact_logit_row_count;
@@ -3277,10 +3277,10 @@ namespace llaminar2
                     std::string("All-position MTP verifier input metadata failed: ") +
                     verifier_input_plan.error);
             }
-            if (!verifierInputPlanUsesLeadingCompactRows(verifier_input_plan))
+            if (!verifierInputPlanHasCompactRows(verifier_input_plan))
             {
                 return fail_after_checkpoint(
-                    "All-position MTP verifier row metadata is not representable by the current compact row-select graph");
+                    "All-position MTP verifier row metadata is malformed");
             }
 
             std::vector<int32_t> sampled_verifier_rows(

@@ -23,6 +23,7 @@
 #include "../../../backends/DeviceId.h"
 
 #include <memory>
+#include <vector>
 
 namespace llaminar2
 {
@@ -288,6 +289,21 @@ namespace llaminar2
             (void)enabled;
             (void)row_count;
             return false;
+        }
+
+        /**
+         * @brief Set the source rows used by compact row-indexed verifier logits.
+         *
+         * Empty means "use the default leading rows". A non-empty vector must
+         * contain exactly the row count configured by
+         * setComputeRowIndexedAllPositionLogits(). Device runners install this
+         * from the MTP verifier metadata plan before building the verifier graph,
+         * so CPU and GPU graph paths consume the same logical row plan even when
+         * GPU stages later read the indices from workspace memory during replay.
+         */
+        virtual bool setRowIndexedAllPositionLogitRows(const std::vector<int> &selected_rows)
+        {
+            return selected_rows.empty();
         }
 
         /// Set model context for registry-created builders in tests/dependency injection.

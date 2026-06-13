@@ -7104,14 +7104,34 @@ namespace llaminar2
                       << plan.error);
             return false;
         }
+        const int max_compact_rows =
+            plan.shape.maxTargetQueryLen() * plan.shape.max_requests;
         if (plan.compact_logit_row_count <= 0 ||
-            plan.compact_logit_row_count > plan.shape.maxTargetQueryLen() ||
+            plan.compact_logit_row_count > max_compact_rows ||
             plan.compact_logit_row_count >
                 static_cast<int>(plan.verifier_logit_rows.size()))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Refusing malformed MTP verifier row plan: rows="
                       << plan.compact_logit_row_count
-                      << " row_values=" << plan.verifier_logit_rows.size());
+                      << " row_values=" << plan.verifier_logit_rows.size()
+                      << " max_rows=" << max_compact_rows);
+            return false;
+        }
+        for (int i = 0; i < plan.compact_logit_row_count; ++i)
+        {
+            if (plan.verifier_logit_rows[static_cast<size_t>(i)] < 0)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Refusing negative MTP verifier row plan entry at "
+                          << i);
+                return false;
+            }
+        }
+        std::vector<int> selected_rows(
+            plan.verifier_logit_rows.begin(),
+            plan.verifier_logit_rows.begin() + plan.compact_logit_row_count);
+        if (!graph_builder_->setRowIndexedAllPositionLogitRows(selected_rows))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Graph builder rejected MTP verifier row plan");
             return false;
         }
 
@@ -7124,6 +7144,8 @@ namespace llaminar2
     {
         pending_mtp_spec_verifier_input_plan_.reset();
         pending_mtp_verifier_device_token_plan_.reset();
+        if (graph_builder_)
+            graph_builder_->setRowIndexedAllPositionLogitRows({});
     }
 
     bool DeviceGraphOrchestrator::materializePendingMTPVerifierInputTokensOnDevice(
@@ -7877,9 +7899,9 @@ namespace llaminar2
             return true;
         }
 
-        // CPU row selection still uses the stage-owned host vector.  The
-        // metadata workspace is needed only once the graph reads row indices
-        // from a persistent device buffer.
+        // CPU row selection consumes the row plan captured in the graph builder.
+        // The metadata workspace is needed only when GPU cached graphs read row
+        // indices from persistent device buffers during replay.
         if (!state_.device_id.is_gpu())
         {
             PerfStatsCollector::addCounter(
@@ -7888,7 +7910,7 @@ namespace llaminar2
                 1.0,
                 "decode",
                 state_.device_id.toString(),
-                {{"path", "cpu_stage_owned"},
+                {{"path", "cpu_builder_row_plan"},
                  {"rows", std::to_string(row_indexed_all_position_logits_row_count_)}});
             return true;
         }

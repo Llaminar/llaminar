@@ -13,6 +13,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/moe/MoEExpertParallelPlan.h"
 #include "execution/moe/MoERebalanceController.h"
 #include "execution/mtp/MTPSpecStateContract.h"
@@ -3754,6 +3755,88 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsMatchFullRowsOnCPU)
 
     EXPECT_FALSE(orchestrator.setComputeRowIndexedAllPositionLogits(true, 0));
     EXPECT_FALSE(orchestrator.setComputeRowIndexedAllPositionLogits(true, 5));
+}
+
+TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectExplicitVerifierRowsOnCPU)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    orchestrator.setWeights(fixture.modelWeights());
+    PreparedWeightStore prepared_store;
+    ASSERT_NO_THROW(prepareDenseForwardWeights(orchestrator, *graph_builder, prepared_store, DeviceId::cpu()));
+
+    const std::vector<int> tokens = {1, 2, 3, 4};
+    const std::vector<int32_t> selected_rows = {1, 3};
+    const int compact_rows = static_cast<int>(selected_rows.size());
+    const size_t vocab = static_cast<size_t>(fixture.config.vocab_size);
+
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+    ASSERT_NE(orchestrator.forward(tokens.data(), static_cast<int>(tokens.size()), 1), nullptr);
+    const float *full_logits = orchestrator.getAllPositionLogits();
+    ASSERT_NE(full_logits, nullptr);
+
+    std::vector<float> expected_compact(static_cast<size_t>(compact_rows) * vocab);
+    for (int compact_row = 0; compact_row < compact_rows; ++compact_row)
+    {
+        const size_t src = static_cast<size_t>(selected_rows[static_cast<size_t>(compact_row)]) * vocab;
+        const size_t dst = static_cast<size_t>(compact_row) * vocab;
+        std::copy(
+            full_logits + src,
+            full_logits + src + vocab,
+            expected_compact.begin() + static_cast<std::ptrdiff_t>(dst));
+    }
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
+
+    orchestrator.clearInferenceState();
+
+    MTPSpecDecodeVerifierInputPlan row_plan;
+    row_plan.ok = true;
+    row_plan.shape.max_requests = 1;
+    row_plan.shape.max_draft_tokens = compact_rows - 1;
+    row_plan.request_count = 1;
+    row_plan.total_verifier_input_tokens = static_cast<int>(tokens.size());
+    row_plan.compact_logit_row_count = compact_rows;
+    row_plan.verifier_input_tokens.assign(tokens.begin(), tokens.end());
+    row_plan.query_start_locs = {0, static_cast<int32_t>(tokens.size())};
+    row_plan.verifier_logit_rows = selected_rows;
+    row_plan.bonus_logit_rows = {selected_rows.back()};
+
+    /*
+     * Request-batched verification can target rows that are not the leading
+     * verifier rows.  CPU graph construction must consume the same explicit row
+     * plan as GPU metadata upload; otherwise compact logits silently verify the
+     * wrong positions.
+     */
+    ASSERT_TRUE(orchestrator.setMTPSpecVerifierInputPlan(row_plan));
+    ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(true, compact_rows));
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+    const float *returned_logits =
+        orchestrator.forward(tokens.data(), static_cast<int>(tokens.size()), 1);
+    ASSERT_NE(returned_logits, nullptr);
+
+    const float *compact_logits = orchestrator.getAllPositionLogits();
+    ASSERT_NE(compact_logits, nullptr);
+    EXPECT_EQ(returned_logits, compact_logits);
+
+    for (size_t i = 0; i < expected_compact.size(); ++i)
+    {
+        ASSERT_TRUE(std::isfinite(compact_logits[i]))
+            << "non-finite explicit-row compact verifier logit at " << i;
+        EXPECT_NEAR(compact_logits[i], expected_compact[i], 1e-5f)
+            << "explicit-row compact verifier mismatch at flat index " << i;
+    }
+
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
+    ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(false, 0));
+    orchestrator.clearMTPSpecVerifierInputPlan();
 }
 
 TEST(Test__MTPGraphConstruction, RowIndexedVerifierRowsScaleWithMTPRequestBatchCapacityOnCPU)
