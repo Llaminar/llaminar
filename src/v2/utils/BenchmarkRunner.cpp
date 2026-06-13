@@ -387,6 +387,7 @@ namespace llaminar2
                 {"prefix_cache_enabled", config->prefix_cache.enabled},
                 {"mtp_enabled", config->mtp.enabled},
                 {"mtp_draft_tokens", config->mtp.draft_tokens},
+                {"mtp_max_request_batch", config->mtp.max_request_batch},
                 {"mtp_verify_mode", mtpVerifyModeToString(config->mtp.verify_mode)},
                 {"mtp_depth_policy", mtpDepthPolicyModeToString(config->mtp.depth_policy.mode)},
                 {"mtp_min_draft_tokens", config->mtp.depth_policy.min_depth},

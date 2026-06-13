@@ -573,6 +573,17 @@ namespace llaminar2
     {
         bool enabled = false;
         int draft_tokens = 1;
+        /**
+         * @brief Maximum number of requests to amortize in one speculative transaction.
+         *
+         * vLLM-style production MTP batches target verification rows across
+         * requests so tiny per-request verifier/condition forwards do not
+         * dominate MoE decode. Llaminar currently executes one request per
+         * runner transaction; values greater than one are accepted by config
+         * parsing so benchmark plans can declare intent, but the runner must
+         * hard-fail until Phase 8 wires true request-batched execution.
+         */
+        int max_request_batch = 1;
         MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
         bool require_terminal_hidden_for_full_hit = true;
         MTPDepthPolicyConfig depth_policy;

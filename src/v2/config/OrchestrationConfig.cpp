@@ -898,6 +898,10 @@ namespace llaminar2
             {
                 errors.push_back("MTP draft tokens must be > 0");
             }
+            if (mtp.max_request_batch <= 0)
+            {
+                errors.push_back("MTP max request batch must be > 0");
+            }
 
             const auto &depth_policy = mtp.depth_policy;
             if (depth_policy.min_depth < 0)
@@ -1065,6 +1069,7 @@ namespace llaminar2
         oss << "  mtp:\n";
         oss << "    enabled: " << (mtp.enabled ? "true" : "false") << "\n";
         oss << "    draft_tokens: " << mtp.draft_tokens << "\n";
+        oss << "    max_request_batch: " << mtp.max_request_batch << "\n";
         oss << "    verify_mode: " << mtpVerifyModeToString(mtp.verify_mode) << "\n";
         oss << "    depth_policy: " << mtpDepthPolicyModeToString(mtp.depth_policy.mode) << "\n";
         oss << "    min_draft_tokens: " << mtp.depth_policy.min_depth << "\n";

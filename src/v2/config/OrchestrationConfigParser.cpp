@@ -328,6 +328,12 @@ namespace llaminar2
                 if (config.mtp.draft_tokens <= 0)
                     throw std::invalid_argument("mtp draft_tokens must be > 0");
             }
+            else if (key == "max_request_batch")
+            {
+                config.mtp.max_request_batch = std::stoi(value);
+                if (config.mtp.max_request_batch <= 0)
+                    throw std::invalid_argument("mtp max_request_batch must be > 0");
+            }
             else if (key == "verify_mode")
             {
                 auto parsed = parseMTPVerifyMode(value);
@@ -1714,6 +1720,21 @@ namespace llaminar2
                     if (c.mtp.draft_tokens <= 0)
                     {
                         throw std::invalid_argument("--mtp-draft-tokens must be > 0");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-max-request-batch",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Maximum requests to amortize in one MTP speculative transaction (Phase 8; executable path currently requires 1)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.max_request_batch = std::stoi(v);
+                    if (c.mtp.max_request_batch <= 0)
+                    {
+                        throw std::invalid_argument("--mtp-max-request-batch must be > 0");
                     }
                 }),
         });

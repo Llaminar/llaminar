@@ -37,6 +37,9 @@ Options:
                          dynamic requires baseline plus fixed d1/d2/d3.
   --seed N               Seed for stochastic rows (default: 123)
   --decode-tokens N      Override benchmark decode tokens via --n-predict N
+  --mtp-request-batch N  Pass --mtp-max-request-batch N on MTP variants
+                         (default: 1; values >1 are Phase 8 diagnostics until
+                         runner-batched speculative transactions are executable)
   --output-dir DIR       Output directory
   --perfstats            Capture LLAMINAR_PERF_STATS_JSON for MTP variants
   --gpu-stage-timing     Include graph-captured GPU stage timings in perfstats
@@ -54,6 +57,7 @@ Environment aliases:
   LLAMINAR_MTP_MATRIX_VARIANTS
   LLAMINAR_MTP_MATRIX_SEED
   LLAMINAR_MTP_MATRIX_DECODE_TOKENS
+  LLAMINAR_MTP_MATRIX_REQUEST_BATCH
   LLAMINAR_MTP_MATRIX_RESULTS_DIR
   LLAMINAR_MTP_MATRIX_ALLOW_PARTIAL_VARIANTS
   LLAMINAR_MTP_MATRIX_GPU_STAGE_TIMING
@@ -75,6 +79,7 @@ modes="${LLAMINAR_MTP_MATRIX_MODES:-greedy,stochastic}"
 variants="${LLAMINAR_MTP_MATRIX_VARIANTS:-baseline,fixed_d1,fixed_d2,fixed_d3,dynamic}"
 seed="${LLAMINAR_MTP_MATRIX_SEED:-123}"
 decode_tokens="${LLAMINAR_MTP_MATRIX_DECODE_TOKENS:-}"
+mtp_request_batch="${LLAMINAR_MTP_MATRIX_REQUEST_BATCH:-1}"
 output_dir="${LLAMINAR_MTP_MATRIX_RESULTS_DIR:-}"
 allow_partial_variants="${LLAMINAR_MTP_MATRIX_ALLOW_PARTIAL_VARIANTS:-0}"
 gpu_stage_timing="${LLAMINAR_MTP_MATRIX_GPU_STAGE_TIMING:-0}"
@@ -126,6 +131,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --decode-tokens)
       decode_tokens="${2:-}"
+      shift 2
+      ;;
+    --mtp-request-batch)
+      mtp_request_batch="${2:-}"
       shift 2
       ;;
     --output-dir)
@@ -180,6 +189,11 @@ done
 
 if [[ -n "${decode_tokens}" && ! "${decode_tokens}" =~ ^[1-9][0-9]*$ ]]; then
   echo "error: --decode-tokens must be a positive integer, got: ${decode_tokens}" >&2
+  exit 2
+fi
+
+if [[ ! "${mtp_request_batch}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --mtp-request-batch must be a positive integer, got: ${mtp_request_batch}" >&2
   exit 2
 fi
 
@@ -447,6 +461,7 @@ metadata_path="${output_dir}/metadata.txt"
   echo "variants=${variants}"
   echo "seed=${seed}"
   echo "decode_tokens=${decode_tokens:-default}"
+  echo "mtp_request_batch=${mtp_request_batch}"
   echo "perfstats=${perfstats}"
   echo "gpu_stage_timing=${gpu_stage_timing}"
   echo "allow_partial_variants=${allow_partial_variants}"
@@ -460,7 +475,7 @@ if [[ ! -x "${perf_summary_script}" ]]; then
   chmod +x "${perf_summary_script}" 2>/dev/null || true
 fi
 
-printf 'topology\tdevice\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\tdepth_updates\tdepth_promotions\tdepth_demotions\tdepth_windows\tlast_depth_reason\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tsampling_enqueue_ms\tstochastic_batch_outcome_ms\tstochastic_batch_d2h_sync_ms\tgreedy_summary_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
+printf 'topology\tdevice\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\trequest_batch\tdepth_updates\tdepth_promotions\tdepth_demotions\tdepth_windows\tlast_depth_reason\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tsampling_enqueue_ms\tstochastic_batch_outcome_ms\tstochastic_batch_d2h_sync_ms\tgreedy_summary_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
 printf 'topology\tdevice\tmodel\tmode\tvariant\tdomain\tphase\tcontext\tname\ttotal_ms\tcount\tavg_us\tstage_count\tsource\tperfstats\n' > "${stage_summary_path}"
 : > "${commands_path}"
 
@@ -510,6 +525,7 @@ append_summary() {
       (.mtp.current_depth // 0),
       (.mtp.min_depth // 0),
       (.mtp.max_depth // 0),
+      (.config.mtp_max_request_batch // 1),
       (.mtp.depth_policy_updates // 0),
       (.mtp.depth_policy_promotions // 0),
       (.mtp.depth_policy_demotions // 0),
@@ -617,6 +633,9 @@ for model in $(split_csv "${models}"); do
         fi
         cmd+=("${mode_args[@]}")
         cmd+=("${variant_args[@]}")
+        if [[ "${variant}" != "baseline" && "${mtp_request_batch}" != "1" ]]; then
+          cmd+=(--mtp-max-request-batch "${mtp_request_batch}")
+        fi
         cmd+=("${extra_args[@]}")
 
         {

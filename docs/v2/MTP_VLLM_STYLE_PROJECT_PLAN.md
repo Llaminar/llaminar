@@ -1772,6 +1772,13 @@ Status:
   `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecStateContract`, and the
   broader MTP unit gate passed. The next implementation step is to feed these
   batched outcomes from a runner/benchmark path instead of only unit fixtures.
+- The request-batch intent knob is now explicit: `MTPRuntimeConfig` carries
+  `max_request_batch`, CLI/YAML accept `--mtp-max-request-batch` /
+  `max_request_batch`, benchmark JSON and the iteration matrix summary export
+  it, and the runner hard-fails values other than 1 until real Phase 8
+  request-batched sidecar/verifier execution is implemented. This prevents
+  accidental no-op "batched" measurements while preserving a stable gate for
+  the next slice.
 
 Exit gate:
 

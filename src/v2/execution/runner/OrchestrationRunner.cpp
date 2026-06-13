@@ -1108,6 +1108,10 @@ namespace llaminar2
         {
             return "MTP decode supports --mtp-draft-tokens in the range [1, 3] for verifier M=2..4";
         }
+        if (mtp.max_request_batch != 1)
+        {
+            return "MTP request-batched speculative transactions are not executable yet; use --mtp-max-request-batch 1 until Phase 8 runner batching lands";
+        }
         if (effective_max_draft_tokens > 1 && !runner_->supportsChainedMTPDrafts())
         {
             return "MTP decode with --mtp-draft-tokens > 1 requires runner support for chained MTP sidecars";

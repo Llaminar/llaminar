@@ -21,9 +21,9 @@ Before a WiP commit, broad units plus touched parity must pass.
   one-hot-q path is structurally aligned. The remaining GPU MoE stochastic
   blocker is single-request target/condition transaction cost, not compact
   sampler table math or bonus deferral.
-- Phase 8 groundwork: accepted-count verifier outcomes now build padded
-  multi-request metadata with flattened state slots. Focused MTP unit gate is
-  green; production runner/benchmark batching is still open.
+- Phase 8 groundwork: accepted outcomes build padded multi-request metadata,
+  and `--mtp-max-request-batch`/matrix `--mtp-request-batch` record batched
+  intent. Executable runner batching still hard-fails above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.
   LocalTP best d3 55.4 vs 34.1 tok/s (1.62x), dynamic 54.2 (1.59x). LocalPP
@@ -78,8 +78,7 @@ d1 54.9, d3 52.5 tok/s; MoE no-MTP 118.26, d1 142.0, d3 132.8 tok/s.
 
 ## Next
 
-1. Implement Phase 8 request-batched/spec-transaction amortization for MoE lanes.
-2. Add benchmark support for batched speculative requests instead of only
-   independent single-request iterations.
+1. Implement Phase 8 executable request-batched spec transactions for MoE.
+2. Promote matrix request-batch lanes from hard-fail diagnostics to benchmarks.
 3. Run Phase 9 NodeLocalTP CPU and ExpertOverlay benchmark presets when the
    active slice touches those topologies.

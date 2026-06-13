@@ -24,6 +24,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
         models: str = "dense",
         perfstats: bool = False,
         gpu_stage_timing: bool = False,
+        mtp_request_batch: int | str = 1,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -50,6 +51,8 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
                 "greedy",
                 "--variants",
                 variants,
+                "--mtp-request-batch",
+                str(mtp_request_batch),
                 "--output-dir",
                 str(tmp_path / "out"),
             ]
@@ -176,6 +179,24 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
         self.assertIn("LLAMINAR_PERF_STATS_JSON=", result.stdout)
         self.assertIn("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1", result.stdout)
 
+    def test_mtp_request_batch_is_forwarded_to_mtp_variants(self) -> None:
+        result = self.run_matrix(
+            "fixed_d1",
+            mtp_request_batch=4,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--mtp-max-request-batch 4", result.stdout)
+
+    def test_mtp_request_batch_rejects_non_positive_values(self) -> None:
+        result = self.run_matrix(
+            "fixed_d1",
+            mtp_request_batch=0,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--mtp-request-batch must be a positive integer", result.stderr)
+
     def test_baseline_summary_row_matches_header_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -236,7 +257,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             header = lines[0].split("\t")
             row = lines[1].split("\t")
             self.assertEqual(len(header), len(row))
-            self.assertEqual(len(header), 74)
+            self.assertEqual(len(header), 75)
             self.assertIn("topology", header)
             self.assertEqual(row[header.index("topology")], "single")
             self.assertEqual(row[header.index("device")], "cpu:0")
@@ -244,6 +265,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
                 "generated_policy",
                 "min_depth",
                 "max_depth",
+                "request_batch",
                 "depth_updates",
                 "depth_promotions",
                 "depth_demotions",
@@ -254,6 +276,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             self.assertEqual(row[header.index("depth_updates")], "0")
             self.assertEqual(row[header.index("last_depth_reason")], "")
             self.assertEqual(row[header.index("generated_policy")], "false")
+            self.assertEqual(row[header.index("request_batch")], "1")
 
     def test_perfstats_rows_emit_ranked_stage_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

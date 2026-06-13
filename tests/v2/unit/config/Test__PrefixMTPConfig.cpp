@@ -87,6 +87,7 @@ TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
 
     EXPECT_FALSE(config.mtp.enabled);
     EXPECT_EQ(config.mtp.draft_tokens, 1);
+    EXPECT_EQ(config.mtp.max_request_batch, 1);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
     EXPECT_TRUE(config.mtp.require_terminal_hidden_for_full_hit);
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Fixed);
@@ -137,6 +138,19 @@ TEST(Test__PrefixMTPConfig, ValidateIgnoresDepthPolicyWhenMTPDisabled)
         << "Disabled MTP must not make no-MTP baselines depend on adaptive-depth knobs";
 }
 
+TEST(Test__PrefixMTPConfig, ValidateRejectsInvalidRequestBatchWhenMTPEnabled)
+{
+    OrchestrationConfig config;
+    config.mtp.enabled = true;
+    config.mtp.max_request_batch = 0;
+
+    const auto errors = config.validate();
+
+    ASSERT_FALSE(errors.empty());
+    EXPECT_NE(errors.front().find("MTP max request batch must be > 0"),
+              std::string::npos);
+}
+
 TEST(Test__PrefixMTPConfig, ValidateFixedDepthIgnoresAdaptiveOnlyKnobs)
 {
     OrchestrationConfig config;
@@ -174,6 +188,7 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
         "--prefix-cache-moe-policy", "invalidate-on-rebalance",
         "--mtp",
         "--mtp-draft-tokens", "2",
+        "--mtp-max-request-batch", "4",
         "--mtp-verify-mode", "speculative-sampling",
         "--mtp-depth-policy", "dynamic",
         "--mtp-min-draft-tokens", "1",
@@ -203,6 +218,7 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
 
     EXPECT_TRUE(config.mtp.enabled);
     EXPECT_EQ(config.mtp.draft_tokens, 2);
+    EXPECT_EQ(config.mtp.max_request_batch, 4);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
@@ -254,6 +270,11 @@ TEST(Test__PrefixMTPConfig, ParserRejectsInvalidPrefixAndMTPEnums)
         auto parser = createOrchestrationConfigParser();
         EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
     }
+    {
+        ArgvHelper args({"llaminar2", "--mtp-max-request-batch", "0"});
+        auto parser = createOrchestrationConfigParser();
+        EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
 }
 
 TEST(Test__PrefixMTPConfig, ParserAcceptsDynamicDepthZeroBypassPolicy)
@@ -294,6 +315,7 @@ prefix_cache:
 mtp:
   enabled: true
   draft_tokens: 3
+  max_request_batch: 2
   verify_mode: greedy
   require_terminal_hidden_for_full_hit: false
   depth_policy: observe
@@ -324,6 +346,7 @@ mtp:
 
     EXPECT_TRUE(config.mtp.enabled);
     EXPECT_EQ(config.mtp.draft_tokens, 3);
+    EXPECT_EQ(config.mtp.max_request_batch, 2);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
     EXPECT_FALSE(config.mtp.require_terminal_hidden_for_full_hit);
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Observe);
@@ -353,6 +376,7 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     source.prefix_cache.moe_policy = PrefixCacheMoEPolicy::InvalidateOnRebalance;
     source.mtp.enabled = true;
     source.mtp.draft_tokens = 2;
+    source.mtp.max_request_batch = 4;
     source.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
     source.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
     source.mtp.depth_policy.max_depth = 3;
@@ -389,6 +413,7 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
 
     EXPECT_TRUE(graph_config.mtp.enabled);
     EXPECT_EQ(graph_config.mtp.draft_tokens, 2);
+    EXPECT_EQ(graph_config.mtp.max_request_batch, 4);
     EXPECT_EQ(graph_config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
     EXPECT_EQ(graph_config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
     EXPECT_EQ(graph_config.mtp.depth_policy.max_depth, 3);
@@ -409,6 +434,7 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::InvalidateOnRebalance;
     config.mtp.enabled = true;
     config.mtp.draft_tokens = 2;
+    config.mtp.max_request_batch = 3;
     config.mtp.verify_mode = MTPVerifyMode::Greedy;
     config.mtp.require_terminal_hidden_for_full_hit = false;
     config.mtp.depth_policy.mode = MTPDepthPolicyMode::Observe;
@@ -429,6 +455,7 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     EXPECT_NE(explanation.find("moe_policy: invalidate-on-rebalance"), std::string::npos);
     EXPECT_NE(explanation.find("mtp:"), std::string::npos);
     EXPECT_NE(explanation.find("draft_tokens: 2"), std::string::npos);
+    EXPECT_NE(explanation.find("max_request_batch: 3"), std::string::npos);
     EXPECT_NE(explanation.find("verify_mode: greedy"), std::string::npos);
     EXPECT_NE(explanation.find("depth_policy: observe"), std::string::npos);
     EXPECT_NE(explanation.find("max_draft_tokens: 3"), std::string::npos);

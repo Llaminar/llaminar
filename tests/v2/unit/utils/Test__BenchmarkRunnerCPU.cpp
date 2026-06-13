@@ -845,6 +845,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     config.prefix_cache.enabled = true;
     config.mtp.enabled = true;
     config.mtp.draft_tokens = 3;
+    config.mtp.max_request_batch = 4;
     config.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
     config.mtp.depth_policy.max_depth = 3;
     config.mtp.depth_policy.window_size = 8;
@@ -899,6 +900,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_TRUE(doc.at("config").at("prefix_cache_enabled").get<bool>());
     EXPECT_TRUE(doc.at("config").at("mtp_enabled").get<bool>());
     EXPECT_EQ(doc.at("config").at("mtp_draft_tokens"), 3);
+    EXPECT_EQ(doc.at("config").at("mtp_max_request_batch"), 4);
     EXPECT_EQ(doc.at("config").at("mtp_depth_policy"), "dynamic");
     EXPECT_EQ(doc.at("config").at("mtp_max_draft_tokens"), 3);
     EXPECT_EQ(doc.at("config").at("mtp_depth_window"), 8);
