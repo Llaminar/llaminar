@@ -139,13 +139,36 @@ def _to_float(row: dict[str, str], key: str, default: float = 0.0) -> float:
         return default
 
 
-def _group_key(row: dict[str, str]) -> tuple[str, ...]:
-    """Build a stable lane key while ignoring metrics and policy variants."""
+def _group_key(row: dict[str, str], source: Path | None = None) -> tuple[str, ...]:
+    """Build a stable same-run lane key while ignoring metrics and variants.
 
-    preferred = [key for key in ("device", "model", "mode", "case") if key in row]
+    Fixed d1/d2/d3 rows are comparable only inside one benchmark lane.  The
+    source path keeps two summaries with the same device/model/mode from
+    overwriting each other, while the lane fields keep multi-topology and
+    multi-request-batch rows separated within one summary.
+    """
+
+    preferred = [
+        key
+        for key in (
+            "topology",
+            "device",
+            "model",
+            "mode",
+            "case",
+            "decode_tokens",
+            "request_batch",
+        )
+        if key in row
+    ]
     if preferred:
-        return tuple(row.get(key, "") for key in preferred)
-    return tuple(
+        parts: list[str] = []
+        if source is not None:
+            parts.append(f"source={source}")
+        parts.extend(f"{key}={row.get(key, '')}" for key in preferred)
+        return tuple(parts)
+    fallback_parts = [f"source={source}"] if source is not None else []
+    fallback_parts.extend(
         row[key]
         for key in sorted(row)
         if key
@@ -161,6 +184,7 @@ def _group_key(row: dict[str, str]) -> tuple[str, ...]:
             "perfstats",
         }
     )
+    return tuple(fallback_parts)
 
 
 def _backend_from_device(device: str) -> str:
@@ -200,7 +224,7 @@ def load_fixed_rows(paths: Iterable[Path]) -> list[FixedDepthRow]:
                     continue
                 rows.append(
                     FixedDepthRow(
-                        group_key=_group_key(row),
+                        group_key=_group_key(row, path),
                         backend=_backend_from_device(row.get("device", "")),
                         model_class=_model_class_from_summary(row.get("model", "")),
                         mode=row.get("mode", ""),
@@ -254,7 +278,7 @@ def is_holdout(group_key: tuple[str, ...], modulus: int, bucket: int) -> bool:
     return int.from_bytes(digest[:8], "little") % modulus == bucket
 
 
-def _accuracy(
+def _accuracy_interval(
     examples: list[LabeledExample],
     backend: str,
     model_class: str,
@@ -262,7 +286,8 @@ def _accuracy(
     depth: int,
     target_depth: int,
     action: str,
-    threshold: float,
+    min_acceptance: float,
+    max_acceptance: float,
 ) -> tuple[int, int]:
     total = 0
     correct = 0
@@ -275,12 +300,7 @@ def _accuracy(
         ):
             continue
         total += 1
-        if action == "promote":
-            predicted = example.acceptance_rate >= threshold
-        elif action == "demote":
-            predicted = example.acceptance_rate <= threshold
-        else:
-            predicted = example.acceptance_rate >= threshold
+        predicted = min_acceptance <= example.acceptance_rate <= max_acceptance
         expected = (
             example.action == action and
             example.target_depth == target_depth
@@ -290,7 +310,7 @@ def _accuracy(
     return correct, total
 
 
-def _choose_threshold(
+def _choose_acceptance_interval(
     examples: list[LabeledExample],
     backend: str,
     model_class: str,
@@ -298,41 +318,58 @@ def _choose_threshold(
     depth: int,
     target_depth: int,
     action: str,
-) -> tuple[float, int, int]:
-    best_threshold = 0.0
+) -> tuple[float, float, int, int]:
+    best_min_acceptance = 0.0
+    best_max_acceptance = 1.0
     best_correct = -1
     best_total = 0
-    for point in range(0, 101):
-        threshold = point / 100.0
-        correct, total = _accuracy(
-            examples,
-            backend,
-            model_class,
-            mode,
-            depth,
-            target_depth,
-            action,
-            threshold,
-        )
-        if total == 0:
-            continue
-        if correct > best_correct:
-            best_threshold = threshold
-            best_correct = correct
-            best_total = total
-        elif correct == best_correct:
-            # Prefer the conservative equally correct rule.  Promotions should
-            # require the strongest acceptance signal still supported by the
-            # training data, while demotions should only fire on the weakest
-            # acceptance signal that still explains the data.  This prevents an
-            # offline table from turning "all zero accepted" into a generated
-            # promotion just because every depth-1 training lane eventually
-            # preferred a deeper fixed-depth benchmark.
-            if action in {"promote", "hold"} and threshold > best_threshold:
-                best_threshold = threshold
-            if action == "demote" and threshold < best_threshold:
-                best_threshold = threshold
-    return best_threshold, best_correct, best_total
+    for min_point in range(0, 101):
+        min_acceptance = min_point / 100.0
+        for max_point in range(min_point, 101):
+            max_acceptance = max_point / 100.0
+            correct, total = _accuracy_interval(
+                examples,
+                backend,
+                model_class,
+                mode,
+                depth,
+                target_depth,
+                action,
+                min_acceptance,
+                max_acceptance,
+            )
+            if total == 0:
+                continue
+            better = correct > best_correct
+            if correct == best_correct:
+                if action == "demote":
+                    # Demotion rules should remain low-acceptance guards.
+                    better = (
+                        min_acceptance < best_min_acceptance or
+                        (
+                            min_acceptance == best_min_acceptance and
+                            max_acceptance < best_max_acceptance
+                        )
+                    )
+                else:
+                    # Promotions/holds prefer the widest high side that still
+                    # explains the data, then the strongest lower bound.  This
+                    # preserves the old high-acceptance behavior when possible,
+                    # but can also express a bounded "probe the next depth"
+                    # region when a low-to-moderate lane wins in benchmark data.
+                    better = (
+                        max_acceptance > best_max_acceptance or
+                        (
+                            max_acceptance == best_max_acceptance and
+                            min_acceptance > best_min_acceptance
+                        )
+                    )
+            if better:
+                best_min_acceptance = min_acceptance
+                best_max_acceptance = max_acceptance
+                best_correct = correct
+                best_total = total
+    return best_min_acceptance, best_max_acceptance, best_correct, best_total
 
 
 def learn_rules(
@@ -378,7 +415,12 @@ def learn_rules(
             if action == "hold" and target_depth != depth:
                 continue
 
-            threshold, train_correct, train_total = _choose_threshold(
+            (
+                min_acceptance,
+                max_acceptance,
+                train_correct,
+                train_total,
+            ) = _choose_acceptance_interval(
                 train,
                 backend,
                 model_class,
@@ -390,7 +432,7 @@ def learn_rules(
             train_accuracy = train_correct / train_total if train_total else 0.0
             if train_accuracy < min_train_accuracy:
                 continue
-            holdout_correct, holdout_total = _accuracy(
+            holdout_correct, holdout_total = _accuracy_interval(
                 holdout,
                 backend,
                 model_class,
@@ -398,15 +440,11 @@ def learn_rules(
                 depth,
                 target_depth,
                 action,
-                threshold,
+                min_acceptance,
+                max_acceptance,
             )
-            min_acceptance = threshold
-            max_acceptance = 1.0
-            if action == "demote":
-                min_acceptance = 0.0
-                max_acceptance = threshold
-            elif action == "hold":
-                min_acceptance = max(0.0, threshold - hold_acceptance_margin)
+            if action == "hold":
+                min_acceptance = max(0.0, min_acceptance - hold_acceptance_margin)
             rules.append(
                 LearnedRule(
                     backend=backend,

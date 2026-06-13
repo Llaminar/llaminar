@@ -980,6 +980,18 @@ Work:
   channels.
 - Move dynamic-depth observations to consume transaction outputs only.
 
+Status:
+
+- Accepted. The runner now drives speculative decode through
+  `MTPSpecDecodeTransaction`, `MTPSpecStepPlan`, and
+  `MTPSpecStateContract` instead of backend-local side channels. Focused
+  coverage includes `V2_Unit_MTPIterationBenchmarkMatrix`,
+  `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`,
+  `V2_Unit_MTPDecodeCatchup`, `V2_Unit_MTPVerifierPolicy`, and
+  `V2_Unit_PrefillDecodeTransition`. Dynamic-depth accounting consumes
+  accepted/rejected/rollback transaction outputs rather than raw runner
+  mutations.
+
 Exit gate:
 
 - Unit tests cover accept-all, reject-first, reject-after-prefix, bonus-ready,
@@ -1002,6 +1014,19 @@ Work:
   buffers.
 - Add diagnostics showing whether a lane used persistent metadata or a
   compatibility vector path.
+
+Status:
+
+- Accepted. Persistent metadata/workspace bindings exist for the verifier and
+  sampler hot paths, including draft tokens, verifier-row positions, sampled
+  device-token slots, stochastic draft sample probabilities, and accepted-count
+  publication plans. GPU paths declare scratch through arena/workspace
+  consumers and hard-fail missing explicit streams; CPU uses the same logical
+  layout through host-side metadata. Focused coverage includes
+  `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_PrefillDecodeTransition`, `V2_Integration_GPUSamplingKernels`, and
+  the static hygiene guards for default streams and ad-hoc ROCm hot-path
+  allocations.
 
 Exit gate:
 
@@ -1323,6 +1348,14 @@ Status:
 - The runtime and benchmark config surfaces expose
   `mtp_depth_generated_policy`, and the hysteresis plus iteration-matrix scripts
   report whether each dynamic lane used the generated table.
+- The policy trainer now keys fixed-depth examples by source summary plus
+  topology, device, model, mode, decode length, request batch, and prompt case
+  when present. This prevents separate short/long or scalar/request-batched
+  benchmark summaries with the same backend/model/mode from overwriting each
+  other before labels are derived. The trainer also learns bounded acceptance
+  intervals instead of only high-acceptance promotions, so future generated
+  rules can express low-to-moderate probe regions without hand-editing the
+  `.inc` table. Regression: `V2_Unit_MTPDepthPolicyTrainer`.
 - Focused side-quest gates passed:
   `V2_Unit_MTPDepthController`, `V2_Unit_MTPDepthPolicyTrainer`,
   `V2_Unit_PrefillDecodeTransition`, `V2_Integration_GPUSamplingKernels`, and
@@ -2342,6 +2375,24 @@ Current status:
   Dense CUDA/ROCm SingleDevice and ROCm dense LocalTP/LocalPP have speed-positive
   evidence, but MoE stochastic on CUDA/ROCm and MoE CPU lanes remain red or
   amber in the dashboard.
+- Fresh MoE stochastic request-batch evidence confirms correctness without
+  performance acceptance. Scalar RB=1 remains speed-negative on the default
+  prompt (`20260613T100145Z-moe-stochastic-single-rb1`: CUDA best d3 83.8
+  versus 114.6 tok/s baseline; ROCm best dynamic 53.0 versus 69.0). RB=2 is
+  worse (`20260613T100431Z-moe-stochastic-single-rb2`: CUDA best d1 70.2
+  versus 115.2; ROCm best d1 46.5 versus 69.1, with d2/d3 acceptance around
+  4-12%). The next Phase 10 sprint should reduce MoE stochastic
+  verifier/condition-token cost in the scalar path before revisiting larger
+  request batches.
+- Long-lane RB=1 evidence sharpens, but does not close, the gap:
+  `20260613T101458Z-moe-stochastic-long-rb1` shows CUDA fixed d3 nearly neutral
+  at 136.4 versus 138.6 tok/s baseline, and ROCm fixed d2 neutral at
+  77.0 versus 77.0 tok/s baseline while ROCm dynamic remains poor at 62.0. A
+  generated-depth-policy refresh using that evidence was benchmark-rejected
+  (`20260613T_phase10_depth_policy_refresh_rocm_moe_stoch`): ROCm dynamic still
+  demoted back to d1 and reached only 60.3 versus 77.7 tok/s baseline. The
+  checked-in generated table therefore remains unchanged; the promoted slice is
+  only the trainer grouping/interval regression.
 - No default-enable proposal is allowed until the active dashboard matrix has
   same-run parity and benchmark evidence for the exact backend/model/sampling
   lanes under consideration.

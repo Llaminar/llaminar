@@ -234,6 +234,75 @@ class MTPDepthPolicyTrainerTest(unittest.TestCase):
             self.assertIn("MTPDepthPolicyModelClass::MoE, 3, 0.760000", include_text)
             self.assertIn(", +2, \"trained_rocm_moe_greedy_promote_d1_to_d3\"", include_text)
 
+    def test_multiple_summaries_do_not_overwrite_same_lane_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            short_summary = tmp / "short.tsv"
+            long_summary = tmp / "long.tsv"
+            output = tmp / "MTPDepthPolicyGenerated.inc"
+            report = tmp / "report.txt"
+            header = (
+                "device\tmodel\tmode\tvariant\tsuccess\tdecode_tps\t"
+                "acceptance_pct\tdecode_tokens\trequest_batch\n"
+            )
+            short_summary.write_text(
+                header
+                + textwrap.dedent(
+                    """\
+                    rocm:0\tmoe\tstochastic\tfixed_d1\ttrue\t53.0\t75.0\t16\t1
+                    rocm:0\tmoe\tstochastic\tfixed_d2\ttrue\t51.0\t70.0\t16\t1
+                    rocm:0\tmoe\tstochastic\tfixed_d3\ttrue\t52.0\t75.0\t16\t1
+                    """
+                ),
+                encoding="utf-8",
+            )
+            long_summary.write_text(
+                header
+                + textwrap.dedent(
+                    """\
+                    rocm:0\tmoe\tstochastic\tfixed_d1\ttrue\t60.0\t46.0\t64\t1
+                    rocm:0\tmoe\tstochastic\tfixed_d2\ttrue\t77.0\t83.0\t64\t1
+                    rocm:0\tmoe\tstochastic\tfixed_d3\ttrue\t74.0\t79.0\t64\t1
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(TRAINER),
+                    "--input",
+                    str(short_summary),
+                    "--input",
+                    str(long_summary),
+                    "--output",
+                    str(output),
+                    "--summary",
+                    str(report),
+                    "--holdout-modulus",
+                    "999",
+                    "--holdout-bucket",
+                    "998",
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            include_text = output.read_text(encoding="utf-8")
+            report_text = report.read_text(encoding="utf-8")
+            self.assertIn("examples=6", report_text)
+            self.assertIn("trained_rocm_moe_stochastic_hold_d1_to_d1", include_text)
+            self.assertIn("trained_rocm_moe_stochastic_promote_d1_to_d2", include_text)
+            self.assertIn(
+                "MTPDepthPolicyModelClass::MoE, 1, 0.460000, 0.740000",
+                include_text,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
