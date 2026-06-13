@@ -1694,6 +1694,58 @@ namespace llaminar2
             }
         }
 
+        return uploadMTPSpecDecodeVerifierLogitRows(
+            graph_plan.verifier_logit_rows,
+            plan.compact_logit_row_count,
+            binding,
+            device,
+            backend,
+            stream);
+    }
+
+    MTPSpecDecodeMetadataUploadResult uploadMTPSpecDecodeVerifierLogitRows(
+        const std::vector<int32_t> &verifier_logit_rows,
+        int row_count,
+        const MTPSpecDecodeMetadataWorkspaceBinding &binding,
+        DeviceId device,
+        IBackend *backend,
+        void *stream)
+    {
+        MTPSpecDecodeMetadataUploadResult result;
+        if (row_count < 0 ||
+            static_cast<int>(verifier_logit_rows.size()) < row_count)
+        {
+            result.error = "MTP verifier row upload has an invalid row count";
+            return result;
+        }
+        const MTPSpecDecodeMetadataShape &shape = binding.shape();
+        if (shape.valid() &&
+            row_count > shape.max_requests * shape.maxTargetQueryLen())
+        {
+            result.error = "MTP verifier row upload exceeds metadata workspace shape";
+            return result;
+        }
+        if (!binding.hasWorkspace())
+        {
+            result.error = std::string("MTP verifier metadata workspace is not completely bound: ") +
+                           binding.bindingError();
+            return result;
+        }
+        if (device.is_gpu())
+        {
+            if (!stream)
+            {
+                result.error =
+                    "MTP verifier row metadata GPU upload requires an explicit non-null stream";
+                return result;
+            }
+            if (!backend)
+            {
+                result.error = "MTP verifier row metadata GPU upload requires a backend";
+                return result;
+            }
+        }
+
         const auto &ptrs = binding.devicePointers();
         if (!ptrs.verifier_logit_rows)
         {
@@ -1702,7 +1754,7 @@ namespace llaminar2
         }
 
         const size_t bytes =
-            static_cast<size_t>(plan.compact_logit_row_count) * sizeof(int32_t);
+            static_cast<size_t>(row_count) * sizeof(int32_t);
         if (bytes == 0)
         {
             result.ok = true;
@@ -1714,7 +1766,7 @@ namespace llaminar2
         {
             ok = backend->hostToDeviceOnStream(
                 ptrs.verifier_logit_rows,
-                graph_plan.verifier_logit_rows.data(),
+                verifier_logit_rows.data(),
                 bytes,
                 device.ordinal,
                 stream);
@@ -1723,7 +1775,7 @@ namespace llaminar2
         {
             std::memcpy(
                 ptrs.verifier_logit_rows,
-                graph_plan.verifier_logit_rows.data(),
+                verifier_logit_rows.data(),
                 bytes);
         }
 

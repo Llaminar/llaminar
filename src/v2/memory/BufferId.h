@@ -104,8 +104,8 @@ namespace llaminar2
         STOCHASTIC_VERIFY_ACCEPTED,  ///< Scalar stochastic verifier accept flags [1, 4]
         STOCHASTIC_VERIFY_ACCEPT_PROBS, ///< Scalar stochastic verifier accept probabilities [1, 4]
         STOCHASTIC_VERIFY_THRESHOLDS,   ///< Scalar stochastic verifier thresholds [1, 4]
-        STOCHASTIC_BATCH_OUTPUT_TOKENS, ///< Reduced stochastic verifier output tokens [1, 5]
-        STOCHASTIC_BATCH_OUTPUT_META,   ///< Reduced stochastic verifier metadata [1, 10]
+        STOCHASTIC_BATCH_OUTPUT_TOKENS, ///< Reduced stochastic verifier output tokens [request, 5]
+        STOCHASTIC_BATCH_OUTPUT_META,   ///< Reduced stochastic verifier metadata [request, 10]
 
         // ── Prefix cache restore/harvest staging ───────────────────────────
         PREFIX_K_STAGING,

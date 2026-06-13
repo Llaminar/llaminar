@@ -3,8 +3,9 @@
  * @brief GPU graph-capture regressions for RoPE dynamic position metadata.
  *
  * RoPE graph replay must not record host-to-device copies. Contiguous positions
- * use a pre-uploaded device scalar for pos_offset; explicit non-contiguous
- * position IDs are not capture-safe and must fail before attempting H2D.
+ * use a pre-uploaded device scalar for pos_offset; explicit position IDs use a
+ * pre-uploaded workspace row buffer so request-batched verifier rows can replay
+ * without rebuilding the graph.
  */
 
 #include <gtest/gtest.h>
@@ -81,7 +82,8 @@ namespace
     CpuReference computeCpuReference(
         const std::vector<float> &q_input,
         const std::vector<float> &k_input,
-        int pos_offset)
+        int pos_offset,
+        const std::vector<int> *position_ids = nullptr)
     {
         auto q = makeTensor(q_input, kSeqLen, kQHeads * kHeadDim);
         auto k = makeTensor(k_input, kSeqLen, kKVHeads * kHeadDim);
@@ -96,6 +98,10 @@ namespace
         params.seq_len = kSeqLen;
         params.pos_offset = pos_offset;
         params.theta_base = kThetaBase;
+        if (position_ids)
+        {
+            params.position_ids = position_ids->data();
+        }
 
         RoPEStage stage(params);
         llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(), ComputeBackendType::CPU);
@@ -311,7 +317,7 @@ TEST(Test__RoPEGraphCaptureNoH2D, ContiguousPositionsReplayWithUpdatedDeviceScal
 #endif
 }
 
-TEST(Test__RoPEGraphCaptureNoH2D, NonContiguousPositionIdsFailDuringCapture)
+TEST(Test__RoPEGraphCaptureNoH2D, ExplicitPositionIdsReplayWithUpdatedDeviceRows)
 {
 #if !defined(GPU_CONTEXT_TEST_BACKEND_CUDA) && !defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
     GTEST_SKIP() << "No GPU graph-capture backend selected";
@@ -322,25 +328,60 @@ TEST(Test__RoPEGraphCaptureNoH2D, NonContiguousPositionIdsFailDuringCapture)
 
     const auto q_input = makeValues(kSeqLen, kQHeads * kHeadDim, 0.5f);
     const auto k_input = makeValues(kSeqLen, kKVHeads * kHeadDim, 0.125f);
-    const std::vector<int> non_contiguous_positions{3, 4, 8, 9, 10, 20};
+    const std::vector<int> first_positions{7, 8, 9, 10, 11, 12};
+    const std::vector<int> second_positions{19, 19, 23, 23, 31, 32};
 
     StreamT stream{};
     createStream(&stream);
 
-    auto bundle = makeGpuStage(q_input, k_input, stream, non_contiguous_positions.data());
+    auto bundle = makeGpuStage(q_input, k_input, stream);
 
-    // Warmup outside capture is allowed to upload explicit position IDs.
+    /*
+     * Request-batched MTP may pass explicit rows that are numerically
+     * contiguous for one launch and non-contiguous for the next.  Once a stage
+     * receives explicit position IDs, graph capture must keep using the
+     * workspace row-buffer path instead of silently switching back to scalar
+     * pos_offset metadata.
+     */
+    bundle.stage->updateDynamicPositionIds(first_positions.data(), kSeqLen);
+    ASSERT_TRUE(bundle.stage->prepareGraphLaunch(bundle.ctx.get(), stream));
+    synchronize(stream);
+
+    // Warmup initializes invariant device tables outside graph capture.
     ASSERT_TRUE(bundle.stage->execute(bundle.ctx.get()));
     synchronize(stream);
     uploadTensor(*bundle.q, q_input, stream);
     uploadTensor(*bundle.k, k_input, stream);
 
+    GraphT graph{};
+    GraphExecT graph_exec{};
     {
         GraphCaptureGuard guard;
-        EXPECT_FALSE(bundle.stage->execute(bundle.ctx.get()))
-            << "Non-contiguous position IDs require H2D and must not be graph-captured";
+        beginCapture(stream);
+        ASSERT_TRUE(bundle.stage->execute(bundle.ctx.get()));
+        endCapture(stream, &graph);
     }
+    ASSERT_NE(graph, nullptr);
+    instantiate(&graph_exec, graph);
 
+    launch(graph_exec, stream);
+    synchronize(stream);
+    const auto first_ref = computeCpuReference(q_input, k_input, first_positions.front(), &first_positions);
+    expectNear(downloadTensor(*bundle.q, q_input.size(), stream), first_ref.q);
+    expectNear(downloadTensor(*bundle.k, k_input.size(), stream), first_ref.k);
+
+    uploadTensor(*bundle.q, q_input, stream);
+    uploadTensor(*bundle.k, k_input, stream);
+    bundle.stage->updateDynamicPositionIds(second_positions.data(), kSeqLen);
+    ASSERT_TRUE(bundle.stage->prepareGraphLaunch(bundle.ctx.get(), stream));
+    launch(graph_exec, stream);
+    synchronize(stream);
+    const auto second_ref = computeCpuReference(q_input, k_input, second_positions.front(), &second_positions);
+    expectNear(downloadTensor(*bundle.q, q_input.size(), stream), second_ref.q);
+    expectNear(downloadTensor(*bundle.k, k_input.size(), stream), second_ref.k);
+
+    destroyGraphExec(graph_exec);
+    destroyGraph(graph);
     destroyStream(stream);
 #endif
 }

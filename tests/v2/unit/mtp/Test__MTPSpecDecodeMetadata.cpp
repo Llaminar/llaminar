@@ -535,6 +535,72 @@ TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanCopiesCompactRows)
                 ElementsAre(0, 1, 2));
 }
 
+TEST(Test__MTPSpecDecodeMetadata, UploadVerifierLogitRowsCopiesDirectGraphRows)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(shape);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+
+    const std::vector<int32_t> graph_rows = {4, 7};
+    MTPSpecDecodeMetadataUploadResult upload =
+        uploadMTPSpecDecodeVerifierLogitRows(
+            graph_rows,
+            static_cast<int>(graph_rows.size()),
+            binding,
+            DeviceId::cpu(),
+            /*backend=*/nullptr,
+            /*stream=*/nullptr);
+    ASSERT_TRUE(upload.ok) << upload.error;
+    EXPECT_EQ(upload.bytes_uploaded, 2u * sizeof(int32_t));
+
+    const auto &ptrs = binding.devicePointers();
+    EXPECT_THAT(std::vector<int32_t>(
+                    ptrs.verifier_logit_rows,
+                    ptrs.verifier_logit_rows + 2),
+                ElementsAre(4, 7));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, UploadVerifierLogitRowsRejectsWorkspaceOverflow)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 1;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(shape);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+
+    const std::vector<int32_t> graph_rows = {0, 1, 2};
+    MTPSpecDecodeMetadataUploadResult upload =
+        uploadMTPSpecDecodeVerifierLogitRows(
+            graph_rows,
+            static_cast<int>(graph_rows.size()),
+            binding,
+            DeviceId::cpu(),
+            /*backend=*/nullptr,
+            /*stream=*/nullptr);
+    EXPECT_FALSE(upload.ok);
+    EXPECT_THAT(upload.error, HasSubstr("exceeds metadata workspace shape"));
+}
+
 TEST(Test__MTPSpecDecodeMetadata, BuildsPaddedBatchMetadataForAcceptAndReject)
 {
     MTPSpecDecodeMetadataShape shape;

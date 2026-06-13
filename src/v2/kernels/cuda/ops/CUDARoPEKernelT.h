@@ -102,6 +102,7 @@ namespace llaminar2
                 {
                     inv_freq_initialized_ = false;
                     dynamic_pos_device_valid_ = false;
+                    dynamic_position_ids_device_valid_ = false;
                 }
                 workspace_ = workspace;
             }
@@ -112,12 +113,17 @@ namespace llaminar2
             void setGPUStream(void *stream) override
             {
                 if (gpu_stream_ != stream)
+                {
                     dynamic_pos_device_valid_ = false;
+                    dynamic_position_ids_device_valid_ = false;
+                }
                 gpu_stream_ = stream;
             }
 
             /// Pre-upload pos_offset device params for graph replay
             void setDynamicPosOffset(int pos_offset) override;
+            /// Pre-upload explicit position IDs for graph-captured replay.
+            void setDynamicPositionIds(const int *position_ids, int seq_len) override;
 
             void resetDynamicState() override
             {
@@ -126,6 +132,8 @@ namespace llaminar2
                 inv_freq_theta_ = 0.0f;
                 dynamic_pos_device_valid_ = false;
                 dynamic_pos_offset_ = 0;
+                dynamic_position_ids_device_valid_ = false;
+                dynamic_position_ids_seq_len_ = 0;
                 if (h_device_params_)
                     h_device_params_->pos_offset = 0;
             }
@@ -248,6 +256,8 @@ namespace llaminar2
             rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
+            bool dynamic_position_ids_device_valid_ = false;
+            int dynamic_position_ids_seq_len_ = 0;
         };
 
         // =========================================================================
@@ -296,12 +306,17 @@ namespace llaminar2
             void setGPUStream(void *stream) override
             {
                 if (gpu_stream_ != stream)
+                {
                     dynamic_pos_device_valid_ = false;
+                    dynamic_position_ids_device_valid_ = false;
+                }
                 gpu_stream_ = stream;
             }
 
             /// Pre-upload pos_offset device params for graph replay
             void setDynamicPosOffset(int pos_offset) override;
+            /// Pre-upload explicit position IDs for graph-captured replay.
+            void setDynamicPositionIds(const int *position_ids, int seq_len) override;
 
             void resetDynamicState() override
             {
@@ -310,6 +325,8 @@ namespace llaminar2
                 inv_freq_theta_ = 0.0f;
                 dynamic_pos_device_valid_ = false;
                 dynamic_pos_offset_ = 0;
+                dynamic_position_ids_device_valid_ = false;
+                dynamic_position_ids_seq_len_ = 0;
                 if (h_device_params_)
                     h_device_params_->pos_offset = 0;
             }
@@ -350,6 +367,7 @@ namespace llaminar2
                 {
                     inv_freq_initialized_ = false;
                     dynamic_pos_device_valid_ = false;
+                    dynamic_position_ids_device_valid_ = false;
                 }
                 workspace_ = workspace;
             }
@@ -469,6 +487,8 @@ namespace llaminar2
             rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
+            bool dynamic_position_ids_device_valid_ = false;
+            int dynamic_position_ids_seq_len_ = 0;
         };
 
         // =========================================================================
@@ -517,12 +537,17 @@ namespace llaminar2
             void setGPUStream(void *stream) override
             {
                 if (gpu_stream_ != stream)
+                {
                     dynamic_pos_device_valid_ = false;
+                    dynamic_position_ids_device_valid_ = false;
+                }
                 gpu_stream_ = stream;
             }
 
             /// Pre-upload pos_offset device params for graph replay
             void setDynamicPosOffset(int pos_offset) override;
+            /// Pre-upload explicit position IDs for graph-captured replay.
+            void setDynamicPositionIds(const int *position_ids, int seq_len) override;
 
             void resetDynamicState() override
             {
@@ -531,6 +556,8 @@ namespace llaminar2
                 inv_freq_theta_ = 0.0f;
                 dynamic_pos_device_valid_ = false;
                 dynamic_pos_offset_ = 0;
+                dynamic_position_ids_device_valid_ = false;
+                dynamic_position_ids_seq_len_ = 0;
                 if (h_device_params_)
                     h_device_params_->pos_offset = 0;
             }
@@ -575,6 +602,7 @@ namespace llaminar2
                 {
                     inv_freq_initialized_ = false;
                     dynamic_pos_device_valid_ = false;
+                    dynamic_position_ids_device_valid_ = false;
                 }
                 workspace_ = workspace;
             }
@@ -694,6 +722,8 @@ namespace llaminar2
             rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
+            bool dynamic_position_ids_device_valid_ = false;
+            int dynamic_position_ids_seq_len_ = 0;
         };
 
     } // namespace cuda

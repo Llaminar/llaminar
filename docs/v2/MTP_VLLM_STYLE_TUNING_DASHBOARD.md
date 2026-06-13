@@ -1,6 +1,6 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Scope: Qwen3.6 dense/MoE MTP on CUDA/ROCm/CPU across SingleDevice, LocalTP,
+Scope: Qwen3.6 dense/MoE MTP on CUDA/ROCm/CPU over SingleDevice, LocalTP,
 LocalPP, NodeLocalTP, and ExpertOverlay. Keep this file under 6KB.
 
 RAG: Green = correct and speed-positive near target. Amber = correct but slow,
@@ -18,19 +18,19 @@ Before a WiP commit, broad units plus touched parity must pass.
   vs 114.4 tok/s, ROCm best 51.5 vs 68.7 tok/s in
   `20260612T225841Z-moe-stochastic-gpu-stage-timing`.
 - vLLM check: bonus sampling is upfront there too; our processed-target,
-  one-hot-q path is structurally aligned. The remaining GPU MoE stochastic
-  blocker is single-request target/condition transaction cost, not compact
+  one-hot-q path is aligned. The remaining GPU MoE stochastic
+  blocker is target/condition transaction cost, not compact
   sampler table math or bonus deferral.
-- Phase 8 groundwork: accepted outcomes build padded request-batch metadata;
-  greedy and stochastic paths share one transaction/publication planner; live
-  request-1 publication now calls the batch publisher through SingleDevice,
-  LocalTP, and LocalPP rank fan-out. Compact verifier scratch, explicit graph
-  rows, padded verifier-decode caching, bounded one-token Qwen35/Qwen36
-  sidecar batches, padded-row publication, scheduler admission, device-token
-  routing, greedy/stochastic owned handoff, and runner-capacity reservation
-  are unit-proven. Benchmark/orchestration paths have batch-aware contracts,
-  aggregate-token accounting, live SingleDevice batch prefill state, and a
-  first-token batch-decode bridge. Batched verifier continuation still hard-fails.
+- Phase 8 request batching: padded metadata, scheduler/owner, batched
+  publication, variable-length hidden gather, true batched sidecar drafts,
+  greedy d1/d2/d3, and bounded stochastic continuation are unit-proven.
+  20260613 fix: stochastic batched prefill now samples compact rows with the
+  same logical-position thresholds as scalar MTP. CUDA/RB=2 and ROCm/RB=2
+  MoE stochastic `-n16` both pass with 12 accepted, 78 rejected, zero rollbacks
+  at 75.90/52.12 tok/s. Same-run scalar d1 is 88.18/56.47 and no-MTP is
+  115.32/69.79. RoPE explicit row metadata is now graph-capture safe on
+  CUDA/ROCm; ROCm MoE RB=2 greedy `-n16` passes without segmented-capture
+  fallback at 69.29 tok/s. Phase 8 is correctness-green but perf-red.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.
   LocalTP best d3 55.4 vs 34.1 tok/s (1.62x), dynamic 54.2 (1.59x). LocalPP
@@ -75,8 +75,9 @@ Before a WiP commit, broad units plus touched parity must pass.
 Dense MTP is accepted on CUDA/ROCm SingleDevice and now looks healthy on ROCm
 LocalTP/LocalPP. MoE stochastic remains the active Phase 8 blocker: correctness
 is green, but single-request verifier/condition cost overwhelms recovered tokens.
-The vLLM-aligned next step is scheduler-style batching/amortization of the
-spec transaction, then MoE-specific tuning once the transaction shape matches.
+The vLLM-aligned next step is batching policy plus transaction amortization:
+RB=2 currently lowers acceptance versus scalar, so perf work should batch
+compatible lanes and avoid worsening the speculative economics.
 
 ## Target Anchors
 
@@ -85,7 +86,8 @@ d1 54.9, d3 52.5 tok/s; MoE no-MTP 118.26, d1 142.0, d3 132.8 tok/s.
 
 ## Next
 
-1. Wire Phase 8 scheduler batches into OrchestrationRunner/server spec transactions.
-2. Promote real runner request-batch lanes from hard-fail diagnostics to benchmarks.
+1. Add/fuse backend multi-request stochastic summary kernels if profiling says
+   the current per-request reducer is still dominant.
+2. Run CUDA/ROCm MoE RB=2 stochastic matrix against scalar baseline.
 3. Run Phase 9 NodeLocalTP CPU and ExpertOverlay benchmark presets when the
    active slice touches those topologies.

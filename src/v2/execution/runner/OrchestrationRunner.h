@@ -524,6 +524,15 @@ namespace llaminar2
             bool prefill_logits_ready = false;
             std::optional<int32_t> ready_sampled_token;
             std::optional<SamplingParams> ready_sampled_params;
+            /**
+             * @brief Independent sampler history for this logical request.
+             *
+             * Request batching must match running each prompt as its own scalar
+             * decode stream. Sharing `sampler_` across lanes would interleave
+             * RNG draws and repetition history, which is harmless for strict
+             * greedy decode but wrong for stochastic or penalty-aware MTP.
+             */
+            Sampler sampler;
             bool is_complete = false;
         };
         std::vector<BatchedDecodeRequestState> batched_request_states_;

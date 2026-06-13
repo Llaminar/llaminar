@@ -60,6 +60,7 @@
 #include "../../../collective/IGlobalTPContext.h"      // For shared_ptr<IGlobalTPContext> ownership
 #include <memory>
 #include <optional>
+#include <algorithm>
 #include <array>
 #include <unordered_map>
 #include <unordered_set>
@@ -249,6 +250,12 @@ namespace llaminar2
         /// terminal row or whether a compact row-select is required first.
         int last_forward_seq_len = 0;
         int last_forward_batch_size = 0;
+        /// Per-request token counts written by the most recent main forward.
+        ///
+        /// For padded request batches `last_forward_seq_len` is the padded row
+        /// width, not every request's true length.  MTP sidecar input refresh
+        /// uses this vector to gather each request's real terminal hidden row.
+        std::vector<int> last_forward_request_lengths;
 
         /// True when `prefix_terminal_hidden` is the accepted terminal row for
         /// the current live state. Ordinary forward makes this stale; prefix
@@ -352,6 +359,7 @@ namespace llaminar2
             std::fill(sequence_lengths.begin(), sequence_lengths.end(), 0);
             last_forward_seq_len = 0;
             last_forward_batch_size = 0;
+            last_forward_request_lengths.clear();
             mtp_terminal_hidden_current = false;
         }
 
@@ -1419,6 +1427,23 @@ namespace llaminar2
         }
 
         /**
+         * @brief Mark a padded batched forward for terminal-hidden tests.
+         *
+         * `request_lengths[i]` is the number of real, non-padding tokens in
+         * request `i` from the most recent forward.
+         */
+        void markMainForwardHiddenProducedForTesting(
+            int seq_len,
+            int batch_size,
+            const std::vector<int> &request_lengths)
+        {
+            noteMainForwardHiddenProducedForMTP(
+                seq_len,
+                batch_size,
+                request_lengths);
+        }
+
+        /**
          * @brief Refresh the stable MTP terminal-hidden buffer for tests.
          *
          * This exposes the same production helper used by MTP sidecar
@@ -1669,6 +1694,16 @@ namespace llaminar2
             int target_sample_slot,
             int position_id) override;
         bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override;
+        bool forwardMTPBatchAndSampleGreedy(
+            const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int32_t *out_tokens) override;
+        bool forwardMTPBatchFromLastDraftAndSampleGreedy(
+            const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int32_t *out_tokens) override;
         bool forwardMTPFromLastDraftAndSampleGreedy(
             int32_t draft_condition_token,
             int position_id,
@@ -2046,6 +2081,11 @@ namespace llaminar2
          */
         int sampleGreedyOnDevice() override;
         int sampleOnDevice(const SamplingParams &params) override;
+        bool sampleMainLogitsBatchRowsOnDevice(
+            int request_count,
+            const SamplingParams &params,
+            int32_t *out_tokens,
+            const float *stochastic_thresholds = nullptr) override;
 
         /**
          * @brief Apply sparse logit penalties on device
@@ -2096,6 +2136,10 @@ namespace llaminar2
             const SamplingParams &params,
             int vocab_size,
             float threshold) override;
+        bool stageStochasticDraftTokensForDeviceVerification(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            int first_draft_slot = 0) override;
         int sampleStochasticDistributionOnDevice(
             DeviceDistributionBuffer buffer,
             int slot,
@@ -2156,6 +2200,19 @@ namespace llaminar2
             uint64_t inverse_sample_seed = 0,
             int inverse_sample_first_logical_position = 0,
             bool use_vllm_probability_rejection = false) override;
+        /**
+         * @brief Reduce a logical stochastic request batch through compact GPU output rows.
+         *
+         * The method consumes the pending verifier stream once, queues each
+         * request's row verifier and summary into a distinct arena output row,
+         * then copies the compact `[request, fields]` summaries back in one
+         * host-visible boundary.  This keeps request-batched decode from
+         * repeatedly draining the GPU stream for every request.
+         */
+        bool verifyStochasticDistributionsRequestBatchOutcomesOnDevice(
+            const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
 
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)
@@ -2204,12 +2261,18 @@ namespace llaminar2
             defer_next_mtp_main_decode_sync_ = false;
             defer_all_position_verifier_sync_ = false;
             clearAllPendingLogitsStreams("clear_cache");
-            stochastic_target_distribution_streams_.fill(nullptr);
-            stochastic_draft_distribution_streams_.fill(nullptr);
+            std::fill(stochastic_target_distribution_streams_.begin(),
+                      stochastic_target_distribution_streams_.end(),
+                      nullptr);
+            std::fill(stochastic_draft_distribution_streams_.begin(),
+                      stochastic_draft_distribution_streams_.end(),
+                      nullptr);
             clearStochasticTargetSampleReadySlots();
             clearStochasticDraftSampleReadySlots();
             shifted_mtp_kv_ready_.valid = false;
             shifted_mtp_kv_ready_.producer_stream = nullptr;
+            request_batched_prefill_logits_row_count_ = 0;
+            request_batched_prefill_logit_rows_.clear();
             cache_stats_ = CacheStats{};
             state_.clear();
             // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
@@ -2770,7 +2833,10 @@ namespace llaminar2
             DeviceSpeculativeVerifyBatchOutcome *out,
             uint64_t inverse_sample_seed,
             int inverse_sample_first_logical_position,
-            bool use_vllm_probability_rejection);
+            bool use_vllm_probability_rejection,
+            int output_request_slot,
+            void *stream_override,
+            bool copy_summary_to_host);
 
         /** Build processed verifier rows without the full-softmax writeback. */
         bool buildStochasticProcessedLogitRowsOnDevice(
@@ -2944,7 +3010,9 @@ namespace llaminar2
                                      bool defer_final_sync = false,
                                      const void *draft_condition_tokens_device = nullptr,
                                      int draft_condition_ready_slot = -1,
-                                     bool draft_condition_ready_is_target = false);
+                                     bool draft_condition_ready_is_target = false,
+                                     int request_batch = 1,
+                                     const int *position_ids_override = nullptr);
         bool populateMTPShiftedCacheFromPrefill(const int *tokens,
                                                 int seq_len,
                                                 int batch_size,
@@ -2959,7 +3027,10 @@ namespace llaminar2
          * directly or explicitly refresh `PREFIX_TERMINAL_HIDDEN` from the
          * latest multi-row forward output.
          */
-        void noteMainForwardHiddenProducedForMTP(int seq_len, int batch_size);
+        void noteMainForwardHiddenProducedForMTP(
+            int seq_len,
+            int batch_size,
+            std::vector<int> request_lengths = {});
 
         /**
          * @brief Resolve the terminal-hidden tensor that should seed a first MTP sidecar.
@@ -2987,6 +3058,7 @@ namespace llaminar2
             int32_t token_id = 0;
             int position_id = 0;
             int seq_len = 0;
+            int batch_size = 1;
             bool uses_device_token_ids = false;
             int condition_token_slot = -1;
             void *condition_token_device = nullptr;
@@ -3032,6 +3104,7 @@ namespace llaminar2
                 token_id = 0;
                 position_id = 0;
                 seq_len = 0;
+                batch_size = 1;
                 uses_device_token_ids = false;
                 condition_token_slot = -1;
                 condition_token_device = nullptr;
@@ -3316,12 +3389,15 @@ namespace llaminar2
         void *argmax_partial_idxs_dev_ = nullptr; ///< INT32 [1, argmax_partial_capacity_]
         int argmax_partial_capacity_ = 0;         ///< Entries in the partial scratch (0 = unavailable)
 
-        void *stochastic_target_token_ids_dev_ = nullptr; ///< INT32 [4, 256]
-        void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [4, 256]
-        void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [3, 256]
-        void *stochastic_draft_probs_dev_ = nullptr;      ///< FP32 [3, 256]
-        void *stochastic_processed_logits_dev_ = nullptr; ///< FP32 staging [4, vocab]
-        void *stochastic_inverse_rejection_samples_dev_ = nullptr; ///< FP32 [3, vocab]
+        int stochastic_target_row_capacity_ = 0;
+        int stochastic_draft_row_capacity_ = 0;
+        int stochastic_batch_output_request_capacity_ = 1;
+        void *stochastic_target_token_ids_dev_ = nullptr; ///< INT32 [target_rows, 256]
+        void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [target_rows, 256]
+        void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [draft_rows, 256]
+        void *stochastic_draft_probs_dev_ = nullptr;      ///< FP32 [draft_rows, 256]
+        void *stochastic_processed_logits_dev_ = nullptr; ///< FP32 staging [target_rows, vocab]
+        void *stochastic_inverse_rejection_samples_dev_ = nullptr; ///< FP32 [draft_rows, vocab]
         void *stochastic_target_sample_tokens_dev_ = nullptr; ///< INT32 [1, 4]
         void *stochastic_draft_sample_tokens_dev_ = nullptr; ///< INT32 [1, 3]
         void *stochastic_draft_sample_probs_dev_ = nullptr; ///< FP32 [1, 3], p(sampled draft token)
@@ -3335,10 +3411,10 @@ namespace llaminar2
         void *stochastic_verify_accepted_dev_ = nullptr;  ///< INT32 [1, 4]
         void *stochastic_verify_accept_probs_dev_ = nullptr; ///< FP32 [1, 4]
         void *stochastic_verify_thresholds_dev_ = nullptr;   ///< FP32 [1, 4]
-        void *stochastic_batch_output_tokens_dev_ = nullptr; ///< INT32 [1, 5]
-        void *stochastic_batch_output_meta_dev_ = nullptr;   ///< INT32 [1, 10]
-        std::array<int, 4> stochastic_target_top_k_ = {0, 0, 0, 0};
-        std::array<int, 3> stochastic_draft_top_k_ = {0, 0, 0};
+        void *stochastic_batch_output_tokens_dev_ = nullptr; ///< INT32 [request, 5]
+        void *stochastic_batch_output_meta_dev_ = nullptr;   ///< INT32 [request, 10]
+        std::vector<int> stochastic_target_top_k_;
+        std::vector<int> stochastic_draft_top_k_;
 
         /**
          * @brief Producer stream for each compact stochastic distribution slot.
@@ -3349,8 +3425,7 @@ namespace llaminar2
          * without inserting a host synchronization. Slots are cleared when the
          * paired sampler consumes them or when request-scoped state is reset.
          */
-        std::array<void *, 4> stochastic_target_distribution_streams_ =
-            {nullptr, nullptr, nullptr, nullptr};
+        std::vector<void *> stochastic_target_distribution_streams_;
 
         /**
          * @brief Producer streams for MTP draft compact distributions.
@@ -3360,8 +3435,7 @@ namespace llaminar2
          * deferred sidecar graph replay on CUDA/ROCm without touching the device
          * null stream or synchronizing the whole context.
          */
-        std::array<void *, 3> stochastic_draft_distribution_streams_ =
-            {nullptr, nullptr, nullptr};
+        std::vector<void *> stochastic_draft_distribution_streams_;
 
         /**
          * @brief Event-backed readiness state for deferred stochastic sample tokens.
@@ -3409,10 +3483,8 @@ namespace llaminar2
             bool valid = false;
             uint64_t live_state_epoch = 0;
         };
-        std::array<StochasticSampleReadyState, 4>
-            stochastic_target_sample_ready_;
-        std::array<StochasticSampleReadyState, 3>
-            stochastic_draft_sample_ready_;
+        std::vector<StochasticSampleReadyState> stochastic_target_sample_ready_;
+        std::vector<StochasticSampleReadyState> stochastic_draft_sample_ready_;
         PendingShiftedMTPKVReadyState shifted_mtp_kv_ready_;
         PendingAcceptedSpecPublicationReadyState accepted_spec_publication_ready_;
 
@@ -3589,6 +3661,8 @@ namespace llaminar2
         bool compute_all_position_logits_ = false;
         bool compute_row_indexed_all_position_logits_ = false;
         int row_indexed_all_position_logits_row_count_ = 0;
+        int request_batched_prefill_logits_row_count_ = 0;
+        std::vector<int32_t> request_batched_prefill_logit_rows_;
 
         /// Runner-owned graph metadata workspace for vLLM-style MTP verification.
         MTPSpecDecodeMetadataWorkspaceBinding mtp_spec_decode_metadata_binding_{

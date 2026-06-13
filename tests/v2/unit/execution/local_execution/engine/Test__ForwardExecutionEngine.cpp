@@ -1071,6 +1071,54 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
     EXPECT_EQ(host.last_workspace_seq_len, 4);
 }
 
+TEST_F(Test__ForwardExecutionEngine, Execute_BatchedGpuPrefillSkipsBucketedAdapter)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+
+    /*
+     * Request-batched MTP benchmark prefill uses the ordinary batched graph
+     * path. Bucketed prefill chunking is a single-sequence adapter, so trying
+     * to pad this shape would reject before the decode amortization lane even
+     * starts.
+     */
+    const std::vector<int> tokens = {
+        80, 81, 82,
+        90, 91, 92,
+    };
+    const std::vector<int> positions = {
+        200, 201, 202,
+        300, 301, 302,
+    };
+    auto input = makeTestInput(3, 2, DeviceId::cuda(0), tokens.data(), positions.data());
+    input.position_offset = 200;
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.execute(input, output, host));
+
+    ASSERT_TRUE(host.has_last_forward_input);
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+    EXPECT_EQ(host.last_token_ids, tokens);
+    EXPECT_EQ(host.last_position_ids, positions);
+    EXPECT_EQ(host.last_forward_input.seq_len, 3);
+    EXPECT_EQ(host.last_forward_input.batch_size, 2);
+    EXPECT_EQ(host.last_forward_input.real_seq_len, 0);
+    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 0);
+    EXPECT_EQ(host.last_workspace_seq_len, 3);
+}
+
 TEST_F(Test__ForwardExecutionEngine, Execute_RawPrefillBelowMinSeqBypassesBucketedGraphCache)
 {
     ScopedDebugEnv env({

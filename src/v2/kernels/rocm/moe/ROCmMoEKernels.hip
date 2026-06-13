@@ -30,6 +30,16 @@ namespace
     constexpr int kGateLogitsExpertsPerBlock = 4;
     constexpr int kGateLogitsGroupedThreads = 256;
 
+    __device__ inline float route_weight_to_float(__half value)
+    {
+        return __half2float(value);
+    }
+
+    __device__ inline float route_weight_to_float(hip_bfloat16 value)
+    {
+        return static_cast<float>(value);
+    }
+
     struct DeviceNativeVNNIMatrixDescView
     {
         const uint8_t *payload;
@@ -330,6 +340,45 @@ __global__ void rocm_moe_gate_logits_small_m_kernel(
         for (int i = lane; i < d_model; i += warpSize)
             sum += hidden_shared[i] * w[i];
     }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    if (lane == 0)
+        logits[static_cast<size_t>(row) * num_experts + expert] = sum;
+}
+
+template <typename GateWeightT>
+__global__ void rocm_moe_gate_logits_small_m_mixed_weights_kernel(
+    const float *__restrict__ hidden,              // [seq_len, d_model]
+    const GateWeightT *__restrict__ gate_weights,  // [num_experts, d_model]
+    float *__restrict__ logits,                    // [seq_len, num_experts]
+    int seq_len, int d_model, int num_experts)
+{
+    extern __shared__ float hidden_shared[];
+
+    const int row = blockIdx.y;
+    if (row >= seq_len) return;
+
+    const float *h = hidden + static_cast<size_t>(row) * d_model;
+    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        hidden_shared[i] = h[i];
+    __syncthreads();
+
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (warp_id >= kGateLogitsExpertsPerBlock)
+        return;
+
+    const int expert = blockIdx.x * kGateLogitsExpertsPerBlock + warp_id;
+    if (expert >= num_experts)
+        return;
+
+    const GateWeightT *w =
+        gate_weights + static_cast<size_t>(expert) * d_model;
+    float sum = 0.0f;
+    for (int i = lane; i < d_model; i += warpSize)
+        sum += hidden_shared[i] * route_weight_to_float(w[i]);
 
     for (int offset = warpSize / 2; offset > 0; offset >>= 1)
         sum += __shfl_down(sum, offset);
@@ -1635,6 +1684,58 @@ __global__ void rocm_moe_weighted_add_kernel(
     output[idx] += weight * input[idx];
 }
 
+/**
+ * @brief Launch the small-M router for FP16/BF16 gate weights.
+ *
+ * Request-batched MTP verification produces M=2..4 router rows. Those rows need
+ * the same dtype support as decode's single-token router, but the C bridge must
+ * stay non-templated so host code can link it predictably.
+ */
+template <typename GateWeightT>
+bool launch_gate_logits_small_m_mixed_weights(
+    const float *hidden, const void *gate_weights, float *logits,
+    int seq_len, int d_model, int num_experts,
+    int device_idx, void *stream,
+    const char *label)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!stream || !hidden || !gate_weights || !logits ||
+        seq_len < 2 || seq_len > 4 || d_model <= 0 || num_experts <= 0)
+    {
+        fprintf(stderr, "HIP MoE %s invalid arguments\n", label);
+        return false;
+    }
+
+    constexpr size_t kSmallMGroupedSharedCapBytes = 48 * 1024;
+    const size_t shared_mem_bytes = static_cast<size_t>(d_model) * sizeof(float);
+    if (shared_mem_bytes > kSmallMGroupedSharedCapBytes)
+    {
+        fprintf(stderr, "HIP MoE %s shared memory too large: requested=%zu cap=%zu\n",
+                label, shared_mem_bytes, kSmallMGroupedSharedCapBytes);
+        return false;
+    }
+
+    const int blocks =
+        (num_experts + kGateLogitsExpertsPerBlock - 1) /
+        kGateLogitsExpertsPerBlock;
+    hipLaunchKernelGGL(rocm_moe_gate_logits_small_m_mixed_weights_kernel<GateWeightT>,
+        dim3(blocks, seq_len), dim3(kGateLogitsGroupedThreads), shared_mem_bytes,
+        static_cast<hipStream_t>(stream),
+        hidden, static_cast<const GateWeightT *>(gate_weights), logits,
+        seq_len, d_model, num_experts);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE %s kernel launch failed: %s\n",
+                label, hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 // =========================================================================
 // Extern "C" bridge functions — called from ROCmMoEKernel.cpp
 // =========================================================================
@@ -1703,6 +1804,26 @@ bool hipMoE_gate_logits_small_m(
         return false;
     }
     return true;
+}
+
+bool hipMoE_gate_logits_small_m_fp16_weights(
+    const float *hidden, const void *gate_weights_fp16, float *logits,
+    int seq_len, int d_model, int num_experts,
+    int device_idx, void *stream)
+{
+    return launch_gate_logits_small_m_mixed_weights<__half>(
+        hidden, gate_weights_fp16, logits, seq_len, d_model, num_experts,
+        device_idx, stream, "gate_logits_small_m_fp16_weights");
+}
+
+bool hipMoE_gate_logits_small_m_bf16_weights(
+    const float *hidden, const void *gate_weights_bf16, float *logits,
+    int seq_len, int d_model, int num_experts,
+    int device_idx, void *stream)
+{
+    return launch_gate_logits_small_m_mixed_weights<hip_bfloat16>(
+        hidden, gate_weights_bf16, logits, seq_len, d_model, num_experts,
+        device_idx, stream, "gate_logits_small_m_bf16_weights");
 }
 
 bool hipMoE_gate_logits_single_token_kpart(

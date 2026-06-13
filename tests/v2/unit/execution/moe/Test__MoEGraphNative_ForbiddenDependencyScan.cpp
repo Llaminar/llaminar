@@ -610,7 +610,7 @@ namespace llaminar2::test
         const std::string forward_body = dgo_contents.substr(forward_start, forward_end - forward_start);
 
         const size_t forward_mtp = forward_body.find("populateMTPShiftedCacheFromPrefill(tokens, seq_len, batch_size");
-        const size_t forward_terminal = forward_body.find("noteMainForwardHiddenProducedForMTP(seq_len, batch_size)");
+        const size_t forward_terminal = forward_body.find("noteMainForwardHiddenProducedForMTP(");
         const size_t forward_release = forward_body.find("releaseHostResidentWeightData();");
         ASSERT_NE(forward_mtp, std::string::npos);
         ASSERT_NE(forward_terminal, std::string::npos);

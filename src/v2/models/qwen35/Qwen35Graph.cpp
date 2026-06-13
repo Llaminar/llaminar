@@ -636,6 +636,7 @@ namespace llaminar2
                           .d_model = config_.d_model,
                           .vocab_size = mtp_lm_head_vocab_size,
                           .use_prefill_replay_row_offset = false,
+                          .compute_all_positions = true,
                           .input_buffer_id = BufferId::MTP_HIDDEN,
                           .output_buffer_id = BufferId::MTP_LOGITS,
                           .prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device),
@@ -755,7 +756,7 @@ namespace llaminar2
             config_.mtp.enabled &&
             (device.is_cpu() || device.is_cuda() || device.is_rocm());
         const int verifier_state_capture_rows =
-            verifier_state_capture_supported ? std::max(0, config_.mtp.draft_tokens + 1) : 0;
+            verifier_state_capture_supported ? resolveMTPMaxTargetQueryRows(config_.mtp) : 0;
 
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm

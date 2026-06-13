@@ -167,6 +167,60 @@ namespace llaminar2
                 threshold);
         }
 
+        enum class MTPSpecStochasticDrawPurpose : int
+        {
+            Sample = 0,
+            Accept = 1,
+            Residual = 2,
+        };
+
+        /**
+         * @brief Deterministic per-logical-position stochastic draw.
+         *
+         * vLLM-style MTP may sample a token as a bonus row in step N or as the
+         * first token in step N+1.  Seeded runs must see the same threshold in
+         * both cases, so the draw key is the logical output position plus the
+         * draw purpose, not the wall-clock point where the code asks for RNG.
+         */
+        float mtpSpecStochasticThresholdForPosition(
+            const SamplingParams &params,
+            Sampler &fallback_sampler,
+            int logical_position,
+            MTPSpecStochasticDrawPurpose purpose)
+        {
+            if (params.seed == 0)
+                return fallback_sampler.random_uniform_01();
+
+            const uint64_t position =
+                static_cast<uint64_t>(std::max(0, logical_position));
+            constexpr uint64_t kDrawPurposesPerToken = 8;
+            const uint64_t offset =
+                position * kDrawPurposesPerToken +
+                static_cast<uint64_t>(purpose);
+            return sampling_math::uniform01(
+                static_cast<uint64_t>(params.seed),
+                offset);
+        }
+
+        uint64_t mtpSpecInverseSampleSeedForThresholds(
+            const SamplingParams &params,
+            const float *thresholds,
+            size_t count)
+        {
+            if (params.seed != 0)
+                return static_cast<uint64_t>(params.seed);
+
+            uint64_t seed = 0xD1B54A32D192ED03ull;
+            for (size_t i = 0; i < count; ++i)
+            {
+                uint32_t bits = 0;
+                std::memcpy(&bits, thresholds + i, sizeof(bits));
+                seed = sampling_math::splitmix64(
+                    seed ^ static_cast<uint64_t>(bits));
+            }
+            return seed;
+        }
+
         /**
          * @brief Build the current single-request target-verifier row plan.
          *
@@ -1205,6 +1259,7 @@ namespace llaminar2
             BatchedDecodeRequestState state;
             state.last_token = tokens.back();
             state.prefill_logits_ready = true;
+            state.sampler = Sampler(active_sampling_params_.seed);
             next_states.push_back(std::move(state));
         }
 
@@ -1246,18 +1301,47 @@ namespace llaminar2
         if (runner_->vocab_size() <= 0)
             return false;
 
-        /*
-         * This Phase 8 bridge can only consume terminal prefill logits that
-         * were created by prefillBatch().  Once every row has emitted that
-         * first token, decodeStepBatch() must switch to the request-owner MTP
-         * verifier transaction before it is allowed to advertise support.
-         */
+        bool has_ready_prefill_logits = false;
+        bool has_verifier_continuation = false;
+        bool has_completed_requests = false;
         for (const BatchedDecodeRequestState &state : batched_request_states_)
         {
-            if (!state.is_complete && !state.prefill_logits_ready)
-                return false;
+            if (state.is_complete)
+            {
+                has_completed_requests = true;
+                continue;
+            }
+            has_ready_prefill_logits =
+                has_ready_prefill_logits || state.prefill_logits_ready;
+            has_verifier_continuation =
+                has_verifier_continuation || !state.prefill_logits_ready;
         }
-        return true;
+        if (has_ready_prefill_logits && has_verifier_continuation)
+            return false;
+        if (has_ready_prefill_logits)
+            return true;
+
+        const MTPRuntimeConfig &mtp =
+            plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        const int draft_depth = effectiveMTPMaxDraftDepth(mtp);
+        const bool greedy_batch_verify =
+            mtp.verify_mode == MTPVerifyMode::Greedy &&
+            active_sampling_params_.is_greedy();
+        const bool stochastic_batch_verify =
+            mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
+            !active_sampling_params_.is_greedy() &&
+            !active_sampling_params_.has_penalties() &&
+            runner_->supportsDeviceStochasticMTPVerification();
+        const bool chained_ok =
+            draft_depth <= 1 || runner_->supportsChainedMTPDrafts();
+        return has_verifier_continuation &&
+               !has_completed_requests &&
+               mtp.enabled &&
+               (greedy_batch_verify || stochastic_batch_verify) &&
+               draft_depth >= 1 &&
+               draft_depth <= 3 &&
+               chained_ok &&
+               runner_->supportsMTPSpecStatePublication();
     }
 
     GenerationBatchResult OrchestrationRunner::decodeStepBatch(int request_batch)
@@ -1313,72 +1397,963 @@ namespace llaminar2
 
         batch_result.requests.resize(static_cast<size_t>(request_batch));
 
+        bool has_ready_prefill_logits = false;
+        bool has_verifier_continuation = false;
+        bool has_completed_requests = false;
         for (int request = 0; request < request_batch; ++request)
         {
-            BatchedDecodeRequestState &state =
+            const BatchedDecodeRequestState &state =
                 batched_request_states_[static_cast<size_t>(request)];
-            GenerationResult &request_result =
-                batch_result.requests[static_cast<size_t>(request)];
-
             if (state.is_complete)
             {
-                request_result.is_complete = true;
+                has_completed_requests = true;
                 continue;
             }
-            if (!state.prefill_logits_ready)
+            has_ready_prefill_logits =
+                has_ready_prefill_logits || state.prefill_logits_ready;
+            has_verifier_continuation =
+                has_verifier_continuation || !state.prefill_logits_ready;
+        }
+
+        if (has_ready_prefill_logits && has_verifier_continuation)
+        {
+            batch_result.error =
+                "decodeStepBatch() cannot mix terminal-prefill sampling and "
+                "MTP verifier continuation in one live batch";
+            return batch_result;
+        }
+
+        if (has_ready_prefill_logits)
+        {
+            bool needs_device_prefill_sampling = false;
+            std::vector<int32_t> device_prefill_tokens(
+                static_cast<size_t>(request_batch),
+                kMTPSpecDecodeInvalidToken);
+            std::vector<float> device_prefill_thresholds;
+
+            if (runner_->primaryDeviceId().is_gpu())
             {
-                batch_result.error =
-                    "Batched MTP verifier decode is not implemented beyond "
-                    "the terminal prefill token";
-                return batch_result;
+                for (int request = 0; request < request_batch; ++request)
+                {
+                    const BatchedDecodeRequestState &state =
+                        batched_request_states_[static_cast<size_t>(request)];
+                    if (!state.is_complete && !state.ready_sampled_token.has_value())
+                    {
+                        needs_device_prefill_sampling = true;
+                        break;
+                    }
+                }
+
+                if (needs_device_prefill_sampling &&
+                    !active_sampling_params_.is_greedy())
+                {
+                    device_prefill_thresholds.resize(
+                        static_cast<size_t>(request_batch), 0.0f);
+                    for (int request = 0; request < request_batch; ++request)
+                    {
+                        BatchedDecodeRequestState &state =
+                            batched_request_states_[static_cast<size_t>(request)];
+                        const int logical_position =
+                            sequence_lengths[static_cast<size_t>(request)];
+                        /*
+                         * Keep request-batched first-token sampling identical
+                         * to scalar stochastic MTP. The draw is keyed by the
+                         * logical output position, not by "row N in this batch",
+                         * so a duplicate prompt in a request batch sees the
+                         * same first-token threshold as a standalone request.
+                         */
+                        device_prefill_thresholds[static_cast<size_t>(request)] =
+                            mtpSpecStochasticThresholdForPosition(
+                                active_sampling_params_,
+                                state.sampler,
+                                logical_position,
+                                MTPSpecStochasticDrawPurpose::Sample);
+                    }
+                }
+
+                if (needs_device_prefill_sampling &&
+                    !runner_->sampleMainLogitsBatchRowsOnDevice(
+                        request_batch,
+                        active_sampling_params_,
+                        device_prefill_tokens.data(),
+                        device_prefill_thresholds.empty()
+                            ? nullptr
+                            : device_prefill_thresholds.data()))
+                {
+                    batch_result.error =
+                        "decodeStepBatch() could not sample request-batched "
+                        "prefill logits on device";
+                    return batch_result;
+                }
             }
 
+            for (int request = 0; request < request_batch; ++request)
+            {
+                BatchedDecodeRequestState &state =
+                    batched_request_states_[static_cast<size_t>(request)];
+                GenerationResult &request_result =
+                    batch_result.requests[static_cast<size_t>(request)];
+
+                if (state.is_complete)
+                {
+                    request_result.is_complete = true;
+                    continue;
+                }
+                if (!state.prefill_logits_ready)
+                {
+                    batch_result.error =
+                        "decodeStepBatch() expected every active request to "
+                        "own terminal prefill logits";
+                    return batch_result;
+                }
+
+                int token = kMTPSpecDecodeInvalidToken;
+                if (state.ready_sampled_token.has_value())
+                {
+                    if (!state.ready_sampled_params.has_value())
+                    {
+                        batch_result.error =
+                            "decodeStepBatch() ready token is missing the "
+                            "sampling parameters that produced it";
+                        return batch_result;
+                    }
+                    if (!samplingParamsEqual(
+                            *state.ready_sampled_params,
+                            active_sampling_params_))
+                    {
+                        batch_result.error =
+                            "decodeStepBatch() ready token was sampled with "
+                            "different sampling parameters";
+                        return batch_result;
+                    }
+                    token = *state.ready_sampled_token;
+                }
+                else if (runner_->primaryDeviceId().is_gpu())
+                {
+                    token = device_prefill_tokens[static_cast<size_t>(request)];
+                    if (token < 0)
+                    {
+                        batch_result.error =
+                            "decodeStepBatch() device prefill sampler returned "
+                            "an invalid token";
+                        return batch_result;
+                    }
+                }
+                else
+                {
+                    const int logical_length = sequence_lengths[static_cast<size_t>(request)];
+                    if (logical_length <= 0 || logical_length > padded_seq_len)
+                    {
+                        batch_result.error =
+                            "decodeStepBatch() received invalid per-request sequence length";
+                        return batch_result;
+                    }
+
+                    const float *sequence_logits = runner_->getLogits(request);
+                    if (!sequence_logits)
+                    {
+                        batch_result.error =
+                            "decodeStepBatch() could not access per-request logits";
+                        return batch_result;
+                    }
+
+                    const float *terminal_logits =
+                        sequence_logits +
+                        static_cast<size_t>(logical_length - 1) *
+                            static_cast<size_t>(vocab);
+                    token = state.sampler.sample(
+                        terminal_logits,
+                        static_cast<size_t>(vocab),
+                        active_sampling_params_);
+                }
+
+                state.prefill_logits_ready = false;
+                state.ready_sampled_token.reset();
+                state.ready_sampled_params.reset();
+                state.last_token = token;
+
+                request_result.tokens.push_back(token);
+                request_result.is_complete =
+                    std::find(stop_tokens_.begin(), stop_tokens_.end(), token) !=
+                    stop_tokens_.end();
+                state.is_complete = request_result.is_complete;
+
+                state.sampler.record_token(token);
+            }
+
+            return batch_result;
+        }
+
+        if (!has_verifier_continuation)
+            return batch_result;
+        if (has_completed_requests)
+        {
+            batch_result.error =
+                "decodeStepBatch() request-batched verifier continuation "
+                "requires every request lane to be active";
+            return batch_result;
+        }
+
+        const MTPRuntimeConfig &mtp =
+            plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        if (!mtp.enabled)
+        {
+            batch_result.error =
+                "decodeStepBatch() MTP verifier continuation requires MTP";
+            return batch_result;
+        }
+        const bool greedy_batch_verify =
+            mtp.verify_mode == MTPVerifyMode::Greedy &&
+            active_sampling_params_.is_greedy();
+        const bool stochastic_batch_verify =
+            mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
+            !active_sampling_params_.is_greedy();
+        if (!greedy_batch_verify && !stochastic_batch_verify)
+        {
+            batch_result.error =
+                "decodeStepBatch() request-batched verifier continuation "
+                "requires greedy verification or stochastic speculative sampling";
+            return batch_result;
+        }
+        if (stochastic_batch_verify && active_sampling_params_.has_penalties())
+        {
+            batch_result.error =
+                "decodeStepBatch() request-batched verifier continuation "
+                "does not yet support penalty-mutated stochastic sampling";
+            return batch_result;
+        }
+        if (stochastic_batch_verify &&
+            !runner_->supportsDeviceStochasticMTPVerification())
+        {
+            batch_result.error =
+                "decodeStepBatch() stochastic request batching requires "
+                "device-resident stochastic MTP verification";
+            return batch_result;
+        }
+        if (greedy_batch_verify && active_sampling_params_.has_penalties())
+        {
+            batch_result.error =
+                "decodeStepBatch() request-batched verifier continuation "
+                "does not yet support penalty-mutated greedy sampling";
+            return batch_result;
+        }
+        const int draft_depth = effectiveMTPMaxDraftDepth(mtp);
+        if (draft_depth < 1 || draft_depth > 3)
+        {
+            batch_result.error =
+                "decodeStepBatch() request-batched verifier continuation "
+                "requires --mtp-draft-tokens in [1, 3]";
+            return batch_result;
+        }
+        if (draft_depth > 1 && !runner_->supportsChainedMTPDrafts())
+        {
+            batch_result.error =
+                "decodeStepBatch() request-batched verifier continuation "
+                "requires batched chained MTP draft support for depth > 1";
+            return batch_result;
+        }
+        if (!runner_->supportsMTPSpecStatePublication())
+        {
+            batch_result.error =
+                "decodeStepBatch() request-batched verifier continuation "
+                "requires runner MTP spec-state publication";
+            return batch_result;
+        }
+
+        PrefixStateSnapshot checkpoint = runner_->captureLivePrefixCheckpoint();
+        if (!checkpoint.valid)
+        {
+            batch_result.error =
+                "decodeStepBatch() could not capture live prefix checkpoint";
+            return batch_result;
+        }
+
+        auto fail_after_checkpoint =
+            [&](const std::string &message) -> GenerationBatchResult
+        {
+            runner_->setComputeAllPositionLogits(false);
+            runner_->setComputeRowIndexedAllPositionLogits(false, 0);
+            std::string restored_suffix;
+            if (!runner_->restoreLivePrefixState(checkpoint))
+                restored_suffix = "; checkpoint restore failed";
+            batch_result.error = message + restored_suffix;
+            return batch_result;
+        };
+
+        std::vector<int32_t> condition_tokens(
+            static_cast<size_t>(request_batch),
+            kMTPSpecDecodeInvalidToken);
+        std::vector<int> position_ids(
+            static_cast<size_t>(request_batch),
+            -1);
+        std::vector<int32_t> sidecar_drafts(
+            static_cast<size_t>(request_batch),
+            kMTPSpecDecodeInvalidToken);
+        std::vector<std::vector<int32_t>> request_drafts(
+            static_cast<size_t>(request_batch));
+        for (int request = 0; request < request_batch; ++request)
+        {
+            const BatchedDecodeRequestState &state =
+                batched_request_states_[static_cast<size_t>(request)];
+            if (state.is_complete)
+            {
+                batch_result.requests[static_cast<size_t>(request)].is_complete = true;
+                continue;
+            }
             const int logical_length = sequence_lengths[static_cast<size_t>(request)];
-            if (logical_length <= 0 || logical_length > padded_seq_len)
+            if (logical_length <= 0)
             {
                 batch_result.error =
                     "decodeStepBatch() received invalid per-request sequence length";
                 return batch_result;
             }
-
-            const float *sequence_logits = runner_->getLogits(request);
-            if (!sequence_logits)
-            {
-                batch_result.error =
-                    "decodeStepBatch() could not access per-request logits";
-                return batch_result;
-            }
-
-            const float *terminal_logits =
-                sequence_logits +
-                static_cast<size_t>(logical_length - 1) *
-                    static_cast<size_t>(vocab);
-            const int token = sampler_.sample(
-                terminal_logits,
-                static_cast<size_t>(vocab),
-                active_sampling_params_);
-
-            state.prefill_logits_ready = false;
-            state.ready_sampled_token.reset();
-            state.ready_sampled_params.reset();
-            state.last_token = token;
-
-            request_result.tokens.push_back(token);
-            request_result.is_complete =
-                std::find(stop_tokens_.begin(), stop_tokens_.end(), token) !=
-                stop_tokens_.end();
-            state.is_complete = request_result.is_complete;
-
-            /*
-             * Reuse the existing sampler history so penalties continue to see
-             * all generated tokens.  The current bridge is primarily for
-             * greedy request-batch handoff; Phase 8's owner transaction will
-             * replace this with per-request histories before stochastic
-             * server batching is accepted.
-             */
-            sampler_.record_token(token);
+            condition_tokens[static_cast<size_t>(request)] = state.last_token;
+            position_ids[static_cast<size_t>(request)] = logical_length;
         }
 
+        /*
+         * One true sidecar graph launch amortizes the first MTP draft across
+         * the request batch. Completed rows are still given a harmless token so
+         * the runner sees a dense request-batch shape; their results are ignored
+         * because they are not enqueued into the owner below.
+         */
+        for (int request = 0; request < request_batch; ++request)
+        {
+            if (condition_tokens[static_cast<size_t>(request)] ==
+                kMTPSpecDecodeInvalidToken)
+            {
+                condition_tokens[static_cast<size_t>(request)] = 0;
+                position_ids[static_cast<size_t>(request)] =
+                    std::max(0, sequence_lengths[static_cast<size_t>(request)]);
+            }
+        }
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "request_batch_sidecar_forward",
+                "decode");
+            if (!runner_->forwardMTPBatchAndSampleGreedy(
+                    condition_tokens.data(),
+                    position_ids.data(),
+                    request_batch,
+                    sidecar_drafts.data()))
+            {
+                return fail_after_checkpoint(
+                    "decodeStepBatch() request-batched MTP sidecar failed");
+            }
+        }
+        for (int request = 0; request < request_batch; ++request)
+        {
+            const int32_t draft = sidecar_drafts[static_cast<size_t>(request)];
+            if (draft < 0)
+            {
+                return fail_after_checkpoint(
+                    "decodeStepBatch() request-batched MTP sidecar produced "
+                    "an invalid first draft token");
+            }
+            request_drafts[static_cast<size_t>(request)].push_back(draft);
+        }
+
+        for (int draft_index = 1; draft_index < draft_depth; ++draft_index)
+        {
+            for (int request = 0; request < request_batch; ++request)
+            {
+                condition_tokens[static_cast<size_t>(request)] =
+                    request_drafts[static_cast<size_t>(request)].back();
+                position_ids[static_cast<size_t>(request)] =
+                    sequence_lengths[static_cast<size_t>(request)] +
+                    draft_index;
+                sidecar_drafts[static_cast<size_t>(request)] =
+                    kMTPSpecDecodeInvalidToken;
+            }
+
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "request_batch_chained_sidecar_forward",
+                "decode",
+                {},
+                {{"draft_index", std::to_string(draft_index)}});
+            if (!runner_->forwardMTPBatchFromLastDraftAndSampleGreedy(
+                    condition_tokens.data(),
+                    position_ids.data(),
+                    request_batch,
+                    sidecar_drafts.data()))
+            {
+                return fail_after_checkpoint(
+                    "decodeStepBatch() request-batched chained MTP sidecar failed");
+            }
+            for (int request = 0; request < request_batch; ++request)
+            {
+                const int32_t draft =
+                    sidecar_drafts[static_cast<size_t>(request)];
+                if (draft < 0)
+                {
+                    return fail_after_checkpoint(
+                        "decodeStepBatch() request-batched chained MTP "
+                        "sidecar produced an invalid draft token");
+                }
+                request_drafts[static_cast<size_t>(request)].push_back(draft);
+            }
+        }
+
+        if (!runner_->flushPendingMTPWork())
+        {
+            return fail_after_checkpoint(
+                "decodeStepBatch() request-batched MTP sidecar flush failed");
+        }
+
+        MTPSpecRequestBatchOwner owner;
+        const std::string compatibility_key =
+            std::string("singledevice:") + runner_->architecture() +
+            (stochastic_batch_verify ? ":stochastic:d" : ":greedy:d") +
+            std::to_string(draft_depth);
+        for (int request = 0; request < request_batch; ++request)
+        {
+            const BatchedDecodeRequestState &state =
+                batched_request_states_[static_cast<size_t>(request)];
+            if (state.is_complete)
+                continue;
+            const int32_t draft =
+                sidecar_drafts[static_cast<size_t>(request)];
+            if (draft < 0)
+            {
+                return fail_after_checkpoint(
+                    "decodeStepBatch() request-batched MTP sidecar produced "
+                    "an invalid draft token");
+            }
+
+            MTPSpecSchedulableRequest pending;
+            pending.request_id = request;
+            pending.ready = true;
+            pending.mode = stochastic_batch_verify
+                               ? MTPSpecRequestBatchMode::STOCHASTIC
+                               : MTPSpecRequestBatchMode::GREEDY;
+            pending.verifier_input = MTPSpecVerifierInputPlacement::HOST_TOKENS;
+            pending.compatibility_key = compatibility_key;
+            pending.vocab_size = vocab;
+            pending.base_cached_tokens =
+                static_cast<int32_t>(sequence_lengths[static_cast<size_t>(request)]);
+            pending.requires_shifted_kv_publication = true;
+            pending.greedy_request.draft_tokens.clear();
+            pending.greedy_request.draft_tokens.reserve(
+                static_cast<size_t>(draft_depth) + 1u);
+            pending.greedy_request.draft_tokens.push_back(state.last_token);
+            pending.greedy_request.draft_tokens.insert(
+                pending.greedy_request.draft_tokens.end(),
+                request_drafts[static_cast<size_t>(request)].begin(),
+                request_drafts[static_cast<size_t>(request)].end());
+            pending.greedy_request.stop_tokens = stop_tokens_;
+            pending.greedy_request.base_sidecar_position =
+                sequence_lengths[static_cast<size_t>(request)];
+            pending.greedy_request.verifier_path =
+                "request_batched_all_position_state_publication";
+            pending.greedy_request.implementation_name =
+                stochastic_batch_verify
+                    ? "request_batched_stochastic_d" + std::to_string(draft_depth)
+                    : "request_batched_greedy_d" + std::to_string(draft_depth);
+
+            std::string enqueue_error;
+            if (!owner.enqueueRequest(std::move(pending), &enqueue_error))
+            {
+                return fail_after_checkpoint(
+                    std::string("decodeStepBatch() could not enqueue MTP request: ") +
+                    enqueue_error);
+            }
+        }
+
+        MTPSpecRequestBatchScheduler scheduler(
+            MTPSpecRequestBatchSchedulerConfig{
+                .max_request_batch = request_batch,
+                .max_draft_tokens = draft_depth + 1,
+                .mode = stochastic_batch_verify
+                            ? MTPSpecRequestBatchMode::STOCHASTIC
+                            : MTPSpecRequestBatchMode::GREEDY});
+
+        auto publish = [&](const MTPSpecTransactionBatchPlan &plan,
+                           std::string *error) -> bool
+        {
+            return runner_->publishAcceptedMTPSpecStateBatch(
+                plan.step_plans,
+                error);
+        };
+
+        std::vector<int> scheduled_request_ids;
+        std::vector<MTPDecodeCatchupGreedyResult> catchup_results;
+        std::vector<std::optional<Sampler>> sampled_terminal_samplers(
+            static_cast<size_t>(request_batch));
+
+        if (!stochastic_batch_verify)
+        {
+            MTPOwnedGreedyVerifierBatchTransactionResult tx =
+                executeOwnedMTPGreedyVerifierScheduledBatchTransactionAndPublish(
+                    *runner_,
+                    owner,
+                    scheduler,
+                    publish);
+            if (!tx.ok)
+            {
+                return fail_after_checkpoint(
+                    std::string("decodeStepBatch() request-batched verifier "
+                                "transaction failed: ") +
+                    tx.error);
+            }
+
+            scheduled_request_ids = tx.scheduled_batch.request_ids;
+            catchup_results = tx.transaction.catchup.results;
+        }
+        else
+        {
+            auto produce_stochastic_outcomes =
+                [&](const MTPSpecRequestBatch &scheduled_batch,
+                    std::vector<MTPDeviceRejectionBatchOutcome> *outcomes,
+                    std::string *error) -> bool
+            {
+                auto set_producer_error = [&](std::string message) -> bool
+                {
+                    if (error)
+                        *error = std::move(message);
+                    return false;
+                };
+
+                if (!outcomes)
+                    return set_producer_error("stochastic outcome output vector is null");
+                if (!scheduled_batch.ok)
+                    return set_producer_error("scheduled stochastic batch is invalid");
+                if (scheduled_batch.request_count <= 0)
+                    return set_producer_error("scheduled stochastic batch is empty");
+
+                std::vector<MTPSpecDecodeVerifierDraftRequest> verifier_requests;
+                verifier_requests.reserve(scheduled_batch.greedy_requests.size());
+                for (size_t i = 0; i < scheduled_batch.greedy_requests.size(); ++i)
+                {
+                    MTPSpecDecodeVerifierDraftRequest request;
+                    request.request_id = scheduled_batch.request_ids[i];
+                    request.draft_tokens =
+                        scheduled_batch.greedy_requests[i].draft_tokens;
+                    verifier_requests.push_back(std::move(request));
+                }
+
+                MTPSpecDecodeVerifierInputPlan verifier_input_plan =
+                    buildMTPSpecDecodeVerifierInputPlan(
+                        scheduled_batch.shape,
+                        verifier_requests);
+                if (!verifier_input_plan.ok)
+                {
+                    return set_producer_error(
+                        std::string("stochastic request-batch verifier input plan failed: ") +
+                        verifier_input_plan.error);
+                }
+                if (!verifierInputPlanHasCompactRows(verifier_input_plan))
+                {
+                    return set_producer_error(
+                        "stochastic request-batch verifier row metadata is malformed");
+                }
+
+                bool row_indexed_enabled = false;
+                bool all_position_enabled = false;
+                auto cleanup_row_modes = [&]() -> bool
+                {
+                    bool ok = true;
+                    runner_->clearMTPSpecVerifierInputPlan();
+                    if (all_position_enabled)
+                    {
+                        all_position_enabled = false;
+                        ok = runner_->setComputeAllPositionLogits(false) && ok;
+                    }
+                    if (row_indexed_enabled)
+                    {
+                        row_indexed_enabled = false;
+                        ok = runner_->setComputeRowIndexedAllPositionLogits(false, 0) && ok;
+                    }
+                    return ok;
+                };
+
+                const int compact_row_count =
+                    verifier_input_plan.compact_logit_row_count;
+                if (!runner_->setComputeRowIndexedAllPositionLogits(
+                        true,
+                        compact_row_count))
+                {
+                    return set_producer_error(
+                        "stochastic request-batch verifier could not enable row-indexed logits");
+                }
+                row_indexed_enabled = true;
+                if (!runner_->setMTPSpecVerifierInputPlan(verifier_input_plan))
+                {
+                    const bool cleanup_ok = cleanup_row_modes();
+                    return set_producer_error(
+                        cleanup_ok
+                            ? "stochastic request-batch verifier could not install row plan"
+                            : "stochastic request-batch verifier could not install row plan and cleanup failed");
+                }
+                if (!runner_->setComputeAllPositionLogits(true))
+                {
+                    const bool cleanup_ok = cleanup_row_modes();
+                    return set_producer_error(
+                        cleanup_ok
+                            ? "stochastic request-batch verifier could not enable all-position logits"
+                            : "stochastic request-batch verifier could not enable all-position logits and cleanup failed");
+                }
+                all_position_enabled = true;
+
+                {
+                    ScopedMTPAllPositionVerifierSyncDeferral verifier_sync_deferral(
+                        runner_.get(),
+                        runner_->primaryDeviceId().is_gpu());
+                    PerfStatsCollector::ScopedTimer verifier_timer(
+                        "mtp",
+                        "request_batch_stochastic_verifier_forward",
+                        "decode",
+                        {},
+                        {{"requests", std::to_string(scheduled_batch.request_count)},
+                         {"draft_depth", std::to_string(draft_depth)}});
+                    const MTPVerifierForwardExecutionResult forward =
+                        executeMTPSpecVerifierForward(
+                            *runner_,
+                            verifier_input_plan);
+                    if (!forward.ok)
+                    {
+                        const bool cleanup_ok = cleanup_row_modes();
+                        return set_producer_error(
+                            cleanup_ok
+                                ? std::string("stochastic request-batch verifier forward failed: ") +
+                                      forward.error
+                                : std::string("stochastic request-batch verifier forward failed and cleanup failed: ") +
+                                      forward.error);
+                    }
+                }
+
+                if (!cleanup_row_modes())
+                {
+                    return set_producer_error(
+                        "stochastic request-batch verifier could not disable row-indexed logits");
+                }
+
+                std::vector<DeviceStochasticBatchOutcomeRequest>
+                    outcome_requests;
+                outcome_requests.reserve(
+                    scheduled_batch.greedy_requests.size());
+                std::vector<Sampler> bonus_samplers(
+                    static_cast<size_t>(request_batch));
+                int next_draft_slot = 0;
+                for (size_t i = 0; i < scheduled_batch.greedy_requests.size(); ++i)
+                {
+                    const int request_id = scheduled_batch.request_ids[i];
+                    if (request_id < 0 || request_id >= request_batch)
+                    {
+                        return set_producer_error(
+                            "stochastic request-batch verifier returned an out-of-range request id");
+                    }
+
+                    const MTPDecodeCatchupGreedyRequest &request =
+                        scheduled_batch.greedy_requests[i];
+                    const int verifier_token_count =
+                        static_cast<int>(request.draft_tokens.size());
+                    const int compare_rows = verifier_token_count - 1;
+                    if (compare_rows <= 0 ||
+                        compare_rows >
+                            sampling_math::kSpeculativeBatchMaxRows ||
+                        static_cast<int>(verifier_input_plan.query_start_locs.size()) <=
+                            static_cast<int>(i))
+                    {
+                        return set_producer_error(
+                            "stochastic request-batch verifier request shape is invalid");
+                    }
+                    if (stop_tokens_.size() >
+                        static_cast<size_t>(
+                            sampling_math::kSpeculativeBatchMaxStopTokens))
+                    {
+                        return set_producer_error(
+                            "stochastic request-batch stop-token count exceeds device summary capacity");
+                    }
+
+                    const int first_compact_row =
+                        verifier_input_plan.query_start_locs[i];
+                    const int first_draft_slot = next_draft_slot;
+                    next_draft_slot += compare_rows;
+                    const int bonus_row = compare_rows;
+                    if (!runner_->buildStochasticProcessedLogitRowsOnDevice(
+                            DeviceLogitsSource::AllPosition,
+                            first_compact_row,
+                            DeviceDistributionBuffer::Target,
+                            first_compact_row,
+                            compare_rows + 1,
+                            active_sampling_params_,
+                            vocab))
+                    {
+                        return set_producer_error(
+                            "stochastic request-batch processed target-row build failed");
+                    }
+
+                    if (!runner_->stageStochasticDraftTokensForDeviceVerification(
+                            request.draft_tokens.data() + 1,
+                            compare_rows,
+                            first_draft_slot))
+                    {
+                        return set_producer_error(
+                            "stochastic request-batch draft-token staging failed");
+                    }
+
+                    Sampler &request_sampler =
+                        batched_request_states_[static_cast<size_t>(request_id)]
+                            .sampler;
+                    DeviceStochasticBatchOutcomeRequest descriptor;
+                    descriptor.request_id = request_id;
+                    descriptor.first_target_slot = first_compact_row;
+                    descriptor.first_draft_slot = first_draft_slot;
+                    descriptor.row_count = compare_rows;
+                    descriptor.first_token = request.draft_tokens.front();
+                    descriptor.first_token_from_device = false;
+                    descriptor.bonus_target_slot = first_compact_row + bonus_row;
+                    descriptor.use_device_draft_tokens = true;
+                    descriptor.use_vllm_probability_rejection = true;
+                    const int base_cached_tokens =
+                        scheduled_batch.base_cached_tokens[i];
+                    for (int row = 0; row < compare_rows; ++row)
+                    {
+                        const int logical_position =
+                            base_cached_tokens + 1 + row;
+                        descriptor.accept_thresholds[static_cast<size_t>(row)] =
+                            mtpSpecStochasticThresholdForPosition(
+                                active_sampling_params_,
+                                request_sampler,
+                                logical_position,
+                                MTPSpecStochasticDrawPurpose::Accept);
+                        descriptor.residual_thresholds[static_cast<size_t>(row)] =
+                            mtpSpecStochasticThresholdForPosition(
+                                active_sampling_params_,
+                                request_sampler,
+                                logical_position,
+                                MTPSpecStochasticDrawPurpose::Residual);
+                        descriptor.draft_tokens[static_cast<size_t>(row)] =
+                            request.draft_tokens[static_cast<size_t>(row + 1)];
+                    }
+
+                    Sampler bonus_sampler = request_sampler;
+                    descriptor.bonus_threshold =
+                        mtpSpecStochasticThresholdForPosition(
+                            active_sampling_params_,
+                            bonus_sampler,
+                            base_cached_tokens + verifier_token_count,
+                            MTPSpecStochasticDrawPurpose::Sample);
+                    bonus_samplers[static_cast<size_t>(request_id)] =
+                        bonus_sampler;
+                    descriptor.inverse_sample_seed =
+                        mtpSpecInverseSampleSeedForThresholds(
+                            active_sampling_params_,
+                            descriptor.residual_thresholds.data(),
+                            static_cast<size_t>(compare_rows));
+                    descriptor.inverse_sample_first_logical_position =
+                        base_cached_tokens + 1;
+                    descriptor.stop_token_count =
+                        static_cast<int>(stop_tokens_.size());
+                    for (int stop_index = 0;
+                         stop_index < descriptor.stop_token_count;
+                         ++stop_index)
+                    {
+                        descriptor.stop_tokens[static_cast<size_t>(stop_index)] =
+                            stop_tokens_[static_cast<size_t>(stop_index)];
+                    }
+
+                    outcome_requests.push_back(std::move(descriptor));
+                }
+
+                outcomes->assign(
+                    outcome_requests.size(),
+                    MTPDeviceRejectionBatchOutcome{});
+                if (!runner_->verifyStochasticDistributionsRequestBatchOutcomesOnDevice(
+                        outcome_requests.data(),
+                        static_cast<int>(outcome_requests.size()),
+                        outcomes->data()))
+                {
+                    return set_producer_error(
+                        "stochastic request-batch device outcome verifier failed");
+                }
+
+                for (size_t i = 0; i < outcome_requests.size(); ++i)
+                {
+                    const int request_id = outcome_requests[i].request_id;
+                    if (request_id < 0 || request_id >= request_batch)
+                    {
+                        return set_producer_error(
+                            "stochastic request-batch outcome descriptor has an out-of-range request id");
+                    }
+                    if ((*outcomes)[i].sampled_terminal)
+                    {
+                        sampled_terminal_samplers[static_cast<size_t>(request_id)] =
+                            bonus_samplers[static_cast<size_t>(request_id)];
+                    }
+                }
+                return true;
+            };
+
+            MTPOwnedDeviceOutcomeBatchTransactionResult tx =
+                executeOwnedMTPDeviceOutcomeScheduledBatchTransactionAndPublish(
+                    owner,
+                    scheduler,
+                    produce_stochastic_outcomes,
+                    publish);
+            if (!tx.ok)
+            {
+                return fail_after_checkpoint(
+                    std::string("decodeStepBatch() request-batched stochastic "
+                                "verifier transaction failed: ") +
+                    tx.error);
+            }
+
+            scheduled_request_ids = tx.scheduled_batch.request_ids;
+            catchup_results.reserve(tx.device_outcomes.size());
+            for (size_t i = 0; i < tx.device_outcomes.size(); ++i)
+            {
+                MTPDecodeCatchupGreedyResult catchup =
+                    buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+                        tx.scheduled_batch.greedy_requests[i],
+                        tx.device_outcomes[i]);
+                if (!catchup.ok)
+                {
+                    return fail_after_checkpoint(
+                        std::string("decodeStepBatch() stochastic catch-up "
+                                    "summary failed: ") +
+                        catchup.error);
+                }
+                catchup_results.push_back(std::move(catchup));
+            }
+        }
+
+        if (static_cast<int>(scheduled_request_ids.size()) !=
+                static_cast<int>(catchup_results.size()) ||
+            scheduled_request_ids.empty())
+        {
+            return fail_after_checkpoint(
+                "decodeStepBatch() request-batched verifier transaction "
+                "returned inconsistent request vectors");
+        }
+
+        bool batch_has_ready_token = false;
+        bool batch_has_non_ready_lane = false;
+        for (const MTPDecodeCatchupGreedyResult &catchup : catchup_results)
+        {
+            const bool has_ready_token =
+                !catchup.stopped_on_output &&
+                catchup.all_speculative_accepted &&
+                catchup.ready_token >= 0;
+            batch_has_ready_token = batch_has_ready_token || has_ready_token;
+            batch_has_non_ready_lane = batch_has_non_ready_lane || !has_ready_token;
+        }
+        const bool inline_mixed_ready_tokens =
+            batch_has_ready_token && batch_has_non_ready_lane;
+
+        for (size_t i = 0; i < scheduled_request_ids.size(); ++i)
+        {
+            const int request = scheduled_request_ids[i];
+            if (request < 0 || request >= request_batch)
+            {
+                return fail_after_checkpoint(
+                    "decodeStepBatch() request-batched verifier returned an "
+                    "out-of-range request id");
+            }
+
+            BatchedDecodeRequestState &state =
+                batched_request_states_[static_cast<size_t>(request)];
+            GenerationResult &request_result =
+                batch_result.requests[static_cast<size_t>(request)];
+            const MTPDecodeCatchupGreedyResult &catchup =
+                catchup_results[i];
+            if (!catchup.ok || catchup.accepted_tokens.empty())
+            {
+                return fail_after_checkpoint(
+                    "decodeStepBatch() request-batched verifier produced an "
+                    "invalid catch-up result");
+            }
+
+            /*
+             * The verifier input prefix includes the already-returned
+             * condition token so model state can be published atomically from
+             * the pre-verifier base. Do not emit or record that token twice.
+             */
+            auto new_token_begin = catchup.accepted_tokens.begin() + 1;
+            request_result.tokens.insert(
+                request_result.tokens.end(),
+                new_token_begin,
+                catchup.accepted_tokens.end());
+            if (sampled_terminal_samplers[static_cast<size_t>(request)].has_value())
+            {
+                state.sampler =
+                    *sampled_terminal_samplers[static_cast<size_t>(request)];
+            }
+
+            const bool has_ready_token =
+                !catchup.stopped_on_output &&
+                catchup.all_speculative_accepted &&
+                catchup.ready_token >= 0;
+            if (inline_mixed_ready_tokens && has_ready_token)
+            {
+                /*
+                 * If only some request lanes have a bonus-ready token, deferring
+                 * those tokens would leave the batch half in terminal-logit
+                 * sampling and half in verifier continuation. vLLM-style
+                 * request batches stay lockstep: emit the bonus token now, but
+                 * do not publish bonus recurrent/KV state. The next verifier
+                 * forward will consume this token as the request condition.
+                 */
+                request_result.tokens.push_back(catchup.ready_token);
+            }
+
+            request_result.is_complete =
+                catchup.stopped_on_output ||
+                (inline_mixed_ready_tokens &&
+                 has_ready_token &&
+                 std::find(stop_tokens_.begin(), stop_tokens_.end(),
+                           catchup.ready_token) != stop_tokens_.end());
+            state.is_complete = request_result.is_complete;
+            state.last_token = !request_result.tokens.empty()
+                                   ? request_result.tokens.back()
+                                   : catchup.accepted_tokens.back();
+
+            if (has_ready_token && !inline_mixed_ready_tokens)
+            {
+                state.prefill_logits_ready = true;
+                state.ready_sampled_token = catchup.ready_token;
+                state.ready_sampled_params = active_sampling_params_;
+            }
+            else
+            {
+                state.prefill_logits_ready = false;
+                state.ready_sampled_token.reset();
+                state.ready_sampled_params.reset();
+            }
+
+            for (auto it = new_token_begin; it != catchup.accepted_tokens.end(); ++it)
+            {
+                const int32_t token = *it;
+                state.sampler.record_token(token);
+            }
+            if (inline_mixed_ready_tokens && has_ready_token)
+            {
+                state.sampler.record_token(catchup.ready_token);
+            }
+
+            ++mtp_stats_.verifier_runs;
+            mtp_stats_.verifier_token_count +=
+                static_cast<uint64_t>(catchup.main_forward_token_count);
+            const int accepted_speculative =
+                std::max(0, catchup.accepted_speculative_prefix);
+            mtp_stats_.accepted_tokens +=
+                static_cast<uint64_t>(accepted_speculative);
+            const int rejected =
+                catchup.all_speculative_accepted ? 0 : 1;
+            mtp_stats_.rejected_tokens += static_cast<uint64_t>(rejected);
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "request_batched_verifier_transactions",
+            1.0,
+            "decode",
+            {},
+            {{"requests", std::to_string(scheduled_request_ids.size())},
+             {"draft_depth", std::to_string(draft_depth)},
+             {"mode", stochastic_batch_verify ? "stochastic" : "greedy"}});
         return batch_result;
     }
 
@@ -1400,10 +2375,6 @@ namespace llaminar2
         if (effective_max_draft_tokens < 1 || effective_max_draft_tokens > 3)
         {
             return "MTP decode supports --mtp-draft-tokens in the range [1, 3] for verifier M=2..4";
-        }
-        if (mtp.max_request_batch != 1)
-        {
-            return "MTP request-batched speculative transactions are not executable yet; use --mtp-max-request-batch 1 until Phase 8 runner batching lands";
         }
         if (effective_max_draft_tokens > 1 && !runner_->supportsChainedMTPDrafts())
         {

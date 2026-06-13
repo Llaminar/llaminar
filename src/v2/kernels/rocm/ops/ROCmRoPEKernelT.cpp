@@ -210,6 +210,63 @@ namespace
         device_valid = true;
         return true;
     }
+
+    bool uploadHIPRoPEPositionIds(
+        llaminar2::DeviceWorkspaceManager *workspace,
+        const int *position_ids,
+        int seq_len,
+        hipStream_t stream,
+        bool &device_valid,
+        int &device_seq_len,
+        const char *context)
+    {
+        device_valid = false;
+        device_seq_len = 0;
+
+        if (!position_ids || seq_len <= 0)
+        {
+            LOG_ERROR("[" << context << "] Cannot upload empty RoPE position_ids");
+            return false;
+        }
+        if (!stream)
+        {
+            LOG_ERROR("[" << context << "] Cannot upload RoPE position_ids on a null/default HIP stream");
+            return false;
+        }
+        if (!workspace)
+        {
+            LOG_ERROR("[" << context << "] Cannot upload RoPE position_ids without a bound workspace");
+            return false;
+        }
+        if (isHIPStreamCapturing(stream, context))
+        {
+            LOG_ERROR("[" << context << "] Refusing to record RoPE position_ids H2D inside HIP graph capture");
+            return false;
+        }
+
+        auto *d_position_ids = workspace->getBuffer(llaminar2::RoPEWorkspaceBuffers::POSITION_IDS);
+        if (!d_position_ids)
+        {
+            LOG_ERROR("[" << context << "] Missing workspace buffer "
+                          << llaminar2::RoPEWorkspaceBuffers::POSITION_IDS);
+            return false;
+        }
+
+        const size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
+        const hipError_t copy_err =
+            hipMemcpyAsync(d_position_ids, position_ids, pos_bytes,
+                           hipMemcpyHostToDevice, stream);
+        if (copy_err != hipSuccess)
+        {
+            LOG_ERROR("[" << context << "] hipMemcpyAsync failed for RoPE position_ids: "
+                          << hipGetErrorString(copy_err));
+            return false;
+        }
+
+        device_seq_len = seq_len;
+        device_valid = true;
+        return true;
+    }
 } // namespace
 
 namespace llaminar2
@@ -244,6 +301,16 @@ namespace llaminar2
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
                     "ROCmRoPEKernelT<FP32>");
             }
+        }
+
+        void ROCmRoPEKernelT<ActivationPrecision::FP32>::setDynamicPositionIds(
+            const int *position_ids,
+            int seq_len)
+        {
+            uploadHIPRoPEPositionIds(
+                workspace_, position_ids, seq_len, static_cast<hipStream_t>(gpu_stream_),
+                dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                "ROCmRoPEKernelT<FP32>");
         }
 
         // IWorkspaceConsumer implementation
@@ -288,6 +355,7 @@ namespace llaminar2
             {
                 inv_freq_initialized_ = false;
                 dynamic_pos_device_valid_ = false;
+                dynamic_position_ids_device_valid_ = false;
             }
             workspace_ = ws;
         }
@@ -351,18 +419,23 @@ namespace llaminar2
                 return false;
             }
 
-            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
-            if (isGraphCaptureActive())
+            if (!dynamic_position_ids_device_valid_ ||
+                dynamic_position_ids_seq_len_ < seq_len)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Refusing to record position_ids H2D inside HIP graph capture");
-                return false;
-            }
-            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice,
-                                            static_cast<hipStream_t>(gpu_stream_));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
-                return false;
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] RoPE position_ids were not ready before HIP graph capture"
+                              << " requested_seq_len=" << seq_len
+                              << " prepared_seq_len=" << dynamic_position_ids_seq_len_
+                              << " device_valid=" << dynamic_position_ids_device_valid_);
+                    return false;
+                }
+                uploadHIPRoPEPositionIds(
+                    workspace_, position_ids, seq_len, static_cast<hipStream_t>(gpu_stream_),
+                    dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                    "ROCmRoPEKernelT<FP32>");
+                if (!dynamic_position_ids_device_valid_)
+                    return false;
             }
 
             return hipOps_rope_fp32_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
@@ -460,7 +533,9 @@ namespace llaminar2
             // If so, use the zero-copy contiguous kernel which computes positions on-the-fly on GPU.
             {
                 bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
-                if (!is_contiguous && position_ids)
+                // Explicit graph rows are mutable workspace data.  Keep them
+                // on the row-buffer path even if today's values are contiguous.
+                if (!force_device_positions && !is_contiguous && position_ids)
                 {
                     is_contiguous = true;
                     for (int i = 0; i < seq_len; ++i)
@@ -518,18 +593,23 @@ namespace llaminar2
                 return false;
             }
 
-            // Copy position_ids to device (async to avoid pipeline drain)
-            size_t pos_bytes = seq_len * sizeof(int);
-            if (isGraphCaptureActive())
+            if (!dynamic_position_ids_device_valid_ ||
+                dynamic_position_ids_seq_len_ < seq_len)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Refusing to record position_ids H2D inside HIP graph capture");
-                return false;
-            }
-            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice, static_cast<hipStream_t>(gpu_stream_));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
-                return false;
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] RoPE position_ids were not ready before HIP graph capture"
+                              << " requested_seq_len=" << seq_len
+                              << " prepared_seq_len=" << dynamic_position_ids_seq_len_
+                              << " device_valid=" << dynamic_position_ids_device_valid_);
+                    return false;
+                }
+                uploadHIPRoPEPositionIds(
+                    workspace_, position_ids, seq_len, static_cast<hipStream_t>(gpu_stream_),
+                    dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                    "ROCmRoPEKernelT<FP32>");
+                if (!dynamic_position_ids_device_valid_)
+                    return false;
             }
 
             // Call the optimized kernel
@@ -563,6 +643,16 @@ namespace llaminar2
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
                     "ROCmRoPEKernelT<BF16>");
             }
+        }
+
+        void ROCmRoPEKernelT<ActivationPrecision::BF16>::setDynamicPositionIds(
+            const int *position_ids,
+            int seq_len)
+        {
+            uploadHIPRoPEPositionIds(
+                workspace_, position_ids, seq_len, static_cast<hipStream_t>(gpu_stream_),
+                dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                "ROCmRoPEKernelT<BF16>");
         }
 
         // IWorkspaceConsumer implementation
@@ -599,6 +689,7 @@ namespace llaminar2
             {
                 inv_freq_initialized_ = false;
                 dynamic_pos_device_valid_ = false;
+                dynamic_position_ids_device_valid_ = false;
             }
             workspace_ = ws;
         }
@@ -662,18 +753,23 @@ namespace llaminar2
                 return false;
             }
 
-            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
-            if (isGraphCaptureActive())
+            if (!dynamic_position_ids_device_valid_ ||
+                dynamic_position_ids_seq_len_ < seq_len)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Refusing to record position_ids H2D inside HIP graph capture");
-                return false;
-            }
-            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice,
-                                            static_cast<hipStream_t>(gpu_stream_));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
-                return false;
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] RoPE position_ids were not ready before HIP graph capture"
+                              << " requested_seq_len=" << seq_len
+                              << " prepared_seq_len=" << dynamic_position_ids_seq_len_
+                              << " device_valid=" << dynamic_position_ids_device_valid_);
+                    return false;
+                }
+                uploadHIPRoPEPositionIds(
+                    workspace_, position_ids, seq_len, static_cast<hipStream_t>(gpu_stream_),
+                    dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                    "ROCmRoPEKernelT<BF16>");
+                if (!dynamic_position_ids_device_valid_)
+                    return false;
             }
 
             return hipOps_rope_bf16_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
@@ -767,7 +863,9 @@ namespace llaminar2
             // CONTIGUOUS DETECTION: Avoid synchronous hipMemcpy pipeline drain
             {
                 bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
-                if (!is_contiguous && position_ids)
+                // Explicit graph rows are mutable workspace data.  Keep them
+                // on the row-buffer path even if today's values are contiguous.
+                if (!force_device_positions && !is_contiguous && position_ids)
                 {
                     is_contiguous = true;
                     for (int i = 0; i < seq_len; ++i)
@@ -826,17 +924,23 @@ namespace llaminar2
                 return false;
             }
 
-            size_t pos_bytes = seq_len * sizeof(int);
-            if (isGraphCaptureActive())
+            if (!dynamic_position_ids_device_valid_ ||
+                dynamic_position_ids_seq_len_ < seq_len)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Refusing to record position_ids H2D inside HIP graph capture");
-                return false;
-            }
-            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice, static_cast<hipStream_t>(gpu_stream_));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
-                return false;
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] RoPE position_ids were not ready before HIP graph capture"
+                              << " requested_seq_len=" << seq_len
+                              << " prepared_seq_len=" << dynamic_position_ids_seq_len_
+                              << " device_valid=" << dynamic_position_ids_device_valid_);
+                    return false;
+                }
+                uploadHIPRoPEPositionIds(
+                    workspace_, position_ids, seq_len, static_cast<hipStream_t>(gpu_stream_),
+                    dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                    "ROCmRoPEKernelT<BF16>");
+                if (!dynamic_position_ids_device_valid_)
+                    return false;
             }
 
             return hipOps_rope_bf16_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
@@ -869,6 +973,16 @@ namespace llaminar2
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
                     "ROCmRoPEKernelT<FP16>");
             }
+        }
+
+        void ROCmRoPEKernelT<ActivationPrecision::FP16>::setDynamicPositionIds(
+            const int *position_ids,
+            int seq_len)
+        {
+            uploadHIPRoPEPositionIds(
+                workspace_, position_ids, seq_len, static_cast<hipStream_t>(gpu_stream_),
+                dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                "ROCmRoPEKernelT<FP16>");
         }
 
         // IWorkspaceConsumer implementation
@@ -905,6 +1019,7 @@ namespace llaminar2
             {
                 inv_freq_initialized_ = false;
                 dynamic_pos_device_valid_ = false;
+                dynamic_position_ids_device_valid_ = false;
             }
             workspace_ = ws;
         }
@@ -968,18 +1083,23 @@ namespace llaminar2
                 return false;
             }
 
-            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
-            if (isGraphCaptureActive())
+            if (!dynamic_position_ids_device_valid_ ||
+                dynamic_position_ids_seq_len_ < seq_len)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Refusing to record position_ids H2D inside HIP graph capture");
-                return false;
-            }
-            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice,
-                                            static_cast<hipStream_t>(gpu_stream_));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
-                return false;
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] RoPE position_ids were not ready before HIP graph capture"
+                              << " requested_seq_len=" << seq_len
+                              << " prepared_seq_len=" << dynamic_position_ids_seq_len_
+                              << " device_valid=" << dynamic_position_ids_device_valid_);
+                    return false;
+                }
+                uploadHIPRoPEPositionIds(
+                    workspace_, position_ids, seq_len, static_cast<hipStream_t>(gpu_stream_),
+                    dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                    "ROCmRoPEKernelT<FP16>");
+                if (!dynamic_position_ids_device_valid_)
+                    return false;
             }
 
             return hipOps_rope_fp16_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);
@@ -1073,7 +1193,9 @@ namespace llaminar2
             // CONTIGUOUS DETECTION: Avoid synchronous hipMemcpy pipeline drain
             {
                 bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
-                if (!is_contiguous && position_ids)
+                // Explicit graph rows are mutable workspace data.  Keep them
+                // on the row-buffer path even if today's values are contiguous.
+                if (!force_device_positions && !is_contiguous && position_ids)
                 {
                     is_contiguous = true;
                     for (int i = 0; i < seq_len; ++i)
@@ -1132,17 +1254,23 @@ namespace llaminar2
                 return false;
             }
 
-            size_t pos_bytes = seq_len * sizeof(int);
-            if (isGraphCaptureActive())
+            if (!dynamic_position_ids_device_valid_ ||
+                dynamic_position_ids_seq_len_ < seq_len)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Refusing to record position_ids H2D inside HIP graph capture");
-                return false;
-            }
-            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice, static_cast<hipStream_t>(gpu_stream_));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
-                return false;
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] RoPE position_ids were not ready before HIP graph capture"
+                              << " requested_seq_len=" << seq_len
+                              << " prepared_seq_len=" << dynamic_position_ids_seq_len_
+                              << " device_valid=" << dynamic_position_ids_device_valid_);
+                    return false;
+                }
+                uploadHIPRoPEPositionIds(
+                    workspace_, position_ids, seq_len, static_cast<hipStream_t>(gpu_stream_),
+                    dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                    "ROCmRoPEKernelT<FP16>");
+                if (!dynamic_position_ids_device_valid_)
+                    return false;
             }
 
             return hipOps_rope_fp16_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, eff_rotary, dev, gpu_stream_);

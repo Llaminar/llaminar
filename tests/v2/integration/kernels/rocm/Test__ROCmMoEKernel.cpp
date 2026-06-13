@@ -77,8 +77,18 @@ extern "C" bool hipMoE_gate_logits_small_m(
     int seq_len, int d_model, int num_experts,
     int device_idx, void *stream);
 
+extern "C" bool hipMoE_gate_logits_small_m_bf16_weights(
+    const float *hidden, const void *gate_weights_bf16, float *logits,
+    int seq_len, int d_model, int num_experts,
+    int device_idx, void *stream);
+
 extern "C" bool hipMoE_gate_logits_single_token(
     const float *hidden, const float *gate_weights, float *logits,
+    int d_model, int num_experts,
+    int device_idx, void *stream);
+
+extern "C" bool hipMoE_gate_logits_single_token_bf16_weights(
+    const float *hidden, const void *gate_weights_bf16, float *logits,
     int d_model, int num_experts,
     int device_idx, void *stream);
 
@@ -4538,6 +4548,144 @@ TEST(Test__ROCmMoEKernel, SmallMGateLogits_ModelShapeMatchesSingleTokenLaunches)
             max_abs_diff = std::max(max_abs_diff, std::fabs(fused[i] - rowwise[i]));
         EXPECT_LE(max_abs_diff, 1e-5f) << "seq_len=" << seq_len;
     }
+}
+
+TEST(Test__ROCmMoEKernel, SmallMBF16GateLogits_ModelShapeMatchesSingleTokenLaunches)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int d_model = 2048;
+    constexpr int num_experts = 256;
+    const DeviceId device = DeviceId::rocm(0);
+
+    std::vector<float> gate_weights_fp32(
+        static_cast<size_t>(num_experts) * d_model);
+    fillRandom(gate_weights_fp32, -0.5f, 0.5f, 20260608);
+    auto gate_weights = TestTensorFactory::createBF16(
+        {static_cast<size_t>(num_experts), static_cast<size_t>(d_model)});
+    gate_weights->from_fp32(gate_weights_fp32.data(), gate_weights_fp32.size());
+    ASSERT_TRUE(gate_weights->ensureOnDevice(device));
+
+    for (int seq_len : {2, 3, 4})
+    {
+        auto hidden = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            -0.5f, 0.5f, 20260609 + seq_len);
+        auto fused_logits = TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
+        auto row_logits = TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
+
+        ASSERT_TRUE(hidden->ensureOnDevice(device));
+        ASSERT_TRUE(fused_logits->ensureOnDevice(device));
+        ASSERT_TRUE(row_logits->ensureOnDevice(device));
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+        ASSERT_TRUE(hipMoE_gate_logits_small_m_bf16_weights(
+            static_cast<const float *>(hidden->gpu_data_ptr()),
+            gate_weights->gpu_data_ptr(),
+            static_cast<float *>(fused_logits->gpu_data_ptr()),
+            seq_len, d_model, num_experts,
+            /*device_idx=*/0,
+            stream));
+        for (int row = 0; row < seq_len; ++row)
+        {
+            ASSERT_TRUE(hipMoE_gate_logits_single_token_bf16_weights(
+                static_cast<const float *>(hidden->gpu_data_ptr()) +
+                    static_cast<size_t>(row) * d_model,
+                gate_weights->gpu_data_ptr(),
+                static_cast<float *>(row_logits->gpu_data_ptr()) +
+                    static_cast<size_t>(row) * num_experts,
+                d_model, num_experts,
+                /*device_idx=*/0,
+                stream));
+        }
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+
+        fused_logits->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        row_logits->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        const float *fused = fused_logits->data();
+        const float *rowwise = row_logits->data();
+
+        float max_abs_diff = 0.0f;
+        for (int i = 0; i < seq_len * num_experts; ++i)
+            max_abs_diff = std::max(max_abs_diff, std::fabs(fused[i] - rowwise[i]));
+        EXPECT_LE(max_abs_diff, 1e-3f) << "seq_len=" << seq_len;
+    }
+}
+
+TEST(Test__ROCmMoEKernel, SmallMBF16FusedRouter_VerifierShapeRunsWithTensorGate)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int seq_len = 4;
+    constexpr int d_model = 64;
+    constexpr int num_experts = 16;
+    constexpr int top_k = 4;
+    const DeviceId device = DeviceId::rocm(0);
+
+    auto hidden = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+        -0.25f, 0.25f, 20260610);
+    std::vector<float> gate_weights_fp32(
+        static_cast<size_t>(num_experts) * d_model);
+    fillRandom(gate_weights_fp32, -0.25f, 0.25f, 20260611);
+    auto gate_weights = TestTensorFactory::createBF16(
+        {static_cast<size_t>(num_experts), static_cast<size_t>(d_model)});
+    gate_weights->from_fp32(gate_weights_fp32.data(), gate_weights_fp32.size());
+    auto routing_indices = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+    auto routing_weights = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+
+    ASSERT_TRUE(hidden->ensureOnDevice(device));
+    ASSERT_TRUE(gate_weights->ensureOnDevice(device));
+    ASSERT_TRUE(routing_indices->ensureOnDevice(device));
+    ASSERT_TRUE(routing_weights->ensureOnDevice(device));
+
+    ScopedEnvOverride perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ROCmMoEKernel moe_kernel(0);
+    auto moe_kernel_workspace = bindDefaultMoEWorkspace(
+        moe_kernel,
+        /*max_seq_len=*/seq_len,
+        d_model,
+        /*intermediate=*/128,
+        num_experts,
+        top_k);
+    MoERoutingResult result;
+    ASSERT_TRUE(moe_kernel.routeWithTensors(
+        hidden.get(),
+        gate_weights.get(),
+        seq_len,
+        d_model,
+        num_experts,
+        top_k,
+        /*normalize_weights=*/true,
+        routing_indices.get(),
+        routing_weights.get(),
+        result));
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    double fused_router_calls = 0.0;
+    for (const auto &record : PerfStatsCollector::snapshot({"kernel.rocm_moe_small_m_fused_router_calls"}))
+        fused_router_calls += record.value;
+    EXPECT_GT(fused_router_calls, 0.0)
+        << "BF16 verifier-sized routing should use the explicit small-M fused router path";
+    PerfStatsCollector::reset();
+
+    ASSERT_EQ(result.expert_indices.size(), static_cast<size_t>(seq_len * top_k));
+    ASSERT_EQ(result.expert_weights.size(), static_cast<size_t>(seq_len * top_k));
+    for (int expert : result.expert_indices)
+    {
+        EXPECT_GE(expert, 0);
+        EXPECT_LT(expert, num_experts);
+    }
+    for (float weight : result.expert_weights)
+        EXPECT_TRUE(std::isfinite(weight));
 }
 
 TEST(Test__ROCmMoEKernel, SoftmaxTopKParallelSelectionPreservesTieOrder)

@@ -388,6 +388,25 @@ namespace llaminar2
         void *stream);
 
     /**
+     * @brief Upload row indices consumed by graph-captured verifier row select stages.
+     *
+     * This is the narrow primitive behind compact all-position logits. The
+     * stochastic verifier path usually calls `uploadMTPSpecDecodeVerifierInputPlan()`,
+     * which first maps logical verifier rows into padded graph rows. Other
+     * graph-native users, such as request-batched prefill terminal-logit
+     * selection, may already have graph row coordinates and can upload them
+     * directly through this helper. GPU callers must pass the explicit stream
+     * that will execute or replay the graph.
+     */
+    MTPSpecDecodeMetadataUploadResult uploadMTPSpecDecodeVerifierLogitRows(
+        const std::vector<int32_t> &verifier_logit_rows,
+        int row_count,
+        const MTPSpecDecodeMetadataWorkspaceBinding &binding,
+        DeviceId device,
+        IBackend *backend,
+        void *stream);
+
+    /**
      * @brief Upload the compact target-verifier row plan for graph replay.
      *
      * The all-position verifier graph reads `VERIFIER_LOGIT_ROWS` from the same

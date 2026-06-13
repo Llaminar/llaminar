@@ -87,6 +87,8 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return true; }
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        bool needsGraphLaunchPreparation() const override { return params_.device_id.is_gpu(); }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
@@ -110,6 +112,39 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Update explicit per-row position IDs for cached graph reuse.
+         *
+         * Request-batched MTP sidecars flatten multiple logical requests into
+         * one tiny graph.  Rows can therefore share the same absolute position
+         * (for example `[595, 595]` for two requests), which is not equivalent
+         * to the contiguous scalar range `[595, 596]`.  This method keeps the
+         * stable host copy alive for CPU/eager execution and asks GPU kernels
+         * to pre-upload the workspace-owned device copy before graph capture.
+         */
+        void updateDynamicPositionIds(const int *position_ids, int seq_len)
+        {
+            params_.seq_len = seq_len;
+            position_ids_cache_.clear();
+            if (position_ids && seq_len > 0)
+            {
+                position_ids_cache_.assign(position_ids, position_ids + seq_len);
+                params_.position_ids = position_ids_cache_.data();
+                params_.pos_offset = position_ids_cache_.front();
+            }
+            else
+            {
+                params_.position_ids = nullptr;
+                params_.pos_offset = 0;
+            }
+
+            if (cached_kernel_)
+            {
+                cached_kernel_->setGPUStream(gpuStream());
+                cached_kernel_->setDynamicPositionIds(params_.position_ids, seq_len);
+            }
+        }
+
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
@@ -130,9 +165,15 @@ namespace llaminar2
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
 
     private:
+        ITensorRoPE *getOrCreateStageKernel(TensorBase *Q_base);
+
         Params params_;
 
-        // Device-scoped cached RoPE kernel (owned by KernelFactory)
+        // Stage-owned RoPE kernel.  Graph-captured dynamic state such as the
+        // active stream, workspace pointer, scalar pos_offset, and explicit
+        // position-id upload validity is stage-local and must not be shared
+        // with other RoPE stages on the same device.
+        mutable std::unique_ptr<ITensorRoPE> owned_kernel_;
         mutable ITensorRoPE *cached_kernel_ = nullptr;
         mutable int cached_kernel_tensor_type_ = -1;
 

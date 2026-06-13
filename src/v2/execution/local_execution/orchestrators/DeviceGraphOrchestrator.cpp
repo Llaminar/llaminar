@@ -44,6 +44,7 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../kernels/common/SamplingMath.h"
+#include "../../compute_stages/stages/RoPEStage.h"
 #include "../../moe/MoERebalanceController.h"
 #include "../../../utils/Sampler.h" // LogitPenalty
 #include "execution/prefix_cache/BlockHash.h"
@@ -74,13 +75,8 @@ namespace llaminar2
         constexpr size_t kStochasticTopKSmallKCap = 64;
         constexpr size_t kStochasticTopKPartialBlocks = 128;
         constexpr size_t kStochasticTopKSmallKThreads = 64;
-        constexpr size_t kStochasticTargetRows = 4; // verifier M=2..4 includes terminal row
-        constexpr size_t kStochasticDraftRows = 3;  // --mtp-draft-tokens max
-        constexpr size_t kStochasticTopKPartialRows = kStochasticTargetRows;
-        constexpr size_t kStochasticTopKPartialCapacity =
-            kStochasticTopKPartialRows *
-            kStochasticTopKPartialBlocks *
-            kStochasticTopKSmallKCap;
+        constexpr size_t kMinStochasticTargetRows = 4; // verifier M=2..4 includes terminal row
+        constexpr size_t kMinStochasticDraftRows = 3;  // --mtp-draft-tokens max for scalar lanes
         /**
          * @brief Logical perf/capture lane for publishing accepted shifted MTP KV rows.
          *
@@ -1711,6 +1707,45 @@ namespace llaminar2
             }
             const size_t stochastic_vocab_cols =
                 static_cast<size_t>(config.vocab_size);
+            /*
+             * Target slots include the bonus row for every request, while
+             * draft slots pack only the compared speculative rows.  Keeping
+             * these capacities separate avoids both stale scalar scratch and
+             * unnecessary bonus-sized draft buffers.
+             */
+            stochastic_target_row_capacity_ =
+                std::max<int>(
+                    static_cast<int>(kMinStochasticTargetRows),
+                    resolveMTPMaxTargetQueryRows(config.mtp));
+            stochastic_draft_row_capacity_ =
+                std::max<int>(
+                    static_cast<int>(kMinStochasticDraftRows),
+                    std::max(1, config.mtp.max_request_batch) *
+                        std::max(1, config.mtp.draft_tokens));
+            stochastic_batch_output_request_capacity_ =
+                std::max(1, config.mtp.max_request_batch);
+            stochastic_target_top_k_.assign(
+                static_cast<size_t>(stochastic_target_row_capacity_),
+                0);
+            stochastic_draft_top_k_.assign(
+                static_cast<size_t>(stochastic_draft_row_capacity_),
+                0);
+            stochastic_target_distribution_streams_.assign(
+                static_cast<size_t>(stochastic_target_row_capacity_),
+                nullptr);
+            stochastic_draft_distribution_streams_.assign(
+                static_cast<size_t>(stochastic_draft_row_capacity_),
+                nullptr);
+            stochastic_target_sample_ready_.assign(
+                static_cast<size_t>(stochastic_target_row_capacity_),
+                StochasticSampleReadyState{});
+            stochastic_draft_sample_ready_.assign(
+                static_cast<size_t>(stochastic_draft_row_capacity_),
+                StochasticSampleReadyState{});
+            const size_t stochastic_topk_partial_capacity =
+                static_cast<size_t>(stochastic_target_row_capacity_) *
+                kStochasticTopKPartialBlocks *
+                kStochasticTopKSmallKCap;
             constexpr size_t kArgmaxPartialCapacity = 1024;
             if (!arena_->registerBuffer(BufferId::ARGMAX_PARTIAL_VALS, 1, kArgmaxPartialCapacity,
                                         "FP32", state_.device_id))
@@ -1725,48 +1760,48 @@ namespace llaminar2
                 return false;
             }
             if (!arena_->registerBuffer(BufferId::STOCHASTIC_TARGET_TOKEN_IDS,
-                                        kStochasticTargetRows,
+                                        static_cast<size_t>(stochastic_target_row_capacity_),
                                         kStochasticDistributionMaxK,
                                         "INT32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_TARGET_PROBS,
-                                        kStochasticTargetRows,
+                                        static_cast<size_t>(stochastic_target_row_capacity_),
                                         kStochasticDistributionMaxK,
                                         "FP32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_DRAFT_TOKEN_IDS,
-                                        kStochasticDraftRows,
+                                        static_cast<size_t>(stochastic_draft_row_capacity_),
                                         kStochasticDistributionMaxK,
                                         "INT32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_DRAFT_PROBS,
-                                        kStochasticDraftRows,
+                                        static_cast<size_t>(stochastic_draft_row_capacity_),
                                         kStochasticDistributionMaxK,
                                         "FP32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_PROCESSED_LOGITS,
-                                        kStochasticTargetRows,
+                                        static_cast<size_t>(stochastic_target_row_capacity_),
                                         stochastic_vocab_cols,
                                         "FP32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_INVERSE_REJECTION_SAMPLES,
-                                        kStochasticDraftRows,
+                                        static_cast<size_t>(stochastic_draft_row_capacity_),
                                         stochastic_vocab_cols,
                                         "FP32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS,
                                         1,
-                                        sampling_math::kSpeculativeBatchMaxOutputTokens,
+                                        static_cast<size_t>(stochastic_target_row_capacity_),
                                         "INT32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_DRAFT_SAMPLE_TOKENS,
                                         1,
-                                        sampling_math::kSpeculativeBatchMaxRows,
+                                        static_cast<size_t>(stochastic_draft_row_capacity_),
                                         "INT32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_DRAFT_SAMPLE_PROBS,
                                         1,
-                                        sampling_math::kSpeculativeBatchMaxRows,
+                                        static_cast<size_t>(stochastic_draft_row_capacity_),
                                         "FP32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::MTP_CONDITION_TOKEN,
@@ -1782,41 +1817,41 @@ namespace llaminar2
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS,
                                         1,
-                                        kStochasticTopKPartialCapacity,
+                                        stochastic_topk_partial_capacity,
                                         "FP32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS,
                                         1,
-                                        kStochasticTopKPartialCapacity,
+                                        stochastic_topk_partial_capacity,
                                         "INT32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_VERIFY_TOKENS,
                                         1,
-                                        kStochasticTargetRows,
+                                        static_cast<size_t>(stochastic_target_row_capacity_),
                                         "INT32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_VERIFY_ACCEPTED,
                                         1,
-                                        kStochasticTargetRows,
+                                        static_cast<size_t>(stochastic_target_row_capacity_),
                                         "INT32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS,
                                         1,
-                                        kStochasticTargetRows,
+                                        static_cast<size_t>(stochastic_target_row_capacity_),
                                         "FP32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_VERIFY_THRESHOLDS,
                                         1,
-                                        kStochasticTargetRows,
+                                        static_cast<size_t>(stochastic_target_row_capacity_),
                                         "FP32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS,
-                                        1,
+                                        static_cast<size_t>(stochastic_batch_output_request_capacity_),
                                         sampling_math::kSpeculativeBatchMaxOutputTokens,
                                         "INT32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_BATCH_OUTPUT_META,
-                                        1,
+                                        static_cast<size_t>(stochastic_batch_output_request_capacity_),
                                         sampling_math::kSpeculativeBatchMetaCount,
                                         "INT32",
                                         state_.device_id))
@@ -3584,11 +3619,63 @@ namespace llaminar2
                 actual_lengths[request];
         }
 
+        const bool compact_prefill_logits =
+            state_.device_id.is_gpu() &&
+            batch_size > 1 &&
+            !compute_all_position_logits_;
+        auto restore_prefill_logits_mode = [&]()
+        {
+            if (!compact_prefill_logits)
+                return;
+            request_batched_prefill_logits_row_count_ = 0;
+            request_batched_prefill_logit_rows_.clear();
+            if (graph_builder_)
+                graph_builder_->setRowIndexedAllPositionLogitRows({});
+            setComputeRowIndexedAllPositionLogits(false, 0);
+            setComputeAllPositionLogits(false);
+        };
+        if (compact_prefill_logits)
+        {
+            std::vector<int> terminal_rows;
+            terminal_rows.reserve(static_cast<size_t>(batch_size));
+            for (int request = 0; request < batch_size; ++request)
+            {
+                terminal_rows.push_back(
+                    request * padded_seq_len + actual_lengths[request] - 1);
+            }
+            request_batched_prefill_logit_rows_.assign(
+                terminal_rows.begin(),
+                terminal_rows.end());
+            if (!setComputeAllPositionLogits(true) ||
+                !setComputeRowIndexedAllPositionLogits(true, batch_size) ||
+                !graph_builder_ ||
+                !graph_builder_->setRowIndexedAllPositionLogitRows(terminal_rows))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to configure "
+                          "device-token request-batched terminal logits row "
+                          "selection");
+                restore_prefill_logits_mode();
+                state_.sequence_lengths = old_sequence_lengths;
+                return false;
+            }
+            request_batched_prefill_logits_row_count_ = batch_size;
+        }
+
         const float *result = forwardImpl(
             flat_shadow.data(),
             token_ids_device,
             padded_seq_len,
             batch_size);
+        if (compact_prefill_logits)
+        {
+            if (graph_builder_)
+                graph_builder_->setRowIndexedAllPositionLogitRows({});
+            setComputeRowIndexedAllPositionLogits(false, 0);
+            setComputeAllPositionLogits(false);
+            request_batched_prefill_logit_rows_.clear();
+            if (!result)
+                request_batched_prefill_logits_row_count_ = 0;
+        }
 
         if (!result)
         {
@@ -3811,9 +3898,11 @@ namespace llaminar2
             size_t rows = static_cast<size_t>(total_tokens);
             if (compute_row_indexed_all_position_logits_)
             {
-                if (batch_size > 1 && !pending_mtp_spec_verifier_input_plan_)
+                if (batch_size > 1 &&
+                    !pending_mtp_spec_verifier_input_plan_ &&
+                    request_batched_prefill_logits_row_count_ <= 0)
                 {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Batched row-indexed all-position logits require an explicit MTP verifier row plan");
+                    LOG_ERROR("[DeviceGraphOrchestrator] Batched row-indexed logits require an explicit MTP verifier or request-prefill row plan");
                     return nullptr;
                 }
                 if (row_indexed_all_position_logits_row_count_ <= 0 ||
@@ -3969,6 +4058,21 @@ namespace llaminar2
         output.logits = logits_output;
         output.hidden = state_.hidden.get();
 
+        std::vector<int> last_forward_request_lengths(
+            static_cast<size_t>(batch_size),
+            seq_len);
+        if (batch_size > 1 && input.sequence_lengths)
+        {
+            for (int request = 0; request < batch_size; ++request)
+            {
+                if (request < static_cast<int>(input.sequence_lengths->size()))
+                {
+                    last_forward_request_lengths[static_cast<size_t>(request)] =
+                        (*input.sequence_lengths)[static_cast<size_t>(request)];
+                }
+            }
+        }
+
         // Execute forward pass
         bool success = executeForward(input, output);
 
@@ -3992,7 +4096,10 @@ namespace llaminar2
             return nullptr;
         }
 
-        noteMainForwardHiddenProducedForMTP(seq_len, batch_size);
+        noteMainForwardHiddenProducedForMTP(
+            seq_len,
+            batch_size,
+            std::move(last_forward_request_lengths));
 
         // After first prefill, release host-resident weight data. Keep the host
         // bytes alive until MTP shifted-prefill has materialized its sidecar
@@ -4670,10 +4777,20 @@ namespace llaminar2
         return true;
     }
 
-    void DeviceGraphOrchestrator::noteMainForwardHiddenProducedForMTP(int seq_len, int batch_size)
+    void DeviceGraphOrchestrator::noteMainForwardHiddenProducedForMTP(
+        int seq_len,
+        int batch_size,
+        std::vector<int> request_lengths)
     {
         state_.last_forward_seq_len = seq_len;
         state_.last_forward_batch_size = batch_size;
+        if (request_lengths.empty())
+        {
+            request_lengths.assign(
+                static_cast<size_t>(std::max(0, batch_size)),
+                seq_len);
+        }
+        state_.last_forward_request_lengths = std::move(request_lengths);
         state_.mtp_terminal_hidden_current = false;
     }
 
@@ -4718,33 +4835,24 @@ namespace llaminar2
 
         if (state_.last_forward_batch_size > 1)
         {
-            if (state_.last_forward_seq_len == 1)
+            if (!refreshMTPTerminalHiddenState(
+                    state_.last_forward_seq_len,
+                    state_.last_forward_batch_size))
             {
-                if (!refreshMTPTerminalHiddenState(
-                        state_.last_forward_seq_len,
-                        state_.last_forward_batch_size))
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to refresh batched terminal hidden for "
-                              << (operation ? operation : "MTP sidecar"));
-                    return false;
-                }
-                if (!state_.prefix_terminal_hidden || !state_.mtp_terminal_hidden_current)
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP terminal hidden refresh did not publish"
-                              << " a current prefix buffer for "
-                              << (operation ? operation : "MTP sidecar"));
-                    return false;
-                }
-                *terminal_hidden = state_.prefix_terminal_hidden.get();
-                *terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
-                return true;
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to refresh batched terminal hidden for "
+                          << (operation ? operation : "MTP sidecar"));
+                return false;
             }
-            LOG_ERROR("[DeviceGraphOrchestrator] "
-                      << (operation ? operation : "MTP sidecar")
-                      << " requires one terminal hidden row per request; last batch_size="
-                      << state_.last_forward_batch_size
-                      << " seq_len=" << state_.last_forward_seq_len);
-            return false;
+            if (!state_.prefix_terminal_hidden || !state_.mtp_terminal_hidden_current)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP terminal hidden refresh did not publish"
+                          << " a current prefix buffer for "
+                          << (operation ? operation : "MTP sidecar"));
+                return false;
+            }
+            *terminal_hidden = state_.prefix_terminal_hidden.get();
+            *terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
+            return true;
         }
 
         if (state_.last_forward_seq_len == 1 && state_.last_forward_batch_size == 1 && state_.hidden)
@@ -4803,12 +4911,6 @@ namespace llaminar2
         if (seq_len <= 0 || batch_size <= 0)
             return false;
         const int total_rows = seq_len * batch_size;
-        if (batch_size > 1 && seq_len != 1)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP terminal hidden capture supports only seq_len=1, got batch_size="
-                      << batch_size << " seq_len=" << seq_len);
-            return false;
-        }
         if (batch_size > 4)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP terminal hidden capture supports at most four rows, got "
@@ -4827,13 +4929,39 @@ namespace llaminar2
         }
         else
         {
-            // A one-token request batch is flattened as rows [0, batch_size).
-            // Copy every row into the stable sidecar input buffer so a batched
-            // MTP graph sees one terminal hidden state per request.
+            if (static_cast<int>(state_.last_forward_request_lengths.size()) <
+                batch_size)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP terminal hidden capture lacks per-request lengths: batch_size="
+                          << batch_size << " recorded="
+                          << state_.last_forward_request_lengths.size());
+                return false;
+            }
+
+            std::vector<int> terminal_rows;
+            terminal_rows.reserve(static_cast<size_t>(batch_size));
+            for (int request = 0; request < batch_size; ++request)
+            {
+                const int request_len =
+                    state_.last_forward_request_lengths[static_cast<size_t>(request)];
+                if (request_len <= 0 || request_len > seq_len)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Invalid batched MTP terminal hidden request length: request="
+                              << request << " length=" << request_len
+                              << " padded_seq_len=" << seq_len);
+                    return false;
+                }
+                terminal_rows.push_back(request * seq_len + request_len - 1);
+            }
+
+            /*
+             * Padded request batches are flattened as
+             * [request, padded_seq_len, d_model]. Gather each request's true
+             * terminal row into the stable sidecar input buffer.
+             */
             if (!selectMTPTerminalHiddenRows(
-                    /*row_start=*/0,
-                    /*row_count=*/batch_size,
-                    /*seq_len=*/total_rows,
+                    terminal_rows,
+                    total_rows,
                     producer_stream))
             {
                 return false;
@@ -4903,8 +5031,15 @@ namespace llaminar2
         bool defer_final_sync,
         const void *draft_condition_tokens_device,
         int draft_condition_ready_slot,
-        bool draft_condition_ready_is_target)
+        bool draft_condition_ready_is_target,
+        int request_batch,
+        const int *position_ids_override)
     {
+        const int seq_len = token_count;
+        const int total_rows =
+            (token_count > 0 && request_batch > 0)
+                ? token_count * request_batch
+                : 0;
         const std::string device_key = state_.device_id.toString();
         const std::string phase = perfPhaseName();
         const std::string sidecar_context =
@@ -4925,12 +5060,24 @@ namespace llaminar2
         const bool use_device_condition_tokens =
             external_device_condition_tokens || stage_host_condition_tokens_on_device;
         if ((!draft_condition_tokens && !external_device_condition_tokens) ||
-            token_count <= 0 || token_count > 4)
+            token_count <= 0 || request_batch <= 0 || total_rows <= 0 ||
+            total_rows > 4)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar received invalid token_count=" << token_count);
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar received invalid shape: seq_len="
+                      << token_count << " batch=" << request_batch);
             return false;
         }
-        if (external_device_condition_tokens && token_count != 1)
+        if (request_batch > 1 && token_count != 1)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Request-batched MTP sidecar supports exactly one token per request");
+            return false;
+        }
+        if (request_batch > 1 && !position_ids_override)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Request-batched MTP sidecar requires per-request position ids");
+            return false;
+        }
+        if (external_device_condition_tokens && total_rows != 1)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] External device-token MTP sidecar currently supports one token per replay");
             return false;
@@ -4945,7 +5092,7 @@ namespace llaminar2
             const int vocab_size = graph_builder_
                                        ? graph_builder_->config().vocab_size
                                        : 0;
-            for (int i = 0; i < token_count; ++i)
+            for (int i = 0; i < total_rows; ++i)
             {
                 const int32_t token = draft_condition_tokens[i];
                 if (token < 0 || (vocab_size > 0 && token >= vocab_size))
@@ -4953,6 +5100,7 @@ namespace llaminar2
                     LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar received invalid host token="
                               << token << " at row=" << i
                               << " seq_len=" << token_count
+                              << " batch=" << request_batch
                               << " context=" << sidecar_context
                               << " vocab=" << vocab_size);
                     return false;
@@ -4968,7 +5116,8 @@ namespace llaminar2
              {"depth", "0"},
              {"device_tokens", boolTag(use_device_condition_tokens)},
              {"kv_cache_only", boolTag(kv_cache_only)},
-             {"seq_len", std::to_string(token_count)}});
+             {"seq_len", std::to_string(token_count)},
+             {"batch", std::to_string(request_batch)}});
         PerfStatsCollector::addCounter(
             "mtp",
             "sidecar_depth0_calls",
@@ -4979,7 +5128,8 @@ namespace llaminar2
              {"depth", "0"},
              {"device_tokens", boolTag(use_device_condition_tokens)},
              {"kv_cache_only", boolTag(kv_cache_only)},
-             {"seq_len", std::to_string(token_count)}});
+             {"seq_len", std::to_string(token_count)},
+             {"batch", std::to_string(request_batch)}});
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return false;
         if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
@@ -5071,11 +5221,13 @@ namespace llaminar2
         {
             if (!tensor)
                 return true;
-            if (tensor->rows() >= static_cast<size_t>(token_count))
+            if (tensor->rows() >= static_cast<size_t>(total_rows))
                 return true;
             LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar buffer " << name
                                                                       << " has only " << tensor->rows()
-                                                                      << " rows for seq_len=" << token_count);
+                                                                      << " rows for total_rows=" << total_rows
+                                                                      << " seq_len=" << token_count
+                                                                      << " batch=" << request_batch);
             return false;
         };
         if (!require_rows("terminal_hidden", terminal_hidden) ||
@@ -5130,13 +5282,13 @@ namespace llaminar2
         {
             if (kv_cache_only)
             {
-                if (token_count == 1)
+                if (total_rows == 1)
                 {
                     return use_device_condition_tokens
                                ? mtp_sidecar_depth0_kv_only_device_token_cache_
                                : mtp_sidecar_depth0_kv_only_cache_;
                 }
-                return mtp_sidecar_depth0_kv_only_batch_caches_[static_cast<size_t>(token_count)];
+                return mtp_sidecar_depth0_kv_only_batch_caches_[static_cast<size_t>(total_rows)];
             }
 
             const bool chained_hidden = terminal_hidden_buffer_id == BufferId::MTP_HIDDEN;
@@ -5179,13 +5331,13 @@ namespace llaminar2
             if (condition_token_slot < 0 ||
                 !mtp_sidecar_condition_token_dev_ ||
                 mtp_sidecar_condition_token_capacity_ < required_capacity ||
-                token_count > kConditionTokenSlotWidth)
+                total_rows > kConditionTokenSlotWidth)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Device-token MTP sidecar requires a role-owned"
                           << " MTP_CONDITION_TOKEN slot: slot=" << condition_token_slot
                           << " capacity=" << mtp_sidecar_condition_token_capacity_
                           << " required=" << required_capacity
-                          << " requested_rows=" << token_count
+                          << " requested_rows=" << total_rows
                           << " context=" << sidecar_context);
                 return false;
             }
@@ -5202,7 +5354,7 @@ namespace llaminar2
         input.kv_cache = state_.mtp_kv_caches[0].get();
         input.position_ids = &position_id;
         input.sequence_lengths = nullptr;
-        input.batch_size = 1;
+        input.batch_size = request_batch;
         input.seq_len = token_count;
         input.device = state_.device_id;
         input.terminal_hidden_buffer_id = terminal_hidden_buffer_id;
@@ -5217,6 +5369,7 @@ namespace llaminar2
             !sidecar_cache.graph ||
             sidecar_cache.terminal_hidden != terminal_hidden ||
             sidecar_cache.seq_len != token_count ||
+            sidecar_cache.batch_size != request_batch ||
             sidecar_cache.uses_device_token_ids != use_device_condition_tokens ||
             sidecar_cache.condition_token_slot != condition_token_slot ||
             sidecar_cache.condition_token_device != condition_token_device ||
@@ -5229,10 +5382,11 @@ namespace llaminar2
             sidecar_cache.invalidate();
             sidecar_cache.token_id =
                 use_device_condition_tokens ? -1 : draft_condition_tokens[0];
-            sidecar_cache.token_ids.assign(static_cast<size_t>(token_count), 0);
-            sidecar_cache.position_ids.assign(static_cast<size_t>(token_count), 0);
+            sidecar_cache.token_ids.assign(static_cast<size_t>(total_rows), 0);
+            sidecar_cache.position_ids.assign(static_cast<size_t>(total_rows), 0);
             sidecar_cache.position_id = position_id;
             sidecar_cache.seq_len = token_count;
+            sidecar_cache.batch_size = request_batch;
             sidecar_cache.uses_device_token_ids = use_device_condition_tokens;
             sidecar_cache.condition_token_slot = condition_token_slot;
             sidecar_cache.condition_token_device = condition_token_device;
@@ -5381,14 +5535,14 @@ namespace llaminar2
         }
         if (stage_host_condition_tokens_on_device)
         {
-            if (sidecar_cache.token_ids.size() != static_cast<size_t>(token_count))
+            if (sidecar_cache.token_ids.size() != static_cast<size_t>(total_rows))
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar cache has unstable staged token storage for seq_len="
-                          << token_count);
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar cache has unstable staged token storage for rows="
+                          << total_rows);
                 return false;
             }
             std::copy(draft_condition_tokens,
-                      draft_condition_tokens + token_count,
+                      draft_condition_tokens + total_rows,
                       sidecar_cache.token_ids.begin());
         }
         if (use_device_condition_tokens)
@@ -5422,7 +5576,7 @@ namespace llaminar2
             }
 
             const size_t staged_token_bytes =
-                sizeof(int32_t) * static_cast<size_t>(token_count);
+                sizeof(int32_t) * static_cast<size_t>(total_rows);
             bool staged_tokens_ok = false;
             if (external_device_condition_tokens)
             {
@@ -5459,7 +5613,7 @@ namespace llaminar2
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to stage MTP sidecar token rows"
                           << " source=" << (external_device_condition_tokens ? "device" : "host")
-                          << " rows=" << token_count);
+                          << " rows=" << total_rows);
                 return false;
             }
 
@@ -5479,7 +5633,7 @@ namespace llaminar2
                 const int vocab_size = graph_builder_
                                            ? graph_builder_->config().vocab_size
                                            : 0;
-                for (int i = 0; i < token_count; ++i)
+                for (int i = 0; i < total_rows; ++i)
                 {
                     const int32_t staged_token = staged_tokens[static_cast<size_t>(i)];
                     if (staged_token < 0 ||
@@ -5550,11 +5704,11 @@ namespace llaminar2
 
         sidecar_cache.token_id =
             use_device_condition_tokens ? -1 : draft_condition_tokens[0];
-        if (sidecar_cache.token_ids.size() != static_cast<size_t>(token_count) ||
-            sidecar_cache.position_ids.size() != static_cast<size_t>(token_count))
+        if (sidecar_cache.token_ids.size() != static_cast<size_t>(total_rows) ||
+            sidecar_cache.position_ids.size() != static_cast<size_t>(total_rows))
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar cache has unstable token/position storage for seq_len="
-                      << token_count);
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar cache has unstable token/position storage for rows="
+                      << total_rows);
             return false;
         }
         if (external_device_condition_tokens)
@@ -5564,18 +5718,29 @@ namespace llaminar2
         else if (stage_host_condition_tokens_on_device)
         {
             std::copy(draft_condition_tokens,
-                      draft_condition_tokens + token_count,
+                      draft_condition_tokens + total_rows,
                       sidecar_cache.token_ids.begin());
         }
         else
         {
             std::copy(draft_condition_tokens,
-                      draft_condition_tokens + token_count,
+                      draft_condition_tokens + total_rows,
                       sidecar_cache.token_ids.begin());
         }
         sidecar_cache.position_id = position_id;
-        for (int i = 0; i < token_count; ++i)
-            sidecar_cache.position_ids[static_cast<size_t>(i)] = position_id + i;
+        for (int request = 0; request < request_batch; ++request)
+        {
+            const int base_position =
+                position_ids_override
+                    ? position_ids_override[request]
+                    : position_id + request * token_count;
+            for (int i = 0; i < token_count; ++i)
+            {
+                const int row = request * token_count + i;
+                sidecar_cache.position_ids[static_cast<size_t>(row)] =
+                    base_position + i;
+            }
+        }
         if (sidecar_dynamic_stream)
         {
             std::string stream_binding_error;
@@ -5590,8 +5755,36 @@ namespace llaminar2
         }
         for (auto *stage : sidecar_cache.dynamic_param_stages)
         {
-            if (stage)
-                stage->updateDynamicParams(position_id, token_count);
+            if (!stage)
+                continue;
+
+            if (request_batch > 1 &&
+                position_ids_override &&
+                stage->type() == ComputeStageType::ROPE)
+            {
+                auto *rope_stage = dynamic_cast<RoPEStage *>(stage);
+                if (!rope_stage)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar found a ROPE stage"
+                              << " that is not a RoPEStage");
+                    return false;
+                }
+                /*
+                 * Request-batched MTP sidecars use an explicit per-row
+                 * position array: two logical requests can both be at
+                 * position N, so the RoPE rows are [N, N], not the scalar
+                 * contiguous range [N, N+1].  The stage pre-uploads these
+                 * positions to its workspace-owned device buffer before graph
+                 * capture/replay, which keeps captured RoPE execution free of
+                 * host-to-device copies.
+                 */
+                rope_stage->updateDynamicPositionIds(
+                    sidecar_cache.position_ids.data(),
+                    total_rows);
+                continue;
+            }
+
+            stage->updateDynamicParams(position_id, token_count);
         }
         sidecar_cache.graph->reset();
 
@@ -6282,6 +6475,272 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::forwardMTPBatchAndSampleGreedy(
+        const int32_t *draft_condition_tokens,
+        const int *position_ids,
+        int request_batch,
+        int32_t *out_tokens)
+    {
+        if (!draft_condition_tokens || !position_ids || !out_tokens ||
+            request_batch <= 1 || request_batch > 4)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP greedy sidecar requires 2..4 requests");
+            return false;
+        }
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return false;
+        if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP greedy sidecar requires an initialized MTP KV cache");
+            return false;
+        }
+        if (static_cast<int>(state_.positions.size()) < request_batch)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP greedy sidecar requires per-request live positions");
+            return false;
+        }
+
+        TensorBase *terminal_hidden = nullptr;
+        BufferId terminal_hidden_buffer_id = BufferId::HIDDEN_STATE;
+        if (!resolveMTPTerminalHiddenInput(
+                &terminal_hidden,
+                &terminal_hidden_buffer_id,
+                "forwardMTPBatchAndSampleGreedy"))
+        {
+            return false;
+        }
+
+        if (!executeMTPDepth0Batched(
+                draft_condition_tokens,
+                /*token_count=*/1,
+                terminal_hidden,
+                position_ids[0],
+                "mtp_decode_sidecar_request_batch",
+                /*kv_cache_only=*/false,
+                terminal_hidden_buffer_id,
+                /*defer_final_sync=*/true,
+                /*draft_condition_tokens_device=*/nullptr,
+                /*draft_condition_ready_slot=*/-1,
+                /*draft_condition_ready_is_target=*/false,
+                request_batch,
+                position_ids))
+        {
+            return false;
+        }
+
+        auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        TensorBase *mtp_logits =
+            (it == state_.extension_buffers.end() || !it->second)
+                ? nullptr
+                : it->second.get();
+        if (!mtp_logits)
+            return false;
+
+        const auto &shape = mtp_logits->shape();
+        if (shape.empty())
+            return false;
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+        if (cols == 0 ||
+            rows < static_cast<size_t>(request_batch) ||
+            cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        const int token_offset = graph_builder_
+                                     ? vocabOffsetForTPConfig(graph_builder_->config())
+                                     : 0;
+        auto device_opt = mtp_logits->current_device();
+        if (device_opt.has_value() && device_opt->is_gpu() && mtp_logits->deviceValid())
+        {
+            IBackend *backend = getBackendFor(*device_opt);
+            const void *gpu_ptr = mtp_logits->gpu_data_ptr();
+            void *stream = consumePendingLogitsStream(
+                PendingLogitsStreamRole::MTPSidecar,
+                "forwardMTPBatchAndSampleGreedy");
+            if (!stream)
+                stream = explicitGPUStreamForOperation("forwardMTPBatchAndSampleGreedy");
+            if (!backend || !gpu_ptr || !stream)
+                return false;
+
+            std::array<float, 4> values{};
+            std::array<int, 4> indices{};
+            if (!backend->argmaxF32BatchedRows(
+                    gpu_ptr,
+                    request_batch,
+                    static_cast<int>(cols),
+                    device_opt->gpu_ordinal(),
+                    values.data(),
+                    indices.data(),
+                    stream,
+                    argmax_partial_vals_dev_,
+                    argmax_partial_idxs_dev_,
+                    argmax_partial_capacity_))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP greedy argmax failed");
+                return false;
+            }
+
+            for (int row = 0; row < request_batch; ++row)
+            {
+                if (indices[static_cast<size_t>(row)] < 0)
+                    return false;
+                out_tokens[row] =
+                    static_cast<int32_t>(token_offset + indices[static_cast<size_t>(row)]);
+            }
+            return true;
+        }
+
+        for (int row = 0; row < request_batch; ++row)
+        {
+            const int token = coordinateGreedyCandidate(
+                sampleGreedyCandidateFromTensor(
+                    mtp_logits,
+                    row,
+                    token_offset,
+                    argmax_partial_vals_dev_,
+                    argmax_partial_idxs_dev_,
+                    argmax_partial_capacity_,
+                    /*stream=*/nullptr,
+                    "mtp_logits_request_batch"),
+                globalTPContextForMTPCoordination());
+            if (token < 0)
+                return false;
+            out_tokens[row] = static_cast<int32_t>(token);
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::forwardMTPBatchFromLastDraftAndSampleGreedy(
+        const int32_t *draft_condition_tokens,
+        const int *position_ids,
+        int request_batch,
+        int32_t *out_tokens)
+    {
+        if (!draft_condition_tokens || !position_ids || !out_tokens ||
+            request_batch <= 1 || request_batch > 4)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched chained MTP greedy sidecar requires 2..4 requests");
+            return false;
+        }
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return false;
+
+        auto hidden_it = state_.extension_buffers.find(BufferId::MTP_HIDDEN);
+        TensorBase *mtp_hidden =
+            (hidden_it == state_.extension_buffers.end() || !hidden_it->second)
+                ? nullptr
+                : hidden_it->second.get();
+        if (!mtp_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched chained MTP greedy sidecar requires previous MTP hidden rows");
+            return false;
+        }
+
+        if (!executeMTPDepth0Batched(
+                draft_condition_tokens,
+                /*token_count=*/1,
+                mtp_hidden,
+                position_ids[0],
+                "mtp_decode_sidecar_request_batch_chain",
+                /*kv_cache_only=*/false,
+                BufferId::MTP_HIDDEN,
+                /*defer_final_sync=*/true,
+                /*draft_condition_tokens_device=*/nullptr,
+                /*draft_condition_ready_slot=*/-1,
+                /*draft_condition_ready_is_target=*/false,
+                request_batch,
+                position_ids))
+        {
+            return false;
+        }
+
+        auto logits_it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        TensorBase *mtp_logits =
+            (logits_it == state_.extension_buffers.end() || !logits_it->second)
+                ? nullptr
+                : logits_it->second.get();
+        if (!mtp_logits)
+            return false;
+
+        const auto &shape = mtp_logits->shape();
+        if (shape.empty())
+            return false;
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+        if (cols == 0 ||
+            rows < static_cast<size_t>(request_batch) ||
+            cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        const int token_offset = graph_builder_
+                                     ? vocabOffsetForTPConfig(graph_builder_->config())
+                                     : 0;
+        auto device_opt = mtp_logits->current_device();
+        if (device_opt.has_value() && device_opt->is_gpu() && mtp_logits->deviceValid())
+        {
+            IBackend *backend = getBackendFor(*device_opt);
+            const void *gpu_ptr = mtp_logits->gpu_data_ptr();
+            void *stream = consumePendingLogitsStream(
+                PendingLogitsStreamRole::MTPSidecar,
+                "forwardMTPBatchFromLastDraftAndSampleGreedy");
+            if (!stream)
+                stream = explicitGPUStreamForOperation(
+                    "forwardMTPBatchFromLastDraftAndSampleGreedy");
+            if (!backend || !gpu_ptr || !stream)
+                return false;
+
+            std::array<float, 4> values{};
+            std::array<int, 4> indices{};
+            if (!backend->argmaxF32BatchedRows(
+                    gpu_ptr,
+                    request_batch,
+                    static_cast<int>(cols),
+                    device_opt->gpu_ordinal(),
+                    values.data(),
+                    indices.data(),
+                    stream,
+                    argmax_partial_vals_dev_,
+                    argmax_partial_idxs_dev_,
+                    argmax_partial_capacity_))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Batched chained MTP greedy argmax failed");
+                return false;
+            }
+
+            for (int row = 0; row < request_batch; ++row)
+            {
+                if (indices[static_cast<size_t>(row)] < 0)
+                    return false;
+                out_tokens[row] =
+                    static_cast<int32_t>(token_offset + indices[static_cast<size_t>(row)]);
+            }
+            return true;
+        }
+
+        for (int row = 0; row < request_batch; ++row)
+        {
+            const int token = coordinateGreedyCandidate(
+                sampleGreedyCandidateFromTensor(
+                    mtp_logits,
+                    row,
+                    token_offset,
+                    argmax_partial_vals_dev_,
+                    argmax_partial_idxs_dev_,
+                    argmax_partial_capacity_,
+                    /*stream=*/nullptr,
+                    "mtp_logits_request_batch_chain"),
+                globalTPContextForMTPCoordination());
+            if (token < 0)
+                return false;
+            out_tokens[row] = static_cast<int32_t>(token);
+        }
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::forwardMTPFromLastDraftAndSampleGreedy(
         int32_t draft_condition_token,
         int position_id,
@@ -6525,8 +6984,12 @@ namespace llaminar2
             clearPendingLogitsStream(
                 PendingLogitsStreamRole::AllPositionVerifier,
                 "setMTPAllPositionVerifierSyncDeferralEnabled(false)");
-            stochastic_target_distribution_streams_.fill(nullptr);
-            stochastic_draft_distribution_streams_.fill(nullptr);
+            std::fill(stochastic_target_distribution_streams_.begin(),
+                      stochastic_target_distribution_streams_.end(),
+                      nullptr);
+            std::fill(stochastic_draft_distribution_streams_.begin(),
+                      stochastic_draft_distribution_streams_.end(),
+                      nullptr);
             clearStochasticTargetSampleReadySlots();
             clearStochasticDraftSampleReadySlots();
         }
@@ -8420,11 +8883,6 @@ namespace llaminar2
             return true;
         }
 
-        if (!pending_mtp_spec_verifier_input_plan_)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Row-indexed GPU verifier graph has no pending MTP row plan");
-            return false;
-        }
         if (!execution_stream)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Row-indexed GPU verifier metadata upload requires an explicit stream");
@@ -8442,6 +8900,67 @@ namespace llaminar2
         }
 
         const int expected_rows = row_indexed_all_position_logits_row_count_;
+        if (!pending_mtp_spec_verifier_input_plan_)
+        {
+            /*
+             * Request-batched GPU prefill also uses the row-indexed LM-head
+             * graph, but it is not an MTP verifier transaction. The rows are
+             * already in flattened padded graph coordinates, so upload them
+             * directly and leave token/materialization metadata untouched.
+             */
+            if (request_batched_prefill_logits_row_count_ >= expected_rows &&
+                static_cast<int>(request_batched_prefill_logit_rows_.size()) >=
+                    expected_rows)
+            {
+                const int graph_rows = input.seq_len * input.batch_size;
+                for (int row = 0; row < expected_rows; ++row)
+                {
+                    const int selected =
+                        request_batched_prefill_logit_rows_[static_cast<size_t>(row)];
+                    if (selected < 0 || selected >= graph_rows)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Request-batched prefill terminal-logit row "
+                                  << selected << " is outside graph row range 0.."
+                                  << (graph_rows - 1));
+                        return false;
+                    }
+                }
+
+                const auto upload = uploadMTPSpecDecodeVerifierLogitRows(
+                    request_batched_prefill_logit_rows_,
+                    expected_rows,
+                    mtp_spec_decode_metadata_binding_,
+                    metadata_device,
+                    backend,
+                    execution_stream);
+                if (!upload.ok)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload request-batched prefill row metadata: "
+                              << upload.error);
+                    return false;
+                }
+
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "prefill_terminal_row_metadata_upload_bytes",
+                    static_cast<double>(upload.bytes_uploaded),
+                    "prefill",
+                    metadata_device.toString());
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "verifier_row_metadata_path",
+                    1.0,
+                    "prefill",
+                    metadata_device.toString(),
+                    {{"path", "request_batched_prefill_terminal_rows"},
+                     {"rows", std::to_string(expected_rows)}});
+                return true;
+            }
+
+            LOG_ERROR("[DeviceGraphOrchestrator] Row-indexed GPU verifier graph has no pending MTP row plan or request-prefill row plan");
+            return false;
+        }
+
         const auto &plan = *pending_mtp_spec_verifier_input_plan_;
         if (plan.compact_logit_row_count != expected_rows)
         {
@@ -8902,9 +9421,9 @@ namespace llaminar2
         const int compare_rows = draft_token_count - 1;
         if (!draft_tokens ||
             draft_token_count <= 0 ||
-            draft_token_count > static_cast<int>(kStochasticTargetRows) ||
+            draft_token_count > stochastic_target_row_capacity_ ||
             compare_rows < 0 ||
-            compare_rows > static_cast<int>(kStochasticDraftRows) ||
+            compare_rows > stochastic_draft_row_capacity_ ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens) ||
@@ -11545,6 +12064,183 @@ namespace llaminar2
         return token;
     }
 
+    bool DeviceGraphOrchestrator::sampleMainLogitsBatchRowsOnDevice(
+        int request_count,
+        const SamplingParams &params,
+        int32_t *out_tokens,
+        const float *stochastic_thresholds)
+    {
+        if (request_count <= 0 || !out_tokens)
+        {
+            return false;
+        }
+        if (!state_.device_id.is_gpu())
+        {
+            return false;
+        }
+        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Request-batched main-logits "
+                      "sampling is not enabled for column-parallel LM heads");
+            return false;
+        }
+
+        TensorBase *logits_tensor = nullptr;
+        if (request_batched_prefill_logits_row_count_ >= request_count &&
+            state_.all_position_logits)
+        {
+            logits_tensor = state_.all_position_logits.get();
+        }
+        else
+        {
+            logits_tensor = state_.logits.get();
+        }
+
+        if (!logits_tensor || !logits_tensor->deviceValid())
+        {
+            return false;
+        }
+
+        void *gpu_ptr = logits_tensor->gpu_data_ptr();
+        if (!gpu_ptr)
+        {
+            return false;
+        }
+
+        const auto &shape = logits_tensor->shape();
+        if (shape.empty())
+        {
+            return false;
+        }
+
+        /*
+         * Batched prefill stores exactly one terminal logits row per request.
+         * This differs from the all-position verifier tensor: there is no
+         * padded sequence dimension to skip here.
+         */
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+        if (rows < static_cast<size_t>(request_count) ||
+            cols == 0 ||
+            cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Request-batched logits shape "
+                      "cannot satisfy sampling request: rows=" << rows
+                      << " cols=" << cols
+                      << " request_count=" << request_count);
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+        {
+            return false;
+        }
+
+        void *stream = consumePendingLogitsStream(
+            PendingLogitsStreamRole::MainDecode,
+            "sampleMainLogitsBatchRowsOnDevice");
+        if (!stream)
+            stream = explicitGPUStreamForOperation(
+                "sampleMainLogitsBatchRowsOnDevice");
+        if (!stream)
+        {
+            return false;
+        }
+
+        auto *base = static_cast<const float *>(gpu_ptr);
+        const int vocab_cols = static_cast<int>(cols);
+        if (params.is_greedy())
+        {
+            std::vector<float> values(static_cast<size_t>(request_count), 0.0f);
+            std::vector<int> indices(static_cast<size_t>(request_count), -1);
+            if (!backend->argmaxF32BatchedRows(
+                    base,
+                    request_count,
+                    vocab_cols,
+                    state_.device_id.gpu_ordinal(),
+                    values.data(),
+                    indices.data(),
+                    stream,
+                    argmax_partial_vals_dev_,
+                    argmax_partial_idxs_dev_,
+                    argmax_partial_capacity_))
+            {
+                return false;
+            }
+
+            for (int row = 0; row < request_count; ++row)
+            {
+                if (indices[static_cast<size_t>(row)] < 0)
+                    return false;
+                out_tokens[row] = static_cast<int32_t>(
+                    indices[static_cast<size_t>(row)]);
+            }
+            request_batched_prefill_logits_row_count_ = 0;
+            return true;
+        }
+
+        if (params.top_k <= 0 || params.top_k > 256)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] GPU stochastic batch-row "
+                      "sampling requires 1 <= top_k <= 256; got top_k="
+                      << params.top_k);
+            return false;
+        }
+        if (!stochastic_thresholds)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] GPU stochastic batch-row "
+                      "sampling requires caller-provided vLLM-style thresholds");
+            return false;
+        }
+        if (logits_tensor != state_.all_position_logits.get() ||
+            request_batched_prefill_logits_row_count_ < request_count)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] GPU stochastic batch-row "
+                      "sampling requires compact request-batched prefill logits");
+            return false;
+        }
+        if (!supportsDeviceStochasticMTPVerification())
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] GPU stochastic batch-row "
+                      "sampling requires compact device distribution support");
+            return false;
+        }
+
+        /*
+         * Scalar stochastic MTP samples the first target token from a compact
+         * top-k/top-p distribution using a threshold keyed by logical output
+         * position.  Request-batched prefill must follow that same contract:
+         * direct backend RNG sampling would make request batching produce a
+         * different first token even when row logits are identical.
+         */
+        for (int row = 0; row < request_count; ++row)
+        {
+            if (!buildStochasticDistributionOnDevice(
+                    DeviceLogitsSource::AllPosition,
+                    row,
+                    DeviceDistributionBuffer::Target,
+                    row,
+                    params,
+                    vocab_cols))
+            {
+                return false;
+            }
+
+            const int token = sampleStochasticDistributionOnDevice(
+                DeviceDistributionBuffer::Target,
+                row,
+                stochastic_thresholds[row]);
+            if (token < 0)
+            {
+                return false;
+            }
+            out_tokens[row] = static_cast<int32_t>(token);
+        }
+        request_batched_prefill_logits_row_count_ = 0;
+        return true;
+    }
+
     /**
      * @brief Apply sparse penalties to the current main logits on the logits stream.
      *
@@ -11773,10 +12469,10 @@ namespace llaminar2
 
         const int max_slots =
             buffer == DeviceDistributionBuffer::Target
-                ? static_cast<int>(kStochasticTargetRows)
-                : static_cast<int>(kStochasticDraftRows);
+                ? stochastic_target_row_capacity_
+                : stochastic_draft_row_capacity_;
         if (first_slot + row_count > max_slots ||
-            row_count > static_cast<int>(kStochasticTargetRows))
+            row_count > stochastic_target_row_capacity_)
         {
             return false;
         }
@@ -11975,13 +12671,13 @@ namespace llaminar2
         {
             token_ids = static_cast<int *>(stochastic_target_token_ids_dev_);
             probs = static_cast<float *>(stochastic_target_probs_dev_);
-            max_slots = static_cast<int>(kStochasticTargetRows);
+            max_slots = stochastic_target_row_capacity_;
         }
         else
         {
             token_ids = static_cast<int *>(stochastic_draft_token_ids_dev_);
             probs = static_cast<float *>(stochastic_draft_probs_dev_);
-            max_slots = static_cast<int>(kStochasticDraftRows);
+            max_slots = stochastic_draft_row_capacity_;
         }
         if (!token_ids || !probs || slot >= max_slots)
             return false;
@@ -12185,7 +12881,7 @@ namespace llaminar2
             return false;
         }
 
-        if (first_slot + row_count > static_cast<int>(kStochasticTargetRows))
+        if (first_slot + row_count > stochastic_target_row_capacity_)
             return false;
 
         auto *token_ids = static_cast<int *>(stochastic_target_token_ids_dev_);
@@ -12316,13 +13012,13 @@ namespace llaminar2
         {
             token_ids = static_cast<int *>(stochastic_target_token_ids_dev_);
             probs = static_cast<float *>(stochastic_target_probs_dev_);
-            max_slots = static_cast<int>(kStochasticTargetRows);
+            max_slots = stochastic_target_row_capacity_;
         }
         else
         {
             token_ids = static_cast<int *>(stochastic_draft_token_ids_dev_);
             probs = static_cast<float *>(stochastic_draft_probs_dev_);
-            max_slots = static_cast<int>(kStochasticDraftRows);
+            max_slots = stochastic_draft_row_capacity_;
         }
         if (!token_ids || !probs || slot >= max_slots)
             return false;
@@ -12476,7 +13172,7 @@ namespace llaminar2
         if (!supportsDeviceStochasticMTPVerification() ||
             source != DeviceLogitsSource::MTP ||
             row < 0 || slot < 0 ||
-            slot >= static_cast<int>(kStochasticDraftRows) ||
+            slot >= stochastic_draft_row_capacity_ ||
             vocab_size <= 0 ||
             !stochastic_draft_sample_tokens_dev_ ||
             !stochastic_draft_sample_probs_dev_ ||
@@ -12635,6 +13331,62 @@ namespace llaminar2
             /*out_token_host=*/nullptr);
     }
 
+    bool DeviceGraphOrchestrator::stageStochasticDraftTokensForDeviceVerification(
+        const int32_t *draft_tokens,
+        int draft_token_count,
+        int first_draft_slot)
+    {
+        if (!supportsDeviceStochasticMTPVerification() ||
+            !draft_tokens ||
+            first_draft_slot < 0 ||
+            draft_token_count <= 0 ||
+            first_draft_slot + draft_token_count > stochastic_draft_row_capacity_ ||
+            !stochastic_draft_sample_tokens_dev_)
+        {
+            return false;
+        }
+
+        if (!state_.device_id.is_gpu())
+            return false;
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        void *stream = explicitGPUStreamForOperation(
+            "stageStochasticDraftTokensForDeviceVerification");
+        if (!backend || !stream)
+            return false;
+
+        for (int slot = 0; slot < draft_token_count; ++slot)
+            clearStochasticDraftSampleReadySlot(first_draft_slot + slot);
+
+        if (!backend->hostToDeviceOnStream(
+                static_cast<int32_t *>(stochastic_draft_sample_tokens_dev_) +
+                    first_draft_slot,
+                draft_tokens,
+                sizeof(int32_t) * static_cast<size_t>(draft_token_count),
+                state_.device_id.gpu_ordinal(),
+                stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to stage stochastic draft tokens for verifier");
+            return false;
+        }
+
+        for (int slot = 0; slot < draft_token_count; ++slot)
+        {
+            if (!recordStochasticDraftSampleReady(first_draft_slot + slot, stream))
+                return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "stochastic_request_batch_draft_token_stages",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"draft_tokens", std::to_string(draft_token_count)},
+             {"first_slot", std::to_string(first_draft_slot)}});
+        return true;
+    }
+
     int DeviceGraphOrchestrator::sampleStochasticDistributionOnDevice(
         DeviceDistributionBuffer buffer,
         int slot,
@@ -12674,8 +13426,8 @@ namespace llaminar2
     {
         if (!supportsDeviceStochasticMTPVerification() || !out ||
             target_slot < 0 || draft_slot < 0 ||
-            target_slot >= static_cast<int>(kStochasticTargetRows) ||
-            draft_slot >= static_cast<int>(kStochasticDraftRows))
+            target_slot >= stochastic_target_row_capacity_ ||
+            draft_slot >= stochastic_draft_row_capacity_)
         {
             return false;
         }
@@ -12771,8 +13523,8 @@ namespace llaminar2
         if (!supportsDeviceStochasticMTPVerification() ||
             first_target_slot < 0 || first_draft_slot < 0 ||
             row_count <= 0 ||
-            first_target_slot + row_count > static_cast<int>(kStochasticTargetRows) ||
-            first_draft_slot + row_count > static_cast<int>(kStochasticDraftRows) ||
+            first_target_slot + row_count > stochastic_target_row_capacity_ ||
+            first_draft_slot + row_count > stochastic_draft_row_capacity_ ||
             !draft_tokens || !accept_thresholds || !residual_thresholds || !out)
         {
             return false;
@@ -12925,7 +13677,10 @@ namespace llaminar2
             out,
             inverse_sample_seed,
             inverse_sample_first_logical_position,
-            use_vllm_probability_rejection);
+            use_vllm_probability_rejection,
+            /*output_request_slot=*/0,
+            /*stream_override=*/nullptr,
+            /*copy_summary_to_host=*/true);
     }
 
     bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
@@ -12962,7 +13717,188 @@ namespace llaminar2
             out,
             inverse_sample_seed,
             inverse_sample_first_logical_position,
-            use_vllm_probability_rejection);
+            use_vllm_probability_rejection,
+            /*output_request_slot=*/0,
+            /*stream_override=*/nullptr,
+            /*copy_summary_to_host=*/true);
+    }
+
+    bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDevice(
+        const DeviceStochasticBatchOutcomeRequest *requests,
+        int request_count,
+        DeviceSpeculativeVerifyBatchOutcome *outcomes)
+    {
+        using namespace sampling_math;
+        if (!requests || !outcomes ||
+            request_count <= 0 ||
+            request_count > stochastic_batch_output_request_capacity_ ||
+            !supportsDeviceStochasticMTPVerification() ||
+            !stochastic_batch_output_tokens_dev_ ||
+            !stochastic_batch_output_meta_dev_)
+        {
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        /*
+         * All target distributions for the scheduled request batch have already
+         * been queued on the verifier stream.  Consume that stream once and keep
+         * every per-request verify/bonus/summary launch ordered behind it, then
+         * perform exactly one compact D2H copy for all request outcomes.
+         */
+        void *stream = consumePendingLogitsStream(
+            PendingLogitsStreamRole::AllPositionVerifier,
+            "verifyStochasticDistributionsRequestBatchOutcomesOnDevice");
+        if (!stream)
+        {
+            stream = explicitGPUStreamForOperation(
+                "verifyStochasticDistributionsRequestBatchOutcomesOnDevice");
+        }
+        if (!stream)
+            return false;
+
+        for (int request_idx = 0; request_idx < request_count; ++request_idx)
+        {
+            outcomes[request_idx] = DeviceSpeculativeVerifyBatchOutcome{};
+            const DeviceStochasticBatchOutcomeRequest &request =
+                requests[request_idx];
+            if (request.row_count <= 0 ||
+                request.row_count > kSpeculativeBatchMaxRows ||
+                request.stop_token_count < 0 ||
+                request.stop_token_count > kSpeculativeBatchMaxStopTokens)
+            {
+                return false;
+            }
+
+            const int32_t *stop_tokens =
+                request.stop_token_count > 0
+                    ? request.stop_tokens.data()
+                    : nullptr;
+            const int32_t *draft_tokens = request.hostDraftTokensOrNull();
+
+            const bool ok =
+                verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(
+                    request.first_target_slot,
+                    request.first_draft_slot,
+                    draft_tokens,
+                    request.accept_thresholds.data(),
+                    request.residual_thresholds.data(),
+                    request.row_count,
+                    request.first_token,
+                    request.first_target_sample_slot,
+                    request.first_token_from_device,
+                    stop_tokens,
+                    request.stop_token_count,
+                    request.bonus_target_slot,
+                    request.bonus_threshold,
+                    outcomes + request_idx,
+                    request.inverse_sample_seed,
+                    request.inverse_sample_first_logical_position,
+                    request.use_vllm_probability_rejection,
+                    /*output_request_slot=*/request_idx,
+                    stream,
+                    /*copy_summary_to_host=*/false);
+            if (!ok)
+                return false;
+        }
+
+        std::vector<int32_t> output_tokens(
+            static_cast<size_t>(request_count) *
+            kSpeculativeBatchMaxOutputTokens,
+            -1);
+        std::vector<int> meta(
+            static_cast<size_t>(request_count) *
+            kSpeculativeBatchMetaCount,
+            0);
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "stochastic_request_batch_summary_d2h_sync",
+                "decode",
+                state_.device_id.toString(),
+                {{"requests", std::to_string(request_count)}});
+            if (!backend->deviceToHostFast(
+                    output_tokens.data(),
+                    stochastic_batch_output_tokens_dev_,
+                    sizeof(int32_t) * output_tokens.size(),
+                    state_.device_id.gpu_ordinal(),
+                    stream) ||
+                !backend->deviceToHostFast(
+                    meta.data(),
+                    stochastic_batch_output_meta_dev_,
+                    sizeof(int) * meta.size(),
+                    state_.device_id.gpu_ordinal(),
+                    stream))
+            {
+                return false;
+            }
+        }
+
+        for (int request_idx = 0; request_idx < request_count; ++request_idx)
+        {
+            const auto token_base =
+                static_cast<size_t>(request_idx) *
+                kSpeculativeBatchMaxOutputTokens;
+            const auto meta_base =
+                static_cast<size_t>(request_idx) *
+                kSpeculativeBatchMetaCount;
+            const int *request_meta = meta.data() + meta_base;
+            if (request_meta[kSpecBatchMetaOk] == 0 ||
+                request_meta[kSpecBatchMetaOutputCount] < 0 ||
+                request_meta[kSpecBatchMetaOutputCount] >
+                    kSpeculativeBatchMaxOutputTokens)
+            {
+                return false;
+            }
+
+            DeviceSpeculativeVerifyBatchOutcome &outcome =
+                outcomes[request_idx];
+            outcome = DeviceSpeculativeVerifyBatchOutcome{};
+            for (int output_idx = 0;
+                 output_idx < request_meta[kSpecBatchMetaOutputCount];
+                 ++output_idx)
+            {
+                const int32_t token =
+                    output_tokens[token_base + static_cast<size_t>(output_idx)];
+                if (token < 0)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Request-batched stochastic summary produced invalid token="
+                              << token << " request=" << request_idx
+                              << " output_index=" << output_idx);
+                    return false;
+                }
+                outcome.output_tokens[static_cast<size_t>(output_idx)] = token;
+            }
+            outcome.ok = true;
+            outcome.output_token_count =
+                request_meta[kSpecBatchMetaOutputCount];
+            outcome.accepted_speculative_prefix =
+                request_meta[kSpecBatchMetaAcceptedSpeculativePrefix];
+            outcome.target_verifier_state_commit_count =
+                request_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
+            outcome.ready_token = request_meta[kSpecBatchMetaReadyToken];
+            outcome.rejected_verified_token =
+                request_meta[kSpecBatchMetaRejectedVerifiedToken];
+            outcome.stopped_on_output =
+                request_meta[kSpecBatchMetaStoppedOnOutput] != 0;
+            outcome.all_speculative_accepted =
+                request_meta[kSpecBatchMetaAllSpeculativeAccepted] != 0;
+            outcome.consumed_verifier_rows =
+                request_meta[kSpecBatchMetaConsumedVerifierRows];
+            outcome.sampled_terminal =
+                request_meta[kSpecBatchMetaSampledTerminal] != 0;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "stochastic_verify_request_batch_outcomes",
+            static_cast<double>(request_count),
+            "decode",
+            state_.device_id.toString());
+        return true;
     }
 
     bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(
@@ -12982,7 +13918,10 @@ namespace llaminar2
         DeviceSpeculativeVerifyBatchOutcome *out,
         uint64_t inverse_sample_seed,
         int inverse_sample_first_logical_position,
-        bool use_vllm_probability_rejection)
+        bool use_vllm_probability_rejection,
+        int output_request_slot,
+        void *stream_override,
+        bool copy_summary_to_host)
     {
         using namespace sampling_math;
         (void)draft_tokens;
@@ -12995,8 +13934,8 @@ namespace llaminar2
             first_target_slot < 0 || first_draft_slot < 0 ||
             row_count <= 0 ||
             row_count > kSpeculativeBatchMaxRows ||
-            first_target_slot + row_count > static_cast<int>(kStochasticTargetRows) ||
-            first_draft_slot + row_count > static_cast<int>(kStochasticDraftRows) ||
+            first_target_slot + row_count > stochastic_target_row_capacity_ ||
+            first_draft_slot + row_count > stochastic_draft_row_capacity_ ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens) ||
@@ -13005,7 +13944,9 @@ namespace llaminar2
               first_target_sample_slot >= kSpeculativeBatchMaxOutputTokens ||
               !stochastic_target_sample_tokens_dev_)) ||
             (has_bonus &&
-             bonus_target_slot >= static_cast<int>(kStochasticTargetRows)) ||
+             bonus_target_slot >= stochastic_target_row_capacity_) ||
+            output_request_slot < 0 ||
+            output_request_slot >= stochastic_batch_output_request_capacity_ ||
             !accept_thresholds || !residual_thresholds)
         {
             return false;
@@ -13021,9 +13962,13 @@ namespace llaminar2
          * the handoff. Falling back to a fresh explicit stream would race the
          * verifier rows, so consume-and-clear the pending stream here.
          */
-        void *stream = consumePendingLogitsStream(
-            PendingLogitsStreamRole::AllPositionVerifier,
-            "verifyStochasticDistributionsBatchOutcomeOnDevice");
+        void *stream = stream_override;
+        if (!stream)
+        {
+            stream = consumePendingLogitsStream(
+                PendingLogitsStreamRole::AllPositionVerifier,
+                "verifyStochasticDistributionsBatchOutcomeOnDevice");
+        }
         if (!stream)
         {
             stream = explicitGPUStreamForOperation(
@@ -13089,6 +14034,12 @@ namespace llaminar2
             static_cast<float *>(stochastic_verify_accept_probs_dev_) + first_target_slot;
         auto *out_threshold_dev =
             static_cast<float *>(stochastic_verify_thresholds_dev_) + first_target_slot;
+        auto *summary_tokens_dev =
+            static_cast<int32_t *>(stochastic_batch_output_tokens_dev_) +
+            static_cast<size_t>(output_request_slot) * kSpeculativeBatchMaxOutputTokens;
+        auto *summary_meta_dev =
+            static_cast<int *>(stochastic_batch_output_meta_dev_) +
+            static_cast<size_t>(output_request_slot) * kSpeculativeBatchMetaCount;
 
         if (!waitForRequiredStochasticDraftSampleReadyRange(
                 first_draft_slot,
@@ -13140,8 +14091,8 @@ namespace llaminar2
             {
                 if (!target_processed_logits ||
                     full_vocab_size <= 0 ||
-                    first_target_slot + row_count > static_cast<int>(kStochasticTargetRows) ||
-                    first_draft_slot + row_count > static_cast<int>(kStochasticDraftRows))
+                    first_target_slot + row_count > stochastic_target_row_capacity_ ||
+                    first_draft_slot + row_count > stochastic_draft_row_capacity_)
                 {
                     LOG_ERROR("[DeviceGraphOrchestrator] vLLM stochastic verifier requested without processed target rows");
                     return false;
@@ -13352,8 +14303,8 @@ namespace llaminar2
                           has_bonus,
                           state_.device_id.gpu_ordinal(),
                           stream,
-                          stochastic_batch_output_tokens_dev_,
-                          stochastic_batch_output_meta_dev_)
+                          summary_tokens_dev,
+                          summary_meta_dev)
                     : backend->enqueueSummarizeSpeculativeVerifyBatch(
                           out_token_dev,
                           out_accepted_dev,
@@ -13365,8 +14316,8 @@ namespace llaminar2
                           has_bonus,
                           state_.device_id.gpu_ordinal(),
                           stream,
-                          stochastic_batch_output_tokens_dev_,
-                          stochastic_batch_output_meta_dev_);
+                          summary_tokens_dev,
+                          summary_meta_dev);
         }
         if (!summary_enqueued)
         {
@@ -13397,7 +14348,8 @@ namespace llaminar2
          * kernel. Fast D2H is safe here and keeps ROCm from spending more time
          * validating the pointer than copying the result.
          */
-        bool copied_summary = false;
+        bool copied_summary = !copy_summary_to_host;
+        if (copy_summary_to_host)
         {
             /*
              * This is the intentional host-visible boundary for the compact
@@ -13413,12 +14365,12 @@ namespace llaminar2
                  {"top_k", std::to_string(target_top_k)}});
             copied_summary =
                 backend->deviceToHostFast(output_tokens.data(),
-                                          stochastic_batch_output_tokens_dev_,
+                                          summary_tokens_dev,
                                           sizeof(int32_t) * output_tokens.size(),
                                           state_.device_id.gpu_ordinal(),
                                           stream) &&
                 backend->deviceToHostFast(meta.data(),
-                                          stochastic_batch_output_meta_dev_,
+                                          summary_meta_dev,
                                           sizeof(int) * meta.size(),
                                           state_.device_id.gpu_ordinal(),
                                           stream);
@@ -13430,7 +14382,7 @@ namespace llaminar2
              * debug-only rows here would turn one intentional host boundary
              * into several extra synchronization points.
              */
-            if (copied_summary && capture_row_debug)
+            if (copy_summary_to_host && copied_summary && capture_row_debug)
             {
                 copied_summary =
                     backend->deviceToHostFast(debug_accept_probs.data(),
@@ -13459,6 +14411,36 @@ namespace llaminar2
         if (!copied_summary)
         {
             return false;
+        }
+        if (!copy_summary_to_host)
+        {
+            for (int row = 0; row < row_count; ++row)
+            {
+                stochastic_target_distribution_streams_[
+                    static_cast<size_t>(first_target_slot + row)] = nullptr;
+                stochastic_draft_distribution_streams_[
+                    static_cast<size_t>(first_draft_slot + row)] = nullptr;
+                stochastic_draft_top_k_[static_cast<size_t>(first_draft_slot + row)] = 0;
+                clearStochasticDraftSampleReadySlot(first_draft_slot + row);
+            }
+            if (has_bonus)
+            {
+                stochastic_target_distribution_streams_[
+                    static_cast<size_t>(bonus_target_slot)] = nullptr;
+            }
+            if (first_token_from_device)
+            {
+                clearStochasticTargetSampleReadySlot(first_target_sample_slot);
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "stochastic_verify_batch_outcome_rows",
+                static_cast<double>(row_count),
+                "decode",
+                state_.device_id.toString(),
+                {{"top_k", std::to_string(target_top_k)}});
+            return true;
         }
         if (capture_row_debug && row_count > 0)
         {
@@ -13604,6 +14586,53 @@ namespace llaminar2
             state_.sequence_lengths[i] = actual_lengths[i];
         }
 
+        /*
+         * Only ordinary request-batched prefill needs synthetic terminal-row
+         * logits. Batched MTP verifier forwards also use forward_batch(), but
+         * they intentionally run with all-position logits enabled and carry
+         * their own verifier row metadata plan.
+         */
+        const bool compact_prefill_logits =
+            state_.device_id.is_gpu() &&
+            batch_size > 1 &&
+            !compute_all_position_logits_;
+        auto restore_prefill_logits_mode = [&]()
+        {
+            if (!compact_prefill_logits)
+                return;
+            request_batched_prefill_logits_row_count_ = 0;
+            request_batched_prefill_logit_rows_.clear();
+            if (graph_builder_)
+                graph_builder_->setRowIndexedAllPositionLogitRows({});
+            setComputeRowIndexedAllPositionLogits(false, 0);
+            setComputeAllPositionLogits(false);
+        };
+        if (compact_prefill_logits)
+        {
+            std::vector<int> terminal_rows;
+            terminal_rows.reserve(static_cast<size_t>(batch_size));
+            for (int request = 0; request < batch_size; ++request)
+            {
+                terminal_rows.push_back(
+                    request * padded_seq_len_ + actual_lengths[request] - 1);
+            }
+            request_batched_prefill_logit_rows_.assign(
+                terminal_rows.begin(),
+                terminal_rows.end());
+            if (!setComputeAllPositionLogits(true) ||
+                !setComputeRowIndexedAllPositionLogits(true, batch_size) ||
+                !graph_builder_ ||
+                !graph_builder_->setRowIndexedAllPositionLogitRows(terminal_rows))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to configure "
+                          "request-batched terminal logits row selection");
+                restore_prefill_logits_mode();
+                state_.sequence_lengths = old_sequence_lengths;
+                return false;
+            }
+            request_batched_prefill_logits_row_count_ = batch_size;
+        }
+
         // Create flattened, padded token array [batch_size * padded_seq_len]
         std::vector<int> flat_tokens(batch_size * padded_seq_len_, 0); // pad with 0
         for (int b = 0; b < batch_size; ++b)
@@ -13618,6 +14647,22 @@ namespace llaminar2
         // Call the 3-parameter forward() with padded tokens
         // Note: forward() will set sequence_lengths[b] = padded_seq_len for all b
         const float *result = forward(flat_tokens.data(), padded_seq_len_, batch_size);
+        if (compact_prefill_logits)
+        {
+            /*
+             * Keep request_batched_prefill_logits_row_count_ until the sampler
+             * consumes the compact logits buffer, but restore graph-builder
+             * knobs so the following decode/verifier graph starts from a clean
+             * normal-logits configuration.
+             */
+            if (graph_builder_)
+                graph_builder_->setRowIndexedAllPositionLogitRows({});
+            setComputeRowIndexedAllPositionLogits(false, 0);
+            setComputeAllPositionLogits(false);
+            request_batched_prefill_logit_rows_.clear();
+            if (!result)
+                request_batched_prefill_logits_row_count_ = 0;
+        }
 
         // Restore actual request progress after the padded graph execution.
         // This is important for:
@@ -13676,6 +14721,8 @@ namespace llaminar2
 
     void DeviceGraphOrchestrator::clearInferenceState()
     {
+        request_batched_prefill_logits_row_count_ = 0;
+        request_batched_prefill_logit_rows_.clear();
         state_.clear();
 
         if (forward_engine_)
@@ -13693,10 +14740,18 @@ namespace llaminar2
         defer_next_mtp_main_decode_sync_ = false;
         defer_all_position_verifier_sync_ = false;
         clearAllPendingLogitsStreams("clearInferenceState");
-        stochastic_target_distribution_streams_.fill(nullptr);
-        stochastic_draft_distribution_streams_.fill(nullptr);
-        stochastic_target_top_k_.fill(0);
-        stochastic_draft_top_k_.fill(0);
+        std::fill(stochastic_target_distribution_streams_.begin(),
+                  stochastic_target_distribution_streams_.end(),
+                  nullptr);
+        std::fill(stochastic_draft_distribution_streams_.begin(),
+                  stochastic_draft_distribution_streams_.end(),
+                  nullptr);
+        std::fill(stochastic_target_top_k_.begin(),
+                  stochastic_target_top_k_.end(),
+                  0);
+        std::fill(stochastic_draft_top_k_.begin(),
+                  stochastic_draft_top_k_.end(),
+                  0);
         clearStochasticTargetSampleReadySlots();
         clearStochasticDraftSampleReadySlots();
 

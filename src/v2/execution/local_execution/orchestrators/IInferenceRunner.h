@@ -88,6 +88,49 @@ namespace llaminar2
         MTPDeviceRejectionBatchOutcome;
 
     /**
+     * @brief One logical request inside a device-side stochastic MTP batch.
+     *
+     * The descriptor is intentionally value-owned: thresholds and stop tokens
+     * are copied into fixed-size arrays before the runner call. That keeps the
+     * request-batch handoff atomic and avoids dangling pointers when the caller
+     * builds several requests before a GPU reducer consumes them.
+     */
+    struct DeviceStochasticBatchOutcomeRequest
+    {
+        int request_id = -1;          ///< Logical request id for diagnostics.
+        int first_target_slot = -1;   ///< First verifier target row slot.
+        int first_draft_slot = -1;    ///< First sampled draft-token slot.
+        int row_count = 0;            ///< Number of speculative rows to compare.
+        int32_t first_token = -1;     ///< First main-model token, if host-owned.
+        bool first_token_from_device = false; ///< Read first token from sample slot.
+        int first_target_sample_slot = -1;    ///< Device first-token slot.
+        int bonus_target_slot = -1;           ///< Bonus row slot, or -1.
+        float bonus_threshold = 0.0f;         ///< RNG draw for bonus sampling.
+        uint64_t inverse_sample_seed = 0;     ///< vLLM rejection inverse RNG seed.
+        int inverse_sample_first_logical_position = 0;
+        bool use_vllm_probability_rejection = false;
+        bool use_device_draft_tokens = true; ///< Null host draft pointer when true.
+        std::array<int32_t, sampling_math::kSpeculativeBatchMaxRows> draft_tokens;
+        std::array<float, sampling_math::kSpeculativeBatchMaxRows> accept_thresholds;
+        std::array<float, sampling_math::kSpeculativeBatchMaxRows> residual_thresholds;
+        std::array<int32_t, sampling_math::kSpeculativeBatchMaxStopTokens> stop_tokens;
+        int stop_token_count = 0;
+
+        DeviceStochasticBatchOutcomeRequest()
+        {
+            draft_tokens.fill(-1);
+            accept_thresholds.fill(0.0f);
+            residual_thresholds.fill(0.0f);
+            stop_tokens.fill(-1);
+        }
+
+        const int32_t *hostDraftTokensOrNull() const
+        {
+            return use_device_draft_tokens ? nullptr : draft_tokens.data();
+        }
+    };
+
+    /**
      * @brief Lightweight view of a captured snapshot with 2D shape metadata
      *
      * Returned by getSnapshotWithShape() to provide shape information
@@ -502,6 +545,54 @@ namespace llaminar2
                 return false;
             *out_token = token;
             return true;
+        }
+
+        /**
+         * @brief Run one first-depth MTP sidecar row for several request slots.
+         *
+         * `draft_condition_tokens[i]` is the already-sampled main-model token
+         * for request `i`, and `position_ids[i]` is that request's live decode
+         * position before the sidecar append. Implementations must execute a
+         * true request batch (`batch_size=request_batch`, `seq_len=1`) and write
+         * one greedy draft token per request to `out_tokens`.
+         *
+         * The default hard-fails so benchmark/server paths cannot accidentally
+         * claim request batching while looping scalar sidecars.
+         */
+        virtual bool forwardMTPBatchAndSampleGreedy(
+            const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int32_t *out_tokens)
+        {
+            (void)draft_condition_tokens;
+            (void)position_ids;
+            (void)request_batch;
+            (void)out_tokens;
+            return false;
+        }
+
+        /**
+         * @brief Run one chained MTP sidecar row for several request slots.
+         *
+         * This is the request-batched counterpart of
+         * `forwardMTPFromLastDraftAndSampleGreedy()`.  It consumes the previous
+         * batched MTP hidden rows, appends one shifted-cache row per request at
+         * `position_ids[i]`, and returns one greedy draft token per request.
+         * The default hard-fails so deeper request-batched drafting cannot
+         * silently devolve into scalar loops.
+         */
+        virtual bool forwardMTPBatchFromLastDraftAndSampleGreedy(
+            const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int32_t *out_tokens)
+        {
+            (void)draft_condition_tokens;
+            (void)position_ids;
+            (void)request_batch;
+            (void)out_tokens;
+            return false;
         }
 
         /**
@@ -986,6 +1077,38 @@ namespace llaminar2
         }
 
         /**
+         * @brief Sample request-batched main logits that already live on device.
+         *
+         * request-batched prefill writes one terminal logits row per logical
+         * request. GPU runners must sample those rows through this hook instead
+         * of exposing a device pointer to the CPU Sampler. Implementations own
+         * stream ordering and any compact D2H copy of selected token ids.
+         *
+         * @param request_count Number of active request rows to sample.
+         * @param params Sampling parameters for all rows.
+         * @param out_tokens Host output buffer [request_count].
+         * @param stochastic_thresholds Optional host thresholds
+         *        [request_count] for non-greedy sampling.  vLLM-style MTP
+         *        keys stochastic draws by logical output position, so callers
+         *        that request stochastic device sampling must provide the
+         *        exact per-request thresholds instead of letting the runner
+         *        advance a backend-local RNG counter.
+         * @return true when every row was sampled on the runner device.
+         */
+        virtual bool sampleMainLogitsBatchRowsOnDevice(
+            int request_count,
+            const SamplingParams &params,
+            int32_t *out_tokens,
+            const float *stochastic_thresholds = nullptr)
+        {
+            (void)request_count;
+            (void)params;
+            (void)out_tokens;
+            (void)stochastic_thresholds;
+            return false;
+        }
+
+        /**
          * @brief Whether this runner can execute a full high-level decode step.
          */
         virtual bool supportsDecodeStep() const { return false; }
@@ -1250,6 +1373,29 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Stage sampled draft tokens into verifier-owned device slots.
+         *
+         * Request-batched stochastic verification amortizes the target
+         * verifier forward across requests.  This hook gives the runner a
+         * structured, explicit-stream way to copy one request's already-sampled
+         * greedy draft tokens into the caller-selected device slots consumed by
+         * verifyStochasticDistributionsBatchOutcomeOnDevice().
+         *
+         * The default hard-fails. GPU implementations must use an explicit
+         * non-null stream and record the normal draft-sample readiness events.
+         */
+        virtual bool stageStochasticDraftTokensForDeviceVerification(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            int first_draft_slot = 0)
+        {
+            (void)draft_tokens;
+            (void)draft_token_count;
+            (void)first_draft_slot;
+            return false;
+        }
+
         virtual int sampleStochasticDistributionOnDevice(
             DeviceDistributionBuffer buffer,
             int slot,
@@ -1466,6 +1612,91 @@ namespace llaminar2
             (void)inverse_sample_first_logical_position;
             (void)use_vllm_probability_rejection;
             return false;
+        }
+
+        /**
+         * @brief Verify and summarize a logical request batch in one runner call.
+         *
+         * This is the orchestration-level contract for vLLM-style stochastic
+         * request batching. Callers must stage all target rows, draft slots, and
+         * RNG draws first, then hand the complete descriptor list to the runner.
+         * The default implementation is intentionally strict but conservative:
+         * it validates the descriptors and delegates each request to the
+         * existing single-request virtual reducer. CUDA/ROCm runners can
+         * override this with a true multi-output backend kernel while preserving
+         * the same public contract.
+         */
+        virtual bool verifyStochasticDistributionsRequestBatchOutcomesOnDevice(
+            const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes)
+        {
+            using namespace sampling_math;
+            if (!requests || !outcomes || request_count <= 0)
+                return false;
+
+            for (int i = 0; i < request_count; ++i)
+            {
+                const DeviceStochasticBatchOutcomeRequest &request = requests[i];
+                if (request.row_count <= 0 ||
+                    request.row_count > kSpeculativeBatchMaxRows ||
+                    request.stop_token_count < 0 ||
+                    request.stop_token_count > kSpeculativeBatchMaxStopTokens)
+                {
+                    return false;
+                }
+
+                const int32_t *stop_tokens =
+                    request.stop_token_count > 0
+                        ? request.stop_tokens.data()
+                        : nullptr;
+                const int32_t *draft_tokens =
+                    request.hostDraftTokensOrNull();
+
+                bool ok = false;
+                if (request.first_token_from_device)
+                {
+                    ok = verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
+                        request.first_target_slot,
+                        request.first_draft_slot,
+                        draft_tokens,
+                        request.accept_thresholds.data(),
+                        request.residual_thresholds.data(),
+                        request.row_count,
+                        request.first_target_sample_slot,
+                        stop_tokens,
+                        request.stop_token_count,
+                        request.bonus_target_slot,
+                        request.bonus_threshold,
+                        outcomes + i,
+                        request.inverse_sample_seed,
+                        request.inverse_sample_first_logical_position,
+                        request.use_vllm_probability_rejection);
+                }
+                else
+                {
+                    ok = verifyStochasticDistributionsBatchOutcomeOnDevice(
+                        request.first_target_slot,
+                        request.first_draft_slot,
+                        draft_tokens,
+                        request.accept_thresholds.data(),
+                        request.residual_thresholds.data(),
+                        request.row_count,
+                        request.first_token,
+                        stop_tokens,
+                        request.stop_token_count,
+                        request.bonus_target_slot,
+                        request.bonus_threshold,
+                        outcomes + i,
+                        request.inverse_sample_seed,
+                        request.inverse_sample_first_logical_position,
+                        request.use_vllm_probability_rejection);
+                }
+                if (!ok)
+                    return false;
+            }
+
+            return true;
         }
 
         /**

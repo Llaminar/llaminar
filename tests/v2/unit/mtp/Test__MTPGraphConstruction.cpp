@@ -1500,7 +1500,7 @@ TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesOneRowPerRequ
     }
 }
 
-TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshRejectsMultiTokenRequests)
+TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesVariableLengthTerminalRows)
 {
     DeviceManager::instance().initialize(-1, false);
 
@@ -1512,13 +1512,238 @@ TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshRejectsMultiTokenRe
         /*batch_size=*/2,
         fixture.config.max_seq_len,
         DeviceId::cpu()));
-    orchestrator.markMainForwardHiddenProducedForTesting(
-        /*seq_len=*/2,
-        /*batch_size=*/2);
 
-    EXPECT_FALSE(orchestrator.refreshMTPTerminalHiddenForTesting(
-        /*seq_len=*/2,
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    ASSERT_GE(hidden->rows(), 6u);
+    float *hidden_data = hidden->mutable_data();
+    ASSERT_NE(hidden_data, nullptr);
+
+    const int d = fixture.config.d_model;
+    for (int row = 0; row < 6; ++row)
+    {
+        for (int col = 0; col < d; ++col)
+        {
+            hidden_data[static_cast<size_t>(row) * d + col] =
+                1000.0f * static_cast<float>(row + 1) + static_cast<float>(col);
+        }
+    }
+
+    /*
+     * The padded prefill layout is [request, padded_seq_len, d_model].
+     * Request 0 has real length 2, so its terminal row is 1. Request 1 has
+     * real length 3, so its terminal row is 1 * 3 + 2 == 5.
+     */
+    orchestrator.markMainForwardHiddenProducedForTesting(
+        /*seq_len=*/3,
+        /*batch_size=*/2,
+        std::vector<int>{2, 3});
+
+    ASSERT_TRUE(orchestrator.refreshMTPTerminalHiddenForTesting(
+        /*seq_len=*/3,
         /*batch_size=*/2));
+
+    const TensorBase *terminal_hidden =
+        orchestrator.mtpTerminalHiddenForTesting();
+    ASSERT_NE(terminal_hidden, nullptr);
+    ASSERT_GE(terminal_hidden->rows(), 2u);
+    const float *terminal_data = terminal_hidden->data();
+    ASSERT_NE(terminal_data, nullptr);
+
+    const std::array<int, 2> expected_source_rows = {1, 5};
+    for (int request = 0; request < 2; ++request)
+    {
+        const int src_row = expected_source_rows[static_cast<size_t>(request)];
+        for (int col = 0; col < d; ++col)
+        {
+            const float expected =
+                hidden_data[static_cast<size_t>(src_row) * d + col];
+            const float actual =
+                terminal_data[static_cast<size_t>(request) * d + col];
+            EXPECT_FLOAT_EQ(actual, expected)
+                << "terminal hidden mismatch for request " << request
+                << " col " << col;
+        }
+    }
+}
+
+TEST(Test__MTPGraphConstruction, RequestBatchedMTPGreedySidecarRunsOneRowPerRequest)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwen35MTPForwardFixture fixture;
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    ASSERT_GE(hidden->rows(), 2u);
+    float *hidden_data = hidden->mutable_data();
+    ASSERT_NE(hidden_data, nullptr);
+    const size_t hidden_values =
+        hidden->rows() * static_cast<size_t>(fixture.config.d_model);
+    for (size_t i = 0; i < hidden_values; ++i)
+        hidden_data[i] = 0.01f * static_cast<float>((i % 29) + 1);
+
+    orchestrator.markMainForwardHiddenProducedForTesting(
+        /*seq_len=*/1,
+        /*batch_size=*/2,
+        std::vector<int>{1, 1});
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    const std::array<int32_t, 2> condition_tokens = {3, 4};
+    const std::array<int, 2> positions = {0, 0};
+    std::array<int32_t, 2> draft_tokens = {-1, -1};
+
+    ASSERT_TRUE(orchestrator.forwardMTPBatchAndSampleGreedy(
+        condition_tokens.data(),
+        positions.data(),
+        static_cast<int>(condition_tokens.size()),
+        draft_tokens.data()));
+
+    for (int32_t token : draft_tokens)
+    {
+        EXPECT_GE(token, 0);
+        EXPECT_LT(token, fixture.config.vocab_size);
+    }
+
+    auto hidden_it =
+        orchestrator.inferenceState().extension_buffers.find(BufferId::MTP_HIDDEN);
+    ASSERT_NE(hidden_it, orchestrator.inferenceState().extension_buffers.end());
+    ASSERT_NE(hidden_it->second, nullptr);
+    const float *mtp_hidden = hidden_it->second->data();
+    ASSERT_NE(mtp_hidden, nullptr);
+    for (int row = 0; row < 2; ++row)
+    {
+        float abs_sum = 0.0f;
+        for (int col = 0; col < fixture.config.d_model; ++col)
+        {
+            const float value =
+                mtp_hidden[static_cast<size_t>(row) *
+                               static_cast<size_t>(fixture.config.d_model) +
+                           static_cast<size_t>(col)];
+            ASSERT_TRUE(std::isfinite(value))
+                << "non-finite MTP hidden at row=" << row << " col=" << col;
+            abs_sum += std::abs(value);
+        }
+        EXPECT_GT(abs_sum, 0.0f) << "MTP hidden row " << row << " was blank";
+    }
+
+    const std::array<int, 2> chained_positions = {1, 1};
+    std::array<int32_t, 2> chained_draft_tokens = {-1, -1};
+    ASSERT_TRUE(orchestrator.forwardMTPBatchFromLastDraftAndSampleGreedy(
+        draft_tokens.data(),
+        chained_positions.data(),
+        static_cast<int>(draft_tokens.size()),
+        chained_draft_tokens.data()));
+
+    for (int32_t token : chained_draft_tokens)
+    {
+        EXPECT_GE(token, 0);
+        EXPECT_LT(token, fixture.config.vocab_size);
+    }
+
+    const float *logits = orchestrator.mtpLogits();
+    ASSERT_NE(logits, nullptr);
+    for (int row = 0; row < 2; ++row)
+    {
+        float abs_sum = 0.0f;
+        for (int col = 0; col < fixture.config.vocab_size; ++col)
+        {
+            const float value =
+                logits[static_cast<size_t>(row) *
+                           static_cast<size_t>(fixture.config.vocab_size) +
+                       static_cast<size_t>(col)];
+            ASSERT_TRUE(std::isfinite(value))
+                << "non-finite MTP logit at row=" << row << " col=" << col;
+            abs_sum += std::abs(value);
+        }
+        EXPECT_GT(abs_sum, 0.0f) << "MTP logits row " << row << " was blank";
+    }
+}
+
+TEST(Test__MTPGraphConstruction, RequestBatchedMTPGreedySidecarPreservesPerRequestPositionIds)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwen35MTPForwardFixture fixture;
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    ASSERT_GE(hidden->rows(), 2u);
+    float *hidden_data = hidden->mutable_data();
+    ASSERT_NE(hidden_data, nullptr);
+
+    /*
+     * Both logical requests are intentionally identical. A request-batched
+     * sidecar must keep explicit per-request positions [7, 7]; treating rows
+     * as one contiguous scalar decode [7, 8] changes RoPE and makes drafts
+     * drift even before verifier publication.
+     */
+    for (int col = 0; col < fixture.config.d_model; ++col)
+    {
+        const float value = 0.01f * static_cast<float>((col % 17) + 1);
+        hidden_data[static_cast<size_t>(col)] = value;
+        hidden_data[static_cast<size_t>(fixture.config.d_model + col)] = value;
+    }
+
+    orchestrator.markMainForwardHiddenProducedForTesting(
+        /*seq_len=*/1,
+        /*batch_size=*/2,
+        std::vector<int>{1, 1});
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    const std::array<int32_t, 2> condition_tokens = {3, 3};
+    const std::array<int, 2> positions = {7, 7};
+    std::array<int32_t, 2> draft_tokens = {-1, -1};
+
+    ASSERT_TRUE(orchestrator.forwardMTPBatchAndSampleGreedy(
+        condition_tokens.data(),
+        positions.data(),
+        static_cast<int>(condition_tokens.size()),
+        draft_tokens.data()));
+
+    const float *logits = orchestrator.mtpLogits();
+    ASSERT_NE(logits, nullptr);
+    float max_abs_diff = 0.0f;
+    for (int col = 0; col < fixture.config.vocab_size; ++col)
+    {
+        const float row0 = logits[static_cast<size_t>(col)];
+        const float row1 =
+            logits[static_cast<size_t>(fixture.config.vocab_size + col)];
+        max_abs_diff = std::max(max_abs_diff, std::abs(row0 - row1));
+    }
+
+    EXPECT_LT(max_abs_diff, 1e-5f)
+        << "identical request-batched sidecar rows must not drift through "
+           "contiguous RoPE positions";
+    EXPECT_EQ(draft_tokens[0], draft_tokens[1]);
 }
 
 TEST(Test__MTPGraphConstruction, RejectsMultiRowFullQwen35SidecarGraph)
@@ -1694,6 +1919,9 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
 {
     auto mpi = std::make_shared<MockMPIContext>(0, 1);
     GraphConfig config = tinyQwen35GDNConfig(DeviceId::cuda(0));
+    config.mtp.draft_tokens = 2;
+    config.mtp.max_request_batch = 2;
+    const int expected_capture_rows = resolveMTPMaxTargetQueryRows(config.mtp);
 
     CPUHybridRingKVCacheFP32 cache(
         tinyGDNHybridConfig(),
@@ -1724,8 +1952,8 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
     ASSERT_NE(short_conv_node, nullptr);
     const auto *short_conv = dynamic_cast<const ShortConv1dStage *>(short_conv_node->stage.get());
     ASSERT_NE(short_conv, nullptr);
-    EXPECT_EQ(short_conv->getParams().speculative_state_slot_rows, 3)
-        << "Phase 13.8 graph construction must request speculative state slots explicitly";
+    EXPECT_EQ(short_conv->getParams().speculative_state_slot_rows, expected_capture_rows)
+        << "Batched verifier graphs must request speculative state slots for every flattened request row";
     const WorkspaceRequirements short_conv_reqs =
         short_conv->getWorkspaceRequirements(/*m=*/2);
     EXPECT_NE(short_conv_reqs.find("gdn_shortconv_speculative_state_slots_layer0"), nullptr)
@@ -1735,8 +1963,8 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
     ASSERT_NE(recurrence_node, nullptr);
     const auto *recurrence = dynamic_cast<const GDNRecurrenceStage *>(recurrence_node->stage.get());
     ASSERT_NE(recurrence, nullptr);
-    EXPECT_EQ(recurrence->getParams().speculative_state_slot_rows, 3)
-        << "Phase 13.8 graph construction must request speculative state slots explicitly";
+    EXPECT_EQ(recurrence->getParams().speculative_state_slot_rows, expected_capture_rows)
+        << "Batched verifier graphs must request speculative state slots for every flattened request row";
     const WorkspaceRequirements recurrence_reqs =
         recurrence->getWorkspaceRequirements(/*m=*/2);
     EXPECT_NE(recurrence_reqs.find("gdn_speculative_state_slots_layer0"), nullptr)
@@ -2863,6 +3091,7 @@ TEST(Test__MTPGraphConstruction, CPUShiftedPrefillBatchesRowsIntoSingleKVOnlySid
         {"depth", "0"},
         {"device_tokens", "false"},
         {"kv_cache_only", "true"},
+        {"batch", "1"},
         {"seq_len", "4"}};
     const PerfStatRecord *sidecar_record = findMTPRecord(
         records,
@@ -4057,6 +4286,53 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectPaddedVerifie
     ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
     ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(false, 0));
     orchestrator.clearMTPSpecVerifierInputPlan();
+}
+
+TEST(Test__MTPGraphConstruction, GPUStochasticRequestBatchScratchScalesWithConfiguredCapacity)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    const auto device = firstAvailableGraphCaptureGPU();
+    if (!device.has_value())
+        GTEST_SKIP() << "No GPU backend available for stochastic request-batch scratch regression";
+
+    TinyQwenForwardFixture fixture(*device, KVCachePrecision::FP32);
+    fixture.config.mtp.max_request_batch = 2;
+    fixture.config.mtp.draft_tokens = 3;
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        *device));
+
+    const auto &extension_buffers = orchestrator.inferenceState().extension_buffers;
+    auto shape_for = [&](BufferId id) -> const std::vector<size_t> &
+    {
+        const auto it = extension_buffers.find(id);
+        EXPECT_NE(it, extension_buffers.end()) << bufferIdName(id);
+        EXPECT_NE(it == extension_buffers.end() ? nullptr : it->second.get(), nullptr)
+            << bufferIdName(id);
+        static const std::vector<size_t> empty_shape;
+        return it == extension_buffers.end() || !it->second ? empty_shape : it->second->shape();
+    };
+
+    /*
+     * The target side needs one bonus row per request, while draft-side samples
+     * pack only compared rows.  A depth-3, two-request batch therefore uses
+     * 2 * (3 + 1) target slots and 2 * 3 draft slots.
+     */
+    EXPECT_THAT(shape_for(BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS),
+                ::testing::ElementsAre(size_t{1}, size_t{8}));
+    EXPECT_THAT(shape_for(BufferId::STOCHASTIC_DRAFT_SAMPLE_TOKENS),
+                ::testing::ElementsAre(size_t{1}, size_t{6}));
+    EXPECT_THAT(shape_for(BufferId::STOCHASTIC_DRAFT_SAMPLE_PROBS),
+                ::testing::ElementsAre(size_t{1}, size_t{6}));
+    EXPECT_THAT(shape_for(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS),
+                ::testing::ElementsAre(size_t{2}, size_t{5}));
+    EXPECT_THAT(shape_for(BufferId::STOCHASTIC_BATCH_OUTPUT_META),
+                ::testing::ElementsAre(size_t{2}, size_t{10}));
 }
 
 TEST(Test__MTPGraphConstruction, GreedyBatchTransactionExecutorRunsOnCPUVerifierGraph)

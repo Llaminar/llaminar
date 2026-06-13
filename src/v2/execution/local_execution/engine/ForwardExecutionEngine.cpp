@@ -841,7 +841,19 @@ namespace llaminar2
             }
         }
 
-        if (prefill_cache_eligible && env.execution.prefill_graph_buckets)
+        const bool bucketed_prefill_eligible =
+            prefill_cache_eligible &&
+            env.execution.prefill_graph_buckets &&
+            input.batch_size == 1;
+
+        if (prefill_cache_eligible && env.execution.prefill_graph_buckets && input.batch_size > 1)
+        {
+            LOG_DEBUG("[ForwardExecutionEngine] Skipping bucketed prefill for batched request prefill: batch_size="
+                      << input.batch_size << " seq_len=" << input.seq_len
+                      << " device=" << input.device.toString());
+        }
+
+        if (bucketed_prefill_eligible)
         {
             const bool already_bucketed_input = input.bucket_seq_len > 0;
             if (already_bucketed_input)

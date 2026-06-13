@@ -1189,6 +1189,11 @@ namespace llaminar2
                 if (mpi_ctx_->rank() == 0)
                 {
                     LOG_ERROR("Warmup decode failed");
+                    if (!last_failure_reason_.empty())
+                    {
+                        LOG_ERROR("Warmup decode failure reason: "
+                                  << last_failure_reason_);
+                    }
                 }
                 if (last_failure_reason_.empty())
                     last_failure_reason_ = "warmup decode failed";
@@ -1313,6 +1318,11 @@ namespace llaminar2
                     if (mpi_ctx_->rank() == 0)
                     {
                         LOG_ERROR("Decode failed on iteration " << (iter + 1));
+                        if (!last_failure_reason_.empty())
+                        {
+                            LOG_ERROR("Decode failure reason: "
+                                      << last_failure_reason_);
+                        }
                     }
                     if (last_failure_reason_.empty())
                         last_failure_reason_ = "decode failed on benchmark iteration";

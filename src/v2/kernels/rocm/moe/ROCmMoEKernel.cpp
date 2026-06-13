@@ -244,6 +244,16 @@ extern "C"
         int seq_len, int d_model, int num_experts,
         int device_idx, void *stream);
 
+    bool hipMoE_gate_logits_small_m_fp16_weights(
+        const float *hidden, const void *gate_weights_fp16, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool hipMoE_gate_logits_small_m_bf16_weights(
+        const float *hidden, const void *gate_weights_bf16, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
     bool hipMoE_gate_logits_single_token_kpart(
         const float *hidden, const float *gate_weights, float *logits,
         float *partials,
@@ -729,7 +739,7 @@ namespace
         int device_ordinal,
         void *stream)
     {
-        if (seq_len < 2 || seq_len > 4 || gate_type != llaminar2::TensorType::FP32)
+        if (seq_len < 2 || seq_len > 4)
             return false;
 
         if (!stream)
@@ -738,18 +748,34 @@ namespace
             return false;
         }
 
-        const auto *gate_weights_fp32 = static_cast<const float *>(gate_weights);
-        if (!hipMoE_gate_logits_small_m(
-                hidden,
-                gate_weights_fp32,
-                logits,
-                seq_len,
-                d_model,
-                num_experts,
-                device_ordinal,
-                stream))
+        bool launched = false;
+        switch (gate_type)
         {
-            LOG_ERROR("[ROCmMoEKernel::routeCore] small-M fused router kernel failed");
+        case llaminar2::TensorType::FP32:
+            launched = hipMoE_gate_logits_small_m(
+                hidden, static_cast<const float *>(gate_weights), logits,
+                seq_len, d_model, num_experts, device_ordinal, stream);
+            break;
+        case llaminar2::TensorType::FP16:
+            launched = hipMoE_gate_logits_small_m_fp16_weights(
+                hidden, gate_weights, logits,
+                seq_len, d_model, num_experts, device_ordinal, stream);
+            break;
+        case llaminar2::TensorType::BF16:
+            launched = hipMoE_gate_logits_small_m_bf16_weights(
+                hidden, gate_weights, logits,
+                seq_len, d_model, num_experts, device_ordinal, stream);
+            break;
+        default:
+            LOG_ERROR("[ROCmMoEKernel::routeCore] unsupported small-M router gate dtype "
+                      << llaminar2::tensorTypeName(gate_type));
+            return false;
+        }
+
+        if (!launched)
+        {
+            LOG_ERROR("[ROCmMoEKernel::routeCore] small-M fused router kernel failed for gate dtype "
+                      << llaminar2::tensorTypeName(gate_type));
             return false;
         }
 
@@ -1560,7 +1586,7 @@ namespace llaminar2
                 return false;
             }
         }
-        else if (seq_len >= 2 && seq_len <= 4 && gate_type == TensorType::FP32)
+        else if (seq_len >= 2 && seq_len <= 4)
         {
             void *stream = getStream();
             if (!launchSmallMGateLogits(
@@ -1583,7 +1609,8 @@ namespace llaminar2
                     PerfStatsCollector::Tags{
                         {"seq_len", std::to_string(seq_len)},
                         {"num_experts", std::to_string(num_experts)},
-                        {"top_k", std::to_string(top_k)}});
+                        {"top_k", std::to_string(top_k)},
+                        {"gate_type", tensorTypeName(gate_type)}});
             }
         }
         else if (gate_type != TensorType::FP32)

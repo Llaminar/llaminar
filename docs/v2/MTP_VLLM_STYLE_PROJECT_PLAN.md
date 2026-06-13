@@ -1775,10 +1775,9 @@ Status:
 - The request-batch intent knob is now explicit: `MTPRuntimeConfig` carries
   `max_request_batch`, CLI/YAML accept `--mtp-max-request-batch` /
   `max_request_batch`, benchmark JSON and the iteration matrix summary export
-  it, and the runner hard-fails values other than 1 until real Phase 8
-  request-batched sidecar/verifier execution is implemented. This prevents
-  accidental no-op "batched" measurements while preserving a stable gate for
-  the next slice.
+  it. Early revisions hard-failed values other than 1; the live greedy
+  SingleDevice path now treats it as capacity/intent instead of disabling
+  ordinary scalar MTP decode.
 - A shared `MTPSpecTransactionDriver` now builds a full batch transaction plan
   from accepted outcomes or greedy catch-up: metadata, commit plan,
   publication plan, and per-request `MTPSpecStepPlan` are produced in one
@@ -1939,8 +1938,8 @@ Status:
   `RuntimeConfig::fromOrchestrationConfig()` resolves effective `batch_size`
   from the larger of `--batch-size` and enabled `--mtp-max-request-batch`, and
   named-domain runners consume the resolved value instead of the raw CLI value.
-  Live decode still hard-fails `max_request_batch > 1` until the request owner
-  is wired, but graph/state capacity can no longer be silently under-sized.
+  Graph/state capacity can no longer be silently under-sized when request
+  batching is enabled.
   Focused gate: `V2_Unit_PrefixMTPConfig`.
 - Benchmark prefill/decode now has an explicit request-batched runner contract.
   `IInferenceRunner` exposes `supportsPrefillBatchForBenchmark()`,
@@ -1956,24 +1955,190 @@ Status:
   landing zones. `IOrchestrationRunner` exposes `supportsPrefillBatch()`,
   `prefillBatch()`, `supportsDecodeStepBatch()`, and `decodeStepBatch()`, and
   `InferenceRunnerAdapter` forwards those results into the benchmark contract.
-  The default remains an explicit unsupported result until `OrchestrationRunner`
-  wires the request owner, scheduler, verifier, and publication callbacks into
-  live state. Focused gate: `V2_Unit_BenchmarkRunnerCPU`.
+  The default remains an explicit unsupported result until each topology wires
+  the request owner, scheduler, verifier, and publication callbacks into live
+  state. SingleDevice greedy has started replacing that unsupported result.
+  Focused gate: `V2_Unit_BenchmarkRunnerCPU`.
 - `OrchestrationRunner::prefillBatch()` now owns the first live SingleDevice
   request-batch state boundary. It validates MTP config, prefix-cache and
   topology exclusions, MPI single-rank execution, and runner batch capacity,
   calls `forward_batch()` once for the admitted prompt rows, records per-request
   terminal-token readiness, and blocks scalar `decodeStep()` while that batched
-  live state is active. `clearCache()` releases the batched state. Batched decode
-  still hard-fails until the request owner consumes these slots through
-  `decodeStepBatch()`. Focused gate: `V2_Unit_PrefillDecodeTransition`.
+  live state is active. `clearCache()` releases the batched state. Later Phase 8
+  slices consume these slots through `decodeStepBatch()`. Focused gate:
+  `V2_Unit_PrefillDecodeTransition`.
 - `OrchestrationRunner::decodeStepBatch()` now consumes the ready terminal
   prefill logits for each live SingleDevice request slot without looping scalar
   `decodeStep()` or re-feeding request 0. The bridge validates per-request
-  sequence metadata, samples each row's terminal logits, records generated token
-  state, and then refuses further batched advancement with a hard error until
-  the request-owner sidecar/verifier/publication transaction is wired. Focused
+  sequence metadata, samples or consumes each row's terminal token, and records
+  generated token state. Later Phase 8 slices have extended this bridge into
+  the request-owner sidecar/verifier/publication transaction below. Focused
   gate: `V2_Unit_PrefillDecodeTransition`.
+- Variable-length request-batched prefill can now publish one stable
+  terminal-hidden row per request for MTP sidecar input. `DeviceGraphOrchestrator`
+  records the most recent per-request forward lengths, maps padded hidden rows
+  as `request * padded_seq_len + actual_len - 1`, and uses the existing
+  graph-native `HiddenStateRowsSelectStage` to gather those rows into
+  `PREFIX_TERMINAL_HIDDEN`. The old multi-token batched rejection test is now a
+  positive variable-length regression. Focused gates:
+  `V2_Unit_MTPGraphConstruction` and the bounded Phase 8 request-batch cluster.
+- `DeviceGraphOrchestrator` now exposes a real request-batched greedy MTP
+  sidecar draft producer through `forwardMTPBatchAndSampleGreedy()`. The graph
+  runs as `seq_len=1, batch_size=request_batch` instead of looping scalar
+  sidecars, requires per-request positions, and projects every compact
+  `MTP_HIDDEN` row into `MTP_LOGITS` by setting the MTP sidecar LM head to
+  `compute_all_positions=true`. The focused regression proves two request rows
+  produce finite hidden/logit rows and valid draft tokens; shifted-prefill
+  single-request multi-token catchup remains separately covered by exact perf
+  tags. Focused gates: `V2_Unit_MTPGraphConstruction` and the bounded Phase 8
+  unit cluster.
+- Live SingleDevice greedy request-batched continuation is now wired for
+  depths 1, 2, and 3. `decodeStepBatch()` builds per-request sidecar condition rows from
+  the already-emitted prompt-logit tokens, runs one true batched sidecar draft,
+  then batched chained sidecar drafts for deeper fixed depths, schedules an
+  owned greedy verifier batch, publishes the returned `MTPSpecStepPlanBatch`
+  atomically, advances each request's sequence length, and returns only the
+  newly committed suffix so the first token is not emitted twice. The next
+  ready bonus token is cached per request and consumed without another verifier
+  forward. `supportsDecodeStepBatch()` now advertises the same d1/d2/d3 greedy
+  capability the live path executes, and request-batch states own independent
+  sampler histories used by the stochastic continuation described below.
+  Focused gates:
+  `V2_Unit_PrefillDecodeTransition`, `V2_Unit_MTPGraphConstruction`, and the
+  bounded Phase 8 unit cluster.
+- Live SingleDevice stochastic request-batched continuation now executes the
+  bounded vLLM-style path for depth 1 through 3. It reuses the true batched
+  greedy sidecar draft producer, runs one padded target verifier forward for
+  the scheduled request batch, then reduces each request's compact stochastic
+  outcome through runner-owned device draft slots and the shared
+  `MTPSpecTransactionDriver` publication contract. Each request owns an
+  independent sampler, including the bonus-token sampler commit when the device
+  summary reports a sampled terminal token, so seeded stochastic rows keep the
+  same per-request semantics as scalar decode. Compact stochastic reduction is
+  still delegated to the single-request reducer today, but the
+  scheduler/owner/publication transaction is already batched. Focused gates:
+  `V2_Unit_PrefillDecodeTransition` and the bounded Phase 8 unit cluster
+  (`V2_Unit_PrefillDecodeTransition`, `V2_Unit_BenchmarkRunnerCPU`,
+  `V2_Unit_MTPVerifierForwardExecutor`, `V2_Unit_MTPSpecRequestBatchOwner`,
+  `V2_Unit_MTPSpecRequestBatchScheduler`, `V2_Unit_MTPSpecStateContract`,
+  `V2_Unit_MTPRejectionSampler`, and `V2_Unit_MTPGraphConstruction`).
+- Stochastic request-batch scratch now scales from the runtime MTP capacity
+  instead of the scalar four-target/three-draft shape. GPU runners allocate
+  target/bonus rows as `max(4, max_request_batch * (draft_tokens + 1))`,
+  draft sample rows as `max(3, max_request_batch * draft_tokens)`, per-request
+  reduced output rows as `[max_request_batch, output_fields]`, and matching
+  top-k partial scratch through the arena. `decodeStepBatch()` maps target and
+  bonus slots to compact verifier rows, while draft slots are packed without
+  bonus gaps. Focused regressions prove a two-request depth-two stochastic
+  batch uses target slots `0/3`, bonus slots `2/5`, and draft slots `0/2`
+  rather than clobbering slot zero, and a GPU-gated arena-shape guard proves
+  two-request depth-three scratch allocates 8 target slots, 6 draft slots, and
+  two compact output rows. The implementation still reduces stochastic
+  summaries once per request; the next slice should add a single multi-request
+  summary/reduction kernel before benchmark acceptance. Focused gate:
+  `V2_Unit_MTPGraphConstruction` and the bounded Phase 8 unit cluster.
+- Stochastic request-batch outcome handoff is now atomic at the runner
+  contract. `DeviceStochasticBatchOutcomeRequest` value-owns thresholds,
+  stop tokens, slot coordinates, bonus rows, and vLLM rejection RNG metadata;
+  `decodeStepBatch()` builds/stages every scheduled request first, then calls
+  `verifyStochasticDistributionsRequestBatchOutcomesOnDevice()` once. The
+  mock regression proves one runner-level outcome call for a two-request
+  depth-two batch while retaining target slots `0/3`, bonus slots `2/5`, and
+  draft slots `0/2`. The default runner implementation delegates to the
+  existing single-request reducer, while GPU runners can override the same
+  contract with compact batched output rows. Focused gate: bounded Phase 8
+  unit cluster.
+- `DeviceGraphOrchestrator` now overrides that request-batch handoff with a
+  compact GPU path. It consumes the pending verifier stream once, enqueues each
+  request's verifier, bonus sampler, and existing summary reducer into a
+  distinct `[request, fields]` arena row, then performs one compact D2H copy
+  for all request outcomes. This removes the repeated per-request stream drain
+  while preserving the proven CUDA/ROCm summary kernels; a fused backend
+  multi-request summary launch is now a benchmark-driven follow-up rather than
+  a correctness prerequisite. Focused gate: bounded Phase 8 unit cluster.
+- Request-batched GPU prefill and verifier metadata now share the compact row
+  upload machinery without confusing their state machines. GPU prefill records
+  direct terminal graph rows for compact request-batch sampling, while MTP
+  verifier forwards keep using the explicit logical verifier-row plan. This
+  fixed the CUDA MoE stochastic RB=2 smoke failure where a prefill row-indexed
+  graph tried to consume a nonexistent MTP row plan. Focused gates:
+  `V2_Unit_MTPSpecDecodeMetadata`,
+  `V2_Unit_PrefillDecodeTransition`, and the bounded Phase 8 unit cluster.
+- Request-batched stochastic verifier forward now distinguishes ordinary
+  request-batched prefill from all-position verifier continuation before
+  setting compact terminal-logit row metadata. This avoids the old hard failure
+  when `forward_batch()` was called under `compute_all_position_logits=true`
+  for the verifier. Focused gate: bounded Phase 8 unit cluster.
+- Qwen3.5/Qwen3.6 GDN and short-conv state-capture rows now scale through
+  `resolveMTPMaxTargetQueryRows(config.mtp)` instead of `draft_tokens + 1`.
+  Multi-request verifier graphs therefore declare enough recurrence capture
+  rows for flattened request batches such as RB=2/d1 and RB=2/d3. Focused
+  gate: `V2_Unit_MTPGraphConstruction`.
+- Mixed stochastic request batches now stay lockstep when one lane accepts all
+  drafts and another rejects. The all-accepted lane emits its bonus-ready token
+  inline but does not publish bonus recurrent/KV state; the next verifier step
+  consumes that token as the condition from the accepted-prefix state, matching
+  the existing deferred-ready contract without leaving half the batch in
+  terminal-prefill sampling. Regression:
+  `RequestBatchedStochasticMixedReadyAndRejectStaysLockstep`.
+- The first real CUDA MoE stochastic request-batched benchmark smoke is green:
+  `llaminar2 benchmark -m Qwen3.6-35B-A3B-UD-IQ3_S.gguf -d cuda:0
+  --n-predict 16 --seed 123 --mtp --mtp-draft-tokens 1
+  --mtp-depth-policy fixed --mtp-verify-mode speculative-sampling
+  --mtp-max-request-batch 2 -c 4096` completed with 74.38 tok/s decode,
+  14 accepted tokens, 76 rejected tokens, 90 verifier runs, and zero rollbacks.
+  This proves the functional Phase 8 path for CUDA RB=2 stochastic; acceptance
+  remains open until CUDA/ROCm request-batch matrices show MoE stochastic
+  speedup against same-run scalar baselines.
+- ROCm MoE request-batched stochastic now reaches the same functional point.
+  Root cause of the previous warmup failure was a backend route gap: MTP
+  request batching enters the small-M verifier router with BF16 gate weights,
+  but ROCm's small-M route only accepted FP32. `ROCmMoEKernel` now dispatches
+  small-M router rows for FP32, FP16, and BF16 through explicit-stream HIP
+  wrappers. Regressions
+  `SmallMBF16GateLogits_ModelShapeMatchesSingleTokenLaunches` and
+  `SmallMBF16FusedRouter_VerifierShapeRunsWithTensorGate` prove BF16 small-M
+  logits match the existing scalar BF16 path and that `routeWithTensors()` uses
+  the dtype-aware small-M path. Focused `V2_Integration_ROCmMoEKernel` passes.
+  The real ROCm smoke
+  `llaminar2 benchmark -m Qwen3.6-35B-A3B-UD-IQ3_S.gguf -d rocm:0
+  --n-predict 16 --seed 123 --mtp --mtp-draft-tokens 1
+  --mtp-depth-policy fixed --mtp-verify-mode speculative-sampling
+  --mtp-max-request-batch 2 -c 4096` completed with 49.53 tok/s decode,
+  9 accepted tokens, 81 rejected tokens, 90 verifier runs, and zero rollbacks.
+  That makes RB=2 stochastic functionally green on CUDA and ROCm, but Phase 8
+  remains performance-red: both backends are slower than scalar/no-MTP
+  baselines, and RB=2 acceptance is much lower than the scalar seeded lane.
+- Request-batched stochastic terminal-prefill sampling now uses the same
+  vLLM-style logical-position threshold contract as scalar MTP. The old GPU
+  path sampled compact prefill rows through the backend RNG counter, so
+  CUDA MoE RB=2 could choose a different first token than scalar MTP even when
+  row logits were identical. `OrchestrationRunner::decodeStepBatch()` now
+  computes per-request thresholds from each request sampler and logical
+  position, and `DeviceGraphOrchestrator::sampleMainLogitsBatchRowsOnDevice()`
+  builds compact top-k/top-p rows before sampling on the explicit GPU stream.
+  Regression `RequestBatchedStochasticGpuPrefillUsesPositionKeyedThresholds`
+  covers the handoff. Fresh evidence in
+  `benchmark_results/mtp_vllm_style/20260613T_phase8_rb2_stochastic_prefill_fix/`
+  shows scalar CUDA MoE stochastic `-n1` and RB=2 `-n1` both generate token
+  `[271]`. CUDA/RB=2 and ROCm/RB=2 MoE stochastic `-n16` both pass with
+  12 accepted, 78 rejected, and zero rollbacks at 75.90/52.12 tok/s. Same-run
+  scalar d1 is 88.18/56.47 tok/s and no-MTP is 115.32/69.79 tok/s, so the
+  remaining Phase 8 blocker is batching policy/transaction economics, not
+  prefill-row stochastic correctness.
+- Request-batched RoPE metadata is now graph-capture safe on CUDA and ROCm.
+  `RoPEStage` owns its kernel instance because stream/workspace/dynamic-position
+  validity is graph-node local, and `prepareGraphLaunch()` uploads either the
+  scalar pos-offset buffer or explicit position-row buffer before capture/replay.
+  CUDA/ROCm kernels now honor explicit position IDs as row-buffer data even when
+  the current values are numerically contiguous, preventing accidental fallback
+  to stale scalar metadata. Regression
+  `V2_Integration_(CUDA|ROCm)RoPEGraphCaptureNoH2D` covers scalar and explicit
+  row replay. The real ROCm Qwen3.6 MoE RB=2 greedy smoke
+  `llaminar2 benchmark -m Qwen3.6-35B-A3B-UD-IQ3_S.gguf -d rocm:0
+  --mtp --mtp-draft-tokens 1 --mtp-max-request-batch 2 --mtp-verify-mode
+  greedy -t 0 --n-predict 16` completed without `MTP0_rope` segmented-capture
+  fallback at 69.29 tok/s, 13 accepted, 75 rejected, and zero rollbacks.
 
 Exit gate:
 
@@ -1982,6 +2147,19 @@ Exit gate:
 - MoE bounded matrix is speed-positive for greedy and stochastic or has a
   measured route/acceptance bottleneck.
 - No MoE path uses dense-only fallbacks.
+
+Closure status:
+
+- Feature/correctness gate closed on 2026-06-13 for SingleDevice
+  CPU/CUDA/ROCm dense and MoE. Request-batched stochastic MoE is now covered
+  by the shared vLLM-style transaction path and by CUDA/ROCm real-model RB=2
+  smokes with zero rollbacks.
+- Performance gate remains red and moves to the tuning dashboard: MoE
+  stochastic request batching currently lowers acceptance versus scalar on
+  the default prompt, and scalar MoE stochastic is still slower than no-MTP.
+  Future work should tune batching policy, verifier/condition transaction
+  amortization, and MoE stochastic economics without changing the Phase 8
+  correctness contract.
 
 ### Phase 9: Multi-Device Promotion
 
@@ -2125,6 +2303,19 @@ Exit gate:
 - Multi-device MTP never lets one participant publish a longer prefix than the
   common accepted count.
 
+Closure status:
+
+- Feature/correctness gate closed on 2026-06-13 for the recorded Phase 9
+  topology set. Dense LocalTP, LocalPP, and NodeLocalTP parity suites are
+  present and previously recorded green; ExpertOverlay MoE parity is recorded
+  green for ROCm2TP-hot plus CPU2LocalTP-cold. The focused Phase 9 unit guard
+  `V2_Unit_(RankOrchestrator|MTPIterationBenchmarkMatrix|MTPSpecStateContract|PrefillDecodeTransition)`
+  passed after rebuilding the interface-dependent multi-device test binary.
+- Performance/tuning remains dashboard-owned. ROCm dense LocalTP/LocalPP
+  lanes are already speed-positive, while NodeLocalTP and ExpertOverlay
+  benchmark presets still need refreshed same-run matrices before any rollout
+  claim.
+
 ### Phase 10: Default-Enablement Evidence
 
 Goal: decide rollout from measured correctness and speed, not optimism.
@@ -2144,6 +2335,16 @@ Exit gate:
 - Dense and MoE have separate acceptance records for greedy and stochastic.
 - Any default enablement proposal names the exact backend/model/sampling lanes
   that passed parity and benchmark gates.
+
+Current status:
+
+- Phase 10 remains open as the active performance/default-readiness phase.
+  Dense CUDA/ROCm SingleDevice and ROCm dense LocalTP/LocalPP have speed-positive
+  evidence, but MoE stochastic on CUDA/ROCm and MoE CPU lanes remain red or
+  amber in the dashboard.
+- No default-enable proposal is allowed until the active dashboard matrix has
+  same-run parity and benchmark evidence for the exact backend/model/sampling
+  lanes under consideration.
 
 ## Iteration Gates
 

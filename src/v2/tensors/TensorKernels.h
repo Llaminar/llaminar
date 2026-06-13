@@ -2466,6 +2466,26 @@ namespace llaminar2
         {
             (void)pos_offset;
         }
+
+        /**
+         * @brief Pre-upload explicit position IDs for graph replay.
+         *
+         * Request-batched speculative sidecars can have rows such as `[N, N]`
+         * because each row belongs to a different logical request.  Those rows
+         * cannot use the contiguous `pos_offset + row` device-param path.  GPU
+         * implementations should copy the host position IDs into their
+         * workspace-owned position buffer on the already-bound explicit stream
+         * before graph capture/replay starts.  Captured RoPE execution must
+         * launch kernels only; it must not record host-to-device copies.
+         *
+         * @param position_ids Host position IDs for the next replay.
+         * @param seq_len Number of valid entries in `position_ids`.
+         */
+        virtual void setDynamicPositionIds(const int *position_ids, int seq_len)
+        {
+            (void)position_ids;
+            (void)seq_len;
+        }
     };
 
     /**

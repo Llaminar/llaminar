@@ -50,6 +50,37 @@ namespace llaminar2
     {
     }
 
+    ITensorRoPE *RoPEStage::getOrCreateStageKernel(TensorBase *Q_base)
+    {
+        if (!Q_base)
+            return nullptr;
+
+        const int tensor_type = static_cast<int>(Q_base->native_type());
+        if (!owned_kernel_ || cached_kernel_tensor_type_ != tensor_type)
+        {
+            try
+            {
+                owned_kernel_ = llaminar::v2::kernels::KernelFactory::createRoPE(
+                    Q_base,
+                    llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id),
+                    params_.device_id.ordinal);
+                cached_kernel_ = owned_kernel_.get();
+                cached_kernel_tensor_type_ = tensor_type;
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[RoPEStage] Failed to create stage-owned RoPE kernel for type "
+                          << Q_base->dtype_name() << ": " << e.what());
+                owned_kernel_.reset();
+                cached_kernel_ = nullptr;
+                cached_kernel_tensor_type_ = -1;
+                return nullptr;
+            }
+        }
+
+        return cached_kernel_;
+    }
+
     bool RoPEStage::execute(IDeviceContext *ctx)
     {
         if (!ensureContext(ctx, "RoPEStage"))
@@ -118,15 +149,9 @@ namespace llaminar2
         const int rotary_dim = static_cast<int>(
             static_cast<float>(params_.head_dim) * params_.partial_rotary_factor);
 
-        // Get or create device-scoped cached kernel via KernelFactory
-        auto *kernel = getOrRefreshKernelByTensorType(
-            cached_kernel_,
-            cached_kernel_tensor_type_,
-            Q_base,
-            [&]()
-            {
-                return llaminar::v2::kernels::KernelFactory::getOrCreateRoPE(Q_base, params_.device_id);
-            });
+        // Get or create the stage-owned kernel so graph-capture metadata is
+        // scoped to this RoPE stage instead of shared across graph nodes.
+        auto *kernel = getOrCreateStageKernel(Q_base);
 
         if (!kernel)
         {
@@ -163,9 +188,12 @@ namespace llaminar2
             // host pointer. Contiguous GPU positions intentionally stay null.
             if (seq_len > 0)
             {
-                position_ids_cache_.resize(static_cast<size_t>(seq_len));
-                std::memcpy(position_ids_cache_.data(), position_ids_ptr,
-                            static_cast<size_t>(seq_len) * sizeof(int));
+                if (position_ids_ptr != position_ids_cache_.data())
+                {
+                    position_ids_cache_.resize(static_cast<size_t>(seq_len));
+                    std::memcpy(position_ids_cache_.data(), position_ids_ptr,
+                                static_cast<size_t>(seq_len) * sizeof(int));
+                }
                 position_ids_ptr = position_ids_cache_.data();
             }
         }
@@ -403,6 +431,55 @@ namespace llaminar2
         }
     }
 
+    bool RoPEStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
+    {
+        (void)ctx;
+        if (!params_.device_id.is_gpu())
+            return true;
+        if (!stream)
+        {
+            LOG_ERROR("[RoPEStage] GPU graph launch preparation requires an explicit non-null stream");
+            return false;
+        }
+        if (!params_.Q)
+        {
+            LOG_ERROR("[RoPEStage] Cannot prepare graph launch without Q tensor");
+            return false;
+        }
+
+        auto *Q_base = requireTensorBasePtr(params_.Q, "Q");
+        if (!Q_base)
+            return false;
+
+        auto *kernel = getOrCreateStageKernel(Q_base);
+        if (!kernel)
+        {
+            LOG_ERROR("[RoPEStage] Failed to prepare RoPE kernel before graph launch");
+            return false;
+        }
+
+        /*
+         * Graph capture must record only RoPE compute kernels.  Position
+         * metadata is mutable between launches, so upload it to the
+         * workspace-owned device buffer on the exact stream the capture
+         * controller is about to use.  This hook also runs before graph replay,
+         * keeping scalar contiguous positions and explicit request-batch
+         * position rows fresh without rebuilding the graph.
+         */
+        setGPUStream(stream);
+        kernel->setGPUStream(stream);
+        if (params_.position_ids && params_.seq_len > 0)
+        {
+            kernel->setDynamicPositionIds(params_.position_ids, params_.seq_len);
+        }
+        else
+        {
+            kernel->setDynamicPosOffset(params_.pos_offset);
+        }
+
+        return true;
+    }
+
     StageDumpInfo RoPEStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
@@ -594,14 +671,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        auto *kernel = getOrRefreshKernelByTensorType(
-            cached_kernel_,
-            cached_kernel_tensor_type_,
-            Q_base,
-            [&]()
-            {
-                return llaminar::v2::kernels::KernelFactory::getOrCreateRoPE(Q_base, params_.device_id);
-            });
+        auto *kernel = getOrCreateStageKernel(Q_base);
 
         if (!kernel)
         {

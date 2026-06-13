@@ -298,6 +298,63 @@ namespace
         device_valid = true;
         return true;
     }
+
+    bool uploadCudaRoPEPositionIds(
+        llaminar2::DeviceWorkspaceManager *workspace,
+        const int *position_ids,
+        int seq_len,
+        cudaStream_t stream,
+        bool &device_valid,
+        int &device_seq_len,
+        const char *context)
+    {
+        device_valid = false;
+        device_seq_len = 0;
+
+        if (!position_ids || seq_len <= 0)
+        {
+            LOG_ERROR("[" << context << "] Cannot upload empty RoPE position_ids");
+            return false;
+        }
+        if (!stream)
+        {
+            LOG_ERROR("[" << context << "] Cannot upload RoPE position_ids on a null/default CUDA stream");
+            return false;
+        }
+        if (!workspace)
+        {
+            LOG_ERROR("[" << context << "] Cannot upload RoPE position_ids without a bound workspace");
+            return false;
+        }
+        if (isCudaStreamCapturing(stream, context))
+        {
+            LOG_ERROR("[" << context << "] Refusing to record RoPE position_ids H2D inside CUDA graph capture");
+            return false;
+        }
+
+        auto *d_position_ids = workspace->getBuffer(llaminar2::RoPEWorkspaceBuffers::POSITION_IDS);
+        if (!d_position_ids)
+        {
+            LOG_ERROR("[" << context << "] Missing workspace buffer "
+                          << llaminar2::RoPEWorkspaceBuffers::POSITION_IDS);
+            return false;
+        }
+
+        const size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
+        const cudaError_t copy_err =
+            cudaMemcpyAsync(d_position_ids, position_ids, pos_bytes,
+                            cudaMemcpyHostToDevice, stream);
+        if (copy_err != cudaSuccess)
+        {
+            LOG_ERROR("[" << context << "] cudaMemcpyAsync failed for RoPE position_ids: "
+                          << cudaGetErrorString(copy_err));
+            return false;
+        }
+
+        device_seq_len = seq_len;
+        device_valid = true;
+        return true;
+    }
 } // namespace
 
 namespace llaminar2
@@ -752,6 +809,16 @@ namespace llaminar2
             }
         }
 
+        void CUDARoPEKernelT<ActivationPrecision::FP32>::setDynamicPositionIds(
+            const int *position_ids,
+            int seq_len)
+        {
+            uploadCudaRoPEPositionIds(
+                workspace_, position_ids, seq_len, static_cast<cudaStream_t>(gpu_stream_),
+                dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                "CUDARoPEKernelT<FP32>");
+        }
+
         bool CUDARoPEKernelT<ActivationPrecision::FP32>::apply_typed(
             float *Q,
             float *K,
@@ -819,7 +886,9 @@ namespace llaminar2
 
             {
                 bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
-                if (!is_contiguous && position_ids)
+                // Explicit graph rows are mutable workspace data.  Keep them
+                // on the row-buffer path even if today's values are contiguous.
+                if (!force_device_positions && !is_contiguous && position_ids)
                 {
                     is_contiguous = true;
                     for (int i = 0; i < seq_len; ++i)
@@ -879,19 +948,23 @@ namespace llaminar2
                 return false;
             }
 
-            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
-            if (isGraphCaptureActive())
+            if (!dynamic_position_ids_device_valid_ ||
+                dynamic_position_ids_seq_len_ < seq_len)
             {
-                LOG_ERROR("[CUDARoPEKernelT<FP32>] Refusing to record position_ids H2D inside CUDA graph capture");
-                return false;
-            }
-            cudaError_t copy_err = cudaMemcpyAsync(d_position_ids, position_ids, pos_bytes,
-                                                   cudaMemcpyHostToDevice, stream);
-            if (copy_err != cudaSuccess)
-            {
-                LOG_ERROR("[CUDARoPEKernelT<FP32>] Failed to copy position_ids to GPU: "
-                          << cudaGetErrorString(copy_err));
-                return false;
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[CUDARoPEKernelT<FP32>] RoPE position_ids were not ready before CUDA graph capture"
+                              << " requested_seq_len=" << seq_len
+                              << " prepared_seq_len=" << dynamic_position_ids_seq_len_
+                              << " device_valid=" << dynamic_position_ids_device_valid_);
+                    return false;
+                }
+                uploadCudaRoPEPositionIds(
+                    workspace_, position_ids, seq_len, stream,
+                    dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                    "CUDARoPEKernelT<FP32>");
+                if (!dynamic_position_ids_device_valid_)
+                    return false;
             }
 
             bool ok = cudaOps_rope_fp32_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
@@ -928,6 +1001,16 @@ namespace llaminar2
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
                     "CUDARoPEKernelT<BF16>");
             }
+        }
+
+        void CUDARoPEKernelT<ActivationPrecision::BF16>::setDynamicPositionIds(
+            const int *position_ids,
+            int seq_len)
+        {
+            uploadCudaRoPEPositionIds(
+                workspace_, position_ids, seq_len, static_cast<cudaStream_t>(gpu_stream_),
+                dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                "CUDARoPEKernelT<BF16>");
         }
 
         bool CUDARoPEKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -992,7 +1075,9 @@ namespace llaminar2
 
             {
                 bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
-                if (!is_contiguous && position_ids)
+                // Explicit graph rows are mutable workspace data.  Keep them
+                // on the row-buffer path even if today's values are contiguous.
+                if (!force_device_positions && !is_contiguous && position_ids)
                 {
                     is_contiguous = true;
                     for (int i = 0; i < seq_len; ++i)
@@ -1050,19 +1135,23 @@ namespace llaminar2
                 return false;
             }
 
-            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
-            if (isGraphCaptureActive())
+            if (!dynamic_position_ids_device_valid_ ||
+                dynamic_position_ids_seq_len_ < seq_len)
             {
-                LOG_ERROR("[CUDARoPEKernelT<BF16>] Refusing to record position_ids H2D inside CUDA graph capture");
-                return false;
-            }
-            cudaError_t copy_err = cudaMemcpyAsync(d_position_ids, position_ids, pos_bytes,
-                                                   cudaMemcpyHostToDevice, stream);
-            if (copy_err != cudaSuccess)
-            {
-                LOG_ERROR("[CUDARoPEKernelT<BF16>] Failed to copy position_ids to GPU: "
-                          << cudaGetErrorString(copy_err));
-                return false;
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[CUDARoPEKernelT<BF16>] RoPE position_ids were not ready before CUDA graph capture"
+                              << " requested_seq_len=" << seq_len
+                              << " prepared_seq_len=" << dynamic_position_ids_seq_len_
+                              << " device_valid=" << dynamic_position_ids_device_valid_);
+                    return false;
+                }
+                uploadCudaRoPEPositionIds(
+                    workspace_, position_ids, seq_len, stream,
+                    dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                    "CUDARoPEKernelT<BF16>");
+                if (!dynamic_position_ids_device_valid_)
+                    return false;
             }
 
             bool ok = cudaOps_rope_bf16_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
@@ -1099,6 +1188,16 @@ namespace llaminar2
                     dynamic_pos_device_valid_, dynamic_pos_offset_, pos_offset,
                     "CUDARoPEKernelT<FP16>");
             }
+        }
+
+        void CUDARoPEKernelT<ActivationPrecision::FP16>::setDynamicPositionIds(
+            const int *position_ids,
+            int seq_len)
+        {
+            uploadCudaRoPEPositionIds(
+                workspace_, position_ids, seq_len, static_cast<cudaStream_t>(gpu_stream_),
+                dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                "CUDARoPEKernelT<FP16>");
         }
 
         bool CUDARoPEKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -1163,7 +1262,9 @@ namespace llaminar2
 
             {
                 bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
-                if (!is_contiguous && position_ids)
+                // Explicit graph rows are mutable workspace data.  Keep them
+                // on the row-buffer path even if today's values are contiguous.
+                if (!force_device_positions && !is_contiguous && position_ids)
                 {
                     is_contiguous = true;
                     for (int i = 0; i < seq_len; ++i)
@@ -1221,19 +1322,23 @@ namespace llaminar2
                 return false;
             }
 
-            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
-            if (isGraphCaptureActive())
+            if (!dynamic_position_ids_device_valid_ ||
+                dynamic_position_ids_seq_len_ < seq_len)
             {
-                LOG_ERROR("[CUDARoPEKernelT<FP16>] Refusing to record position_ids H2D inside CUDA graph capture");
-                return false;
-            }
-            cudaError_t copy_err = cudaMemcpyAsync(d_position_ids, position_ids, pos_bytes,
-                                                   cudaMemcpyHostToDevice, stream);
-            if (copy_err != cudaSuccess)
-            {
-                LOG_ERROR("[CUDARoPEKernelT<FP16>] Failed to copy position_ids to GPU: "
-                          << cudaGetErrorString(copy_err));
-                return false;
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[CUDARoPEKernelT<FP16>] RoPE position_ids were not ready before CUDA graph capture"
+                              << " requested_seq_len=" << seq_len
+                              << " prepared_seq_len=" << dynamic_position_ids_seq_len_
+                              << " device_valid=" << dynamic_position_ids_device_valid_);
+                    return false;
+                }
+                uploadCudaRoPEPositionIds(
+                    workspace_, position_ids, seq_len, stream,
+                    dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
+                    "CUDARoPEKernelT<FP16>");
+                if (!dynamic_position_ids_device_valid_)
+                    return false;
             }
 
             bool ok = cudaOps_rope_fp16_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
