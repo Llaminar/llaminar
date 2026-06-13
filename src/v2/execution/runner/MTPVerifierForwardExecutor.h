@@ -183,4 +183,73 @@ namespace llaminar2
         MTPGreedyVerifierBatchPublicationFn publish,
         MTPVerifierForwardExecutionOptions forward_options = {});
 
+    /**
+     * @brief Result of reducing a scheduled stochastic verifier batch.
+     *
+     * GPU stochastic verifier kernels should return compact device outcomes,
+     * not host-visible logits. This object records the publication-ready
+     * transaction plan produced from those compact outcomes.
+     */
+    struct MTPDeviceOutcomeBatchTransactionResult
+    {
+        bool ok = false;
+        std::string error;
+
+        MTPSpecRequestBatch scheduled_batch;
+        std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes;
+        MTPSpecTransactionBatchPlan transaction_plan;
+    };
+
+    /**
+     * @brief Build a transaction plan from a scheduled stochastic outcome batch.
+     */
+    MTPDeviceOutcomeBatchTransactionResult executeMTPDeviceOutcomeScheduledBatchTransaction(
+        const MTPSpecRequestBatch &scheduled_batch,
+        std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes);
+
+    /**
+     * @brief Callback that produces compact stochastic verifier outcomes.
+     *
+     * The producer is called only after the owner has reserved a concrete
+     * scheduled batch, letting backend code execute a graph for exactly those
+     * requests and write one compact outcome per admitted request.
+     */
+    using MTPDeviceOutcomeBatchProducerFn =
+        std::function<bool(const MTPSpecRequestBatch &,
+                           std::vector<MTPDeviceRejectionBatchOutcome> *,
+                           std::string *)>;
+
+    /**
+     * @brief Result of owned stochastic outcome publication.
+     */
+    struct MTPOwnedDeviceOutcomeBatchTransactionResult
+    {
+        bool ok = false;
+        std::string error;
+
+        MTPSpecRequestBatch scheduled_batch;
+        std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes;
+        MTPSpecTransactionBatchPlan transaction_plan;
+        bool produced = false;
+        bool published = false;
+        bool committed = false;
+        bool released = false;
+    };
+
+    /**
+     * @brief Schedule, produce, publish, and commit one stochastic batch.
+     *
+     * This mirrors the greedy publication-aware helper but leaves verifier
+     * execution to a producer callback. That matches the vLLM-style GPU path:
+     * graph-captured device work reduces stochastic rows into compact outcomes,
+     * then shared host code validates the outcomes before live-state
+     * publication and request ownership commit.
+     */
+    MTPOwnedDeviceOutcomeBatchTransactionResult
+    executeOwnedMTPDeviceOutcomeScheduledBatchTransactionAndPublish(
+        MTPSpecRequestBatchOwner &owner,
+        const MTPSpecRequestBatchScheduler &scheduler,
+        MTPDeviceOutcomeBatchProducerFn produce,
+        MTPGreedyVerifierBatchPublicationFn publish);
+
 } // namespace llaminar2

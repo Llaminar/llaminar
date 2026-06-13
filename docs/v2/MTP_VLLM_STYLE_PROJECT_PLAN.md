@@ -1925,6 +1925,16 @@ Status:
   benchmark/server batch lane can use scheduler output without reimplementing
   ownership cleanup or committing before live-state publication. Focused gate:
   `V2_Unit_MTPVerifierForwardExecutor`.
+- Owned stochastic request-batched publication now has the matching
+  device-outcome coordinator. The owner reserves an admitted stochastic batch,
+  a producer callback returns compact `MTPDeviceRejectionBatchOutcome` rows for
+  exactly that batch, shared transaction planning validates accepted counts and
+  publication slots, and the owner commits only after the caller's
+  accepted-state publisher succeeds. Producer, planning, or publication failure
+  releases the reservation unchanged. Focused gates:
+  `V2_Unit_MTPVerifierForwardExecutor`, `V2_Unit_MTPSpecRequestBatchOwner`,
+  `V2_Unit_MTPSpecRequestBatchScheduler`, `V2_Unit_MTPSpecStateContract`, and
+  `V2_Unit_MTPRejectionSampler`.
 - Request-batch intent now reserves runner capacity before runner construction.
   `RuntimeConfig::fromOrchestrationConfig()` resolves effective `batch_size`
   from the larger of `--batch-size` and enabled `--mtp-max-request-batch`, and

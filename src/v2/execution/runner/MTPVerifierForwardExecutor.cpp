@@ -442,4 +442,175 @@ namespace llaminar2
         return result;
     }
 
+    MTPDeviceOutcomeBatchTransactionResult executeMTPDeviceOutcomeScheduledBatchTransaction(
+        const MTPSpecRequestBatch &scheduled_batch,
+        std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes)
+    {
+        MTPDeviceOutcomeBatchTransactionResult result;
+        result.scheduled_batch = scheduled_batch;
+        result.device_outcomes = std::move(device_outcomes);
+
+        auto fail = [&](std::string error) -> MTPDeviceOutcomeBatchTransactionResult
+        {
+            result.ok = false;
+            result.error = std::move(error);
+            return result;
+        };
+
+        if (!scheduled_batch.ok)
+        {
+            return fail(
+                std::string("cannot execute invalid scheduled MTP outcome batch: ") +
+                scheduled_batch.error);
+        }
+        if (scheduled_batch.mode != MTPSpecRequestBatchMode::STOCHASTIC)
+            return fail("scheduled MTP outcome batch is not stochastic");
+        if (scheduled_batch.request_count <= 0)
+            return fail("scheduled MTP outcome batch has no admitted requests");
+
+        const size_t request_count =
+            static_cast<size_t>(scheduled_batch.request_count);
+        if (scheduled_batch.request_ids.size() != request_count ||
+            scheduled_batch.greedy_requests.size() != request_count ||
+            scheduled_batch.base_cached_tokens.size() != request_count)
+        {
+            return fail("scheduled MTP outcome batch vectors do not match request_count");
+        }
+        if (result.device_outcomes.size() != request_count)
+            return fail("scheduled MTP outcome batch result vector mismatch");
+
+        result.transaction_plan =
+            buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+                scheduled_batch.shape,
+                scheduled_batch.request_ids,
+                scheduled_batch.vocab_size,
+                scheduled_batch.greedy_requests,
+                result.device_outcomes,
+                scheduled_batch.base_cached_tokens);
+        if (!result.transaction_plan.ok)
+        {
+            return fail(
+                std::string("scheduled MTP outcome transaction plan failed: ") +
+                result.transaction_plan.error);
+        }
+
+        result.ok = true;
+        return result;
+    }
+
+    MTPOwnedDeviceOutcomeBatchTransactionResult
+    executeOwnedMTPDeviceOutcomeScheduledBatchTransactionAndPublish(
+        MTPSpecRequestBatchOwner &owner,
+        const MTPSpecRequestBatchScheduler &scheduler,
+        MTPDeviceOutcomeBatchProducerFn produce,
+        MTPGreedyVerifierBatchPublicationFn publish)
+    {
+        MTPOwnedDeviceOutcomeBatchTransactionResult result;
+
+        if (!produce)
+        {
+            result.ok = false;
+            result.error =
+                "owned MTP outcome producer callback is required";
+            return result;
+        }
+        if (!publish)
+        {
+            result.ok = false;
+            result.error =
+                "owned MTP outcome publication callback is required";
+            return result;
+        }
+
+        result.scheduled_batch = owner.scheduleNextBatch(scheduler);
+        if (!result.scheduled_batch.ok)
+        {
+            result.ok = false;
+            result.error =
+                std::string("owned MTP outcome scheduling failed: ") +
+                result.scheduled_batch.error;
+            return result;
+        }
+
+        std::string produce_error;
+        result.produced =
+            produce(result.scheduled_batch,
+                    &result.device_outcomes,
+                    &produce_error);
+        if (!result.produced)
+        {
+            std::string release_error;
+            result.released = owner.releaseInFlightBatch(&release_error);
+            result.ok = false;
+            result.error = "owned MTP outcome production failed";
+            if (!produce_error.empty())
+            {
+                result.error += ": ";
+                result.error += produce_error;
+            }
+            if (!result.released)
+            {
+                result.error += "; release failed: ";
+                result.error += release_error;
+            }
+            return result;
+        }
+
+        MTPDeviceOutcomeBatchTransactionResult planned =
+            executeMTPDeviceOutcomeScheduledBatchTransaction(
+                result.scheduled_batch,
+                result.device_outcomes);
+        result.transaction_plan = planned.transaction_plan;
+        if (!planned.ok)
+        {
+            std::string release_error;
+            result.released = owner.releaseInFlightBatch(&release_error);
+            result.ok = false;
+            result.error =
+                std::string("owned MTP outcome transaction failed: ") +
+                planned.error;
+            if (!result.released)
+            {
+                result.error += "; release failed: ";
+                result.error += release_error;
+            }
+            return result;
+        }
+
+        std::string publish_error;
+        result.published = publish(result.transaction_plan, &publish_error);
+        if (!result.published)
+        {
+            std::string release_error;
+            result.released = owner.releaseInFlightBatch(&release_error);
+            result.ok = false;
+            result.error = "owned MTP outcome publication failed";
+            if (!publish_error.empty())
+            {
+                result.error += ": ";
+                result.error += publish_error;
+            }
+            if (!result.released)
+            {
+                result.error += "; release failed: ";
+                result.error += release_error;
+            }
+            return result;
+        }
+
+        std::string commit_error;
+        result.committed = owner.commitInFlightBatch(&commit_error);
+        if (!result.committed)
+        {
+            result.ok = false;
+            result.error =
+                std::string("owned MTP outcome publication succeeded but commit failed: ") +
+                commit_error;
+            return result;
+        }
+
+        result.ok = true;
+        return result;
+    }
+
 } // namespace llaminar2

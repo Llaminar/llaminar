@@ -199,6 +199,39 @@ namespace
         }
         return buildMTPSpecDecodeVerifierInputPlan(shape, requests);
     }
+
+    MTPDeviceRejectionBatchOutcome makeDeviceAcceptAllOutcome()
+    {
+        MTPDeviceRejectionBatchOutcome outcome;
+        outcome.ok = true;
+        outcome.output_tokens[0] = 7;
+        outcome.output_tokens[1] = 9;
+        outcome.output_tokens[2] = 8;
+        outcome.output_token_count = 3;
+        outcome.accepted_speculative_prefix = 2;
+        outcome.target_verifier_state_commit_count = 3;
+        outcome.ready_token = 4;
+        outcome.all_speculative_accepted = true;
+        outcome.consumed_verifier_rows = 2;
+        outcome.sampled_terminal = true;
+        return outcome;
+    }
+
+    MTPDeviceRejectionBatchOutcome makeDeviceRejectAfterFirstOutcome()
+    {
+        MTPDeviceRejectionBatchOutcome outcome;
+        outcome.ok = true;
+        outcome.output_tokens[0] = 11;
+        outcome.output_tokens[1] = 77;
+        outcome.output_token_count = 2;
+        outcome.accepted_speculative_prefix = 0;
+        outcome.target_verifier_state_commit_count = 1;
+        outcome.ready_token = -1;
+        outcome.rejected_verified_token = 77;
+        outcome.all_speculative_accepted = false;
+        outcome.consumed_verifier_rows = 1;
+        return outcome;
+    }
 } // namespace
 
 TEST(Test__MTPVerifierForwardExecutor, SingleRequestUsesHostForward)
@@ -614,6 +647,71 @@ TEST(Test__MTPVerifierForwardExecutor, ScheduledTransactionRejectsNonGreedyBatch
     EXPECT_EQ(runner.batch_forward_count, 0);
 }
 
+TEST(Test__MTPVerifierForwardExecutor, ScheduledDeviceOutcomeBatchBuildsTransactionPlan)
+{
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/3,
+            MTPSpecRequestBatchMode::STOCHASTIC});
+
+    MTPSpecSchedulableRequest first;
+    first.request_id = 10;
+    first.mode = MTPSpecRequestBatchMode::STOCHASTIC;
+    first.compatibility_key = "qwen36-moe-cuda0";
+    first.vocab_size = 100;
+    first.base_cached_tokens = 100;
+    first.greedy_request.draft_tokens = {7, 9, 8};
+
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 11;
+    second.base_cached_tokens = 200;
+    second.greedy_request.draft_tokens = {11, 12, 13};
+
+    MTPSpecRequestBatch scheduled =
+        scheduler.buildNextBatch({first, second});
+    ASSERT_TRUE(scheduled.ok) << scheduled.error;
+
+    MTPDeviceOutcomeBatchTransactionResult result =
+        executeMTPDeviceOutcomeScheduledBatchTransaction(
+            scheduled,
+            {makeDeviceAcceptAllOutcome(), makeDeviceRejectAfterFirstOutcome()});
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.transaction_plan.request_count, 2);
+    ASSERT_THAT(result.transaction_plan.step_plans.steps, testing::SizeIs(2));
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[0].request_id, 10);
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[0].accepted_count, 3);
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[0].bonus_ready_state_slot_index, 3);
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[1].request_id, 11);
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[1].accepted_count, 1);
+    EXPECT_TRUE(result.transaction_plan.step_plans.steps[1].requiresCorrectionReplay());
+}
+
+TEST(Test__MTPVerifierForwardExecutor, ScheduledDeviceOutcomeBatchRejectsNonStochasticBatch)
+{
+    MTPSpecRequestBatch scheduled;
+    scheduled.ok = true;
+    scheduled.mode = MTPSpecRequestBatchMode::GREEDY;
+    scheduled.request_count = 1;
+    scheduled.shape.max_requests = 1;
+    scheduled.shape.max_draft_tokens = 2;
+    scheduled.request_ids = {10};
+    scheduled.vocab_size = 100;
+    scheduled.base_cached_tokens = {100};
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9};
+    scheduled.greedy_requests = {request};
+
+    MTPDeviceOutcomeBatchTransactionResult result =
+        executeMTPDeviceOutcomeScheduledBatchTransaction(
+            scheduled,
+            {makeDeviceAcceptAllOutcome()});
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, testing::HasSubstr("not stochastic"));
+}
+
 TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionCommitsOnSuccess)
 {
     RecordingInferenceRunner runner;
@@ -804,6 +902,218 @@ TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionAndPublishReject
     EXPECT_EQ(runner.forward_count, 0);
     EXPECT_EQ(runner.batch_forward_count, 0);
     EXPECT_THAT(result.error, testing::HasSubstr("publication callback is required"));
+}
+
+TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionPublishesBeforeCommit)
+{
+    MTPSpecRequestBatchOwner owner;
+    MTPSpecSchedulableRequest first;
+    first.request_id = 60;
+    first.mode = MTPSpecRequestBatchMode::STOCHASTIC;
+    first.compatibility_key = "qwen36-moe-cuda0";
+    first.vocab_size = 100;
+    first.base_cached_tokens = 100;
+    first.greedy_request.draft_tokens = {7, 9, 8};
+    ASSERT_TRUE(owner.enqueueRequest(first));
+
+    MTPSpecSchedulableRequest second = first;
+    second.request_id = 61;
+    second.base_cached_tokens = 200;
+    second.greedy_request.draft_tokens = {11, 12, 13};
+    ASSERT_TRUE(owner.enqueueRequest(second));
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/2,
+            /*max_draft_tokens=*/3,
+            MTPSpecRequestBatchMode::STOCHASTIC});
+
+    bool producer_called = false;
+    bool publisher_called = false;
+    MTPOwnedDeviceOutcomeBatchTransactionResult result =
+        executeOwnedMTPDeviceOutcomeScheduledBatchTransactionAndPublish(
+            owner,
+            scheduler,
+            [&](const MTPSpecRequestBatch &scheduled,
+                std::vector<MTPDeviceRejectionBatchOutcome> *outcomes,
+                std::string *) -> bool
+            {
+                producer_called = true;
+                EXPECT_THAT(scheduled.request_ids, testing::ElementsAre(60, 61));
+                if (!outcomes)
+                    return false;
+                *outcomes = {
+                    makeDeviceAcceptAllOutcome(),
+                    makeDeviceRejectAfterFirstOutcome()};
+                return true;
+            },
+            [&](const MTPSpecTransactionBatchPlan &plan,
+                std::string *error) -> bool
+            {
+                publisher_called = true;
+                if (!plan.ok)
+                {
+                    if (error)
+                        *error = plan.error;
+                    return false;
+                }
+                return plan.step_plans.steps.size() == 2u &&
+                       plan.step_plans.steps[0].request_id == 60 &&
+                       plan.step_plans.steps[1].request_id == 61;
+            });
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(producer_called);
+    EXPECT_TRUE(publisher_called);
+    EXPECT_TRUE(result.produced);
+    EXPECT_TRUE(result.published);
+    EXPECT_TRUE(result.committed);
+    EXPECT_FALSE(result.released);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    EXPECT_EQ(owner.pendingCount(), 0u);
+}
+
+TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionReleasesOnProducerFailure)
+{
+    MTPSpecRequestBatchOwner owner;
+    MTPSpecSchedulableRequest request;
+    request.request_id = 70;
+    request.mode = MTPSpecRequestBatchMode::STOCHASTIC;
+    request.compatibility_key = "qwen36-moe-cuda0";
+    request.vocab_size = 100;
+    request.base_cached_tokens = 100;
+    request.greedy_request.draft_tokens = {7, 9};
+    ASSERT_TRUE(owner.enqueueRequest(request));
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/1,
+            /*max_draft_tokens=*/2,
+            MTPSpecRequestBatchMode::STOCHASTIC});
+
+    bool publisher_called = false;
+    MTPOwnedDeviceOutcomeBatchTransactionResult result =
+        executeOwnedMTPDeviceOutcomeScheduledBatchTransactionAndPublish(
+            owner,
+            scheduler,
+            [&](const MTPSpecRequestBatch &,
+                std::vector<MTPDeviceRejectionBatchOutcome> *,
+                std::string *error) -> bool
+            {
+                if (error)
+                    *error = "synthetic producer failure";
+                return false;
+            },
+            [&](const MTPSpecTransactionBatchPlan &,
+                std::string *) -> bool
+            {
+                publisher_called = true;
+                return true;
+            });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_FALSE(result.produced);
+    EXPECT_FALSE(result.published);
+    EXPECT_FALSE(result.committed);
+    EXPECT_TRUE(result.released);
+    EXPECT_FALSE(publisher_called);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    EXPECT_EQ(owner.pendingCount(), 1u);
+    EXPECT_THAT(result.error, testing::HasSubstr("production failed"));
+    EXPECT_THAT(result.error, testing::HasSubstr("synthetic producer failure"));
+}
+
+TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionReleasesOnPublicationFailure)
+{
+    MTPSpecRequestBatchOwner owner;
+    MTPSpecSchedulableRequest request;
+    request.request_id = 80;
+    request.mode = MTPSpecRequestBatchMode::STOCHASTIC;
+    request.compatibility_key = "qwen36-moe-cuda0";
+    request.vocab_size = 100;
+    request.base_cached_tokens = 100;
+    request.greedy_request.draft_tokens = {7, 9, 8};
+    ASSERT_TRUE(owner.enqueueRequest(request));
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/1,
+            /*max_draft_tokens=*/3,
+            MTPSpecRequestBatchMode::STOCHASTIC});
+
+    MTPOwnedDeviceOutcomeBatchTransactionResult result =
+        executeOwnedMTPDeviceOutcomeScheduledBatchTransactionAndPublish(
+            owner,
+            scheduler,
+            [&](const MTPSpecRequestBatch &,
+                std::vector<MTPDeviceRejectionBatchOutcome> *outcomes,
+                std::string *) -> bool
+            {
+                if (!outcomes)
+                    return false;
+                *outcomes = {makeDeviceAcceptAllOutcome()};
+                return true;
+            },
+            [&](const MTPSpecTransactionBatchPlan &,
+                std::string *error) -> bool
+            {
+                if (error)
+                    *error = "synthetic stochastic publication failure";
+                return false;
+            });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_TRUE(result.produced);
+    EXPECT_FALSE(result.published);
+    EXPECT_FALSE(result.committed);
+    EXPECT_TRUE(result.released);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    EXPECT_EQ(owner.pendingCount(), 1u);
+    EXPECT_THAT(result.error, testing::HasSubstr("publication failed"));
+    EXPECT_THAT(result.error, testing::HasSubstr("synthetic stochastic publication failure"));
+}
+
+TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionRejectsMissingCallbacks)
+{
+    MTPSpecRequestBatchOwner owner;
+    MTPSpecSchedulableRequest request;
+    request.request_id = 90;
+    request.mode = MTPSpecRequestBatchMode::STOCHASTIC;
+    request.compatibility_key = "qwen36-moe-cuda0";
+    request.vocab_size = 100;
+    request.base_cached_tokens = 100;
+    request.greedy_request.draft_tokens = {7, 9};
+    ASSERT_TRUE(owner.enqueueRequest(request));
+
+    MTPSpecRequestBatchScheduler scheduler(
+        MTPSpecRequestBatchSchedulerConfig{
+            /*max_request_batch=*/1,
+            /*max_draft_tokens=*/2,
+            MTPSpecRequestBatchMode::STOCHASTIC});
+
+    MTPOwnedDeviceOutcomeBatchTransactionResult missing_producer =
+        executeOwnedMTPDeviceOutcomeScheduledBatchTransactionAndPublish(
+            owner,
+            scheduler,
+            {},
+            [](const MTPSpecTransactionBatchPlan &, std::string *) { return true; });
+    EXPECT_FALSE(missing_producer.ok);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    EXPECT_EQ(owner.pendingCount(), 1u);
+    EXPECT_THAT(missing_producer.error, testing::HasSubstr("producer callback is required"));
+
+    MTPOwnedDeviceOutcomeBatchTransactionResult missing_publisher =
+        executeOwnedMTPDeviceOutcomeScheduledBatchTransactionAndPublish(
+            owner,
+            scheduler,
+            [](const MTPSpecRequestBatch &,
+               std::vector<MTPDeviceRejectionBatchOutcome> *,
+               std::string *) { return true; },
+            {});
+    EXPECT_FALSE(missing_publisher.ok);
+    EXPECT_FALSE(owner.hasInFlightBatch());
+    EXPECT_EQ(owner.pendingCount(), 1u);
+    EXPECT_THAT(missing_publisher.error, testing::HasSubstr("publication callback is required"));
 }
 
 TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionReleasesOnForwardFailure)
