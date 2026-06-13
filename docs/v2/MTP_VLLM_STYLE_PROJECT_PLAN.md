@@ -1959,6 +1959,14 @@ Status:
   The default remains an explicit unsupported result until `OrchestrationRunner`
   wires the request owner, scheduler, verifier, and publication callbacks into
   live state. Focused gate: `V2_Unit_BenchmarkRunnerCPU`.
+- `OrchestrationRunner::prefillBatch()` now owns the first live SingleDevice
+  request-batch state boundary. It validates MTP config, prefix-cache and
+  topology exclusions, MPI single-rank execution, and runner batch capacity,
+  calls `forward_batch()` once for the admitted prompt rows, records per-request
+  terminal-token readiness, and blocks scalar `decodeStep()` while that batched
+  live state is active. `clearCache()` releases the batched state. Batched decode
+  still hard-fails until the request owner consumes these slots through
+  `decodeStepBatch()`. Focused gate: `V2_Unit_PrefillDecodeTransition`.
 
 Exit gate:
 

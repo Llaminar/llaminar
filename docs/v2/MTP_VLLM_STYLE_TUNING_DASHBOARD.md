@@ -28,9 +28,9 @@ Before a WiP commit, broad units plus touched parity must pass.
   rows, padded verifier-decode caching, bounded one-token Qwen35/Qwen36
   sidecar batches, padded-row publication, scheduler admission, device-token
   routing, greedy/stochastic owned handoff, and runner-capacity reservation
-  are unit-proven. Benchmark/orchestration prefill+decode now has a batch-aware
-  contract and aggregate-token accounting, but live runners still hard-fail
-  `--mtp-max-request-batch > 1` until server/runner ownership is wired.
+  are unit-proven. Benchmark/orchestration paths have batch-aware contracts,
+  aggregate-token accounting, and live SingleDevice batch prefill state.
+  Batched decode still hard-fails until server/runner ownership is wired.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.
   LocalTP best d3 55.4 vs 34.1 tok/s (1.62x), dynamic 54.2 (1.59x). LocalPP

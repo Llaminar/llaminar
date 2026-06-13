@@ -158,6 +158,9 @@ namespace llaminar2
         // =====================================================================
 
         bool prefill(const std::vector<int32_t> &tokens) override;
+        bool supportsPrefillBatch(int request_batch) const override;
+        bool prefillBatch(
+            const std::vector<std::vector<int32_t>> &token_batches) override;
         GenerationResult decodeStep() override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,
@@ -451,6 +454,7 @@ namespace llaminar2
             bool budget_limited,
             bool rollback);
         GenerationResult decodeStepMTP();
+        void clearBatchedDecodeState();
         bool forwardPrefillTokens(
             const int *tokens,
             int token_count,
@@ -502,6 +506,26 @@ namespace llaminar2
         bool prefill_logits_ready_{false};                              // True when terminal logits already predict the next decode token
         std::optional<int32_t> ready_sampled_token_;                    // Token already sampled from ready terminal logits
         std::optional<SamplingParams> ready_sampled_params_;            // Sampling params used to produce ready_sampled_token_
+        /**
+         * @brief Per-request state initialized by prefillBatch().
+         *
+         * Phase 8 request batching must never reuse the scalar last-token or
+         * ready-logit fields above. This small state object is the ownership
+         * bridge for the future decodeStepBatch() implementation: every
+         * request starts with its own terminal prompt token and ready-logit
+         * bit, while scalar decode is explicitly disabled until the batch is
+         * cleared or consumed by the batched decode API.
+         */
+        struct BatchedDecodeRequestState
+        {
+            int32_t last_token = 0;
+            bool prefill_logits_ready = false;
+            std::optional<int32_t> ready_sampled_token;
+            std::optional<SamplingParams> ready_sampled_params;
+            bool is_complete = false;
+        };
+        std::vector<BatchedDecodeRequestState> batched_request_states_;
+        bool batched_decode_active_{false};
         int decode_step_token_budget_{0};                               // Optional per-step cap used by generate(); 0 means unlimited
         bool mpi_coordinated_mode_{false};                              // When true, rank 0 broadcasts commands for worker loop
         std::shared_ptr<ITokenizer> tokenizer_;

@@ -833,6 +833,12 @@ namespace llaminar2
         return true;
     }
 
+    void OrchestrationRunner::clearBatchedDecodeState()
+    {
+        batched_decode_active_ = false;
+        batched_request_states_.clear();
+    }
+
     bool OrchestrationRunner::prefill(const std::vector<int32_t> &prompt_tokens)
     {
         if (!initialized_)
@@ -853,6 +859,7 @@ namespace llaminar2
         mtp_stats_ = {};
         ready_sampled_token_.reset();
         ready_sampled_params_.reset();
+        clearBatchedDecodeState();
         last_token_ = prompt_tokens.back();
 
         // Broadcast to worker ranks so they prefill with the same tokens
@@ -1088,6 +1095,143 @@ namespace llaminar2
         // GDN recurrence state and KV cache entries).
         prefill_logits_ready_ = true;
 
+        return true;
+    }
+
+    bool OrchestrationRunner::supportsPrefillBatch(int request_batch) const
+    {
+        if (!initialized_ || !runner_ || request_batch <= 1)
+            return false;
+
+        const MTPRuntimeConfig &mtp =
+            plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        if (!mtp.enabled || request_batch > mtp.max_request_batch)
+            return false;
+
+        const auto &plan_prefix = plan_.runtime.prefix_cache;
+        const auto &config_prefix = config_.prefix_cache;
+        const bool prefix_cache_enabled =
+            (plan_prefix.enabled || config_prefix.enabled) &&
+            plan_prefix.storage_mode != PrefixCacheStorageMode::Disabled &&
+            config_prefix.storage_mode != PrefixCacheStorageMode::Disabled;
+        if (prefix_cache_enabled)
+            return false;
+
+        if (plan_.usesLocalTP() ||
+            plan_.usesLocalPP() ||
+            plan_.usesGlobalTP() ||
+            plan_.usesPipelineParallel())
+        {
+            return false;
+        }
+
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+            return false;
+
+        return runner_->batch_size() >= request_batch;
+    }
+
+    bool OrchestrationRunner::prefillBatch(
+        const std::vector<std::vector<int32_t>> &token_batches)
+    {
+        if (!initialized_)
+            return setError("Runner not initialized");
+        if (!runner_)
+            return setError("Runner unavailable");
+
+        const int request_batch = static_cast<int>(token_batches.size());
+        if (request_batch <= 1)
+        {
+            return setError(
+                "Request-batched prefill requires at least two logical requests");
+        }
+
+        const MTPRuntimeConfig &mtp =
+            plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        if (!mtp.enabled)
+            return setError("Request-batched prefill requires MTP to be enabled");
+        if (request_batch > mtp.max_request_batch)
+        {
+            return setError(
+                "Request-batched prefill exceeds configured MTP max_request_batch");
+        }
+
+        const auto &plan_prefix = plan_.runtime.prefix_cache;
+        const auto &config_prefix = config_.prefix_cache;
+        const bool prefix_cache_enabled =
+            (plan_prefix.enabled || config_prefix.enabled) &&
+            plan_prefix.storage_mode != PrefixCacheStorageMode::Disabled &&
+            config_prefix.storage_mode != PrefixCacheStorageMode::Disabled;
+        if (prefix_cache_enabled)
+        {
+            return setError(
+                "Request-batched prefill with prefix cache requires Phase 9 "
+                "common-prefix coordination");
+        }
+
+        if (plan_.usesLocalTP() ||
+            plan_.usesLocalPP() ||
+            plan_.usesGlobalTP() ||
+            plan_.usesPipelineParallel())
+        {
+            return setError(
+                "Request-batched prefill is currently implemented only for "
+                "SingleDevice runners");
+        }
+
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        {
+            return setError(
+                "Request-batched prefill is not enabled for MPI multi-rank runners");
+        }
+
+        if (runner_->batch_size() < request_batch)
+        {
+            return setError(
+                "Request-batched prefill exceeds initialized runner batch capacity");
+        }
+
+        std::vector<std::vector<int>> converted;
+        converted.reserve(token_batches.size());
+        std::vector<BatchedDecodeRequestState> next_states;
+        next_states.reserve(token_batches.size());
+        for (const std::vector<int32_t> &tokens : token_batches)
+        {
+            if (tokens.empty())
+                return setError("Request-batched prefill received an empty prompt");
+
+            converted.emplace_back(tokens.begin(), tokens.end());
+
+            BatchedDecodeRequestState state;
+            state.last_token = tokens.back();
+            state.prefill_logits_ready = true;
+            next_states.push_back(std::move(state));
+        }
+
+        mtp_bypassed_ = false;
+        mtp_bypass_recorded_for_request_ = false;
+        mtp_bypass_reason_.clear();
+        mtp_stats_ = {};
+        prefix_request_summary_ = {};
+        ready_sampled_token_.reset();
+        ready_sampled_params_.reset();
+        prefill_logits_ready_ = false;
+        last_token_ = next_states.front().last_token;
+
+        if (!runner_->forward_batch(converted))
+        {
+            clearBatchedDecodeState();
+            return setError("Forward batch failed during request-batched prefill");
+        }
+
+        /*
+         * From this point onward the scalar decode state is intentionally
+         * invalid. decodeStepBatch() is the only API allowed to consume this
+         * request set, because it must advance and publish every request slot
+         * under the same ownership transaction.
+         */
+        batched_request_states_ = std::move(next_states);
+        batched_decode_active_ = true;
         return true;
     }
 
@@ -5168,6 +5312,13 @@ namespace llaminar2
             result.error = "Runner not initialized";
             return result;
         }
+        if (batched_decode_active_)
+        {
+            result.error =
+                "decodeStep() cannot consume request-batched prefill state; "
+                "use decodeStepBatch()";
+            return result;
+        }
 
         // Broadcast to worker ranks so they run decode in lockstep
         if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
@@ -5578,6 +5729,7 @@ namespace llaminar2
         prefill_logits_ready_ = false;
         ready_sampled_token_.reset();
         ready_sampled_params_.reset();
+        clearBatchedDecodeState();
         sampler_ = Sampler(active_sampling_params_.seed);
         mtp_bypassed_ = false;
         mtp_bypass_recorded_for_request_ = false;

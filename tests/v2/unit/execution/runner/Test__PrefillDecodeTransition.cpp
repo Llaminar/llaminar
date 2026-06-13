@@ -180,6 +180,26 @@ namespace
             return true;
         }
 
+        bool forward_batch(const std::vector<std::vector<int>> &token_batches) override
+        {
+            ++forward_batch_call_count_;
+            last_forward_batch_ = token_batches;
+            sequence_lengths_.clear();
+            sequence_lengths_.reserve(token_batches.size());
+            padded_seq_len_ = 0;
+            for (const auto &tokens : token_batches)
+            {
+                sequence_lengths_.push_back(static_cast<int>(tokens.size()));
+                padded_seq_len_ = std::max(
+                    padded_seq_len_,
+                    static_cast<int>(tokens.size()));
+            }
+            position_ += padded_seq_len_;
+            setupPrefillLogits();
+            is_first_forward_in_cycle_ = false;
+            return !token_batches.empty();
+        }
+
         bool forwardWithDeviceTokenIds(
             const int *token_shadow,
             const void *token_ids_device,
@@ -852,11 +872,19 @@ namespace
             is_first_forward_in_cycle_ = true; // Reset cycle
             setupPrefillLogits();              // Reset logits state
             position_ = 0;
+            sequence_lengths_.clear();
+            padded_seq_len_ = 0;
             row_indexed_all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_row_count_ = 0;
         }
 
         int get_position() const override { return position_; }
+        int batch_size() const override { return batch_capacity_; }
+        int padded_seq_len() const override { return padded_seq_len_; }
+        const std::vector<int> &sequence_lengths() const override
+        {
+            return sequence_lengths_;
+        }
 
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
         const char *architecture() const override { return "mock"; }
@@ -1649,6 +1677,15 @@ namespace
         const std::vector<int> &lastForwardTokens() const { return last_forward_tokens_; }
         const std::vector<std::vector<int>> &forwardHistory() const { return forward_history_; }
         int lastForwardSeqLen() const { return last_forward_seq_len_; }
+        int forwardBatchCallCount() const { return forward_batch_call_count_; }
+        const std::vector<std::vector<int>> &lastForwardBatch() const
+        {
+            return last_forward_batch_;
+        }
+        void setBatchCapacity(int capacity)
+        {
+            batch_capacity_ = capacity;
+        }
         void enableMTP(bool accept_mtp_token)
         {
             mtp_enabled_ = true;
@@ -2184,6 +2221,8 @@ namespace
         MTPSpecStepPlanBatch last_published_mtp_spec_batch_;
         std::vector<int> last_forward_tokens_;
         std::vector<std::vector<int>> forward_history_;
+        std::vector<std::vector<int>> last_forward_batch_;
+        std::vector<int> sequence_lengths_;
         std::vector<int> last_commit_mtp_tokens_;
         std::vector<int32_t> last_mtp_spec_verifier_rows_;
         std::vector<int32_t> last_mtp_spec_verifier_tokens_;
@@ -2201,9 +2240,12 @@ namespace
         size_t decode_argmax_script_index_{0};
         mutable size_t captured_checkpoint_script_index_{0};
         int last_forward_seq_len_{0};
+        int forward_batch_call_count_{0};
         int publish_mtp_spec_state_count_{0};
         int publish_mtp_spec_state_batch_count_{0};
         int position_{0};
+        int batch_capacity_{1};
+        int padded_seq_len_{0};
     };
 
     // =========================================================================
@@ -2250,7 +2292,8 @@ namespace
                                                                              bool sidecar_sample_fusion = false,
                                                                              MTPDepthPolicyConfig depth_policy = {},
                                                                              MTPVerifyMode verify_mode = MTPVerifyMode::Greedy,
-                                                                             bool local_pp_topology = false)
+                                                                             bool local_pp_topology = false,
+                                                                             int max_request_batch = 1)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
@@ -2282,6 +2325,7 @@ namespace
                 config.device_for_this_rank = GlobalDeviceAddress::cpu();
             config.mtp.enabled = mtp_enabled;
             config.mtp.draft_tokens = mtp_draft_tokens;
+            config.mtp.max_request_batch = max_request_batch;
             config.mtp.verify_mode = verify_mode;
             config.mtp.depth_policy = depth_policy;
 
@@ -2317,6 +2361,28 @@ namespace
 
             runners_.push_back(std::move(runner));
             return {runners_.back().get(), mock_ptr};
+        }
+
+        std::pair<OrchestrationRunner *, MockInferenceRunner *>
+        createSingleDeviceRequestBatchRunner(int max_request_batch = 2)
+        {
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/false,
+                /*hide_local_logits=*/false,
+                DeviceId::cpu(),
+                /*mtp_draft_tokens=*/1,
+                /*chained_mtp_support=*/false,
+                /*sidecar_sample_fusion=*/false,
+                MTPDepthPolicyConfig{},
+                MTPVerifyMode::Greedy,
+                /*local_pp_topology=*/false,
+                max_request_batch);
+            mock->setBatchCapacity(max_request_batch);
+            return {runner, mock};
         }
 
         LocalTPRunnerHarness createLocalTPRunner(bool mtp_accept = true,
@@ -2440,6 +2506,48 @@ namespace
         EXPECT_EQ(mock->forwardCallCount(), 1);
         EXPECT_EQ(mock->lastForwardSeqLen(), 5);
         EXPECT_THAT(mock->lastForwardTokens(), ElementsAre(1, 2, 3, 4, 5));
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, PrefillBatchInitializesRequestSlotsAndBlocksScalarDecode)
+    {
+        auto [runner, mock] = createSingleDeviceRequestBatchRunner(/*max_request_batch=*/3);
+
+        ASSERT_TRUE(runner->supportsPrefillBatch(2));
+        ASSERT_TRUE(runner->prefillBatch({{1, 2, 3}, {4, 5}}))
+            << runner->lastError();
+
+        EXPECT_EQ(mock->forwardCallCount(), 0)
+            << "Request-batched prefill must not initialize only request 0";
+        EXPECT_EQ(mock->forwardBatchCallCount(), 1);
+        EXPECT_THAT(mock->lastForwardBatch(),
+                    ElementsAre(ElementsAre(1, 2, 3), ElementsAre(4, 5)));
+        EXPECT_THAT(mock->sequence_lengths(), ElementsAre(3, 2));
+
+        GenerationResult scalar_decode = runner->decodeStep();
+        EXPECT_FALSE(scalar_decode.error.empty());
+        EXPECT_THAT(scalar_decode.error, HasSubstr("decodeStep() cannot consume"));
+        EXPECT_EQ(mock->forwardCallCount(), 0)
+            << "Scalar decode must fail before mutating batched live state";
+
+        runner->clearCache();
+        ASSERT_TRUE(runner->prefill({9, 8}));
+        GenerationResult scalar_after_clear = runner->decodeStep();
+        EXPECT_FALSE(scalar_after_clear.error.empty());
+        EXPECT_THAT(scalar_after_clear.error, HasSubstr("MTP request-batched"));
+        EXPECT_THAT(scalar_after_clear.error, Not(HasSubstr("decodeStep() cannot consume")))
+            << "clearCache() must release request-batched live-state ownership";
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, PrefillBatchRejectsUndersizedRunnerCapacityBeforeForward)
+    {
+        auto [runner, mock] = createSingleDeviceRequestBatchRunner(/*max_request_batch=*/3);
+        mock->setBatchCapacity(1);
+
+        EXPECT_FALSE(runner->supportsPrefillBatch(2));
+        EXPECT_FALSE(runner->prefillBatch({{1, 2}, {3, 4}}));
+        EXPECT_THAT(runner->lastError(), HasSubstr("batch capacity"));
+        EXPECT_EQ(mock->forwardBatchCallCount(), 0);
+        EXPECT_EQ(mock->forwardCallCount(), 0);
     }
 
     /**
