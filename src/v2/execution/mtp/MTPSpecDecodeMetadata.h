@@ -237,6 +237,20 @@ namespace llaminar2
         const MTPSpecDecodeMetadataShape &shape,
         const MTPSpecDecodeAcceptedOutcome &outcome);
 
+    /**
+     * @brief Build metadata for a batch of device-resident verifier outcomes.
+     *
+     * This is the shared vLLM-style path for amortized speculative decode: each
+     * request contributes its accepted-count result, optional bonus-ready token,
+     * and committed output tokens while rejected draft identities may remain on
+     * device. The returned metadata uses padded per-request slots but assigns
+     * state indices from one flattened target-verifier batch, which is the
+     * layout the graph-side row selectors and state publishers consume.
+     */
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchFromAcceptedOutcomes(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<MTPSpecDecodeAcceptedOutcome> &outcomes);
+
     MTPSpecDecodeStateCommitPlan buildMTPSpecDecodeStateCommitPlan(
         const MTPSpecDecodeMetadataBatch &batch);
 

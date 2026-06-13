@@ -6,58 +6,45 @@ LocalPP, NodeLocalTP, and ExpertOverlay. Keep this file under 6KB.
 RAG: Green = correct and speed-positive near target. Amber = correct but slow,
 partial, or policy-sensitive. Red = failing, speed-negative, or unproven.
 
-Iteration contract: refresh no-MTP, fixed d1/d2/d3, and dynamic for the active
-device/model/mode. Before a WiP commit, broad units plus touched parity must pass.
+Iteration rule: refresh no-MTP, fixed d1/d2/d3, and dynamic for active lanes.
+Before a WiP commit, broad units plus touched parity must pass.
 
 ## Latest Evidence
 
-- GPU stochastic matrix:
+- SingleDevice GPU stochastic matrix:
   `benchmark_results/mtp_vllm_style/20260612T170149Z-gpu-stochastic-vllm-greedyq-c4096-post-moe-workspace/`.
-  CUDA/ROCm dense+MoE rows ran with zero rollbacks.
-- Dense stochastic remains speed-positive in the short `-c 4096` lane: CUDA best
-  d2 52.6 vs 44.7 tok/s (1.18x), ROCm best d1 37.0 vs 31.3 tok/s (1.18x).
-  Dynamic starts at d3 on CUDA and d1 on ROCm; `n=16` is too short for
-  hysteresis updates.
-- MoE stochastic remains speed-red in the fresh GPU stage-timing probe
-  `20260612T225841Z-moe-stochastic-gpu-stage-timing`: CUDA best dynamic 81.6
-  vs 114.4 tok/s, ROCm best d1 51.5 vs 68.7 tok/s. Stage timers show routed
-  expert FFN dominates both main-decode condition rows and main-verifier rows;
-  sampler/D2H is mostly the host-visible drain boundary.
-- Phase 9 ExpertOverlay mixed parity is now green for ROCm2TP-hot plus
-  CPU2LocalTP-cold. Fixes: ROCm MoE local-expert nested workspace declarations,
-  LocalTP all-position verifier stream consumption, and deterministic ROCm MoE
-  parity mode. Guards: `V2_Unit_RankOrchestrator`,
-  `V2_Unit_MoELocalExpertStage_PreparedWeights`, and full
-  `^V2_Integration_Parity_Qwen36MoE_ExpertOverlay_`.
-- Fresh gate: full `^V2_Unit_` passed 502/502 after rebuilding, then
-  `^V2_Integration_ROCmMoEKernel$|^V2_Integration_Parity_Qwen36MoE_ExpertOverlay_`
-  passed 6/6.
-- NodeLocalTP dynamic-depth scalar coordination is green in the dense parity
-  lane: full `^V2_Integration_Parity_Qwen36_NodeLocalTP_` passed 5/5
-  real-model tests plus fixture.
-- LocalPP dense MTP is green on ROCm for prefix restore, prefix+MTP restore,
-  fixed d1/d3, dynamic depth, and stochastic all-position publication. PP
-  non-final stages publish main verifier state only; the final stage owns
-  logits, sampling, terminal hidden, and shifted sidecar KV. Gate:
+  Dense is speed-positive: CUDA d2 52.6 vs 44.7 tok/s (1.18x), ROCm d1
+  37.0 vs 31.3 tok/s (1.18x). MoE stochastic is speed-red: CUDA best 81.6
+  vs 114.4 tok/s, ROCm best 51.5 vs 68.7 tok/s in
+  `20260612T225841Z-moe-stochastic-gpu-stage-timing`.
+- vLLM check: bonus sampling is upfront there too; our processed-target,
+  one-hot-q path is structurally aligned. The remaining GPU MoE stochastic
+  blocker is single-request target/condition transaction cost, not compact
+  sampler table math or bonus deferral.
+- Phase 8 groundwork: accepted-count verifier outcomes now build padded
+  multi-request metadata with flattened state slots. Focused MTP unit gate is
+  green; production runner/benchmark batching is still open.
+- Fresh Phase 9 ROCm dense greedy topology matrix:
+  `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.
+  LocalTP best d3 55.4 vs 34.1 tok/s (1.62x), dynamic 54.2 (1.59x). LocalPP
+  best dynamic 62.9 vs 30.3 tok/s (2.08x), fixed d3 55.5 (1.83x). All MTP
+  lanes completed with zero rollbacks.
+- ExpertOverlay mixed parity is green for ROCm2TP-hot plus CPU2LocalTP-cold.
+  Gate: `^V2_Integration_Parity_Qwen36MoE_ExpertOverlay_` passed 6/6 after
+  the ROCm MoE local-expert workspace and stream-handoff fixes.
+- NodeLocalTP dense parity is green: full `^V2_Integration_Parity_Qwen36_NodeLocalTP_`
+  passed 5/5 real-model tests plus fixture. LocalPP dense parity is green:
   full `^V2_Integration_Parity_Qwen36_LocalPP_` passed 7/7.
-- Matrix runner has `topology` presets plus `--gpu-stage-timing` perfstats and
-  `stage_summary.tsv` for ranked decode-stage evidence.
-- ROCm topology smoke `20260612T232547Z-rocm-topology...` is green after the
-  compact verifier capability gate: LocalTP d1 34.4 vs 36.7 tok/s (0.94x),
-  LocalPP d1 40.9 vs 31.4 tok/s (1.30x), both 12/12 accepted.
-- Stage-owned CUDA side-stream workspace declarations still hold the dense VRAM
-  win: one-token d3 stochastic graph workspace is about 784 MB instead of the
-  stale LM-head-sized 1827 MB plan.
 
 ## Topology Matrix
 
 | Topology | Impl | Parity | Bench/Tuning |
 |---|---|---|---|
-| SingleDevice | Green dense/MoE greedy+stochastic on CPU/CUDA/ROCm | Green broad device matrix | Dense accepted; MoE speed weak |
-| LocalTP | Green dense fixed d1/d2/d3 + dynamic; rank-wide depth/stream handoff | Green Qwen3.6 dense parity | ROCm dense d1 green but slow: 34.4 vs 36.7 tok/s |
-| LocalPP | Green dense final-stage sidecar + all-stage publication; PP device-token handoff gated | Green dense prefix+d1/d3/dyn/stoch+prefix-MTP restore | ROCm dense d1 positive: 40.9 vs 31.4 tok/s |
-| NodeLocalTP | Green dense fixed d1/d2/d3 + dynamic scalar broadcast | Green full dense NodeLocalTP parity | Topology preset ready; MoE unproven |
-| ExpertOverlay | Green MoE hot/mixed correctness path; dense not a separate target | Green ROCm2TP-hot + CPU2LocalTP-cold parity | Preset ready; speed Amber/Red |
+| SingleDevice | Green dense/MoE greedy+stochastic on CPU/CUDA/ROCm | Green broad device matrix | Dense accepted; MoE stochastic Red |
+| LocalTP | Green dense fixed d1/d2/d3 + dynamic; rank-wide depth/stream handoff | Green Qwen3.6 dense parity | ROCm dense d3 1.62x Green; stochastic/MoE unproven |
+| LocalPP | Green dense final-stage sidecar + all-stage publication | Green prefix+d1/d3/dyn/stoch+prefix-MTP restore | ROCm dense dynamic 2.08x Green; stochastic/MoE unproven |
+| NodeLocalTP | Green dense fixed d1/d2/d3 + dynamic scalar broadcast | Green full dense NodeLocalTP parity | Benchmark preset ready; MoE unproven |
+| ExpertOverlay | Green MoE hot/mixed correctness path | Green ROCm2TP-hot + CPU2LocalTP-cold parity | Speed Amber/Red; preset ready |
 
 ## Device Matrix
 
@@ -66,22 +53,23 @@ device/model/mode. Before a WiP commit, broad units plus touched parity must pas
 | CUDA | Dense 27B | greedy | Green | base 44.0; d1/d2/d3/dyn 63.9/76.1/91.4/87.8 | dynamic lag |
 | CUDA | Dense 27B | stochastic | Green | base 44.7; 52.6/52.6/47.7/47.7 | short-lane d3 regress |
 | ROCm | Dense 27B | greedy | Green | base 30.3; 42.3/48.1/65.0/52.9 | absolute CUDA gap |
-| ROCm | Dense 27B | stochastic | Green | base 31.3; 37.0/28.7/27.0/36.9 | d2/d3 acceptance/cost |
+| ROCm | Dense 27B | stochastic | Green | base 31.3; 37.0/28.7/27.0/36.9 | d2/d3 cost |
 | CPU | Dense 27B | greedy | Green | base 4.7; 5.9/6.0/9.3/6.1 | dynamic shallow |
 | CPU | Dense 27B | stochastic | Green | base 4.46; 5.06/5.78/4.85/5.41 | verifier/condition |
 | CUDA | MoE 35B | greedy | Amber | base 139.2; d1/d2/d3/dyn 129.6/136.6/139.1/146.1 | weak win |
 | CUDA | MoE 35B | stochastic | Red | base 115.3; 78.5/76.0/79.0/78.3 | verifier+condition cost |
 | ROCm | MoE 35B | greedy | Amber | base 77.0; 79.0/91.5/90.3/86.1 | below dense-class win |
-| ROCm | MoE 35B | stochastic | Red | base 69.1; 51.8/48.5/40.7/51.6 | verifier/model drain |
+| ROCm | MoE 35B | stochastic | Red | base 69.1; 51.8/48.5/40.7/51.6 | single-request transaction cost |
 | CPU | MoE 35B | greedy | Amber | base 17.7; 13.5/13.9/12.4/13.3 | host verifier cost |
 | CPU | MoE 35B | stochastic | Amber | base 17.6; 14.5/13.3/14.1/14.0 | host verifier cost |
 
 ## Current Read
 
-Dense relative speedup is accepted on CUDA/ROCm. GPU MoE greedy is correct and
-sometimes positive but still below the dense-class win. GPU MoE stochastic is
-not benchmark-accepted: the vLLM-shaped path is correct, but verifier,
-condition, and sidecar transaction work overwhelm recovered tokens.
+Dense MTP is accepted on CUDA/ROCm SingleDevice and now looks healthy on ROCm
+LocalTP/LocalPP. MoE stochastic remains the active Phase 8 blocker: correctness
+is green, but single-request verifier/condition cost overwhelms recovered tokens.
+The vLLM-aligned next step is scheduler-style batching/amortization of the
+spec transaction, then MoE-specific tuning once the transaction shape matches.
 
 ## Target Anchors
 
@@ -90,8 +78,8 @@ d1 54.9, d3 52.5 tok/s; MoE no-MTP 118.26, d1 142.0, d3 132.8 tok/s.
 
 ## Next
 
-1. Run selected Phase 9 topology preset benchmarks as hardware allows.
-2. Continue Phase 8 transaction-level vLLM alignment for MoE; reduce verifier,
-   condition, and sidecar graph economics before deeper sampler/kernel tuning.
-3. Re-run the bounded GPU MoE stochastic matrix after the next transaction-cost
-   slice, then refresh this table from same-run baselines.
+1. Implement Phase 8 request-batched/spec-transaction amortization for MoE lanes.
+2. Add benchmark support for batched speculative requests instead of only
+   independent single-request iterations.
+3. Run Phase 9 NodeLocalTP CPU and ExpertOverlay benchmark presets when the
+   active slice touches those topologies.

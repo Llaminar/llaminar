@@ -863,6 +863,83 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsAcceptedOutcomeWithBonusReadyToken)
     EXPECT_THAT(batch.sampled_tokens, ElementsAre(7, 9, 8, 4));
 }
 
+TEST(Test__MTPSpecDecodeMetadata, BuildsBatchedAcceptedOutcomesWithFlattenedStateSlots)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeAcceptedOutcome accept_all;
+    accept_all.request_id = 10;
+    accept_all.vocab_size = 100;
+    accept_all.draft_count = 3;
+    accept_all.committed_output_tokens = {7, 9, 8};
+    accept_all.bonus_ready_token = 4;
+    accept_all.accepted_verifier_input_prefix = 3;
+    accept_all.target_verifier_state_commit_count = 3;
+    accept_all.all_drafts_accepted = true;
+
+    MTPSpecDecodeAcceptedOutcome reject_after_first;
+    reject_after_first.request_id = 11;
+    reject_after_first.vocab_size = 100;
+    reject_after_first.draft_count = 2;
+    reject_after_first.committed_output_tokens = {11, 77};
+    reject_after_first.accepted_verifier_input_prefix = 1;
+    reject_after_first.target_verifier_state_commit_count = 1;
+    reject_after_first.all_drafts_accepted = false;
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromAcceptedOutcomes(
+            shape,
+            {accept_all, reject_after_first});
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    EXPECT_EQ(batch.request_count, 2);
+    EXPECT_EQ(batch.total_target_query_tokens, 7);
+    EXPECT_THAT(batch.draft_counts, ElementsAre(3, 2));
+    EXPECT_THAT(batch.target_query_lens, ElementsAre(4, 3));
+    EXPECT_THAT(batch.valid_sampled_counts, ElementsAre(4, 2));
+    EXPECT_THAT(batch.accepted_draft_prefixes, ElementsAre(3, 1));
+    EXPECT_THAT(batch.committed_output_counts, ElementsAre(3, 2));
+    EXPECT_THAT(batch.target_verifier_state_commit_counts, ElementsAre(3, 1));
+    EXPECT_THAT(batch.rejected_token_counts, ElementsAre(0, 1));
+    EXPECT_THAT(batch.token_indices_to_sample, ElementsAre(3, 1));
+    EXPECT_THAT(batch.next_condition_tokens, ElementsAre(4, 77));
+    EXPECT_THAT(batch.all_drafts_accepted_flags, ElementsAre(1, 0));
+    EXPECT_THAT(batch.query_start_locs, ElementsAre(0, 4, 7));
+
+    EXPECT_THAT(batch.state_indices,
+                ElementsAre(0, 1, 2, 3,
+                            4, 5, 6, kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(batch.speculative_state_slot_indices,
+                ElementsAre(0, 1, 2, 3,
+                            4, 5, 6, kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(batch.accepted_state_counts, ElementsAre(3, 1));
+    EXPECT_THAT(batch.committed_state_rows, ElementsAre(2, 0));
+    EXPECT_THAT(batch.committed_state_indices, ElementsAre(2, 4));
+    EXPECT_THAT(batch.accepted_state_slot_indices, ElementsAre(2, 4));
+    EXPECT_THAT(batch.correction_replay_start_indices,
+                ElementsAre(kMTPSpecDecodeInvalidToken, 1));
+    EXPECT_THAT(batch.correction_replay_counts, ElementsAre(0, 1));
+    EXPECT_THAT(batch.bonus_ready_token_rows,
+                ElementsAre(3, kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(batch.bonus_ready_state_slot_indices,
+                ElementsAre(3, kMTPSpecDecodeInvalidToken));
+
+    EXPECT_THAT(batch.draft_tokens,
+                ElementsAre(7, 9, 8,
+                            11, kMTPSpecDecodeInvalidToken,
+                            kMTPSpecDecodeInvalidToken))
+        << "unknown rejected device draft slots must stay invalid";
+    EXPECT_THAT(batch.sampled_tokens,
+                ElementsAre(7, 9, 8, 4,
+                            11, 77, kMTPSpecDecodeInvalidToken,
+                            kMTPSpecDecodeInvalidToken));
+    ASSERT_THAT(batch.transactions, SizeIs(2));
+    EXPECT_TRUE(batch.transactions[0].allDraftsAccepted());
+    EXPECT_FALSE(batch.transactions[1].allDraftsAccepted());
+}
+
 TEST(Test__MTPSpecDecodeMetadata, StateCommitPlanDoesNotReplayStoppedCorrectionSuffix)
 {
     MTPSpecDecodeMetadataShape shape;

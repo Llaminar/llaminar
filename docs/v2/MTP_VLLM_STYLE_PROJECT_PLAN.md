@@ -1756,6 +1756,22 @@ Status:
   synchronization boundary draining queued model work, not the primary kernel
   target. The next Phase 8 slice should therefore reduce repeated full MoE
   condition/verifier transaction work before deeper sampler tuning.
+- vLLM source inspection confirms that the known-good path samples the bonus
+  row up front and processes target verifier rows as a batch. Llaminar's
+  processed-target, greedy-draft/one-hot-q stochastic verifier is therefore
+  architecturally aligned at the sampler level. The remaining speed gap is that
+  Llaminar benchmarks one request at a time, so every MoE speculative step pays
+  a tiny-batch 40-layer target/condition transaction. The next Phase 8
+  implementation slice should add request-batched speculative transaction
+  support and a benchmark lane that measures amortized target verification,
+  rather than reviving compact-table sampler shortcuts or lazy bonus sampling.
+- First request-batching groundwork is in shared metadata: accepted-count
+  verifier outcomes can now build one padded multi-request metadata batch with
+  flattened verifier state slots, while unknown rejected device draft ids stay
+  invalid instead of being synthesized on host. Focused gates:
+  `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecStateContract`, and the
+  broader MTP unit gate passed. The next implementation step is to feed these
+  batched outcomes from a runner/benchmark path instead of only unit fixtures.
 
 Exit gate:
 
@@ -1891,6 +1907,14 @@ Status:
   `20260612T232547Z-rocm-topology-dense-greedy-smoke-capability-fix` is green:
   LocalTP d1 accepted 12/12 at 34.4 vs 36.7 tok/s, and LocalPP d1 accepted
   12/12 at 40.9 vs 31.4 tok/s.
+- Fresh bounded ROCm dense greedy topology matrix
+  `20260612T234446Z-iteration-matrix-3ed9c37e` is green with same-run
+  baseline/fixed/dynamic evidence. LocalTP ROCm2: baseline 34.1 tok/s, d1 34.6
+  (1.01x), d2 34.3 (1.00x, 80% acceptance), d3 55.4 (1.62x), dynamic 54.2
+  (1.59x). LocalPP ROCm2: baseline 30.3 tok/s, d1 44.0 (1.45x), d2 39.8
+  (1.32x, 80% acceptance), d3 55.5 (1.83x), dynamic 62.9 (2.08x). All MTP
+  lanes completed with zero rollbacks; stage timing shows the remaining cost is
+  verifier graph replay and sidecar work, not publication failure.
 
 Exit gate:
 
