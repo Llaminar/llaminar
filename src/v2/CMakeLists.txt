@@ -1235,6 +1235,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/mtp/MTPSpecKVPublisher.cpp
     execution/mtp/MTPSpecStateContract.cpp
     execution/mtp/MTPSpecStatePublisher.cpp
+    execution/mtp/MTPSpecTransactionDriver.cpp
     execution/mtp/MTPSpecDecodeTransaction.cpp
     execution/mtp/MTPRejectionSampler.cpp
     execution/mtp/MTPWeightManifest.cpp

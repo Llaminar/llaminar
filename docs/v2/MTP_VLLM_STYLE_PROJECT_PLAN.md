@@ -1779,6 +1779,14 @@ Status:
   request-batched sidecar/verifier execution is implemented. This prevents
   accidental no-op "batched" measurements while preserving a stable gate for
   the next slice.
+- A shared `MTPSpecTransactionDriver` now builds a full batch transaction plan
+  from accepted outcomes or greedy catch-up: metadata, commit plan,
+  publication plan, and per-request `MTPSpecStepPlan` are produced in one
+  checked object. `OrchestrationRunner` consumes this driver for the current
+  single-request all-position publication path, so the future request-batched
+  scheduler path will attach to the same accepted-count semantics instead of
+  cloning runner-local metadata construction. Focused gates:
+  `V2_Unit_MTPSpecStateContract` and `V2_Unit_PrefillDecodeTransition`.
 
 Exit gate:
 

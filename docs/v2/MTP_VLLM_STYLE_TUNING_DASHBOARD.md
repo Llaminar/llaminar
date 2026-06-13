@@ -21,9 +21,10 @@ Before a WiP commit, broad units plus touched parity must pass.
   one-hot-q path is structurally aligned. The remaining GPU MoE stochastic
   blocker is single-request target/condition transaction cost, not compact
   sampler table math or bonus deferral.
-- Phase 8 groundwork: accepted outcomes build padded multi-request metadata,
-  and `--mtp-max-request-batch`/matrix `--mtp-request-batch` record batched
-  intent. Executable runner batching still hard-fails above 1.
+- Phase 8 groundwork: accepted outcomes build padded multi-request metadata;
+  a shared batch transaction planner now produces commit/publication step
+  plans and the live runner uses it for the current single-request path.
+  `--mtp-max-request-batch` records intent but still hard-fails above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.
   LocalTP best d3 55.4 vs 34.1 tok/s (1.62x), dynamic 54.2 (1.59x). LocalPP

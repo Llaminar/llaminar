@@ -5,6 +5,7 @@
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "execution/mtp/MTPSpecStatePublisher.h"
+#include "execution/mtp/MTPSpecTransactionDriver.h"
 
 using namespace llaminar2;
 using namespace testing;
@@ -380,6 +381,124 @@ TEST(Test__MTPSpecStateContract, AllowsGlobalStateSlotsAcrossMultipleRequests)
     EXPECT_EQ(plans.steps[1].accepted_state_slot_index, 4);
     EXPECT_EQ(plans.steps[1].target_cached_tokens, 201);
     EXPECT_TRUE(plans.steps[1].requiresCorrectionReplay());
+}
+
+TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedAcceptedOutcomePlan)
+{
+    MTPSpecDecodeAcceptedOutcome accept_all;
+    accept_all.request_id = 10;
+    accept_all.vocab_size = 100;
+    accept_all.draft_count = 3;
+    accept_all.committed_output_tokens = {7, 9, 8};
+    accept_all.bonus_ready_token = 4;
+    accept_all.accepted_verifier_input_prefix = 3;
+    accept_all.target_verifier_state_commit_count = 3;
+    accept_all.all_drafts_accepted = true;
+
+    MTPSpecDecodeAcceptedOutcome reject_after_first;
+    reject_after_first.request_id = 11;
+    reject_after_first.vocab_size = 100;
+    reject_after_first.draft_count = 2;
+    reject_after_first.committed_output_tokens = {11, 77};
+    reject_after_first.accepted_verifier_input_prefix = 1;
+    reject_after_first.target_verifier_state_commit_count = 1;
+    reject_after_first.all_drafts_accepted = false;
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromAcceptedOutcomes(
+            shape,
+            {accept_all, reject_after_first},
+            /*base_cached_tokens=*/{100, 200});
+
+    ASSERT_TRUE(plan.ok) << plan.error;
+    EXPECT_EQ(plan.request_count, 2);
+    EXPECT_EQ(plan.metadata.total_target_query_tokens, 7);
+    EXPECT_THAT(plan.publication_plan.base_cached_tokens,
+                ElementsAre(100, 200));
+    EXPECT_THAT(plan.publication_plan.target_cached_tokens,
+                ElementsAre(103, 201));
+    ASSERT_THAT(plan.step_plans.steps, SizeIs(2));
+
+    const MTPSpecStepPlan &first = plan.step_plans.steps[0];
+    EXPECT_EQ(first.request_id, 10);
+    EXPECT_EQ(first.accepted_count, 3);
+    EXPECT_EQ(first.accepted_state_slot_index, 2);
+    EXPECT_EQ(first.bonus_ready_state_slot_index, 3);
+    EXPECT_TRUE(first.all_drafts_accepted);
+    EXPECT_FALSE(first.requiresCorrectionReplay());
+
+    const MTPSpecStepPlan &second = plan.step_plans.steps[1];
+    EXPECT_EQ(second.request_id, 11);
+    EXPECT_EQ(second.accepted_count, 1);
+    EXPECT_EQ(second.accepted_state_slot_index, 4)
+        << "request 1's accepted slot must refer to the flattened verifier batch";
+    EXPECT_EQ(second.correction_replay_start_index, 1);
+    EXPECT_EQ(second.correction_replay_count, 1);
+    EXPECT_TRUE(second.requiresCorrectionReplay());
+}
+
+TEST(Test__MTPSpecStateContract, TransactionDriverRejectsBaseCacheCountMismatch)
+{
+    MTPSpecDecodeAcceptedOutcome outcome;
+    outcome.request_id = 10;
+    outcome.vocab_size = 100;
+    outcome.draft_count = 2;
+    outcome.committed_output_tokens = {7};
+    outcome.accepted_verifier_input_prefix = 1;
+    outcome.target_verifier_state_commit_count = 1;
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 2;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromAcceptedOutcomes(
+            shape,
+            {outcome},
+            /*base_cached_tokens=*/{});
+
+    EXPECT_FALSE(plan.ok);
+    EXPECT_THAT(plan.error, HasSubstr("base-cache vector"));
+}
+
+TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGreedyCatchupPlan)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+
+    MTPDecodeCatchupGreedyResult result;
+    result.ok = true;
+    result.accepted_tokens = {7, 9, 3};
+    result.verifier_tokens = {9, 3};
+    result.all_speculative_accepted = false;
+    result.stopped_on_output = false;
+    result.accepted_speculative_prefix = 1;
+    result.rejected_verified_token = 3;
+    result.target_verifier_state_commit_count = 2;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromGreedyCatchup(
+            shapeFor(/*requests=*/1, /*draft_tokens=*/3),
+            /*request_id=*/23,
+            /*vocab_size=*/100,
+            request,
+            result,
+            /*base_cached_tokens=*/64);
+
+    ASSERT_TRUE(plan.ok) << plan.error;
+    ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
+    const MTPSpecStepPlan &step = plan.step_plans.steps.front();
+    EXPECT_EQ(step.request_id, 23);
+    EXPECT_EQ(step.accepted_count, 2);
+    EXPECT_EQ(step.base_cached_tokens, 64);
+    EXPECT_EQ(step.target_cached_tokens, 66);
+    EXPECT_EQ(step.accepted_state_slot_index, 1);
+    EXPECT_EQ(step.correction_replay_start_index, 2);
+    EXPECT_EQ(step.correction_replay_count, 1);
 }
 
 TEST(Test__MTPSpecStateContract, RejectsPublicationThatDriftsFromMetadata)

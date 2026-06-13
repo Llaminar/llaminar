@@ -18,6 +18,7 @@
 #include "../mtp/MTPSpecDecodeMetadata.h"
 #include "../mtp/MTPSpecDecodeTransaction.h"
 #include "../mtp/MTPSpecStateContract.h"
+#include "../mtp/MTPSpecTransactionDriver.h"
 #include "../mtp/MTPVerifierPolicy.h"
 #include "../mtp/MTPWeightManifest.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
@@ -4126,35 +4127,34 @@ namespace llaminar2
                     .all_drafts_accepted = catchup.all_speculative_accepted,
                     .stopped_on_output = catchup.stopped_on_output};
             }
-            MTPSpecDecodeMetadataBatch metadata =
+            const int32_t verifier_base_cached_tokens =
+                static_cast<int32_t>(verifier_base_checkpoint.cached_tokens);
+            MTPSpecTransactionBatchPlan transaction_plan =
                 deferred_accepted_outcome.has_value()
-                    ? buildMTPSpecDecodeMetadataBatchFromAcceptedOutcome(
+                    ? buildMTPSpecTransactionBatchPlanFromAcceptedOutcome(
                           metadata_shape,
-                          *deferred_accepted_outcome)
-                    : buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+                          *deferred_accepted_outcome,
+                          verifier_base_cached_tokens)
+                    : buildMTPSpecTransactionBatchPlanFromGreedyCatchup(
                           metadata_shape,
                           /*request_id=*/0,
                           vocab,
                           catchup_request,
-                          catchup);
-            if (!metadata.ok)
+                          catchup,
+                          verifier_base_cached_tokens);
+            if (!transaction_plan.ok)
             {
                 return fail_after_checkpoint(
-                    std::string("All-position MTP verifier metadata failed: ") +
-                    metadata.error);
+                    std::string("All-position MTP verifier transaction plan failed: ") +
+                    transaction_plan.error);
             }
-            MTPSpecStepPlanBatch step_plans =
-                buildMTPSpecStepPlans(
-                    metadata,
-                    std::vector<int32_t>{
-                        static_cast<int32_t>(
-                            verifier_base_checkpoint.cached_tokens)});
-            if (!step_plans.ok || step_plans.steps.size() != 1)
+            const MTPSpecStepPlanBatch &step_plans =
+                transaction_plan.step_plans;
+            if (step_plans.steps.size() != 1)
             {
                 return fail_after_checkpoint(
                     std::string("All-position MTP verifier step-plan failed: ") +
-                    (step_plans.ok ? std::string("missing step")
-                                   : step_plans.error));
+                    "missing single-request step");
             }
 
             const MTPSpecStepPlan &step = step_plans.steps.front();
