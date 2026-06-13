@@ -302,6 +302,50 @@ TEST(Test__MTPDecodeCatchup, AllPositionVerifierWithCorrectionReplayMatchesStepw
     EXPECT_TRUE(eq.ok) << eq.error;
 }
 
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierBuildsCompactRequestBatch)
+{
+    MTPDecodeCatchupGreedyRequest accept_all;
+    accept_all.draft_tokens = {7, 9, 8};
+
+    MTPDecodeCatchupGreedyRequest reject_after_first;
+    reject_after_first.draft_tokens = {11, 12, 13};
+
+    MTPDecodeCatchupGreedyBatchResult batch =
+        buildAllPositionMTPDecodeCatchupGreedyBatchResult(
+            {accept_all, reject_after_first},
+            /*sampled_verifier_rows=*/{9, 8, 4, 77, 123, 123});
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    ASSERT_THAT(batch.results, SizeIs(2));
+
+    const MTPDecodeCatchupGreedyResult &first = batch.results[0];
+    EXPECT_THAT(first.accepted_tokens, ElementsAre(7, 9, 8));
+    EXPECT_TRUE(first.all_speculative_accepted);
+    EXPECT_EQ(first.ready_token, 4);
+    EXPECT_EQ(first.target_verifier_state_commit_count, 3);
+
+    const MTPDecodeCatchupGreedyResult &second = batch.results[1];
+    EXPECT_THAT(second.accepted_tokens, ElementsAre(11, 77));
+    EXPECT_FALSE(second.all_speculative_accepted);
+    EXPECT_EQ(second.rejected_verified_token, 77);
+    EXPECT_EQ(second.ready_token, -1);
+    EXPECT_EQ(second.target_verifier_state_commit_count, 1);
+}
+
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierBatchRejectsUnusedRows)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9};
+
+    MTPDecodeCatchupGreedyBatchResult batch =
+        buildAllPositionMTPDecodeCatchupGreedyBatchResult(
+            {request},
+            /*sampled_verifier_rows=*/{9, 4, 123});
+
+    EXPECT_FALSE(batch.ok);
+    EXPECT_THAT(batch.error, HasSubstr("unused sampled rows"));
+}
+
 TEST(Test__MTPDecodeCatchup, AllPositionVerifierStopsOnAcceptedTokenWithoutReadyToken)
 {
     MTPDecodeCatchupGreedyRequest request;

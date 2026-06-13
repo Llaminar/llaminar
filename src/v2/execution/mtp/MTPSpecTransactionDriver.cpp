@@ -103,14 +103,31 @@ namespace llaminar2
         const MTPDecodeCatchupGreedyResult &result,
         int32_t base_cached_tokens)
     {
-        return planFromMetadata(
-            buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
-                shape,
-                request_id,
-                vocab_size,
-                request,
-                result),
+        return buildMTPSpecTransactionBatchPlanFromGreedyCatchups(
+            shape,
+            std::vector<int>{request_id},
+            vocab_size,
+            std::vector<MTPDecodeCatchupGreedyRequest>{request},
+            std::vector<MTPDecodeCatchupGreedyResult>{result},
             std::vector<int32_t>{base_cached_tokens});
+    }
+
+    MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromGreedyCatchups(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<int> &request_ids,
+        int vocab_size,
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<MTPDecodeCatchupGreedyResult> &results,
+        const std::vector<int32_t> &base_cached_tokens)
+    {
+        return planFromMetadata(
+            buildMTPSpecDecodeMetadataBatchFromGreedyCatchups(
+                shape,
+                request_ids,
+                vocab_size,
+                requests,
+                results),
+            base_cached_tokens);
     }
 
 } // namespace llaminar2

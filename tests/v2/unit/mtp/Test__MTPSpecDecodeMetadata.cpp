@@ -603,6 +603,58 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsPaddedBatchMetadataForAcceptAndReject)
     EXPECT_FALSE(batch.transactions[1].allDraftsAccepted());
 }
 
+TEST(Test__MTPSpecDecodeMetadata, BuildsPaddedBatchMetadataFromGreedyCatchups)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPDecodeCatchupGreedyRequest accept_all_request;
+    accept_all_request.draft_tokens = {7, 9, 8};
+    MTPDecodeCatchupGreedyResult accept_all_result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            accept_all_request,
+            /*sampled_verifier_rows=*/{9, 8, 4});
+    ASSERT_TRUE(accept_all_result.ok) << accept_all_result.error;
+
+    MTPDecodeCatchupGreedyRequest reject_request;
+    reject_request.draft_tokens = {11, 12, 13};
+    MTPDecodeCatchupGreedyResult reject_result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            reject_request,
+            /*sampled_verifier_rows=*/{77, 123, 123});
+    ASSERT_TRUE(reject_result.ok) << reject_result.error;
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromGreedyCatchups(
+            shape,
+            /*request_ids=*/{10, 11},
+            /*vocab_size=*/100,
+            {accept_all_request, reject_request},
+            {accept_all_result, reject_result});
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    EXPECT_EQ(batch.request_count, 2);
+    EXPECT_EQ(batch.total_target_query_tokens, 8);
+    EXPECT_THAT(batch.query_start_locs, ElementsAre(0, 4, 8));
+    EXPECT_THAT(batch.accepted_draft_prefixes, ElementsAre(3, 1));
+    EXPECT_THAT(batch.committed_output_counts, ElementsAre(3, 2));
+    EXPECT_THAT(batch.accepted_state_counts, ElementsAre(3, 1));
+    EXPECT_THAT(batch.committed_state_rows, ElementsAre(2, 0));
+    EXPECT_THAT(batch.committed_state_indices, ElementsAre(2, 4));
+    EXPECT_THAT(batch.accepted_state_slot_indices, ElementsAre(2, 4));
+    EXPECT_THAT(batch.correction_replay_start_indices,
+                ElementsAre(kMTPSpecDecodeInvalidToken, 1));
+    EXPECT_THAT(batch.correction_replay_counts, ElementsAre(0, 1));
+    EXPECT_THAT(batch.bonus_ready_state_slot_indices,
+                ElementsAre(3, kMTPSpecDecodeInvalidToken));
+    ASSERT_THAT(batch.transactions, SizeIs(2));
+    EXPECT_EQ(batch.transactions[0].request_id, 10);
+    EXPECT_TRUE(batch.transactions[0].allDraftsAccepted());
+    EXPECT_EQ(batch.transactions[1].request_id, 11);
+    EXPECT_FALSE(batch.transactions[1].allDraftsAccepted());
+}
+
 TEST(Test__MTPSpecDecodeMetadata, BuildsVerifierInputPlanForCurrentRowIndexedContract)
 {
     MTPSpecDecodeMetadataShape shape;

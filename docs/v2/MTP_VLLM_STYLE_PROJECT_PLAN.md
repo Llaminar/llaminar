@@ -1787,6 +1787,14 @@ Status:
   scheduler path will attach to the same accepted-count semantics instead of
   cloning runner-local metadata construction. Focused gates:
   `V2_Unit_MTPSpecStateContract` and `V2_Unit_PrefillDecodeTransition`.
+- The greedy all-position path now has the same batched verifier-to-publication
+  adapter as accepted-count stochastic outcomes. `MTPDecodeCatchup` splits one
+  compact sampled-row batch into per-request results, metadata construction
+  builds one padded multi-request greedy batch, and
+  `MTPSpecTransactionDriver` returns a single publication plan for mixed
+  all-accepted and rejected requests. Focused gates:
+  `V2_Unit_MTPDecodeCatchup`, `V2_Unit_MTPSpecDecodeMetadata`, and
+  `V2_Unit_MTPSpecStateContract`.
 - Compact verifier scratch now scales with request-batch intent instead of the
   historical four-row constant. `mtp_target_query_rows` resolves to
   `max(4, max_request_batch * (draft_tokens + 1))`, the Qwen/Qwen3/Qwen3.5
@@ -1819,6 +1827,15 @@ Status:
   `forward_batch()`. It hard-fails batched device-token input until that path
   has an explicit workspace contract. Focused gates:
   `V2_Unit_MTPVerifierForwardExecutor` and the bounded MTP/schema unit gate.
+- Greedy request-batched verifier transactions are now executable as a shared
+  helper. `executeMTPGreedyVerifierBatchTransaction()` enables row-indexed
+  verifier logits, installs the compact row plan, executes the padded batch
+  forward, samples compact rows, cleans up row mode on success or failure, and
+  returns one batched transaction/publication plan. Focused gate:
+  `V2_Unit_MTPVerifierForwardExecutor`. The same helper is now proven against
+  the real CPU `DeviceGraphOrchestrator` verifier graph, including paired
+  all-position/row-indexed mode ownership. Focused gate:
+  `V2_Unit_MTPGraphConstruction`.
 - Qwen35/Qwen36 MTP sidecar graph construction now allows bounded one-token
   request batches. The graph still rejects more than four total MTP rows,
   non-KV full sidecars with `seq_len != 1`, and multi-token catchup shapes

@@ -24,14 +24,14 @@ Before a WiP commit, broad units plus touched parity must pass.
 - Phase 8 groundwork: accepted outcomes build padded multi-request metadata;
   a shared batch transaction planner now produces commit/publication step
   plans and the live runner uses it for the current single-request path.
-  Compact verifier LM-head scratch now scales above four rows for request-batch
-  capacity and is covered by CPU row-indexed graph tests.
-  Explicit non-leading verifier row plans are now builder-owned on CPU too.
-  Padded batched verifier graph rows and actual per-request lengths are now
-  materialized and unit-proven; a shared verifier-forward helper now routes
-  single, device-row, and host-batched graph execution.
-  Qwen35/Qwen36 sidecar graph construction now accepts bounded one-token
-  request batches, with matching batched terminal-hidden publication.
+  Greedy catch-up now also consumes compact sampled-row request batches and
+  produces one padded publication plan for mixed accept/reject requests; a
+  shared greedy batch executor now runs row-indexed verifier forward, samples
+  compact rows, cleans up graph mode, and returns that plan. The executor is
+  CPU-DGO proven, including all-position/row-indexed mode pairing.
+  Compact verifier scratch, explicit graph rows, padded forward lengths,
+  verifier-forward routing, bounded one-token Qwen35/Qwen36 sidecar batches,
+  and batched terminal-hidden publication are unit-proven.
   `--mtp-max-request-batch` records intent but still hard-fails above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.

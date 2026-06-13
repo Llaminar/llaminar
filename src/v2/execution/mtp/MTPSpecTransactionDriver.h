@@ -73,4 +73,20 @@ namespace llaminar2
         const MTPDecodeCatchupGreedyResult &result,
         int32_t base_cached_tokens);
 
+    /**
+     * @brief Batched greedy catch-up transaction planner.
+     *
+     * This is the vLLM-style all-position greedy path after verifier rows have
+     * been sampled.  It keeps request ids, base-cache counts, metadata, commit
+     * rows, and step plans aligned in one object so production batching can
+     * publish every request atomically.
+     */
+    MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromGreedyCatchups(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<int> &request_ids,
+        int vocab_size,
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<MTPDecodeCatchupGreedyResult> &results,
+        const std::vector<int32_t> &base_cached_tokens);
+
 } // namespace llaminar2

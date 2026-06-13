@@ -68,6 +68,21 @@ namespace llaminar2
         int target_verifier_state_commit_count = -1;
     };
 
+    /**
+     * @brief Result for a compact batch of all-position verifier catch-up rows.
+     *
+     * The rows are still interpreted per request by the single-request
+     * `MTPDecodeCatchupGreedyResult` contract.  Keeping the outer batch result
+     * thin makes failures easy to report while preserving request-local
+     * equivalence checks.
+     */
+    struct MTPDecodeCatchupGreedyBatchResult
+    {
+        bool ok = false;
+        std::string error;
+        std::vector<MTPDecodeCatchupGreedyResult> results;
+    };
+
     struct MTPDecodeCatchupGreedyEquivalence
     {
         bool ok = false;
@@ -101,6 +116,19 @@ namespace llaminar2
         const MTPDecodeCatchupGreedyRequest &request,
         const std::vector<int32_t> &sampled_verifier_rows,
         std::optional<int32_t> correction_replay_ready_token = std::nullopt);
+
+    /**
+     * @brief Build greedy catch-up results from one compact verifier row batch.
+     *
+     * Rows are consumed in request order, with exactly
+     * `request.draft_tokens.size()` rows assigned to each request.  This is the
+     * CPU-side mirror of the graph row materializer: graph execution may be
+     * padded, but the sampled-row vector passed here must already be compact.
+     */
+    MTPDecodeCatchupGreedyBatchResult buildAllPositionMTPDecodeCatchupGreedyBatchResult(
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<int32_t> &sampled_verifier_rows,
+        const std::vector<std::optional<int32_t>> &correction_replay_ready_tokens = {});
 
     /**
      * @brief Run greedy MTP verification through normal one-token decode.

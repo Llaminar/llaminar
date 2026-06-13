@@ -93,4 +93,154 @@ namespace llaminar2
         return result;
     }
 
+    MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierBatchTransaction(
+        IInferenceRunner &runner,
+        const MTPGreedyVerifierBatchTransactionRequest &request)
+    {
+        MTPGreedyVerifierBatchTransactionResult result;
+
+        auto fail = [&](std::string error) -> MTPGreedyVerifierBatchTransactionResult
+        {
+            result.ok = false;
+            result.error = std::move(error);
+            return result;
+        };
+
+        if (!request.shape.valid())
+            return fail("MTP greedy verifier batch transaction has invalid shape");
+        if (request.requests.empty())
+            return fail("MTP greedy verifier batch transaction has no requests");
+        if (request.request_ids.size() != request.requests.size())
+            return fail("MTP greedy verifier batch transaction request-id vector mismatch");
+        if (request.base_cached_tokens.size() != request.requests.size())
+            return fail("MTP greedy verifier batch transaction base-cache vector mismatch");
+        if (static_cast<int>(request.requests.size()) > request.shape.max_requests)
+            return fail("MTP greedy verifier batch transaction exceeds max_requests");
+
+        std::vector<MTPSpecDecodeVerifierDraftRequest> verifier_requests;
+        verifier_requests.reserve(request.requests.size());
+        for (size_t i = 0; i < request.requests.size(); ++i)
+        {
+            MTPSpecDecodeVerifierDraftRequest verifier_request;
+            verifier_request.request_id = request.request_ids[i];
+            verifier_request.draft_tokens = request.requests[i].draft_tokens;
+            verifier_requests.push_back(std::move(verifier_request));
+        }
+
+        result.verifier_input_plan =
+            buildMTPSpecDecodeVerifierInputPlan(
+                request.shape,
+                verifier_requests);
+        if (!result.verifier_input_plan.ok)
+        {
+            return fail(std::string("MTP greedy verifier input plan failed: ") +
+                        result.verifier_input_plan.error);
+        }
+
+        const int compact_row_count =
+            result.verifier_input_plan.compact_logit_row_count;
+        if (compact_row_count <= 0)
+            return fail("MTP greedy verifier input plan produced no compact rows");
+
+        bool row_indexed_enabled = false;
+        bool all_position_enabled = false;
+        auto cleanup_row_indexed = [&]() -> bool
+        {
+            bool ok = true;
+            runner.clearMTPSpecVerifierInputPlan();
+            if (all_position_enabled)
+            {
+                all_position_enabled = false;
+                ok = runner.setComputeAllPositionLogits(false) && ok;
+            }
+            if (!row_indexed_enabled)
+                return ok;
+            row_indexed_enabled = false;
+            return runner.setComputeRowIndexedAllPositionLogits(false, 0) && ok;
+        };
+
+        if (!runner.setComputeRowIndexedAllPositionLogits(true, compact_row_count))
+            return fail("MTP greedy verifier batch could not enable row-indexed logits");
+        row_indexed_enabled = true;
+
+        if (!runner.setMTPSpecVerifierInputPlan(result.verifier_input_plan))
+        {
+            const bool cleanup_ok = cleanup_row_indexed();
+            return fail(
+                cleanup_ok
+                    ? "MTP greedy verifier batch could not install row plan"
+                    : "MTP greedy verifier batch could not install row plan and cleanup failed");
+        }
+
+        if (!runner.setComputeAllPositionLogits(true))
+        {
+            const bool cleanup_ok = cleanup_row_indexed();
+            return fail(
+                cleanup_ok
+                    ? "MTP greedy verifier batch could not enable all-position logits"
+                    : "MTP greedy verifier batch could not enable all-position logits and cleanup failed");
+        }
+        all_position_enabled = true;
+
+        result.forward =
+            executeMTPSpecVerifierForward(
+                runner,
+                result.verifier_input_plan);
+        if (!result.forward.ok)
+        {
+            const bool cleanup_ok = cleanup_row_indexed();
+            return fail(
+                cleanup_ok
+                    ? std::string("MTP greedy verifier forward failed: ") +
+                          result.forward.error
+                    : std::string("MTP greedy verifier forward failed and cleanup failed: ") +
+                          result.forward.error);
+        }
+
+        result.sampled_verifier_rows.assign(
+            static_cast<size_t>(compact_row_count),
+            kMTPSpecDecodeInvalidToken);
+        if (!runner.sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                /*start_row=*/0,
+                compact_row_count,
+                result.sampled_verifier_rows.data()))
+        {
+            const bool cleanup_ok = cleanup_row_indexed();
+            return fail(
+                cleanup_ok
+                    ? "MTP greedy verifier batch could not sample compact rows"
+                    : "MTP greedy verifier batch could not sample compact rows and cleanup failed");
+        }
+
+        if (!cleanup_row_indexed())
+            return fail("MTP greedy verifier batch could not disable row-indexed logits");
+
+        result.catchup =
+            buildAllPositionMTPDecodeCatchupGreedyBatchResult(
+                request.requests,
+                result.sampled_verifier_rows);
+        if (!result.catchup.ok)
+        {
+            return fail(std::string("MTP greedy verifier catch-up batch failed: ") +
+                        result.catchup.error);
+        }
+
+        result.transaction_plan =
+            buildMTPSpecTransactionBatchPlanFromGreedyCatchups(
+                request.shape,
+                request.request_ids,
+                request.vocab_size,
+                request.requests,
+                result.catchup.results,
+                request.base_cached_tokens);
+        if (!result.transaction_plan.ok)
+        {
+            return fail(std::string("MTP greedy verifier transaction plan failed: ") +
+                        result.transaction_plan.error);
+        }
+
+        result.ok = true;
+        return result;
+    }
+
 } // namespace llaminar2

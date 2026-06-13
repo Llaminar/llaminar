@@ -9,6 +9,7 @@
 #include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <sstream>
 #include <utility>
 
@@ -263,6 +264,84 @@ namespace llaminar2
                       : std::string("none"));
         result.debug_trace = trace.str();
         return result;
+    }
+
+    MTPDecodeCatchupGreedyBatchResult buildAllPositionMTPDecodeCatchupGreedyBatchResult(
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<int32_t> &sampled_verifier_rows,
+        const std::vector<std::optional<int32_t>> &correction_replay_ready_tokens)
+    {
+        MTPDecodeCatchupGreedyBatchResult batch;
+
+        auto fail = [&](std::string reason) -> MTPDecodeCatchupGreedyBatchResult
+        {
+            batch.ok = false;
+            batch.error = std::move(reason);
+            return batch;
+        };
+
+        if (requests.empty())
+            return fail("all-position MTP verifier batch has no requests");
+        if (!correction_replay_ready_tokens.empty() &&
+            correction_replay_ready_tokens.size() != requests.size())
+        {
+            return fail("all-position MTP verifier batch correction-ready vector does not match request count");
+        }
+
+        batch.results.reserve(requests.size());
+        size_t compact_row_cursor = 0;
+        for (size_t request_index = 0; request_index < requests.size(); ++request_index)
+        {
+            const MTPDecodeCatchupGreedyRequest &request = requests[request_index];
+            const size_t row_count = request.draft_tokens.size();
+            if (row_count == 0)
+            {
+                std::ostringstream msg;
+                msg << "request " << request_index << ": no draft tokens";
+                return fail(msg.str());
+            }
+            if (compact_row_cursor + row_count > sampled_verifier_rows.size())
+            {
+                std::ostringstream msg;
+                msg << "request " << request_index
+                    << ": compact verifier rows end past sampled-row vector";
+                return fail(msg.str());
+            }
+
+            std::vector<int32_t> request_rows(
+                sampled_verifier_rows.begin() + static_cast<std::ptrdiff_t>(compact_row_cursor),
+                sampled_verifier_rows.begin() + static_cast<std::ptrdiff_t>(compact_row_cursor + row_count));
+            const std::optional<int32_t> correction_ready =
+                correction_replay_ready_tokens.empty()
+                    ? std::optional<int32_t>{}
+                    : correction_replay_ready_tokens[request_index];
+
+            MTPDecodeCatchupGreedyResult result =
+                buildAllPositionMTPDecodeCatchupGreedyResult(
+                    request,
+                    request_rows,
+                    correction_ready);
+            if (!result.ok)
+            {
+                std::ostringstream msg;
+                msg << "request " << request_index << ": " << result.error;
+                return fail(msg.str());
+            }
+            batch.results.push_back(std::move(result));
+            compact_row_cursor += row_count;
+        }
+
+        if (compact_row_cursor != sampled_verifier_rows.size())
+        {
+            std::ostringstream msg;
+            msg << "all-position MTP verifier batch has "
+                << (sampled_verifier_rows.size() - compact_row_cursor)
+                << " unused sampled rows";
+            return fail(msg.str());
+        }
+
+        batch.ok = true;
+        return batch;
     }
 
     MTPDecodeCatchupGreedyResult runSharedStepwiseMTPDecodeCatchupGreedy(

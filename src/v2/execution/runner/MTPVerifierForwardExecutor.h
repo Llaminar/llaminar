@@ -1,8 +1,11 @@
 #pragma once
 
+#include "../mtp/MTPDecodeCatchup.h"
 #include "../mtp/MTPSpecDecodeMetadata.h"
+#include "../mtp/MTPSpecTransactionDriver.h"
 
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
@@ -54,5 +57,50 @@ namespace llaminar2
         IInferenceRunner &runner,
         const MTPSpecDecodeVerifierInputPlan &plan,
         const MTPVerifierForwardExecutionOptions &options = {});
+
+    /**
+     * @brief Input for one greedy request-batched verifier transaction.
+     *
+     * Every request supplies the compact all-position verifier input
+     * `[main_token, draft_0, ...]` through `requests`.  The executor runs one
+     * verifier graph, greedily samples the compact verifier rows, and converts
+     * the result into one publication-ready transaction plan.
+     */
+    struct MTPGreedyVerifierBatchTransactionRequest
+    {
+        MTPSpecDecodeMetadataShape shape;
+        std::vector<int> request_ids;
+        int vocab_size = 0;
+        std::vector<MTPDecodeCatchupGreedyRequest> requests;
+        std::vector<int32_t> base_cached_tokens;
+    };
+
+    /**
+     * @brief Result of an executable greedy verifier batch transaction.
+     */
+    struct MTPGreedyVerifierBatchTransactionResult
+    {
+        bool ok = false;
+        std::string error;
+
+        MTPSpecDecodeVerifierInputPlan verifier_input_plan;
+        MTPVerifierForwardExecutionResult forward;
+        std::vector<int32_t> sampled_verifier_rows;
+        MTPDecodeCatchupGreedyBatchResult catchup;
+        MTPSpecTransactionBatchPlan transaction_plan;
+    };
+
+    /**
+     * @brief Execute a compact greedy verifier batch and build publication plans.
+     *
+     * The helper owns the short-lived all-position verifier modes: it enables
+     * row-indexed all-position logits, installs the compact row plan, executes
+     * the verifier forward, samples rows `0..N-1`, and then disables the modes
+     * even on failure.  It does not mutate live state publication itself;
+     * callers apply the returned `transaction_plan` atomically.
+     */
+    MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierBatchTransaction(
+        IInferenceRunner &runner,
+        const MTPGreedyVerifierBatchTransactionRequest &request);
 
 } // namespace llaminar2

@@ -501,6 +501,56 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGreedyCatchupPlan)
     EXPECT_EQ(step.correction_replay_count, 1);
 }
 
+TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedGreedyCatchupPlan)
+{
+    MTPDecodeCatchupGreedyRequest accept_all_request;
+    accept_all_request.draft_tokens = {7, 9, 8};
+    MTPDecodeCatchupGreedyResult accept_all_result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            accept_all_request,
+            /*sampled_verifier_rows=*/{9, 8, 4});
+    ASSERT_TRUE(accept_all_result.ok) << accept_all_result.error;
+
+    MTPDecodeCatchupGreedyRequest reject_request;
+    reject_request.draft_tokens = {11, 12, 13};
+    MTPDecodeCatchupGreedyResult reject_result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            reject_request,
+            /*sampled_verifier_rows=*/{77, 123, 123});
+    ASSERT_TRUE(reject_result.ok) << reject_result.error;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromGreedyCatchups(
+            shapeFor(/*requests=*/2, /*draft_tokens=*/3),
+            /*request_ids=*/{10, 11},
+            /*vocab_size=*/100,
+            {accept_all_request, reject_request},
+            {accept_all_result, reject_result},
+            /*base_cached_tokens=*/{100, 200});
+
+    ASSERT_TRUE(plan.ok) << plan.error;
+    EXPECT_EQ(plan.request_count, 2);
+    EXPECT_EQ(plan.metadata.total_target_query_tokens, 8);
+    ASSERT_THAT(plan.step_plans.steps, SizeIs(2));
+
+    const MTPSpecStepPlan &first = plan.step_plans.steps[0];
+    EXPECT_EQ(first.request_id, 10);
+    EXPECT_EQ(first.accepted_count, 3);
+    EXPECT_EQ(first.target_cached_tokens, 103);
+    EXPECT_EQ(first.accepted_state_slot_index, 2);
+    EXPECT_EQ(first.bonus_ready_state_slot_index, 3);
+    EXPECT_FALSE(first.requiresCorrectionReplay());
+
+    const MTPSpecStepPlan &second = plan.step_plans.steps[1];
+    EXPECT_EQ(second.request_id, 11);
+    EXPECT_EQ(second.accepted_count, 1);
+    EXPECT_EQ(second.target_cached_tokens, 201);
+    EXPECT_EQ(second.accepted_state_slot_index, 4);
+    EXPECT_EQ(second.correction_replay_start_index, 1);
+    EXPECT_EQ(second.correction_replay_count, 1);
+    EXPECT_TRUE(second.requiresCorrectionReplay());
+}
+
 TEST(Test__MTPSpecStateContract, RejectsPublicationThatDriftsFromMetadata)
 {
     MTPSpecDecodeRequest request;

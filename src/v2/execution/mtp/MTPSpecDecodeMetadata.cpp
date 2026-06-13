@@ -877,97 +877,159 @@ namespace llaminar2
         const MTPDecodeCatchupGreedyRequest &request,
         const MTPDecodeCatchupGreedyResult &result)
     {
-        if (!result.ok)
+        return buildMTPSpecDecodeMetadataBatchFromGreedyCatchups(
+            shape,
+            std::vector<int>{request_id},
+            vocab_size,
+            std::vector<MTPDecodeCatchupGreedyRequest>{request},
+            std::vector<MTPDecodeCatchupGreedyResult>{result});
+    }
+
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchFromGreedyCatchups(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<int> &request_ids,
+        int vocab_size,
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<MTPDecodeCatchupGreedyResult> &results)
+    {
+        if (request_ids.size() != requests.size())
+            return metadataFailure(shape, "MTP spec-decode request-id vector does not match request count");
+        if (results.size() != requests.size())
+            return metadataFailure(shape, "MTP spec-decode catch-up result vector does not match request count");
+
+        std::vector<MTPSpecDecodeRequest> spec_requests;
+        std::vector<int32_t> committed_output_counts;
+        std::vector<int32_t> target_verifier_state_commit_counts;
+        std::vector<int32_t> stopped_flags;
+        std::vector<int> expected_accepted_verifier_prefixes;
+        std::vector<bool> expected_all_drafts_accepted_flags;
+        std::vector<int32_t> expected_next_condition_tokens;
+        std::vector<int> expected_valid_sampled_counts;
+        spec_requests.reserve(requests.size());
+        committed_output_counts.reserve(requests.size());
+        target_verifier_state_commit_counts.reserve(requests.size());
+        stopped_flags.reserve(requests.size());
+        expected_accepted_verifier_prefixes.reserve(requests.size());
+        expected_all_drafts_accepted_flags.reserve(requests.size());
+        expected_next_condition_tokens.reserve(requests.size());
+        expected_valid_sampled_counts.reserve(requests.size());
+
+        for (size_t i = 0; i < requests.size(); ++i)
         {
-            return metadataFailure(
-                shape,
-                std::string("cannot build MTP spec-decode metadata from failed catch-up: ") +
-                    result.error);
-        }
-        if (request.draft_tokens.empty())
-            return metadataFailure(shape, "MTP spec-decode catch-up request has no draft tokens");
-        if (result.accepted_tokens.empty())
-            return metadataFailure(shape, "MTP spec-decode catch-up result has no committed output tokens");
-        if (result.accepted_speculative_prefix < 0)
-            return metadataFailure(shape, "MTP spec-decode catch-up accepted prefix is negative");
-        if (result.ready_token < 0 &&
-            result.all_speculative_accepted &&
-            !result.stopped_on_output)
-        {
-            return metadataFailure(
-                shape,
-                "MTP spec-decode catch-up accepted all drafts without a ready token");
+            const MTPDecodeCatchupGreedyRequest &request = requests[i];
+            const MTPDecodeCatchupGreedyResult &result = results[i];
+            auto fail_request = [&](const char *reason)
+            {
+                std::ostringstream msg;
+                msg << "request " << i << ": " << reason;
+                return metadataFailure(shape, msg.str());
+            };
+
+            if (!result.ok)
+            {
+                std::ostringstream msg;
+                msg << "request " << i
+                    << ": cannot build MTP spec-decode metadata from failed catch-up: "
+                    << result.error;
+                return metadataFailure(shape, msg.str());
+            }
+            if (request.draft_tokens.empty())
+                return fail_request("MTP spec-decode catch-up request has no draft tokens");
+            if (result.accepted_tokens.empty())
+                return fail_request("MTP spec-decode catch-up result has no committed output tokens");
+            if (result.accepted_speculative_prefix < 0)
+                return fail_request("MTP spec-decode catch-up accepted prefix is negative");
+            if (result.ready_token < 0 &&
+                result.all_speculative_accepted &&
+                !result.stopped_on_output)
+            {
+                return fail_request("MTP spec-decode catch-up accepted all drafts without a ready token");
+            }
+
+            const bool expected_all_drafts_accepted =
+                result.all_speculative_accepted && !result.stopped_on_output;
+            const std::optional<int32_t> bonus_ready_token =
+                expected_all_drafts_accepted
+                    ? std::optional<int32_t>{result.ready_token}
+                    : std::optional<int32_t>{};
+            const int expected_accepted_verifier_prefix =
+                std::min<int>(
+                    static_cast<int>(request.draft_tokens.size()),
+                    result.accepted_speculative_prefix + 1);
+
+            spec_requests.push_back(
+                buildMTPSpecDecodeRequestFromVerifierOutput(
+                    request_ids[i],
+                    vocab_size,
+                    request.draft_tokens,
+                    result.accepted_tokens,
+                    bonus_ready_token,
+                    result.all_speculative_accepted,
+                    result.stopped_on_output));
+            committed_output_counts.push_back(
+                static_cast<int32_t>(result.accepted_tokens.size()));
+            target_verifier_state_commit_counts.push_back(
+                static_cast<int32_t>(
+                    result.target_verifier_state_commit_count >= 0
+                        ? result.target_verifier_state_commit_count
+                        : expected_accepted_verifier_prefix));
+            stopped_flags.push_back(result.stopped_on_output ? 1 : 0);
+            expected_accepted_verifier_prefixes.push_back(
+                expected_accepted_verifier_prefix);
+            expected_all_drafts_accepted_flags.push_back(
+                expected_all_drafts_accepted);
+            expected_valid_sampled_counts.push_back(
+                static_cast<int>(result.accepted_tokens.size()) +
+                (expected_all_drafts_accepted ? 1 : 0));
+            expected_next_condition_tokens.push_back(
+                expected_all_drafts_accepted
+                    ? result.ready_token
+                    : result.accepted_tokens.back());
         }
 
-        const bool expected_all_drafts_accepted =
-            result.all_speculative_accepted && !result.stopped_on_output;
-        const std::optional<int32_t> bonus_ready_token =
-            expected_all_drafts_accepted
-                ? std::optional<int32_t>{result.ready_token}
-                : std::optional<int32_t>{};
-        const int expected_accepted_verifier_prefix =
-            std::min<int>(
-                static_cast<int>(request.draft_tokens.size()),
-                result.accepted_speculative_prefix + 1);
-
-        MTPSpecDecodeRequest spec_request =
-            buildMTPSpecDecodeRequestFromVerifierOutput(
-                request_id,
-                vocab_size,
-                request.draft_tokens,
-                result.accepted_tokens,
-                bonus_ready_token,
-                result.all_speculative_accepted,
-                result.stopped_on_output);
         MTPSpecDecodeMetadataBatch batch =
             buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
                 shape,
-                {spec_request},
-                {static_cast<int32_t>(result.accepted_tokens.size())},
-                {static_cast<int32_t>(
-                    result.target_verifier_state_commit_count >= 0
-                        ? result.target_verifier_state_commit_count
-                        : expected_accepted_verifier_prefix)},
-                {result.stopped_on_output ? 1 : 0});
+                spec_requests,
+                committed_output_counts,
+                target_verifier_state_commit_counts,
+                stopped_flags);
         if (!batch.ok)
             return batch;
-        if (batch.transactions.empty())
-            return metadataFailure(shape, "MTP spec-decode metadata batch produced no transaction");
+        if (batch.transactions.size() != requests.size())
+            return metadataFailure(shape, "MTP spec-decode metadata batch produced the wrong transaction count");
 
-        const MTPSpecDecodeTransaction &tx = batch.transactions.front();
-        if (tx.accepted_speculative_prefix != expected_accepted_verifier_prefix)
+        for (size_t i = 0; i < requests.size(); ++i)
         {
-            return metadataFailure(
-                shape,
-                "MTP spec-decode accepted-prefix mismatch between catch-up result and transaction");
-        }
+            const MTPSpecDecodeTransaction &tx = batch.transactions[i];
+            if (tx.accepted_speculative_prefix !=
+                expected_accepted_verifier_prefixes[i])
+            {
+                return metadataFailure(
+                    shape,
+                    "MTP spec-decode accepted-prefix mismatch between catch-up result and transaction");
+            }
 
-        if (tx.allDraftsAccepted() != expected_all_drafts_accepted)
-        {
-            return metadataFailure(
-                shape,
-                "MTP spec-decode all-drafts-accepted mismatch between catch-up result and transaction");
-        }
+            if (tx.allDraftsAccepted() != expected_all_drafts_accepted_flags[i])
+            {
+                return metadataFailure(
+                    shape,
+                    "MTP spec-decode all-drafts-accepted mismatch between catch-up result and transaction");
+            }
 
-        const int expected_valid_sampled_count =
-            static_cast<int>(result.accepted_tokens.size()) +
-            (expected_all_drafts_accepted ? 1 : 0);
-        if (tx.valid_sampled_count != expected_valid_sampled_count)
-        {
-            return metadataFailure(
-                shape,
-                "MTP spec-decode valid-sampled-count mismatch between catch-up result and transaction");
-        }
+            if (tx.valid_sampled_count != expected_valid_sampled_counts[i])
+            {
+                return metadataFailure(
+                    shape,
+                    "MTP spec-decode valid-sampled-count mismatch between catch-up result and transaction");
+            }
 
-        const int32_t expected_next_condition_token =
-            expected_all_drafts_accepted
-                ? result.ready_token
-                : result.accepted_tokens.back();
-        if (tx.next_condition_token != expected_next_condition_token)
-        {
-            return metadataFailure(
-                shape,
-                "MTP spec-decode next-condition-token mismatch between catch-up result and transaction");
+            if (tx.next_condition_token != expected_next_condition_tokens[i])
+            {
+                return metadataFailure(
+                    shape,
+                    "MTP spec-decode next-condition-token mismatch between catch-up result and transaction");
+            }
         }
 
         return batch;

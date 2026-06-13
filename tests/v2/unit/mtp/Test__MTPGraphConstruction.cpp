@@ -14,6 +14,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/runner/MTPVerifierForwardExecutor.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/moe/MoEExpertParallelPlan.h"
 #include "execution/moe/MoERebalanceController.h"
@@ -4056,6 +4057,68 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectPaddedVerifie
     ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
     ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(false, 0));
     orchestrator.clearMTPSpecVerifierInputPlan();
+}
+
+TEST(Test__MTPGraphConstruction, GreedyBatchTransactionExecutorRunsOnCPUVerifierGraph)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.max_request_batch = 2;
+    fixture.config.mtp.draft_tokens = 3;
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    orchestrator.setWeights(fixture.modelWeights());
+    PreparedWeightStore prepared_store;
+    ASSERT_NO_THROW(prepareDenseForwardWeights(orchestrator, *graph_builder, prepared_store, DeviceId::cpu()));
+
+    MTPDecodeCatchupGreedyRequest request0;
+    request0.draft_tokens = {1, 2};
+    MTPDecodeCatchupGreedyRequest request1;
+    request1.draft_tokens = {3, 4, 5};
+
+    MTPGreedyVerifierBatchTransactionRequest batch_request;
+    batch_request.shape.max_requests = 2;
+    batch_request.shape.max_draft_tokens = 3;
+    batch_request.request_ids = {10, 11};
+    batch_request.vocab_size = fixture.config.vocab_size;
+    batch_request.requests = {request0, request1};
+    batch_request.base_cached_tokens = {100, 200};
+
+    /*
+     * This test is intentionally higher-level than the raw row-copy checks
+     * above. It proves the shared executor can drive the real CPU graph:
+     * install compact verifier rows, run one padded batch forward, sample the
+     * compact rows, clean up row mode, and produce a multi-request publication
+     * plan without the runner hand-assembling metadata.
+     */
+    MTPGreedyVerifierBatchTransactionResult result =
+        executeMTPGreedyVerifierBatchTransaction(orchestrator, batch_request);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.forward.used_batch_forward);
+    EXPECT_EQ(result.forward.graph_plan.padded_seq_len, 3);
+    EXPECT_EQ(result.forward.graph_plan.verifier_logit_rows,
+              (std::vector<int32_t>{0, 1, 3, 4, 5}));
+    EXPECT_EQ(result.sampled_verifier_rows.size(), 5u);
+
+    ASSERT_TRUE(result.transaction_plan.ok) << result.transaction_plan.error;
+    EXPECT_EQ(result.transaction_plan.request_count, 2);
+    EXPECT_EQ(result.transaction_plan.metadata.total_target_query_tokens, 7);
+    ASSERT_THAT(result.transaction_plan.step_plans.steps, ::testing::SizeIs(2));
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[0].request_id, 10);
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[0].base_cached_tokens, 100);
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[1].request_id, 11);
+    EXPECT_EQ(result.transaction_plan.step_plans.steps[1].base_cached_tokens, 200);
+
+    const auto state = orchestrator.prefixStateProbe();
+    ASSERT_THAT(state.positions, ::testing::ElementsAre(2, 3));
+    ASSERT_THAT(state.sequence_lengths, ::testing::ElementsAre(2, 3));
 }
 
 TEST(Test__MTPGraphConstruction, RowIndexedVerifierRowsScaleWithMTPRequestBatchCapacityOnCPU)

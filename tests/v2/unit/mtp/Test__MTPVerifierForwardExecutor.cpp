@@ -53,6 +53,74 @@ namespace
             return batch_forward_success;
         }
 
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override
+        {
+            if (enabled)
+            {
+                ++row_indexed_enable_count;
+                last_row_indexed_count = row_count;
+                row_indexed_enabled = true;
+                return row_indexed_enable_success;
+            }
+
+            ++row_indexed_disable_count;
+            row_indexed_enabled = false;
+            return row_indexed_disable_success;
+        }
+
+        bool setComputeAllPositionLogits(bool enabled) override
+        {
+            if (enabled)
+            {
+                ++all_position_enable_count;
+                all_position_enabled = true;
+                return all_position_enable_success;
+            }
+
+            ++all_position_disable_count;
+            all_position_enabled = false;
+            return all_position_disable_success;
+        }
+
+        bool setMTPSpecVerifierInputPlan(
+            const MTPSpecDecodeVerifierInputPlan &plan) override
+        {
+            ++set_plan_count;
+            last_verifier_plan = plan;
+            verifier_plan_installed = set_plan_success;
+            return set_plan_success;
+        }
+
+        void clearMTPSpecVerifierInputPlan() override
+        {
+            ++clear_plan_count;
+            verifier_plan_installed = false;
+        }
+
+        bool sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            int start_row,
+            int row_count,
+            int32_t *out_tokens) override
+        {
+            ++sample_rows_count;
+            last_sample_start_row = start_row;
+            last_sample_row_count = row_count;
+            if (!sample_rows_success || !out_tokens ||
+                start_row < 0 || row_count < 0 ||
+                start_row + row_count >
+                    static_cast<int>(scripted_verifier_samples.size()))
+            {
+                return false;
+            }
+
+            for (int i = 0; i < row_count; ++i)
+            {
+                out_tokens[i] =
+                    scripted_verifier_samples[static_cast<size_t>(start_row + i)];
+            }
+            return true;
+        }
+
         const float *logits() const override { return nullptr; }
         int vocab_size() const override { return 0; }
         void clear_cache() override {}
@@ -68,6 +136,27 @@ namespace
         bool forward_success = true;
         bool device_forward_success = true;
         bool batch_forward_success = true;
+        bool row_indexed_enable_success = true;
+        bool row_indexed_disable_success = true;
+        bool all_position_enable_success = true;
+        bool all_position_disable_success = true;
+        bool set_plan_success = true;
+        bool sample_rows_success = true;
+        bool row_indexed_enabled = false;
+        bool all_position_enabled = false;
+        bool verifier_plan_installed = false;
+        int row_indexed_enable_count = 0;
+        int row_indexed_disable_count = 0;
+        int all_position_enable_count = 0;
+        int all_position_disable_count = 0;
+        int last_row_indexed_count = 0;
+        int set_plan_count = 0;
+        int clear_plan_count = 0;
+        int sample_rows_count = 0;
+        int last_sample_start_row = -1;
+        int last_sample_row_count = -1;
+        MTPSpecDecodeVerifierInputPlan last_verifier_plan;
+        std::vector<int32_t> scripted_verifier_samples;
         std::vector<int> last_forward_tokens;
         std::vector<std::vector<int>> last_token_batches;
     };
@@ -191,6 +280,100 @@ TEST(Test__MTPVerifierForwardExecutor, RequestBatchRejectsSingleRowDeviceTokenHo
     EXPECT_EQ(runner.forward_count, 0);
     EXPECT_EQ(runner.device_forward_count, 0);
     EXPECT_EQ(runner.batch_forward_count, 0);
+}
+
+TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionBuildsPublicationPlan)
+{
+    RecordingInferenceRunner runner;
+    runner.scripted_verifier_samples = {9, 8, 4, 77, 123, 123};
+
+    MTPDecodeCatchupGreedyRequest accept_all;
+    accept_all.draft_tokens = {7, 9, 8};
+
+    MTPDecodeCatchupGreedyRequest reject_after_first;
+    reject_after_first.draft_tokens = {11, 12, 13};
+
+    MTPGreedyVerifierBatchTransactionRequest request;
+    request.shape.max_requests = 2;
+    request.shape.max_draft_tokens = 3;
+    request.request_ids = {10, 11};
+    request.vocab_size = 100;
+    request.requests = {accept_all, reject_after_first};
+    request.base_cached_tokens = {100, 200};
+
+    MTPGreedyVerifierBatchTransactionResult result =
+        executeMTPGreedyVerifierBatchTransaction(runner, request);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.forward.used_batch_forward);
+    EXPECT_EQ(runner.batch_forward_count, 1);
+    EXPECT_EQ(runner.last_token_batches,
+              (std::vector<std::vector<int>>{{7, 9, 8}, {11, 12, 13}}));
+    EXPECT_EQ(runner.row_indexed_enable_count, 1);
+    EXPECT_EQ(runner.row_indexed_disable_count, 1);
+    EXPECT_EQ(runner.all_position_enable_count, 1);
+    EXPECT_EQ(runner.all_position_disable_count, 1);
+    EXPECT_EQ(runner.last_row_indexed_count, 6);
+    EXPECT_EQ(runner.set_plan_count, 1);
+    EXPECT_EQ(runner.clear_plan_count, 1);
+    EXPECT_FALSE(runner.row_indexed_enabled);
+    EXPECT_FALSE(runner.all_position_enabled);
+    EXPECT_FALSE(runner.verifier_plan_installed);
+    EXPECT_EQ(runner.sample_rows_count, 1);
+    EXPECT_EQ(runner.last_sample_start_row, 0);
+    EXPECT_EQ(runner.last_sample_row_count, 6);
+    EXPECT_EQ(result.sampled_verifier_rows,
+              (std::vector<int32_t>{9, 8, 4, 77, 123, 123}));
+
+    ASSERT_EQ(result.transaction_plan.step_plans.steps.size(), 2u);
+    const MTPSpecStepPlan &first =
+        result.transaction_plan.step_plans.steps[0];
+    EXPECT_EQ(first.request_id, 10);
+    EXPECT_EQ(first.accepted_count, 3);
+    EXPECT_EQ(first.target_cached_tokens, 103);
+    EXPECT_EQ(first.bonus_ready_state_slot_index, 3);
+
+    const MTPSpecStepPlan &second =
+        result.transaction_plan.step_plans.steps[1];
+    EXPECT_EQ(second.request_id, 11);
+    EXPECT_EQ(second.accepted_count, 1);
+    EXPECT_EQ(second.target_cached_tokens, 201);
+    EXPECT_TRUE(second.requiresCorrectionReplay());
+}
+
+TEST(Test__MTPVerifierForwardExecutor, GreedyBatchTransactionCleansUpAfterForwardFailure)
+{
+    RecordingInferenceRunner runner;
+    runner.batch_forward_success = false;
+
+    MTPDecodeCatchupGreedyRequest request0;
+    request0.draft_tokens = {7, 9};
+    MTPDecodeCatchupGreedyRequest request1;
+    request1.draft_tokens = {11, 12};
+
+    MTPGreedyVerifierBatchTransactionRequest request;
+    request.shape.max_requests = 2;
+    request.shape.max_draft_tokens = 2;
+    request.request_ids = {10, 11};
+    request.vocab_size = 100;
+    request.requests = {request0, request1};
+    request.base_cached_tokens = {100, 200};
+
+    MTPGreedyVerifierBatchTransactionResult result =
+        executeMTPGreedyVerifierBatchTransaction(runner, request);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.error.find("forward failed"), std::string::npos);
+    EXPECT_EQ(runner.batch_forward_count, 1);
+    EXPECT_EQ(runner.row_indexed_enable_count, 1);
+    EXPECT_EQ(runner.row_indexed_disable_count, 1);
+    EXPECT_EQ(runner.all_position_enable_count, 1);
+    EXPECT_EQ(runner.all_position_disable_count, 1);
+    EXPECT_EQ(runner.clear_plan_count, 1);
+    EXPECT_FALSE(runner.row_indexed_enabled);
+    EXPECT_FALSE(runner.all_position_enabled);
+    EXPECT_FALSE(runner.verifier_plan_installed);
+    EXPECT_EQ(runner.sample_rows_count, 0);
 }
 
 } // namespace llaminar2

@@ -255,6 +255,22 @@ namespace llaminar2
         const MTPDecodeCatchupGreedyResult &result);
 
     /**
+     * @brief Build metadata for a compact batch of greedy verifier results.
+     *
+     * This is the request-batched equivalent of
+     * `buildMTPSpecDecodeMetadataBatchFromGreedyCatchup()`.  Every request
+     * supplies its draft-token vector and all-position verifier result; the
+     * returned batch uses one flattened verifier-state index space so state
+     * publication can target the same rows sampled by the verifier graph.
+     */
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchFromGreedyCatchups(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<int> &request_ids,
+        int vocab_size,
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<MTPDecodeCatchupGreedyResult> &results);
+
+    /**
      * @brief Build metadata from accepted counts instead of host draft tokens.
      *
      * Use this for device-resident stochastic MTP lanes where rejected draft
