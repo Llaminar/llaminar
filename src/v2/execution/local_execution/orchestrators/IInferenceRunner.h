@@ -30,6 +30,7 @@ namespace llaminar2
     struct SamplingParams;
     struct LogitPenalty;
     struct MTPSpecStepPlan;
+    struct MTPSpecStepPlanBatch;
     struct MTPSpecDecodeVerifierInputPlan;
     struct PrefillChunkSchedulerPolicy;
     class MoERebalanceController;
@@ -350,6 +351,26 @@ namespace llaminar2
             (void)plan;
             if (error)
                 *error = "runner does not support MTP spec-state publication";
+            return false;
+        }
+
+        /**
+         * @brief Publish accepted verifier state for a request batch.
+         *
+         * Request-batched verifier graphs use one padded graph execution for
+         * several logical requests. Implementations must map each request's
+         * accepted row to the physical verifier graph row, publish KV/state for
+         * the matching request index, and fail loudly if the last forward graph
+         * is not the graph that produced the batch. The default preserves the
+         * single-request contract and refuses real batches.
+         */
+        virtual bool publishAcceptedMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr)
+        {
+            (void)plans;
+            if (error)
+                *error = "runner does not support batched MTP spec-state publication";
             return false;
         }
 

@@ -1857,6 +1857,16 @@ Status:
   races when this path is wired into graph-captured request batching. It still
   rejects multi-token per-request batches. Focused gate:
   `V2_Unit_MTPGraphConstruction`.
+- Batched verifier forwards with an installed MTP row plan now route through
+  the decode graph cache instead of the ordinary batched prefill path, giving
+  accepted-state publication the exact padded verifier graph it must restore
+  from. `DeviceGraphOrchestrator::publishAcceptedMTPSpecStateBatch()` now
+  validates common padded shape, publishes KV per request index, restores
+  stage state from each request's physical verifier row, updates per-request
+  positions, and packs terminal-hidden rows atomically. Mixed zero-accepted
+  shifted-KV batches still hard-fail before mutation until the scheduler owns
+  correction replay for those lanes. Focused gates:
+  `V2_Unit_MTPGraphConstruction` and the bounded Phase 8 unit cluster.
 
 Exit gate:
 

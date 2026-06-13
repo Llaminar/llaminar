@@ -1665,6 +1665,9 @@ namespace llaminar2
         bool publishAcceptedMTPSpecState(
             const MTPSpecStepPlan &plan,
             std::string *error = nullptr) override;
+        bool publishAcceptedMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -2526,6 +2529,12 @@ namespace llaminar2
             return compute_row_indexed_all_position_logits_
                        ? row_indexed_all_position_logits_row_count_
                        : 0;
+        }
+
+        /** Whether the next all-position verifier forward has explicit MTP row metadata. */
+        bool mtpSpecVerifierInputPlanActive() const override
+        {
+            return pending_mtp_spec_verifier_input_plan_.has_value();
         }
 
         /** Upload any pending compact verifier row metadata before graph execution. */
@@ -3647,10 +3656,28 @@ namespace llaminar2
             int seq_len,
             void *stream = nullptr);
 
+        /// Execute a cached graph-native arbitrary hidden-row select into an MTP buffer.
+        bool executeMTPHiddenRowsSelect(
+            TensorBase *input,
+            BufferId input_buffer_id,
+            TensorBase *output,
+            BufferId output_buffer_id,
+            MTPTerminalHiddenRowsSelectGraphCache &cache,
+            const char *node_name,
+            const std::vector<int> &row_indices,
+            int seq_len,
+            void *stream = nullptr);
+
         /// Copy a contiguous verifier/prefill row range into the stable MTP input buffer.
         bool selectMTPTerminalHiddenRows(
             int row_start,
             int row_count,
+            int seq_len,
+            void *stream = nullptr);
+
+        /// Copy arbitrary verifier rows into the stable MTP input buffer.
+        bool selectMTPTerminalHiddenRows(
+            const std::vector<int> &row_indices,
             int seq_len,
             void *stream = nullptr);
 

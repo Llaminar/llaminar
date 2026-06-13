@@ -32,6 +32,23 @@ namespace llaminar2
         void *stream,
         bool require_captured_stage)
     {
+        return publishAcceptedMTPSpecStateFromVerifierRow(
+            plan,
+            plan.accepted_count - 1,
+            state_stages,
+            device,
+            stream,
+            require_captured_stage);
+    }
+
+    MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromVerifierRow(
+        const MTPSpecStepPlan &plan,
+        int verifier_restore_row,
+        const std::vector<IComputeStage *> &state_stages,
+        DeviceId device,
+        void *stream,
+        bool require_captured_stage)
+    {
         if (!device.is_valid())
             return publicationFailure(plan, "cannot publish MTP spec state on invalid device");
         if (device.is_gpu() && stream == nullptr)
@@ -52,6 +69,12 @@ namespace llaminar2
                 plan,
                 "MTP spec-step accepted count is outside the draft prefix");
         }
+        if (plan.accepted_count > 0 && verifier_restore_row < 0)
+        {
+            return publicationFailure(
+                plan,
+                "MTP spec-state publication received a negative verifier restore row");
+        }
 
         MTPSpecStatePublicationResult result;
         result.ok = true;
@@ -64,7 +87,7 @@ namespace llaminar2
             return result;
         }
 
-        const int restore_row = plan.accepted_count - 1;
+        const int restore_row = verifier_restore_row;
         if (device.is_cpu() && state_stages.size() > 1)
         {
             std::vector<int> status(state_stages.size(), 0);
@@ -173,6 +196,23 @@ namespace llaminar2
         void *stream,
         bool require_captured_stage)
     {
+        return publishAcceptedMTPSpecStateFromVerifierRow(
+            plan,
+            plan.accepted_count - 1,
+            graph,
+            device,
+            stream,
+            require_captured_stage);
+    }
+
+    MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromVerifierRow(
+        const MTPSpecStepPlan &plan,
+        int verifier_restore_row,
+        ComputeGraph &graph,
+        DeviceId device,
+        void *stream,
+        bool require_captured_stage)
+    {
         std::vector<IComputeStage *> stages;
         const auto &order = graph.getExecutionOrder();
         stages.reserve(order.size());
@@ -198,8 +238,9 @@ namespace llaminar2
             stages.push_back(node->stage.get());
         }
 
-        return publishAcceptedMTPSpecState(
+        return publishAcceptedMTPSpecStateFromVerifierRow(
             plan,
+            verifier_restore_row,
             stages,
             device,
             stream,

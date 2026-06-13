@@ -148,6 +148,17 @@ namespace llaminar2
         virtual int allPositionLogitRows() const { return 0; }
 
         /**
+         * @brief True while a vLLM-style MTP verifier row plan is installed.
+         *
+         * Batched verifier forwards have `batch_size > 1` and `seq_len > 1`,
+         * so their shape alone looks like prefill. This explicit host signal
+         * lets the engine route only those planned verifier forwards through
+         * the decode graph cache and keeps ordinary batched prompt execution on
+         * the prefill path.
+         */
+        virtual bool mtpSpecVerifierInputPlanActive() const { return false; }
+
+        /**
          * @brief Prepare per-step metadata consumed by an all-position verifier graph.
          *
          * The forward engine calls this after workspace binding and after it has

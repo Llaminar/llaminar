@@ -4315,6 +4315,76 @@ namespace llaminar2
         for (int i = 0; i < row_count; ++i)
             selected_rows.push_back(row_start + i);
 
+        return executeMTPHiddenRowsSelect(
+            input,
+            input_buffer_id,
+            output,
+            output_buffer_id,
+            cache,
+            node_name,
+            selected_rows,
+            seq_len,
+            stream);
+    }
+
+    bool DeviceGraphOrchestrator::executeMTPHiddenRowsSelect(
+        TensorBase *input,
+        BufferId input_buffer_id,
+        TensorBase *output,
+        BufferId output_buffer_id,
+        MTPTerminalHiddenRowsSelectGraphCache &cache,
+        const char *node_name,
+        const std::vector<int> &selected_rows,
+        int seq_len,
+        void *stream)
+    {
+        if (selected_rows.empty())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Empty MTP hidden row-index selection");
+            return false;
+        }
+        if (selected_rows.size() > 4)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP hidden rows selection supports at most four rows, got "
+                      << selected_rows.size());
+            return false;
+        }
+        if (!input || !output)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden rows without input/output buffer");
+            return false;
+        }
+        if (state_.d_model <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden rows with invalid d_model="
+                      << state_.d_model);
+            return false;
+        }
+
+        const size_t hidden_rows = input->rows();
+        if (hidden_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hidden-state rows-select capacity exceeds int range: rows="
+                      << hidden_rows);
+            return false;
+        }
+        const int seq_capacity = static_cast<int>(hidden_rows);
+        if (seq_capacity < seq_len)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hidden-state rows-select capacity too small: capacity="
+                      << seq_capacity << " seq_len=" << seq_len);
+            return false;
+        }
+        for (const int row : selected_rows)
+        {
+            if (row < 0 || row >= seq_len)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP hidden row index "
+                          << row << " for seq_len=" << seq_len);
+                return false;
+            }
+        }
+
         const bool rebuild =
             !cache.valid ||
             !cache.graph ||
@@ -4324,7 +4394,7 @@ namespace llaminar2
             cache.device != state_.device_id ||
             cache.seq_capacity != seq_capacity ||
             cache.d_model != state_.d_model ||
-            cache.selected_row_count != row_count;
+            cache.selected_row_count != static_cast<int>(selected_rows.size());
 
         if (rebuild)
         {
@@ -4334,7 +4404,7 @@ namespace llaminar2
             params.output = output;
             params.seq_len = seq_capacity;
             params.d_model = state_.d_model;
-            params.selected_row_count = row_count;
+            params.selected_row_count = static_cast<int>(selected_rows.size());
             params.selected_row_indices = selected_rows;
             params.input_buffer_id = input_buffer_id;
             params.output_buffer_id = output_buffer_id;
@@ -4362,7 +4432,7 @@ namespace llaminar2
             cache.device = state_.device_id;
             cache.seq_capacity = seq_capacity;
             cache.d_model = state_.d_model;
-            cache.selected_row_count = row_count;
+            cache.selected_row_count = static_cast<int>(selected_rows.size());
             cache.valid = true;
         }
 
@@ -4440,6 +4510,47 @@ namespace llaminar2
             row_count,
             seq_len,
             stream);
+    }
+
+    bool DeviceGraphOrchestrator::selectMTPTerminalHiddenRows(
+        const std::vector<int> &row_indices,
+        int seq_len,
+        void *stream)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        state_.mtp_terminal_hidden_current = false;
+        PerfStatsCollector::ScopedTimer timer(
+            "mtp",
+            "terminal_hidden_rows_select",
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"rows", std::to_string(row_indices.size())},
+             {"selection", "explicit"}});
+        if (seq_len <= 0 || row_indices.empty())
+            return false;
+        if (!state_.hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP terminal hidden rows without hidden-state buffer");
+            return false;
+        }
+        if (!ensureMTPTerminalHiddenBuffer(static_cast<int>(row_indices.size())))
+            return false;
+        if (!executeMTPHiddenRowsSelect(
+                state_.hidden.get(),
+                BufferId::HIDDEN_STATE,
+                state_.prefix_terminal_hidden.get(),
+                BufferId::PREFIX_TERMINAL_HIDDEN,
+                mtp_terminal_hidden_rows_select_cache_,
+                "mtp_terminal_hidden_rows_select",
+                row_indices,
+                seq_len,
+                stream))
+        {
+            return false;
+        }
+        state_.mtp_terminal_hidden_current = true;
+        return true;
     }
 
     void DeviceGraphOrchestrator::noteMainForwardHiddenProducedForMTP(int seq_len, int batch_size)
@@ -6553,6 +6664,231 @@ namespace llaminar2
              {"restored_stages", std::to_string(result.restored_stage_count)},
              {"skipped_stages", std::to_string(result.skipped_stage_count)},
              {"target_rows", std::to_string(plan.target_rows)}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::publishAcceptedMTPSpecStateBatch(
+        const MTPSpecStepPlanBatch &plans,
+        std::string *error)
+    {
+        auto fail = [&](std::string reason) -> bool
+        {
+            if (error)
+                *error = reason;
+            LOG_ERROR("[DeviceGraphOrchestrator] " << reason);
+            return false;
+        };
+
+        if (!plans.ok)
+            return fail("MTP batched spec-state publication received an invalid plan batch: " + plans.error);
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return fail("MTP batched spec-state publication requires an MTP-enabled graph builder");
+        if (!forward_engine_)
+            return fail("MTP batched spec-state publication requires an initialized forward engine");
+        if (plans.request_count <= 0 ||
+            static_cast<int>(plans.steps.size()) != plans.request_count)
+        {
+            return fail("MTP batched spec-state publication received inconsistent request count");
+        }
+        if (plans.request_count > state_.batch_size)
+        {
+            return fail("MTP batched spec-state publication exceeds initialized runner batch size");
+        }
+        if (static_cast<int>(state_.positions.size()) < plans.request_count ||
+            static_cast<int>(state_.sequence_lengths.size()) < plans.request_count)
+        {
+            return fail("MTP batched spec-state publication requires per-request position state");
+        }
+
+        auto verifier_graph = forward_engine_->lastExecutedForwardGraph();
+        if (!verifier_graph || !*verifier_graph || !verifier_graph->graph)
+            return fail("MTP batched spec-state publication has no cached verifier graph from the last forward");
+        if (!verifier_graph->is_decode || !verifier_graph->all_position_logits)
+            return fail("MTP batched spec-state publication requires the last forward to be an all-position verifier decode graph");
+        if (verifier_graph->signature.batch_size != plans.request_count)
+        {
+            std::ostringstream msg;
+            msg << "MTP batched spec-state publication request-count mismatch: plan="
+                << plans.request_count << " graph=" << verifier_graph->signature.batch_size;
+            return fail(msg.str());
+        }
+
+        const int padded_seq_len = verifier_graph->signature.seq_len;
+        if (padded_seq_len <= 0)
+            return fail("MTP batched spec-state publication received an invalid verifier graph sequence length");
+
+        int max_draft_count = 0;
+        std::vector<bool> seen_request(static_cast<size_t>(plans.request_count), false);
+        std::vector<int> restore_rows(static_cast<size_t>(plans.request_count), -1);
+        bool any_shifted_kv_publication = false;
+        bool any_correction = false;
+        for (const MTPSpecStepPlan &step : plans.steps)
+        {
+            if (step.request_index < 0 || step.request_index >= plans.request_count)
+                return fail("MTP batched spec-state publication received an out-of-range request index");
+            if (seen_request[static_cast<size_t>(step.request_index)])
+                return fail("MTP batched spec-state publication received a duplicate request index");
+            seen_request[static_cast<size_t>(step.request_index)] = true;
+
+            if (step.draft_count < 0 || step.draft_count > padded_seq_len)
+                return fail("MTP batched spec-state publication step draft count is outside the padded verifier shape");
+            if (step.target_rows != step.draft_count + 1)
+                return fail("MTP batched spec-state publication step target rows do not match draft count");
+            if (step.accepted_count < 0 || step.accepted_count > step.draft_count)
+                return fail("MTP batched spec-state publication step accepted count is outside draft count");
+            if (step.target_cached_tokens != step.base_cached_tokens + step.accepted_count)
+                return fail("MTP batched spec-state publication step target cache count drifted from base plus accepted");
+
+            max_draft_count = std::max(max_draft_count, step.draft_count);
+            any_shifted_kv_publication =
+                any_shifted_kv_publication || step.publish_mtp_shifted_kv;
+            any_correction = any_correction || step.requiresCorrectionReplay();
+            if (step.accepted_count > 0)
+            {
+                restore_rows[static_cast<size_t>(step.request_index)] =
+                    step.request_index * padded_seq_len + step.accepted_count - 1;
+            }
+        }
+        for (bool seen : seen_request)
+        {
+            if (!seen)
+                return fail("MTP batched spec-state publication plan is missing a request index");
+        }
+        if (padded_seq_len != max_draft_count)
+        {
+            std::ostringstream msg;
+            msg << "MTP batched spec-state publication verifier padded length mismatch: plan="
+                << max_draft_count << " graph=" << padded_seq_len;
+            return fail(msg.str());
+        }
+        if (any_shifted_kv_publication && plans.request_count > 1)
+        {
+            for (const MTPSpecStepPlan &step : plans.steps)
+            {
+                if (step.accepted_count <= 0)
+                {
+                    return fail(
+                        "MTP batched spec-state publication with shifted sidecar KV requires every request to publish an accepted terminal hidden row");
+                }
+            }
+        }
+
+        void *stream = verifier_graph->stream;
+        if (state_.device_id.is_gpu() && !stream)
+            stream = explicitGPUStreamForOperation("mtp_spec_state_publication_batch");
+        if (state_.device_id.is_gpu() && !stream)
+            return fail("MTP batched spec-state publication could not resolve an explicit GPU stream");
+        if (any_shifted_kv_publication &&
+            state_.device_id.is_gpu() &&
+            !waitForPendingShiftedMTPKVReady(
+                stream,
+                "mtp_spec_state_publication_batch"))
+        {
+            return fail("MTP batched spec-state publication could not order after deferred shifted MTP KV append");
+        }
+        if (!state_.kv_cache)
+            return fail("MTP batched spec-state publication requires an initialized main KV cache");
+
+        int restored_stage_total = 0;
+        int skipped_stage_total = 0;
+        std::vector<int> terminal_rows;
+        terminal_rows.resize(
+            any_shifted_kv_publication ? static_cast<size_t>(plans.request_count) : 0u,
+            -1);
+
+        for (const MTPSpecStepPlan &step : plans.steps)
+        {
+            std::vector<IKVCache *> mtp_caches;
+            if (step.publish_mtp_shifted_kv)
+            {
+                mtp_caches.reserve(state_.mtp_kv_caches.size());
+                for (const auto &cache : state_.mtp_kv_caches)
+                {
+                    if (!cache)
+                        return fail("MTP batched spec-state publication requires initialized MTP KV caches");
+                    mtp_caches.push_back(cache.get());
+                }
+            }
+
+            MTPSpecKVPublicationResult kv_result =
+                publishAcceptedMTPSpecKVState(
+                    step,
+                    *state_.kv_cache,
+                    mtp_caches,
+                    step.request_index,
+                    stream);
+            if (!kv_result.ok)
+                return fail(kv_result.error);
+
+            const int restore_row = restore_rows[static_cast<size_t>(step.request_index)];
+            MTPSpecStatePublicationResult state_result =
+                publishAcceptedMTPSpecStateFromVerifierRow(
+                    step,
+                    restore_row,
+                    *verifier_graph->graph,
+                    state_.device_id,
+                    stream,
+                    /*require_captured_stage=*/mtpSpecStatePublicationRequiresCapturedStage());
+            if (!state_result.ok)
+                return fail(state_result.error);
+
+            restored_stage_total += state_result.restored_stage_count;
+            skipped_stage_total += state_result.skipped_stage_count;
+            state_.positions[static_cast<size_t>(step.request_index)] =
+                step.target_cached_tokens;
+            state_.sequence_lengths[static_cast<size_t>(step.request_index)] =
+                step.target_cached_tokens;
+            if (step.publish_mtp_shifted_kv && step.accepted_count > 0)
+            {
+                terminal_rows[static_cast<size_t>(step.request_index)] =
+                    restore_row;
+            }
+        }
+
+        if (!terminal_rows.empty())
+        {
+            for (int row : terminal_rows)
+            {
+                if (row < 0)
+                    return fail("MTP batched spec-state publication could not resolve every terminal hidden row");
+            }
+            const int total_graph_rows =
+                verifier_graph->signature.seq_len *
+                verifier_graph->signature.batch_size;
+            if (!selectMTPTerminalHiddenRows(terminal_rows, total_graph_rows, stream))
+            {
+                return fail("MTP batched spec-state publication could not restore accepted terminal hidden rows");
+            }
+        }
+
+        const LivePrefixMutationReason mutation_reason =
+            any_correction
+                ? LivePrefixMutationReason::RejectedCorrection
+                : LivePrefixMutationReason::AcceptedSpecPublication;
+        handleLivePrefixReplayStateAfterMutation(
+            mutation_reason,
+            "mtp_spec_state_publication_batch",
+            /*preserve_gpu_replay_state=*/false);
+
+        if (state_.device_id.is_gpu() &&
+            !recordAcceptedSpecPublicationReady(
+                stream,
+                "mtp_spec_state_publication_batch"))
+        {
+            return fail("MTP batched spec-state publication could not record live-state readiness");
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "spec_state_batch_publications",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"requests", std::to_string(plans.request_count)},
+             {"padded_seq_len", std::to_string(padded_seq_len)},
+             {"publishes_mtp_shifted_kv", any_shifted_kv_publication ? "true" : "false"},
+             {"restored_stages", std::to_string(restored_stage_total)},
+             {"skipped_stages", std::to_string(skipped_stage_total)}});
         return true;
     }
 

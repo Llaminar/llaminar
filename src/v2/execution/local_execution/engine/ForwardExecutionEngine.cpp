@@ -738,15 +738,23 @@ namespace llaminar2
         // continuations against an existing KV/GDN history; those must use the
         // decode graph path rather than the prompt-prefill path.
         const int decode_max_seq_len = std::max(1, config_.cache_config.decode_seq_len);
+        const bool all_position_logits = host.computeAllPositionLogitsEnabled();
+        const bool mtp_spec_verifier_decode =
+            all_position_logits &&
+            host.mtpSpecVerifierInputPlanActive() &&
+            input.seq_len > 0 &&
+            input.seq_len <= decode_max_seq_len;
         const bool is_single_token_decode = (input.seq_len == 1 && input.batch_size <= 1);
         const bool is_short_continuation_decode =
             input.batch_size <= 1 &&
             input.seq_len > 1 &&
             input.seq_len <= decode_max_seq_len &&
             first_position > 0;
-        const bool is_decode = is_single_token_decode || is_short_continuation_decode;
+        const bool is_decode =
+            is_single_token_decode ||
+            is_short_continuation_decode ||
+            mtp_spec_verifier_decode;
         const bool decode_has_history = is_decode && first_position > 0;
-        const bool all_position_logits = host.computeAllPositionLogitsEnabled();
         const bool has_unified_pp = config_.has_unified_pp;
         const bool is_standard_path = !has_unified_pp && !config_.pp_stage_config.has_value();
         const bool is_partial_pp_path = !has_unified_pp && config_.pp_stage_config.has_value();

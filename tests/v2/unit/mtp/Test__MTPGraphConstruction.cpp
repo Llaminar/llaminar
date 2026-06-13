@@ -4121,6 +4121,201 @@ TEST(Test__MTPGraphConstruction, GreedyBatchTransactionExecutorRunsOnCPUVerifier
     ASSERT_THAT(state.sequence_lengths, ::testing::ElementsAre(2, 3));
 }
 
+TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationUsesPaddedVerifierRowsOnCPU)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.max_request_batch = 2;
+    fixture.config.mtp.draft_tokens = 3;
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    orchestrator.setWeights(fixture.modelWeights());
+    PreparedWeightStore prepared_store;
+    ASSERT_NO_THROW(prepareDenseForwardWeights(orchestrator, *graph_builder, prepared_store, DeviceId::cpu()));
+
+    /*
+     * The verifier graph is padded to three rows even though request 0 has
+     * only two draft rows. Publication must therefore restore request 1 from
+     * physical graph row 5, not compact metadata slot 3 or request-local row 2.
+     */
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeVerifierDraftRequest verifier_request0;
+    verifier_request0.request_id = 10;
+    verifier_request0.draft_tokens = {1, 2};
+
+    MTPSpecDecodeVerifierDraftRequest verifier_request1;
+    verifier_request1.request_id = 11;
+    verifier_request1.draft_tokens = {3, 4, 5};
+
+    MTPSpecDecodeVerifierInputPlan verifier_input_plan =
+        buildMTPSpecDecodeVerifierInputPlan(
+            shape,
+            {verifier_request0, verifier_request1});
+    ASSERT_TRUE(verifier_input_plan.ok) << verifier_input_plan.error;
+    ASSERT_TRUE(orchestrator.setMTPSpecVerifierInputPlan(verifier_input_plan));
+    ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(
+        true,
+        verifier_input_plan.compact_logit_row_count));
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+    ASSERT_TRUE(orchestrator.forward_batch({{1, 2}, {3, 4, 5}}));
+
+    MTPSpecStepPlanBatch batch;
+    batch.ok = true;
+    batch.shape.max_requests = 2;
+    batch.shape.max_draft_tokens = 3;
+    batch.request_count = 2;
+
+    MTPSpecStepPlan first;
+    first.request_index = 0;
+    first.request_id = 10;
+    first.draft_count = 2;
+    first.target_rows = 3;
+    first.valid_sampled_count = 3;
+    first.committed_output_count = 2;
+    first.accepted_count = 2;
+    first.base_cached_tokens = 0;
+    first.target_cached_tokens = 2;
+    first.accepted_state_slot_index = 1;
+    first.bonus_ready_token_row = 2;
+    first.bonus_ready_token_index = 2;
+    first.bonus_ready_state_slot_index = 2;
+    first.all_drafts_accepted = true;
+
+    MTPSpecStepPlan second;
+    second.request_index = 1;
+    second.request_id = 11;
+    second.draft_count = 3;
+    second.target_rows = 4;
+    second.valid_sampled_count = 4;
+    second.committed_output_count = 3;
+    second.accepted_count = 3;
+    second.base_cached_tokens = 0;
+    second.target_cached_tokens = 3;
+    second.accepted_state_slot_index = 6;
+    second.bonus_ready_token_row = 3;
+    second.bonus_ready_token_index = 3;
+    second.bonus_ready_state_slot_index = 7;
+    second.all_drafts_accepted = true;
+    batch.steps = {first, second};
+
+    std::string publication_error;
+    ASSERT_TRUE(orchestrator.publishAcceptedMTPSpecStateBatch(
+        batch,
+        &publication_error))
+        << publication_error;
+
+    const auto state = orchestrator.prefixStateProbe();
+    ASSERT_THAT(state.positions, ::testing::ElementsAre(2, 3));
+    ASSERT_THAT(state.sequence_lengths, ::testing::ElementsAre(2, 3));
+    EXPECT_EQ(state.live_state_mutations, 1u);
+    EXPECT_EQ(state.last_live_state_mutation_operation,
+              "mtp_spec_state_publication_batch");
+    EXPECT_EQ(state.last_live_state_mutation_reason,
+              "accepted_publication");
+}
+
+TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationRejectsMissingTerminalHiddenRowsBeforeMutation)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.max_request_batch = 2;
+    fixture.config.mtp.draft_tokens = 3;
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    orchestrator.setWeights(fixture.modelWeights());
+    PreparedWeightStore prepared_store;
+    ASSERT_NO_THROW(prepareDenseForwardWeights(orchestrator, *graph_builder, prepared_store, DeviceId::cpu()));
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeVerifierDraftRequest verifier_request0;
+    verifier_request0.request_id = 10;
+    verifier_request0.draft_tokens = {1, 2};
+
+    MTPSpecDecodeVerifierDraftRequest verifier_request1;
+    verifier_request1.request_id = 11;
+    verifier_request1.draft_tokens = {3, 4, 5};
+
+    MTPSpecDecodeVerifierInputPlan verifier_input_plan =
+        buildMTPSpecDecodeVerifierInputPlan(
+            shape,
+            {verifier_request0, verifier_request1});
+    ASSERT_TRUE(verifier_input_plan.ok) << verifier_input_plan.error;
+    ASSERT_TRUE(orchestrator.setMTPSpecVerifierInputPlan(verifier_input_plan));
+    ASSERT_TRUE(orchestrator.setComputeRowIndexedAllPositionLogits(
+        true,
+        verifier_input_plan.compact_logit_row_count));
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+    ASSERT_TRUE(orchestrator.forward_batch({{1, 2}, {3, 4, 5}}));
+    const auto before = orchestrator.prefixStateProbe();
+
+    MTPSpecStepPlanBatch batch;
+    batch.ok = true;
+    batch.shape.max_requests = 2;
+    batch.shape.max_draft_tokens = 3;
+    batch.request_count = 2;
+
+    MTPSpecStepPlan rejected;
+    rejected.request_index = 0;
+    rejected.request_id = 10;
+    rejected.draft_count = 2;
+    rejected.target_rows = 3;
+    rejected.valid_sampled_count = 1;
+    rejected.committed_output_count = 1;
+    rejected.accepted_count = 0;
+    rejected.rejected_count = 2;
+    rejected.base_cached_tokens = 0;
+    rejected.target_cached_tokens = 0;
+    rejected.correction_replay_start_index = 0;
+    rejected.correction_replay_count = 1;
+    rejected.next_condition_token = 7;
+
+    MTPSpecStepPlan accepted;
+    accepted.request_index = 1;
+    accepted.request_id = 11;
+    accepted.draft_count = 3;
+    accepted.target_rows = 4;
+    accepted.valid_sampled_count = 4;
+    accepted.committed_output_count = 3;
+    accepted.accepted_count = 3;
+    accepted.base_cached_tokens = 0;
+    accepted.target_cached_tokens = 3;
+    accepted.accepted_state_slot_index = 6;
+    accepted.bonus_ready_token_row = 3;
+    accepted.bonus_ready_token_index = 3;
+    accepted.bonus_ready_state_slot_index = 7;
+    accepted.all_drafts_accepted = true;
+    batch.steps = {rejected, accepted};
+
+    std::string publication_error;
+    EXPECT_FALSE(orchestrator.publishAcceptedMTPSpecStateBatch(
+        batch,
+        &publication_error));
+    EXPECT_NE(publication_error.find("requires every request"), std::string::npos);
+
+    const auto after = orchestrator.prefixStateProbe();
+    EXPECT_EQ(after.positions, before.positions);
+    EXPECT_EQ(after.sequence_lengths, before.sequence_lengths);
+    EXPECT_EQ(after.live_state_mutations, before.live_state_mutations);
+}
+
 TEST(Test__MTPGraphConstruction, RowIndexedVerifierRowsScaleWithMTPRequestBatchCapacityOnCPU)
 {
     DeviceManager::instance().initialize(-1, false);
