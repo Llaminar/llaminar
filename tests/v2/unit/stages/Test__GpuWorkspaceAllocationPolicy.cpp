@@ -774,6 +774,39 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPStochasticBatchOutcomeCopiesOnlySema
     }
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPResidentOutcomeHostBridgeQueuesD2HBeforeOneSync)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHost(",
+        "    bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(");
+    const auto compact = removeAsciiWhitespace(stripCommentsAndStringLiterals(body));
+
+    /*
+     * The resident stochastic outcome bridge is still a host-visible boundary,
+     * but it should enqueue the token and metadata copies on the verifier
+     * stream and then synchronize once.  Multiple deviceToHostFast() calls
+     * would serialize the boundary and make ROCm/CUDA wait more than needed.
+     */
+    EXPECT_EQ(compact.find("deviceToHostFast("), std::string::npos);
+    EXPECT_NE(compact.find("deviceToHostOnStream(output_tokens.data()"),
+              std::string::npos);
+    EXPECT_NE(compact.find("deviceToHostOnStream(meta.data()"),
+              std::string::npos);
+    const size_t first_copy =
+        compact.find("deviceToHostOnStream(output_tokens.data()");
+    const size_t second_copy =
+        compact.find("deviceToHostOnStream(meta.data()");
+    const size_t sync = compact.find("synchronizeStream(handle.stream");
+    ASSERT_NE(first_copy, std::string::npos);
+    ASSERT_NE(second_copy, std::string::npos);
+    ASSERT_NE(sync, std::string::npos);
+    EXPECT_LT(first_copy, sync);
+    EXPECT_LT(second_copy, sync);
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecStatePublicationPreservesSidecarReplayState)
 {
     const auto source =

@@ -437,6 +437,8 @@ namespace llaminar2
         // Async H2D without sync (for pipelined loading)
         bool hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
                                   int device_id, void *stream) override;
+        bool deviceToHostOnStream(void *dst, const void *src, size_t bytes,
+                                  int device_id, void *stream) override;
 
         // Pinned host memory
         void *allocatePinned(size_t bytes, int device_id) override;

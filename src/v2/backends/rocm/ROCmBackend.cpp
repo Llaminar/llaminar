@@ -2890,6 +2890,11 @@ namespace llaminar2
     {
         if (device_id >= device_count_ || device_id < 0)
             return false;
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmBackend::hostToDeviceOnStream] refused to use HIP null stream");
+            return false;
+        }
 
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
@@ -2900,6 +2905,31 @@ namespace llaminar2
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmBackend::hostToDeviceOnStream] failed: " << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::deviceToHostOnStream(void *dst, const void *src, size_t bytes,
+                                            int device_id, void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+            return false;
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmBackend::deviceToHostOnStream] refused to use HIP null stream");
+            return false;
+        }
+
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+            return false;
+
+        err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost,
+                             static_cast<hipStream_t>(stream));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::deviceToHostOnStream] failed: " << hipGetErrorString(err));
             return false;
         }
         return true;

@@ -2441,6 +2441,12 @@ Current status:
   host-first and device-first descriptor construction. This does not yet remove
   the scalar hot-path D2H boundary; it gives the next publication slice a
   concrete handle to consume for accepted-state publish and next-token staging.
+- The resident-outcome host bridge now queues compact output-token and metadata
+  D2H copies with `deviceToHostOnStream()` on the verifier stream and performs
+  a single `synchronizeStream()` handoff. CUDA and ROCm reject null streams for
+  stream-aware H2D/D2H copies, and
+  `V2_Unit_GpuWorkspaceAllocationPolicy` guards against regressing this bridge
+  back to multiple `deviceToHostFast()` synchronizations.
 - The tuning dashboard has been reshaped into an explicit device/topology
   matrix covering SingleDevice, LocalTP CUDA2, LocalTP ROCm2/ROCm4, LocalPP,
   NodeLocalTP, and ExpertOverlay with RAG columns for dense/MoE and

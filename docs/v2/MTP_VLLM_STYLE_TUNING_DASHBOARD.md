@@ -42,13 +42,12 @@ device-side bonus sampler is graph-captured and skips full-vocab bonus sampling
 when a batch rejects before the bonus row, but ROCm is still dominated by
 summary/D2H sync rather than bonus-row work.
 
-2026-06-13 resident-outcome slice: `DeviceSpeculativeOutcomeHandle` now exposes
-runner-owned compact summary rows on the verifier stream, and the legacy
-request-batch host API is a wrapper over resident enqueue plus explicit copy.
-Scalar host APIs now use the same one-request resident bridge before copying, so
-all stochastic verifier outcomes have one stream/ownership contract. The next
-structural win is publishing accepted state and feeding the next token from this
-handle directly.
+2026-06-13 resident-outcome slices: `DeviceSpeculativeOutcomeHandle` now exposes
+runner-owned compact summary rows on the verifier stream. Request-batch and
+scalar host APIs share the resident enqueue path; the compatibility host bridge
+queues token+metadata D2H on that stream and synchronizes once. The next
+structural win is publishing accepted state and feeding the next token directly
+from the handle.
 
 ## Device And Topology Matrix
 

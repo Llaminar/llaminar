@@ -13874,18 +13874,28 @@ namespace llaminar2
                 "decode",
                 state_.device_id.toString(),
                 {{"requests", std::to_string(request_count)}});
-            if (!backend->deviceToHostFast(
+            /*
+             * Queue both compact copies on the verifier stream and synchronize
+             * exactly once at the ownership boundary.  Calling deviceToHostFast()
+             * twice would perform two stream synchronizations; that is tiny for
+             * the copy bytes but painful when this boundary is waiting for the
+             * preceding stochastic verifier kernels.
+             */
+            if (!backend->deviceToHostOnStream(
                     output_tokens.data(),
                     handle.output_tokens_device,
                     sizeof(int32_t) * output_tokens.size(),
                     state_.device_id.gpu_ordinal(),
                     handle.stream) ||
-                !backend->deviceToHostFast(
+                !backend->deviceToHostOnStream(
                     meta.data(),
                     handle.meta_device,
                     sizeof(int) * meta.size(),
                     state_.device_id.gpu_ordinal(),
-                    handle.stream))
+                    handle.stream) ||
+                !backend->synchronizeStream(
+                    handle.stream,
+                    state_.device_id.gpu_ordinal()))
             {
                 return false;
             }

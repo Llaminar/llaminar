@@ -1891,6 +1891,35 @@ namespace llaminar2
             return hostToDevice(dst, src, bytes, device_id, stream);
         }
 
+        /**
+         * @brief Submit async D2H copy on a specific stream WITHOUT synchronizing
+         *
+         * This is the device-to-host companion to hostToDeviceOnStream().  It is
+         * intended for small compact summaries where several D2H copies should
+         * be queued on one explicit producer stream and followed by exactly one
+         * synchronizeStream() at the ownership handoff.  GPU implementations
+         * must reject nullptr streams; CPU implementations may treat the stream
+         * as an ignored synchronous marker.
+         *
+         * @param dst Host destination pointer (should be pinned for true async DMA)
+         * @param src Device source pointer
+         * @param bytes Number of bytes to copy
+         * @param device_id GPU device ID (0-based)
+         * @param stream Opaque stream handle (must not be nullptr for GPU)
+         * @return true on successful enqueue/copy, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream)
+         * - ROCm: hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost, stream)
+         * - CPU: memcpy (synchronous fallback)
+         */
+        virtual bool deviceToHostOnStream(void *dst, const void *src, size_t bytes,
+                                          int device_id, void *stream)
+        {
+            // Default: fall back to synchronous deviceToHost.
+            return deviceToHost(dst, src, bytes, device_id, stream);
+        }
+
         // ====================================================================
         // Pinned Host Memory Allocation
         // ====================================================================

@@ -2784,6 +2784,11 @@ namespace llaminar2
     {
         if (device_id >= device_count_ || device_id < 0)
             return false;
+        if (!stream)
+        {
+            LOG_ERROR("[CUDABackend::hostToDeviceOnStream] refused to use CUDA null stream");
+            return false;
+        }
         if (!setDevice(device_id))
             return false;
 
@@ -2792,6 +2797,29 @@ namespace llaminar2
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend::hostToDeviceOnStream] failed: " << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::deviceToHostOnStream(void *dst, const void *src, size_t bytes,
+                                           int device_id, void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+            return false;
+        if (!stream)
+        {
+            LOG_ERROR("[CUDABackend::deviceToHostOnStream] refused to use CUDA null stream");
+            return false;
+        }
+        if (!setDevice(device_id))
+            return false;
+
+        cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost,
+                                          static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::deviceToHostOnStream] failed: " << cudaGetErrorString(err));
             return false;
         }
         return true;
