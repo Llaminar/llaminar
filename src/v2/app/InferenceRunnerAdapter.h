@@ -43,9 +43,11 @@ namespace llaminar2
         int sampleGreedyOnDevice() override;
         int sampleOnDevice(const SamplingParams &params) override;
         bool supportsDecodeStep() const override;
+        bool supportsDecodeStepBatchForBenchmark(int request_batch) const override;
         void setDecodeSamplingParams(const SamplingParams &params) override;
         void setDecodeStepTokenBudget(int max_tokens) override;
         DecodeStepOutput decodeStepForBenchmark() override;
+        DecodeBatchStepOutput decodeBatchStepForBenchmark(int request_batch) override;
         bool maybeApplyDecodeBoundaryMaintenance() override;
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;

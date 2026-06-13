@@ -28,8 +28,9 @@ Before a WiP commit, broad units plus touched parity must pass.
   rows, padded verifier-decode caching, bounded one-token Qwen35/Qwen36
   sidecar batches, padded-row publication, scheduler admission, device-token
   routing, greedy/stochastic owned handoff, and runner-capacity reservation
-  are unit-proven. `--mtp-max-request-batch` records intent but still
-  hard-fails above 1.
+  are unit-proven. Benchmark/orchestration decode now has a batch-aware
+  contract and aggregate-token accounting, but live runners still hard-fail
+  `--mtp-max-request-batch > 1` until server/runner ownership is wired.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.
   LocalTP best d3 55.4 vs 34.1 tok/s (1.62x), dynamic 54.2 (1.59x). LocalPP
@@ -84,7 +85,7 @@ d1 54.9, d3 52.5 tok/s; MoE no-MTP 118.26, d1 142.0, d3 132.8 tok/s.
 
 ## Next
 
-1. Wire Phase 8 scheduler batches into benchmark/server-side spec transactions.
-2. Promote matrix request-batch lanes from hard-fail diagnostics to benchmarks.
+1. Wire Phase 8 scheduler batches into OrchestrationRunner/server spec transactions.
+2. Promote real runner request-batch lanes from hard-fail diagnostics to benchmarks.
 3. Run Phase 9 NodeLocalTP CPU and ExpertOverlay benchmark presets when the
    active slice touches those topologies.

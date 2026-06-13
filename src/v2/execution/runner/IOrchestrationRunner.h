@@ -64,6 +64,25 @@ namespace llaminar2
     };
 
     /**
+     * @brief Result of one request-batched decode step.
+     *
+     * `requests[i]` is the decode result for logical request `i` in the batch.
+     * `error` is reserved for batch-wide failures such as scheduler,
+     * publication, or collective errors that prevent per-request results from
+     * being trustworthy.
+     */
+    struct GenerationBatchResult
+    {
+        std::vector<GenerationResult> requests;
+        std::string error;
+
+        /**
+         * @brief Check if the whole batch step succeeded.
+         */
+        bool success() const { return error.empty(); }
+    };
+
+    /**
      * @brief Interface for orchestrated inference
      *
      * This interface extends the basic IInferenceRunner concept to support
@@ -139,6 +158,37 @@ namespace llaminar2
          * @return GenerationResult with the generated token
          */
         virtual GenerationResult decodeStep() = 0;
+
+        /**
+         * @brief Whether decodeStepBatch() is implemented for this runner.
+         *
+         * Request batching is an explicit capability because it requires
+         * scheduler ownership, per-request publication, and rollback semantics
+         * that are stricter than a loop around decodeStep().
+         *
+         * @param request_batch Number of logical requests the caller wants to
+         *        advance together.
+         */
+        virtual bool supportsDecodeStepBatch(int request_batch) const
+        {
+            (void)request_batch;
+            return false;
+        }
+
+        /**
+         * @brief Decode step for a logical request batch.
+         *
+         * Implementations must honor setDecodeStepTokenBudget() as a
+         * per-request token limit and must publish or roll back all admitted
+         * requests atomically.
+         *
+         * @param request_batch Number of active logical requests.
+         */
+        virtual GenerationBatchResult decodeStepBatch(int request_batch)
+        {
+            (void)request_batch;
+            return GenerationBatchResult{{}, "decodeStepBatch unsupported"};
+        }
 
         /**
          * @brief Full generation loop

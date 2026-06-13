@@ -549,6 +549,157 @@ namespace llaminar2
         // Track the end of the last forward() call for inter-step measurement
         auto last_forward_end = start;
 
+        if (decode_request_batch_ > 1)
+        {
+            const int request_batch = decode_request_batch_;
+            runner_->setDecodeSamplingParams(decode_sampling_params_);
+
+            if (!runner_->supportsDecodeStepBatchForBenchmark(request_batch))
+            {
+                last_failure_reason_ =
+                    "request-batched benchmark decode unsupported by runner; "
+                    "real Phase 8 MTP batching must opt in explicitly";
+                auto end = std::chrono::high_resolution_clock::now();
+                result.success = false;
+                result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                result.tokens_generated = 0;
+                return result;
+            }
+
+            /*
+             * `n_tokens` is a per-request target. Throughput is reported as
+             * aggregate emitted tokens so the request-batched lane measures the
+             * amortized verifier transaction instead of hiding batch width.
+             * Generated text/token ids remain request-0 only for compact human
+             * inspection and stable JSON output.
+             */
+            std::vector<int> generated_by_request(static_cast<size_t>(request_batch), 0);
+            std::vector<bool> complete_by_request(static_cast<size_t>(request_batch), false);
+
+            auto all_requests_done = [&]() {
+                for (int i = 0; i < request_batch; ++i)
+                {
+                    if (!complete_by_request[static_cast<size_t>(i)] &&
+                        generated_by_request[static_cast<size_t>(i)] < n_tokens)
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            while (!all_requests_done())
+            {
+                int remaining_budget = 0;
+                for (int i = 0; i < request_batch; ++i)
+                {
+                    if (!complete_by_request[static_cast<size_t>(i)])
+                    {
+                        remaining_budget = std::max(
+                            remaining_budget,
+                            n_tokens - generated_by_request[static_cast<size_t>(i)]);
+                    }
+                }
+
+                runner_->setDecodeStepTokenBudget(remaining_budget);
+                DecodeBatchStepOutput step = runner_->decodeBatchStepForBenchmark(request_batch);
+                runner_->setDecodeStepTokenBudget(0);
+
+                const bool local_step_ok =
+                    step.error.empty() &&
+                    static_cast<int>(step.tokens_by_request.size()) == request_batch &&
+                    (step.is_complete_by_request.empty() ||
+                     static_cast<int>(step.is_complete_by_request.size()) == request_batch);
+                if (!synchronizeSuccess(local_step_ok, "request-batched decode step"))
+                {
+                    last_failure_reason_ = !step.error.empty()
+                                               ? step.error
+                                               : "request-batched decode step returned an invalid shape";
+                    auto end = std::chrono::high_resolution_clock::now();
+                    result.success = false;
+                    result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.tokens_generated = tokens_generated;
+                    return result;
+                }
+
+                int emitted_this_step = 0;
+                for (int request = 0; request < request_batch; ++request)
+                {
+                    const size_t request_index = static_cast<size_t>(request);
+                    if (complete_by_request[request_index])
+                        continue;
+
+                    const int remaining = n_tokens - generated_by_request[request_index];
+                    const int step_token_count = static_cast<int>(std::min<size_t>(
+                        step.tokens_by_request[request_index].size(),
+                        static_cast<size_t>(std::max(0, remaining))));
+
+                    for (int j = 0; j < step_token_count; ++j)
+                    {
+                        const int32_t token =
+                            step.tokens_by_request[request_index][static_cast<size_t>(j)];
+                        if (request == 0)
+                        {
+                            result.generated_token_ids.push_back(token);
+                            if (!tokenizer_->is_stop_token(token))
+                            {
+                                result.generated_text += tokenizer_->decode_token(token);
+                            }
+                        }
+                        if (!ignore_stop_tokens && tokenizer_->is_stop_token(token))
+                        {
+                            complete_by_request[request_index] = true;
+                            break;
+                        }
+                    }
+
+                    generated_by_request[request_index] += step_token_count;
+                    tokens_generated += step_token_count;
+                    emitted_this_step += step_token_count;
+
+                    if (!step.is_complete_by_request.empty() &&
+                        step.is_complete_by_request[request_index])
+                    {
+                        complete_by_request[request_index] = true;
+                    }
+                    if (generated_by_request[request_index] >= n_tokens)
+                    {
+                        complete_by_request[request_index] = true;
+                    }
+                }
+
+                if (emitted_this_step <= 0 && !all_requests_done())
+                {
+                    last_failure_reason_ = "request-batched decode step produced no tokens";
+                    auto end = std::chrono::high_resolution_clock::now();
+                    result.success = false;
+                    result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.tokens_generated = tokens_generated;
+                    return result;
+                }
+
+                const bool maintenance_success = runner_->maybeApplyDecodeBoundaryMaintenance();
+                if (!synchronizeSuccess(maintenance_success, "request-batched decode maintenance"))
+                {
+                    last_failure_reason_ = "request-batched decode maintenance failed";
+                    auto end = std::chrono::high_resolution_clock::now();
+                    result.success = false;
+                    result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.tokens_generated = tokens_generated;
+                    return result;
+                }
+            }
+
+            const bool decode_success = synchronizeSuccess(true, "request-batched decode complete");
+            auto end = std::chrono::high_resolution_clock::now();
+            result.success = decode_success;
+            result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            result.tokens_generated = tokens_generated;
+            if (!decode_success)
+                last_failure_reason_ = "request-batched decode synchronization failed";
+            return result;
+        }
+
         if (runner_->supportsDecodeStep())
         {
             runner_->setDecodeSamplingParams(decode_sampling_params_);
@@ -924,6 +1075,9 @@ namespace llaminar2
         decode_sampling_params_.seed = config.seed >= 0
                                            ? static_cast<unsigned int>(config.seed)
                                            : 42u;
+        decode_request_batch_ = config.mtp.enabled
+                                    ? std::max(1, config.mtp.max_request_batch)
+                                    : 1;
         if (config.mtp.enabled &&
             config.mtp.verify_mode == MTPVerifyMode::SpeculativeSampling)
         {

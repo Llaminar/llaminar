@@ -78,6 +78,11 @@ namespace llaminar2
         return orch_runner_ != nullptr;
     }
 
+    bool InferenceRunnerAdapter::supportsDecodeStepBatchForBenchmark(int request_batch) const
+    {
+        return orch_runner_ != nullptr && orch_runner_->supportsDecodeStepBatch(request_batch);
+    }
+
     void InferenceRunnerAdapter::setDecodeSamplingParams(const SamplingParams &params)
     {
         if (orch_runner_)
@@ -99,6 +104,30 @@ namespace llaminar2
 
         GenerationResult result = orch_runner_->decodeStep();
         return DecodeStepOutput{std::move(result.tokens), result.is_complete, std::move(result.error)};
+    }
+
+    DecodeBatchStepOutput InferenceRunnerAdapter::decodeBatchStepForBenchmark(int request_batch)
+    {
+        if (!orch_runner_)
+        {
+            return DecodeBatchStepOutput{{}, {}, "orchestration runner unavailable"};
+        }
+
+        GenerationBatchResult result = orch_runner_->decodeStepBatch(request_batch);
+        DecodeBatchStepOutput output;
+        output.error = std::move(result.error);
+        output.tokens_by_request.reserve(result.requests.size());
+        output.is_complete_by_request.reserve(result.requests.size());
+        for (GenerationResult &request_result : result.requests)
+        {
+            if (output.error.empty() && !request_result.error.empty())
+            {
+                output.error = request_result.error;
+            }
+            output.tokens_by_request.push_back(std::move(request_result.tokens));
+            output.is_complete_by_request.push_back(request_result.is_complete);
+        }
+        return output;
     }
 
     bool InferenceRunnerAdapter::maybeApplyDecodeBoundaryMaintenance()

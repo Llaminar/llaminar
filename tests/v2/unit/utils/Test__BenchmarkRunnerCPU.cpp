@@ -14,8 +14,10 @@
 #include <string>
 
 #include "utils/BenchmarkRunner.h"
+#include "app/InferenceRunnerAdapter.h"
 #include "config/OrchestrationConfig.h"
 #include "backends/DeviceId.h"
+#include "mocks/MockOrchestrationRunner.h"
 #include "mocks/MockMPIContext.h"
 #include "mocks/MockTokenizer.h"
 #include "nlohmann/json.hpp"
@@ -214,6 +216,91 @@ namespace
         int maintenance_calls_ = 0;
         int sample_greedy_calls_ = 0;
         int emitted_tokens_ = 0;
+        bool sampling_params_set_ = false;
+        SamplingParams last_sampling_params_;
+    };
+
+    class MockBatchedOrchestratedDecodeRunner : public MockCPUInferenceRunner
+    {
+    public:
+        bool supportsDecodeStep() const override { return true; }
+
+        bool supportsDecodeStepBatchForBenchmark(int request_batch) const override
+        {
+            return request_batch > 1 && request_batch <= max_request_batch_;
+        }
+
+        void setDecodeSamplingParams(const SamplingParams &params) override
+        {
+            sampling_params_set_ = true;
+            last_sampling_params_ = params;
+        }
+
+        void setDecodeStepTokenBudget(int max_tokens) override
+        {
+            decode_step_budget_ = max_tokens;
+        }
+
+        DecodeStepOutput decodeStepForBenchmark() override
+        {
+            ++single_decode_step_calls_;
+            return DecodeStepOutput{{}, false, "single-request decode should not be used"};
+        }
+
+        DecodeBatchStepOutput decodeBatchStepForBenchmark(int request_batch) override
+        {
+            ++batch_decode_step_calls_;
+            last_request_batch_ = request_batch;
+            emitted_by_request_.resize(static_cast<size_t>(request_batch), 0);
+
+            const int per_request_emit =
+                decode_step_budget_ > 0 ? std::min(decode_step_budget_, 1) : 1;
+
+            DecodeBatchStepOutput output;
+            output.tokens_by_request.resize(static_cast<size_t>(request_batch));
+            output.is_complete_by_request.assign(static_cast<size_t>(request_batch), false);
+
+            for (int request = 0; request < request_batch; ++request)
+            {
+                const size_t request_index = static_cast<size_t>(request);
+                for (int i = 0; i < per_request_emit; ++i)
+                {
+                    output.tokens_by_request[request_index].push_back(
+                        100 + request * 10 + emitted_by_request_[request_index]);
+                    ++emitted_by_request_[request_index];
+                }
+            }
+
+            return output;
+        }
+
+        bool maybeApplyDecodeBoundaryMaintenance() override
+        {
+            ++maintenance_calls_;
+            return true;
+        }
+
+        void clear_cache() override
+        {
+            MockCPUInferenceRunner::clear_cache();
+            std::fill(emitted_by_request_.begin(), emitted_by_request_.end(), 0);
+        }
+
+        int singleDecodeStepCalls() const { return single_decode_step_calls_; }
+        int batchDecodeStepCalls() const { return batch_decode_step_calls_; }
+        int maintenanceCalls() const { return maintenance_calls_; }
+        int lastRequestBatch() const { return last_request_batch_; }
+        bool samplingParamsSet() const { return sampling_params_set_; }
+        const SamplingParams &lastSamplingParams() const { return last_sampling_params_; }
+
+    private:
+        static constexpr int max_request_batch_ = 8;
+        int decode_step_budget_ = 0;
+        int single_decode_step_calls_ = 0;
+        int batch_decode_step_calls_ = 0;
+        int maintenance_calls_ = 0;
+        int last_request_batch_ = 0;
+        std::vector<int> emitted_by_request_;
         bool sampling_params_set_ = false;
         SamplingParams last_sampling_params_;
     };
@@ -514,6 +601,98 @@ TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
     EXPECT_GT(runner->maintenanceCalls(), 0);
     EXPECT_EQ(runner->sampleGreedyCalls(), 0)
         << "BenchmarkRunner must not bypass orchestration decodeStep when it is available";
+}
+
+TEST(Test__BenchmarkRunnerCPU, UsesRequestBatchedDecodeStepWhenMTPBatchRequested)
+{
+    auto runner = std::make_shared<MockBatchedOrchestratedDecodeRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.mtp.enabled = true;
+    config.mtp.max_request_batch = 2;
+    config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+    config.temperature = 0.7f;
+    config.top_k = 32;
+    config.top_p = 0.9f;
+
+    auto result = bench.run(config);
+
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    EXPECT_TRUE(result.decode_success);
+    EXPECT_EQ(result.decode_tokens, 6)
+        << "Request-batched decode reports aggregate generated tokens across requests";
+    EXPECT_THAT(result.generated_token_ids, ::testing::ElementsAre(100, 101, 102))
+        << "Human-readable generated tokens stay request-0 only";
+    EXPECT_EQ(runner->lastRequestBatch(), 2);
+    EXPECT_GT(runner->batchDecodeStepCalls(), 0);
+    EXPECT_GT(runner->maintenanceCalls(), 0);
+    EXPECT_EQ(runner->singleDecodeStepCalls(), 0)
+        << "max_request_batch > 1 must not silently fall through to single-request decode";
+    ASSERT_TRUE(runner->samplingParamsSet());
+    EXPECT_EQ(runner->lastSamplingParams().temperature, 0.7f);
+    EXPECT_EQ(runner->lastSamplingParams().top_k, 32);
+    EXPECT_EQ(runner->lastSamplingParams().top_p, 0.9f);
+}
+
+TEST(Test__BenchmarkRunnerCPU, FailsRequestBatchedDecodeWhenRunnerDoesNotOptIn)
+{
+    auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 2;
+    config.mtp.enabled = true;
+    config.mtp.max_request_batch = 2;
+
+    auto result = bench.run(config);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_FALSE(result.decode_success);
+    EXPECT_NE(result.failure_reason.find("request-batched benchmark decode unsupported"),
+              std::string::npos);
+    EXPECT_EQ(runner->decodeStepCalls(), 0)
+        << "Unsupported request batching must hard-fail instead of measuring request-count one";
+}
+
+TEST(Test__BenchmarkRunnerCPU, AdapterForwardsRequestBatchedDecodeContract)
+{
+    MockOrchestrationRunner orch;
+    InferenceRunnerAdapter adapter(&orch);
+
+    EXPECT_CALL(orch, supportsDecodeStepBatch(3))
+        .WillOnce(::testing::Return(true));
+    EXPECT_TRUE(adapter.supportsDecodeStepBatchForBenchmark(3));
+
+    GenerationResult first;
+    first.tokens = {11, 12};
+    first.is_complete = false;
+    GenerationResult second;
+    second.tokens = {21};
+    second.is_complete = true;
+
+    GenerationBatchResult batch;
+    batch.requests = {first, second};
+
+    EXPECT_CALL(orch, decodeStepBatch(2))
+        .WillOnce(::testing::Return(batch));
+
+    DecodeBatchStepOutput output = adapter.decodeBatchStepForBenchmark(2);
+
+    EXPECT_TRUE(output.error.empty());
+    ASSERT_EQ(output.tokens_by_request.size(), 2u);
+    EXPECT_THAT(output.tokens_by_request[0], ::testing::ElementsAre(11, 12));
+    EXPECT_THAT(output.tokens_by_request[1], ::testing::ElementsAre(21));
+    EXPECT_THAT(output.is_complete_by_request, ::testing::ElementsAre(false, true));
 }
 
 TEST(Test__BenchmarkRunnerCPU, UsesRequestedSamplingParamsForSpeculativeMTPBenchmark)

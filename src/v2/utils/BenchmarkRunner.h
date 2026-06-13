@@ -159,6 +159,7 @@ namespace llaminar2
         std::function<void()> decode_step_cb_;
         DecodeLoopProfile decode_loop_profile_; ///< Accumulated across benchmark iterations
         SamplingParams decode_sampling_params_; ///< Sampling params used by orchestrated decodeStep()
+        int decode_request_batch_ = 1;          ///< Active logical request batch for MTP benchmark decode.
         std::string last_failure_reason_;
 
         /**

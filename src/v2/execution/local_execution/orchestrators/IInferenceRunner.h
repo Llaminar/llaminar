@@ -121,6 +121,22 @@ namespace llaminar2
     };
 
     /**
+     * @brief Optional high-level batched decode-step result for benchmark lanes.
+     *
+     * Each entry in `tokens_by_request` contains the accepted tokens for the
+     * matching logical request in the active request batch. The benchmark treats
+     * `n_predict` as a per-request target and reports aggregate emitted tokens
+     * across the batch, so request-batched lanes measure amortized verifier cost
+     * without pretending they are single-request decode.
+     */
+    struct DecodeBatchStepOutput
+    {
+        std::vector<std::vector<int32_t>> tokens_by_request;
+        std::vector<bool> is_complete_by_request;
+        std::string error;
+    };
+
+    /**
      * @brief Execution path type
      */
     enum class ExecutionPath
@@ -947,6 +963,22 @@ namespace llaminar2
         virtual bool supportsDecodeStep() const { return false; }
 
         /**
+         * @brief Whether this runner can execute a full batched decode step.
+         *
+         * This is intentionally separate from supportsDecodeStep(): request
+         * batching has different ownership and publication semantics, and a
+         * runner must opt in explicitly before benchmarks may report batched
+         * MTP throughput.
+         *
+         * @param request_batch Number of logical requests in the batch.
+         */
+        virtual bool supportsDecodeStepBatchForBenchmark(int request_batch) const
+        {
+            (void)request_batch;
+            return false;
+        }
+
+        /**
          * @brief Set sampling params consumed by decodeStepForBenchmark().
          */
         virtual void setDecodeSamplingParams(const SamplingParams & /*params*/) {}
@@ -962,6 +994,21 @@ namespace llaminar2
         virtual DecodeStepOutput decodeStepForBenchmark()
         {
             return DecodeStepOutput{{}, false, "decodeStepForBenchmark unsupported"};
+        }
+
+        /**
+         * @brief Execute one high-level batched decode step.
+         *
+         * The caller supplies a per-request token budget with
+         * setDecodeStepTokenBudget() before this call. Implementations must not
+         * emit more than that many tokens for any single request.
+         *
+         * @param request_batch Number of active logical requests.
+         */
+        virtual DecodeBatchStepOutput decodeBatchStepForBenchmark(int request_batch)
+        {
+            (void)request_batch;
+            return DecodeBatchStepOutput{{}, {}, "decodeBatchStepForBenchmark unsupported"};
         }
 
         /**
