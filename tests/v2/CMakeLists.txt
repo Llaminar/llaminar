@@ -6505,6 +6505,18 @@ add_v2_test(V2_Unit_MTPSpecRequestBatchScheduler
     MPI_PROCS 1
 )
 
+# Test: vLLM-style MTP request-batch ownership and handoff
+add_executable(v2_test_mtp_spec_request_batch_owner unit/mtp/Test__MTPSpecRequestBatchOwner.cpp)
+target_link_libraries(v2_test_mtp_spec_request_batch_owner llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
+target_include_directories(v2_test_mtp_spec_request_batch_owner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPSpecRequestBatchOwner
+    COMMAND $<TARGET_FILE:v2_test_mtp_spec_request_batch_owner>
+    LABELS "V2;Unit;MTP;SpecDecode;Scheduler;Ownership"
+    MPI_PROCS 1
+)
+
 # Test: vLLM-style MTP spec-step state publication contract
 add_executable(v2_test_mtp_spec_state_contract unit/mtp/Test__MTPSpecStateContract.cpp)
 target_link_libraries(v2_test_mtp_spec_state_contract llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)

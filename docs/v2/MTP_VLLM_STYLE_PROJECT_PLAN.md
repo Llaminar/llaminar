@@ -1908,6 +1908,13 @@ Status:
   executor hard-fails if placement and `device_token_ids` disagree. Focused
   gates: `V2_Unit_MTPSpecRequestBatchScheduler` and
   `V2_Unit_MTPVerifierForwardExecutor`.
+- Request-batch ownership now has a two-phase CPU contract. The new
+  `MTPSpecRequestBatchOwner` reserves scheduled requests without removing them,
+  rejects duplicate ids and in-flight mutations, commits only admitted request
+  ids after publication succeeds, and releases reservations unchanged after a
+  failed verifier/publication transaction. This gives benchmark/server batching
+  a concrete handoff point instead of letting scheduler output silently drop
+  live requests. Focused gate: `V2_Unit_MTPSpecRequestBatchOwner`.
 - Request-batch intent now reserves runner capacity before runner construction.
   `RuntimeConfig::fromOrchestrationConfig()` resolves effective `batch_size`
   from the larger of `--batch-size` and enabled `--mtp-max-request-batch`, and

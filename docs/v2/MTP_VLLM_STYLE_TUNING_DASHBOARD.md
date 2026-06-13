@@ -27,8 +27,9 @@ Before a WiP commit, broad units plus touched parity must pass.
   LocalTP, and LocalPP rank fan-out. Compact verifier scratch, explicit graph
   rows, padded verifier-decode caching, bounded one-token Qwen35/Qwen36
   sidecar batches, padded-row publication, scheduler admission, device-token
-  transaction routing, and runner-capacity reservation are unit-proven.
-  `--mtp-max-request-batch` records intent but still hard-fails above 1.
+  routing, two-phase batch ownership, and runner-capacity reservation are
+  unit-proven. `--mtp-max-request-batch` records intent but still hard-fails
+  above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.
   LocalTP best d3 55.4 vs 34.1 tok/s (1.62x), dynamic 54.2 (1.59x). LocalPP
