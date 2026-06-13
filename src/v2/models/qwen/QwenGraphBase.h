@@ -170,7 +170,8 @@ namespace llaminar2
 
         bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override
         {
-            if (enabled && (row_count <= 0 || row_count > 4))
+            const int max_rows = resolveMTPMaxTargetQueryRows(config_.mtp);
+            if (enabled && (row_count <= 0 || row_count > max_rows))
                 return false;
             config_.compute_row_indexed_logits = enabled;
             config_.row_indexed_logits_row_count = enabled ? row_count : 0;

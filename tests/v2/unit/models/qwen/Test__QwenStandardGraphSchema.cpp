@@ -1141,6 +1141,42 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolveLayerBuffers)
     EXPECT_EQ(findBuf("V_dequant"), nullptr) << "V_dequant should be filtered out at default precision";
 }
 
+TEST(Test__QwenStandardGraphSchema, LayerBuffers_MTPRequestBatchVerifierRowsScale)
+{
+    Qwen2SchemaFactory factory;
+    GraphSchema schema = factory.createSchema();
+
+    GraphResolverConfig config{};
+    config.d_model = 896;
+    config.n_heads = 14;
+    config.n_kv_heads = 2;
+    config.head_dim = 64;
+    config.d_ff = 4864;
+    config.vocab_size = 151936;
+    config.seq_len = 512;
+    config.batch_size = 1;
+    config.local_n_heads = 14;
+    config.local_n_kv_heads = 2;
+    config.local_d_ff = 4864;
+    config.local_vocab = 151936;
+    config.custom_formulas["mtp_target_query_rows"] = 8;
+
+    auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
+    auto findBuf = [&](const std::string &name) -> const BufferDescriptor *
+    {
+        for (const auto &b : reqs.buffers)
+            if (b.name == name)
+                return &b;
+        return nullptr;
+    };
+
+    const BufferDescriptor *lm_head_input_rows = findBuf("lm_head_input_rows");
+    ASSERT_NE(lm_head_input_rows, nullptr);
+    ASSERT_EQ(lm_head_input_rows->shape.size(), 2u);
+    EXPECT_EQ(lm_head_input_rows->shape[0], 8u);
+    EXPECT_EQ(lm_head_input_rows->shape[1], 896u);
+}
+
 /**
  * Test BufferAllocator resolveModelBuffers returns StageBufferRequirements
  */

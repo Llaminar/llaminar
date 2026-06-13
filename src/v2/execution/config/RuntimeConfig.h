@@ -590,6 +590,22 @@ namespace llaminar2
     };
 
     /**
+     * @brief Resolve compact target-verifier row capacity for MTP graph buffers.
+     *
+     * A single request at depth 3 needs `draft_tokens + 1 == 4` target rows:
+     * one row per draft comparison plus the bonus row.  Request-batched MTP
+     * flattens those per-request rows into one compact LM-head input tensor, so
+     * the capacity scales with `max_request_batch`.  The historical four-row
+     * floor is kept so default single-request graphs preserve their shape.
+     */
+    inline int resolveMTPMaxTargetQueryRows(const MTPRuntimeConfig &config)
+    {
+        const int request_count = std::max(1, config.max_request_batch);
+        const int draft_count = std::max(1, config.draft_tokens);
+        return std::max(4, request_count * (draft_count + 1));
+    }
+
+    /**
      * @brief Get bytes per element for ActivationPrecision
      *
      * Returns the storage size per logical element:

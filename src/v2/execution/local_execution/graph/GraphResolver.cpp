@@ -1099,6 +1099,13 @@ namespace llaminar2
             return static_cast<size_t>(config.local_n_heads * config.head_dim);
         if (formula == "local_kv_dim" || formula == "local_n_kv_heads*head_dim")
             return static_cast<size_t>(config.local_n_kv_heads * config.head_dim);
+        if (formula == "mtp_target_query_rows")
+        {
+            auto it = config.custom_formulas.find(formula);
+            if (it != config.custom_formulas.end())
+                return it->second;
+            return 4;
+        }
 
         // Model-provided custom formulas (e.g., GDN dimensions)
         {

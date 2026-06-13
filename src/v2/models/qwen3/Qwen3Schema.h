@@ -238,7 +238,7 @@ namespace llaminar2
                 {"gate", {"seq_len", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "ffn_scratch", 10, "Gate projection for SwiGLU"},
                 {"up", {"seq_len", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "ffn_scratch", 10, "Up projection for SwiGLU"},
                 {"lm_head_input_row", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Stable selected hidden row for bucketed prefill LM head"},
-                {"lm_head_input_rows", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Compact verifier hidden rows for row-indexed LM head"},
+                {"lm_head_input_rows", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Compact verifier hidden rows for row-indexed LM head"},
             };
 
             schema.model_buffers = {

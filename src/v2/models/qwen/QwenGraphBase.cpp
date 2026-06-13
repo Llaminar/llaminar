@@ -403,18 +403,23 @@ namespace llaminar2
                 return final_norm_output;
 
             const int row_count = config_.row_indexed_logits_row_count;
-            if (row_count <= 0 || row_count > total_tokens || row_count > 4)
-            {
-                LOG_ERROR("[QwenGraphBase] Row-indexed all-position logits require 1..min(4,total_tokens) rows, got "
-                          << row_count << " for total_tokens=" << total_tokens);
-                throw std::runtime_error("invalid row-indexed all-position logits row count");
-            }
-
             TensorBase *scratch_rows = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
             if (!scratch_rows)
             {
                 LOG_ERROR("[QwenGraphBase] Row-indexed all-position logits require lm_head_input_rows scratch buffer");
                 throw std::runtime_error("row-indexed all-position logits scratch buffer missing");
+            }
+            const int scratch_row_capacity =
+                scratch_rows ? static_cast<int>(scratch_rows->rows()) : 0;
+            if (row_count <= 0 ||
+                row_count > total_tokens ||
+                row_count > scratch_row_capacity)
+            {
+                LOG_ERROR("[QwenGraphBase] Row-indexed all-position logits require "
+                          << "1..min(scratch_rows,total_tokens) rows, got "
+                          << row_count << " for total_tokens=" << total_tokens
+                          << " scratch_rows=" << scratch_row_capacity);
+                throw std::runtime_error("invalid row-indexed all-position logits row count");
             }
 
             // The verifier sequence starts at the current live position. Row i
@@ -1738,18 +1743,23 @@ namespace llaminar2
         if (config_.compute_all_position_logits && config_.compute_row_indexed_logits)
         {
             const int row_count = config_.row_indexed_logits_row_count;
-            if (row_count <= 0 || row_count > total_tokens || row_count > 4)
-            {
-                LOG_ERROR("[QwenGraphBase] Standalone LM-head graph row-indexed verifier requires 1..min(4,total_tokens) rows, got "
-                          << row_count << " for total_tokens=" << total_tokens);
-                throw std::runtime_error("invalid standalone row-indexed all-position logits row count");
-            }
-
             TensorBase *scratch_rows = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
             if (!scratch_rows)
             {
                 LOG_ERROR("[QwenGraphBase] Standalone row-indexed verifier requires lm_head_input_rows scratch buffer");
                 throw std::runtime_error("standalone row-indexed verifier scratch buffer missing");
+            }
+            const int scratch_row_capacity =
+                scratch_rows ? static_cast<int>(scratch_rows->rows()) : 0;
+            if (row_count <= 0 ||
+                row_count > total_tokens ||
+                row_count > scratch_row_capacity)
+            {
+                LOG_ERROR("[QwenGraphBase] Standalone LM-head graph row-indexed verifier requires "
+                          << "1..min(scratch_rows,total_tokens) rows, got "
+                          << row_count << " for total_tokens=" << total_tokens
+                          << " scratch_rows=" << scratch_row_capacity);
+                throw std::runtime_error("invalid standalone row-indexed all-position logits row count");
             }
 
             std::vector<int> selected_rows;
@@ -2297,6 +2307,9 @@ namespace llaminar2
                                  : config_.vocab_size;
         if (config.local_vocab <= 0)
             config.local_vocab = config_.vocab_size;
+
+        config.custom_formulas["mtp_target_query_rows"] =
+            static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp));
 
         LOG_DEBUG("[QwenGraphBase::getResolverConfig] Created config: "
                   << "seq_len=" << config.seq_len << ", "

@@ -1787,6 +1787,14 @@ Status:
   scheduler path will attach to the same accepted-count semantics instead of
   cloning runner-local metadata construction. Focused gates:
   `V2_Unit_MTPSpecStateContract` and `V2_Unit_PrefillDecodeTransition`.
+- Compact verifier scratch now scales with request-batch intent instead of the
+  historical four-row constant. `mtp_target_query_rows` resolves to
+  `max(4, max_request_batch * (draft_tokens + 1))`, the Qwen/Qwen3/Qwen3.5
+  schemas use it for `lm_head_input_rows`, and CPU graph construction proves a
+  two-request/depth-two capacity by comparing six row-indexed verifier logits
+  against full all-position logits. Focused gates:
+  `V2_Unit_MTPGraphConstruction`, `V2_Unit_QwenStandardGraphSchema`,
+  `V2_Unit_Qwen3BufferSizes`, and `V2_Unit_Qwen35BufferSizes`.
 
 Exit gate:
 

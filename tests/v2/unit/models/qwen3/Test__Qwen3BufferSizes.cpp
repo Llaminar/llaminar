@@ -125,6 +125,31 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_ExactShapes)
     EXPECT_EQ(lm_head_input_rows->shape[1], 2048u);
 }
 
+TEST(Test__Qwen3BufferSizes, LayerBuffers_MTPRequestBatchVerifierRowsScale)
+{
+    Qwen3SchemaFactory factory;
+    GraphSchema schema = factory.createSchema();
+
+    GraphResolverConfig config{};
+    config.d_model = 2048;
+    config.n_heads = 16;
+    config.n_kv_heads = 4;
+    config.head_dim = 128;
+    config.seq_len = 512;
+    config.batch_size = 1;
+    config.local_n_heads = 16;
+    config.local_n_kv_heads = 4;
+    config.local_d_ff = 8960;
+    config.custom_formulas["mtp_target_query_rows"] = 8;
+
+    auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
+    auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
+    ASSERT_NE(lm_head_input_rows, nullptr);
+    ASSERT_EQ(lm_head_input_rows->shape.size(), 2u);
+    EXPECT_EQ(lm_head_input_rows->shape[0], 8u);
+    EXPECT_EQ(lm_head_input_rows->shape[1], 2048u);
+}
+
 // ============================================================================
 // Model Buffer Size Lock-in
 // ============================================================================

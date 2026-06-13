@@ -24,6 +24,8 @@ Before a WiP commit, broad units plus touched parity must pass.
 - Phase 8 groundwork: accepted outcomes build padded multi-request metadata;
   a shared batch transaction planner now produces commit/publication step
   plans and the live runner uses it for the current single-request path.
+  Compact verifier LM-head scratch now scales above four rows for request-batch
+  capacity and is covered by CPU row-indexed graph tests.
   `--mtp-max-request-batch` records intent but still hard-fails above 1.
 - Fresh Phase 9 ROCm dense greedy topology matrix:
   `benchmark_results/mtp_vllm_style/20260612T234446Z-iteration-matrix-3ed9c37e/`.

@@ -388,7 +388,7 @@ namespace llaminar2
                 {"workspace_context", {"batch_size * local_n_heads * seq_len", "head_dim"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 5, "Attention context [B*Nh*S, Hd]"},
                 {"workspace_mask", {"batch_size * seq_len", "seq_len"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 5, "Attention mask [B*S, S]"},
                 {"lm_head_input_row", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Stable selected hidden row for bucketed prefill LM head"},
-                {"lm_head_input_rows", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Compact verifier hidden rows for row-indexed LM head"},
+                {"lm_head_input_rows", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Compact verifier hidden rows for row-indexed LM head"},
             };
 
             schema.model_buffers = {
