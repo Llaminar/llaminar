@@ -281,7 +281,6 @@ namespace llaminar2
         for (const MTPSpecStepPlan &step : plans.steps)
             result.accepted_count += step.accepted_count;
 
-        bool any_accepted = false;
         for (const MTPSpecStepPlan &step : plans.steps)
         {
             if (step.accepted_count < 0 || step.accepted_count > step.draft_count)
@@ -290,14 +289,14 @@ namespace llaminar2
                     plans,
                     "batched MTP spec-state publication step accepted count is outside the draft prefix");
             }
-            any_accepted = any_accepted || step.accepted_count > 0;
-        }
-        if (!any_accepted)
-        {
-            result.skipped_stage_count = static_cast<int>(state_stages.size());
-            return result;
         }
 
+        /*
+         * Device-indexed batch publication must not infer "nothing to do" from
+         * host-side accepted_count fields.  The authoritative row choices live
+         * in device_verifier_restore_rows, and rejected requests are encoded as
+         * negative row indices that request-aware stages leave unchanged.
+         */
         for (size_t i = 0; i < state_stages.size(); ++i)
         {
             IComputeStage *stage = state_stages[i];

@@ -8756,22 +8756,6 @@ namespace llaminar2
             }
             return false;
         }
-        if (request.request_count != 1 &&
-            mtpSpecStatePublicationRequiresCapturedStage())
-        {
-            if (error)
-            {
-                // GDN and short-conv live state is still one backend-owned
-                // state buffer per layer. Batched resident publication must
-                // first introduce per-request recurrent state storage; looping
-                // this scalar restore would silently publish the wrong state.
-                *error =
-                    "device-resident MTP hybrid recurrent-state publication currently supports one request; "
-                    "per-request GDN/short-conv live-state storage and batched device-indexed verifier "
-                    "state restore are not implemented";
-            }
-            return false;
-        }
         if (!state_.kv_cache->supportsDeviceResidentSequenceStatePublication())
         {
             if (error)
@@ -8988,23 +8972,6 @@ namespace llaminar2
          * terminal hidden directly from that device metadata instead of waiting
          * for the compatibility host outcome bridge to rebuild a host plan.
          */
-        MTPSpecStepPlan direct_state_plan;
-        direct_state_plan.request_index = 0;
-        direct_state_plan.request_id = 0;
-        direct_state_plan.draft_count = request.max_draft_tokens - 1;
-        direct_state_plan.target_rows = request.max_draft_tokens;
-        /*
-         * Device-indexed recurrent-state publication restores from
-         * ptrs.accepted_state_slot_indices, not from host-visible token counts.
-         * Keep these legacy plan fields neutral so the hot path cannot quietly
-         * depend on a host base-cache shadow.
-         */
-        direct_state_plan.base_cached_tokens = 0;
-        direct_state_plan.target_cached_tokens =
-            direct_state_plan.base_cached_tokens;
-        direct_state_plan.accepted_count = 0;
-        direct_state_plan.publish_mtp_shifted_kv = request.publish_mtp_shifted_kv;
-
         MTPSpecStatePublicationResult state_result;
         {
             PerfStatsCollector::ScopedTimer timer(
@@ -9014,14 +8981,80 @@ namespace llaminar2
                 state_.device_id.toString(),
                 {{"request_count", std::to_string(request.request_count)},
                  {"max_draft_tokens", std::to_string(request.max_draft_tokens)}});
-            state_result =
-                llaminar2::publishAcceptedMTPSpecStateFromDeviceVerifierRow(
-                    direct_state_plan,
-                    ptrs.accepted_state_slot_indices,
-                    *verifier_graph->graph,
-                    state_.device_id,
-                    request.outcome.stream,
-                    /*require_captured_stage=*/mtpSpecStatePublicationRequiresCapturedStage());
+            if (request.request_count == 1)
+            {
+                MTPSpecStepPlan direct_state_plan;
+                direct_state_plan.request_index = 0;
+                direct_state_plan.request_id = 0;
+                direct_state_plan.draft_count = request.max_draft_tokens - 1;
+                direct_state_plan.target_rows = request.max_draft_tokens;
+                /*
+                 * Device-indexed recurrent-state publication restores from
+                 * ptrs.accepted_state_slot_indices, not from host-visible token
+                 * counts. Keep these legacy plan fields neutral so the hot path
+                 * cannot quietly depend on a host base-cache shadow.
+                 */
+                direct_state_plan.base_cached_tokens = 0;
+                direct_state_plan.target_cached_tokens =
+                    direct_state_plan.base_cached_tokens;
+                direct_state_plan.accepted_count = 0;
+                direct_state_plan.publish_mtp_shifted_kv =
+                    request.publish_mtp_shifted_kv;
+
+                state_result =
+                    llaminar2::publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+                        direct_state_plan,
+                        ptrs.accepted_state_slot_indices,
+                        *verifier_graph->graph,
+                        state_.device_id,
+                        request.outcome.stream,
+                        /*require_captured_stage=*/mtpSpecStatePublicationRequiresCapturedStage());
+            }
+            else
+            {
+                MTPSpecStepPlanBatch direct_state_batch;
+                direct_state_batch.ok = true;
+                direct_state_batch.shape.max_requests = request.request_count;
+                direct_state_batch.shape.max_draft_tokens =
+                    std::max(0, request.max_draft_tokens - 1);
+                direct_state_batch.request_count = request.request_count;
+                direct_state_batch.steps.reserve(
+                    static_cast<size_t>(request.request_count));
+
+                /*
+                 * The accepted-state row indices are already device-resident
+                 * and authoritative. These synthetic plans only give the shared
+                 * restore contract request identity and row-shape bounds; they
+                 * must never steer restore from host-visible accepted counts.
+                 */
+                for (int request_index = 0;
+                     request_index < request.request_count;
+                     ++request_index)
+                {
+                    MTPSpecStepPlan step;
+                    step.request_index = request_index;
+                    step.request_id = request_index;
+                    step.draft_count =
+                        std::max(0, request.max_draft_tokens - 1);
+                    step.target_rows = request.max_draft_tokens;
+                    step.base_cached_tokens = 0;
+                    step.target_cached_tokens = 0;
+                    step.accepted_count = 0;
+                    step.publish_mtp_shifted_kv =
+                        request.publish_mtp_shifted_kv;
+                    direct_state_batch.steps.push_back(step);
+                }
+
+                state_result =
+                    llaminar2::publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+                        direct_state_batch,
+                        ptrs.accepted_state_slot_indices,
+                        /*row_index_stride=*/1,
+                        *verifier_graph->graph,
+                        state_.device_id,
+                        request.outcome.stream,
+                        /*require_captured_stage=*/mtpSpecStatePublicationRequiresCapturedStage());
+            }
         }
         if (!state_result.ok)
         {

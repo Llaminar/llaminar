@@ -3166,9 +3166,10 @@ Current status:
 - [ ] Request-batched stochastic resident publication supports CUDA/ROCm
   recurrent and short-conv batch restore from device row-index arrays, then
   publishes KV, terminal hidden, logical-state mailbox, and host adoption from
-  one resident handle. The CUDA/ROCm GDN/short-conv state-bank and batch-restore
-  hooks now exist; this item remains open until DGO promotes the request-batched
-  resident path and focused CUDA/ROCm runner smokes prove KV, terminal hidden,
+  one resident handle. The CUDA/ROCm GDN/short-conv state-bank hooks and DGO
+  resident batch-restore branch now exist; this item remains open until the
+  request-batched runner path consumes `DeviceSpeculativePublicationRequest`
+  end-to-end and focused CUDA/ROCm runner smokes prove KV, terminal hidden,
   logical-state mailbox, and host adoption all move from one accepted handle.
 - [ ] LocalTP and GlobalTP grouped verifier support added for sharded logits:
   compact outcome reducers perform domain-wide argmax/top-k/top-p/probability

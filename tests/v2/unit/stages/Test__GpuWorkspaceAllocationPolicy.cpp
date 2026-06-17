@@ -2286,18 +2286,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationRequiresAto
               std::string::npos)
         << "The direct endpoint should exercise the device metadata preflight "
            "before reporting the remaining unsupported handoff.";
-    EXPECT_NE(compact_publish.find("request.request_count!=1&&mtpSpecStatePublicationRequiresCapturedStage()"),
+    EXPECT_EQ(compact_publish.find("request.request_count!=1&&mtpSpecStatePublicationRequiresCapturedStage()"),
               std::string::npos)
-        << "The direct endpoint may publish dense request batches, but hybrid "
-           "GDN/short-conv publication must hard-fail until per-request live "
-           "state and device-indexed verifier-state restore support multiple "
-           "requests.";
-    EXPECT_NE(publish_body.find("per-request GDN/short-conv live-state storage"),
+        << "CUDA/ROCm GDN and short-conv now own per-request verifier live-state "
+           "banks; resident request batches must use the batch restore hook "
+           "instead of failing at the old scalar ownership guard.";
+    EXPECT_EQ(publish_body.find("per-request GDN/short-conv live-state storage"),
               std::string::npos)
-        << "The request-batch guard must name the scalar recurrent-state "
-           "ownership boundary; a loop over device row indices would overwrite "
-           "one layer-owned GPU state buffer rather than publish independent "
-           "request states.";
+        << "The stale scalar-only ownership error must not remain in the "
+           "promoted resident publication path.";
     EXPECT_NE(compact_publish.find("waitForPendingShiftedMTPKVReady("),
               std::string::npos)
         << "Direct publication mutates shifted MTP KV and must order after any "
@@ -2337,8 +2334,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationRequiresAto
         << "Direct publication must update shifted MTP KV caches as part of the atomic handoff.";
     EXPECT_NE(compact_publish.find("publishAcceptedMTPSpecStateFromDeviceVerifierRow("),
               std::string::npos)
-        << "Direct publication must restore GDN/short-conv verifier state from "
-           "device-derived accepted row metadata, not from the host bridge.";
+        << "Scalar direct publication keeps the single-row device-indexed helper.";
+    EXPECT_NE(compact_publish.find("publishAcceptedMTPSpecStateFromDeviceVerifierRows("),
+              std::string::npos)
+        << "Request-batched resident publication must restore GDN/short-conv "
+           "state through the batch hook once, not by looping the scalar helper.";
     EXPECT_NE(compact_publish.find("ptrs.accepted_state_slot_indices"),
               std::string::npos)
         << "Direct recurrent-state publication must consume compact GPU row metadata.";
