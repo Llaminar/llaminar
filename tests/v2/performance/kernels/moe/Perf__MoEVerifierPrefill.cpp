@@ -381,6 +381,29 @@ namespace
     }
 
     /**
+     * @brief Assert that the graph-captured grouped verifier is economical.
+     *
+     * The correctness oracle is intentionally the expensive path: row-wise
+     * decode for routed/shared rows, or split routed+shared verifier prefill
+     * for the production combined-shared case.  Phase 9.8 requires the
+     * promoted grouped verifier to be decode-equivalent and faster than that
+     * reference, otherwise a "green" correctness test can silently preserve a
+     * serial verifier cost in the hot path.
+     */
+    void expectGraphReplayFasterThanReference(const BenchResult &result)
+    {
+        ASSERT_GT(result.rowwise_ms, 0.0)
+            << result.backend << ' ' << result.case_name << " M=" << result.m;
+        ASSERT_GT(result.graph_ms, 0.0)
+            << result.backend << ' ' << result.case_name << " M=" << result.m;
+        EXPECT_LT(result.graph_ms, result.rowwise_ms)
+            << result.backend << ' ' << result.case_name << " M=" << result.m
+            << " graph_ms=" << result.graph_ms
+            << " reference_ms=" << result.rowwise_ms
+            << " speedup=" << (result.rowwise_ms / result.graph_ms);
+    }
+
+    /**
      * @brief Owns prepared expert descriptors and their backing GPU weights.
      *
      * The production grouped MoE kernels consume descriptor tables, but those
@@ -1154,10 +1177,14 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M1234_RoutedAndShared)
     {
         auto routed = runCudaCase(/*shared=*/false, rows);
         expectClose(routed.metrics);
+        if (rows >= 2)
+            expectGraphReplayFasterThanReference(routed);
         printResult(routed);
 
         auto shared = runCudaCase(/*shared=*/true, rows);
         expectClose(shared.metrics);
+        if (rows >= 2)
+            expectGraphReplayFasterThanReference(shared);
         printResult(shared);
     }
 #endif
@@ -1187,6 +1214,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M4_CombinedRoutedSharedUpperBound)
         /*case_name_override=*/"combined_top9_upper_bound",
         /*unique_routes=*/true);
     expectClose(combined.metrics);
+    expectGraphReplayFasterThanReference(combined);
     printResult(combined);
 #endif
 }
@@ -1209,6 +1237,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M234_CombinedSharedGateProductionShape)
     {
         auto combined = runCudaCombinedSharedGateCase(rows);
         expectClose(combined.metrics);
+        expectGraphReplayFasterThanReference(combined);
         printResult(combined);
     }
 #endif

@@ -3068,6 +3068,17 @@ Current status:
   AUTO/KB4/KB8 winners for M=2/3/4 respectively. This is pipeline smoke only;
   CPU generated-table consumption and the full all-codebook generated-table
   acceptance boxes remain open.
+- [x] GPU MoE verifier-prefill speedometer now hard-gates economy as well as
+  strict metrics. CUDA and ROCm M=2/3/4 routed/shared rows plus production
+  combined shared-gate rows must have graph replay faster than their
+  decode-equivalent row-wise or split routed+shared references. Sprint gate:
+  `LLAMINAR_MOE_VERIFIER_PREFILL_ITERS=5 LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS=1 LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS=1 build_v2_release/tests/v2/v2_perf_moe_verifier_prefill --gtest_filter='Perf__MoEVerifierPrefill.CUDA_M1234_RoutedAndShared:Perf__MoEVerifierPrefill.CUDA_M4_CombinedRoutedSharedUpperBound:Perf__MoEVerifierPrefill.CUDA_M234_CombinedSharedGateProductionShape:Perf__MoEVerifierPrefill.ROCm_M1234_RoutedAndShared:Perf__MoEVerifierPrefill.ROCm_M4_CombinedRoutedSharedUpperBound:Perf__MoEVerifierPrefill.ROCm_M234_CombinedSharedGateProductionShape'`.
+  Latest production-shaped combined shared-gate rows: CUDA graph M2/M3/M4 =
+  `0.1176/0.1499/0.1763 ms` versus reference
+  `0.3011/0.1618/0.1833 ms`; ROCm graph M2/M3/M4 =
+  `0.2591/0.3123/0.3550 ms` versus reference
+  `0.3040/0.3387/0.3752 ms`. This closes the isolated GPU MoE
+  verifier-prefill economy gate; full-model MoE stochastic remains open.
 - [x] Greedy GPU all-position verification no longer re-uploads first-token or
   draft-token shadows when the runner advertises device slots. Main-logits
   greedy sampling writes the first target token into the runner-owned target

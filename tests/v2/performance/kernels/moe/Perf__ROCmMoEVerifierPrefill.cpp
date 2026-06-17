@@ -367,6 +367,28 @@ namespace
                   << result.metrics.worst_row << '\n';
     }
 
+    /**
+     * @brief Assert that grouped graph replay beats its decode-equivalent oracle.
+     *
+     * The reference time is deliberately conservative: row-wise decode for
+     * isolated routed/shared rows, and split routed+shared verifier prefill for
+     * the production combined-shared case.  This makes the performance test a
+     * Phase 9.8 guard: grouped verifier rows must be both numerically strict
+     * and cheaper than the serial/equivalent path they replace.
+     */
+    void expectGraphReplayFasterThanReference(const BenchResult &result)
+    {
+        ASSERT_GT(result.rowwise_ms, 0.0)
+            << result.backend << ' ' << result.case_name << " M=" << result.m;
+        ASSERT_GT(result.graph_ms, 0.0)
+            << result.backend << ' ' << result.case_name << " M=" << result.m;
+        EXPECT_LT(result.graph_ms, result.rowwise_ms)
+            << result.backend << ' ' << result.case_name << " M=" << result.m
+            << " graph_ms=" << result.graph_ms
+            << " reference_ms=" << result.rowwise_ms
+            << " speedup=" << (result.rowwise_ms / result.graph_ms);
+    }
+
     struct PreparedExpertTables
     {
         std::vector<std::unique_ptr<llaminar2::TensorBase>> weights;
@@ -998,10 +1020,14 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M1234_RoutedAndShared)
     {
         auto routed = runROCmCase(/*shared=*/false, rows);
         expectClose(routed.metrics);
+        if (rows >= 2)
+            expectGraphReplayFasterThanReference(routed);
         printResult(routed);
 
         auto shared = runROCmCase(/*shared=*/true, rows);
         expectClose(shared.metrics);
+        if (rows >= 2)
+            expectGraphReplayFasterThanReference(shared);
         printResult(shared);
     }
 #endif
@@ -1030,6 +1056,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M4_CombinedRoutedSharedUpperBound)
         /*case_name_override=*/"combined_top9_upper_bound",
         /*unique_routes=*/true);
     expectClose(combined.metrics);
+    expectGraphReplayFasterThanReference(combined);
     printResult(combined);
 #endif
 }
@@ -1052,6 +1079,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M234_CombinedSharedGateProductionShape)
     {
         auto combined = runROCmCombinedSharedGateCase(rows);
         expectClose(combined.metrics);
+        expectGraphReplayFasterThanReference(combined);
         printResult(combined);
     }
 #endif

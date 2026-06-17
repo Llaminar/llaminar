@@ -4556,7 +4556,8 @@ add_v2_test(V2_Perf_MoEGraphNativeOverlay
 
 # Focused MoE MTP verifier-prefill speedometer.
 # Times CUDA/ROCm grouped verifier prefill for M=2/3/4 routed and shared expert
-# cases, with parity against decode-equivalent rows before reporting CSV rows.
+# cases, with strict parity and graph-vs-reference economy assertions before
+# reporting CSV rows.
 add_executable(v2_perf_moe_verifier_prefill
     performance/kernels/moe/Perf__MoEVerifierPrefill.cpp
     performance/kernels/moe/Perf__ROCmMoEVerifierPrefill.cpp

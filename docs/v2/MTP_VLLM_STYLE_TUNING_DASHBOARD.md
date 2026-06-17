@@ -27,7 +27,10 @@ and sampled-token checks; the latest CPU grouped gate took 135.31s real time,
 so Phase 9.8 still keeps CPU perf suspect. MoE direct all-position publication stays disabled after the rejected
 CUDA M=2 candidate (`row0 cos=0.9826 rel_l2=0.1855`). Phase 9.8 kernel slice:
 NativeVNNI static gates, CPU/CUDA/ROCm M=2..4 serial-equivalence, and focused
-trainer CSV smoke all pass. Greedy GPU all-position now keeps first+draft
+trainer CSV smoke all pass. MoE verifier-prefill perf now hard-gates
+graph replay faster than serial/split reference; sprint rows: CUDA combined
+M2/3/4 0.118/0.150/0.176 ms vs 0.301/0.162/0.183, ROCm
+0.259/0.312/0.355 vs 0.304/0.339/0.375. Greedy GPU all-position now keeps first+draft
 tokens in device slots, removes the resident verifier token-row H2D fallback,
 snapshots base-cache counts D2D, keeps scalar GDN/short-conv device-index
 publication device-only, lets dense request batches pass the hybrid guard, and
@@ -41,13 +44,11 @@ mailbox directly; host outcome bridging is response/sampler-only.
 | CUDA MoE stochastic | 129.0 | d3 124.4 (0.96x) | R | d3 76.9% acc, verifier/producer limited |
 | ROCm MoE stochastic | 78.6 | d3 82.0 (1.04x) | A | d3 74.3% acc after MoE sidecar recapture |
 
-Latest signal: compact one-hot draft verification is accepted. Compact D2H
-enqueue is sub-ms; large ROCm bridge waits are upstream producer work. Recapturing
-MoE sidecars after publication recovers ROCm d3 to 82.0 tok/s vs 78.6 baseline,
-but reset is not the floor: `sidecar_replay_reset_ms=10.7`, while
+Latest signal: compact one-hot draft verification is accepted; response D2H is
+not the floor. ROCm d3 recapture reaches 82.0 tok/s vs 78.6 baseline, while
 `main_verifier_graph_replay_gpu_ms=1503`; sampled verifier time is led by MoE
-expert FFN at 151 ms and router at 21 ms. Phase 10 needs persistent vLLM-style
-MoE metadata and fused verifier work, not more D2H/reset plumbing.
+expert FFN at 151 ms and router at 21 ms. Phase 10 needs vLLM-style MoE
+metadata/fusion, not more bridge plumbing.
 
 ## Device And Topology Matrix
 
@@ -89,10 +90,9 @@ Target anchors from `ggml-org/llama.cpp@6ddc943`: CUDA dense no-MTP 41.83, d1
 
 1. Close Phase 9.8 dense economy: prove grouped verifier perf beats serial on
    CPU/CUDA/ROCm.
-2. Reduce full MoE verifier graph replay cost; align routed/shared expert work
-   with vLLM fused-MoE runner semantics before polishing controller policy.
-3. Move transaction-output adoption behind resident device metadata so response
-   D2H is only an output flush.
+2. Reduce full MoE verifier replay beyond isolated expert-prefill; align
+   routed/shared work with vLLM fused-MoE semantics.
+3. Keep response D2H as output flush only.
 4. Promote and smoke hybrid request-batched GDN publication end-to-end.
 5. Refresh LocalTP CUDA2, LocalTP ROCm4, NodeLocalTP CPU, and ExpertOverlay
    matrices before rollout claims.
