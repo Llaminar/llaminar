@@ -1918,7 +1918,7 @@ namespace llaminar2
         lm_params.compute_all_positions = lm_head_compute_all_positions;
         lm_params.use_prefill_replay_row_offset = lm_head_use_prefill_row_offset;
         lm_params.force_decode_equivalent_verifier_prefill =
-            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            (device.is_cuda() || device.is_rocm()) &&
             config_.compute_all_position_logits &&
             config_.mtp.enabled &&
             lm_head_compute_all_positions &&
@@ -1979,7 +1979,7 @@ namespace llaminar2
         // Compute total tokens for GEMM m parameter
         int total_tokens = batch_size * seq_len;
         const bool force_decode_equivalent_ffn_verifier_prefill =
-            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            (device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4 &&
             config_.compute_all_position_logits &&
@@ -2946,7 +2946,7 @@ namespace llaminar2
         int wo_n = static_cast<int>(wo_weight->shape()[0]);
         int wo_k = static_cast<int>(wo_weight->shape()[1]);
         const bool force_decode_equivalent_wo_verifier_prefill =
-            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            (device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4 &&
             config_.compute_all_position_logits &&

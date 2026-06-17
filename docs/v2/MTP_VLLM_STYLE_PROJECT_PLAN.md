@@ -3133,10 +3133,12 @@ Current status:
   recurrent-state guard. The DGO guard now fails request batches only when the
   model has GDN/short-conv verifier state that still lacks per-request live
   storage.
-- [x] Hybrid/GDN request-batched all-position verifier graphs hard-fail at
-  graph construction while capture is `[row,state]` and live state is one
-  buffer per layer. Focused gate: `V2_Unit_GpuWorkspaceAllocationPolicy` plus
-  CUDA/ROCm Qwen3.6 stochastic graph smokes.
+- [x] Hybrid/GDN request-batched all-position verifier graphs carry request
+  shape through graph construction instead of hiding the missing ownership
+  model. Unsupported backends now fail at the stage/kernel capability boundary,
+  where the explicit live-state-bank contract can name the missing backend
+  feature. Focused gate: `V2_Unit_GpuWorkspaceAllocationPolicy` and
+  `V2_Unit_MTPGraphConstruction`.
 - [x] Request-batched verifier-state restore has a shared stage and
   tensor-kernel contract with default hard-fail semantics. GDN recurrence and
   short-conv stages now expose the batch hook and delegate to the backend
@@ -3144,24 +3146,30 @@ Current status:
   `V2_Unit_GpuWorkspaceAllocationPolicy`.
 - [x] `MTPSpecStatePublisher` has a request-batched device-index publication
   helper that validates GPU + explicit-stream ownership and calls captured
-  stages through the batch restore hook exactly once. It deliberately remains
-  fail-closed until backends implement request-owned recurrent live-state
-  banks. Focused gate: `V2_Unit_MTPSpecStateContract`.
+  stages through the batch restore hook exactly once. It remains fail-closed
+  for production promotion until CUDA/ROCm request-batched runner smokes prove
+  the full resident transaction. Focused gate: `V2_Unit_MTPSpecStateContract`.
 - [x] Qwen3.5/Qwen3.6 GDN graph construction now passes request shape
   (`request_count`, `request_seq_len`) into short-conv and GDN recurrence
   stages instead of leaving them with only flattened token count. Focused gate:
   `V2_Unit_GpuWorkspaceAllocationPolicy`.
+- [x] CUDA and ROCm short-conv/GDN wrappers now provide request-owned
+  recurrent live-state banks for verifier batches. Batched verifier execution
+  restores each request from its own device row-index, captures
+  `[request,row,state]` snapshots in the existing flat transaction layout, and
+  rejects invalid flattened shapes or scalar effective-length shortcuts instead
+  of carrying state across requests. Focused gate:
+  `V2_Unit_MTPSpecStateContract`, `V2_Unit_MTPGraphConstruction`,
+  `V2_Unit_GDNKernels`, and `V2_Unit_GpuWorkspaceAllocationPolicy`.
 - [ ] CUDA hot-path H2D/D2H verifier transaction dependencies removed.
 - [ ] ROCm hot-path H2D/D2H verifier transaction dependencies removed.
 - [ ] Request-batched stochastic resident publication supports CUDA/ROCm
   recurrent and short-conv batch restore from device row-index arrays, then
   publishes KV, terminal hidden, logical-state mailbox, and host adoption from
-  one resident handle. Current DGO support is intentionally scalar-only because
-  `HybridGDNLayerState` and backend GDN/short-conv `gpu_state_` are one live
-  state per layer; request-batched publication first needs per-request
-  recurrent live-state storage, batch-aware verifier execution that prevents
-  state carry-over between requests, request-aware capture layout
-  `[request, verifier_row, state]`, then batched device-index restore.
+  one resident handle. The CUDA/ROCm GDN/short-conv state-bank and batch-restore
+  hooks now exist; this item remains open until DGO promotes the request-batched
+  resident path and focused CUDA/ROCm runner smokes prove KV, terminal hidden,
+  logical-state mailbox, and host adoption all move from one accepted handle.
 - [ ] LocalTP and GlobalTP grouped verifier support added for sharded logits:
   compact outcome reducers perform domain-wide argmax/top-k/top-p/probability
   acceptance across shards, and TP lanes fail-closed until that reducer is

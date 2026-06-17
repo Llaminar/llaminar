@@ -4012,13 +4012,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierUsesDecodeEqui
            "the backend is publishing decode-equivalent all-position rows.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35GDNAllPositionVerifierBatchesFailUntilStateIsRequestAware)
+TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35GDNAllPositionVerifierBatchesCarryRequestShape)
 {
     const auto graph_source = readFile(repoRoot() / "src/v2/models/qwen35/Qwen35Graph.cpp");
     const auto gdn_header =
         readFile(repoRoot() / "src/v2/execution/compute_stages/stages/GDNRecurrenceStage.h");
     const auto shortconv_header =
         readFile(repoRoot() / "src/v2/execution/compute_stages/stages/ShortConv1dStage.h");
+    const auto tensor_header = readFile(repoRoot() / "src/v2/tensors/TensorKernels.h");
     const auto gdn_section = sliceBetween(
         graph_source,
         "ComputeGraph Qwen35Graph::buildGDNAttentionGraph(",
@@ -4026,19 +4027,28 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35GDNAllPositionVerifierBatchesFail
     const std::string compact =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(gdn_section));
 
-    EXPECT_NE(compact.find("verifier_state_capture_supported&&batch_size>1&&seq_len>1"),
+    EXPECT_EQ(compact.find("throwstd::runtime_error"),
               std::string::npos)
-        << "Hybrid/GDN request-batched all-position verifier graphs need "
-           "[request,row,state] capture and per-request live-state banks before "
-           "they can execute safely.";
-    EXPECT_NE(gdn_section.find("request-aware recurrent-state capture and live-state banks"),
+        << "GDN verifier request batches should fail at the backend capability "
+           "boundary, not at graph construction.";
+    EXPECT_NE(compact.find("per_request_verifier_state_capture_rows*std::max(1,batch_size)"),
               std::string::npos)
-        << "The hard failure should name the missing ownership model so future "
-           "agents do not replace it with a quiet fallback.";
+        << "Hybrid/GDN verifier state snapshots use flat transaction rows, so "
+           "capture slots must scale by request count.";
     EXPECT_NE(gdn_header.find("int request_count = 1"),
               std::string::npos);
     EXPECT_NE(shortconv_header.find("int request_count = 1"),
               std::string::npos);
+    EXPECT_NE(tensor_header.find("supportsRequestLiveStateBank"),
+              std::string::npos)
+        << "Request-batched GDN publication must be guarded by a backend "
+           "live-state-bank capability.";
+    EXPECT_NE(tensor_header.find("forwardBatchedRequests"),
+              std::string::npos)
+        << "Short-conv needs a request-batched execution hook, not a scalar loop.";
+    EXPECT_NE(tensor_header.find("chunkForwardBatchedRequests"),
+              std::string::npos)
+        << "GDN recurrence needs a request-batched execution hook, not a scalar loop.";
     EXPECT_NE(graph_source.find("conv_params.request_count = batch_size"),
               std::string::npos)
         << "Short-conv verifier capture needs request shape, not only flattened token count.";

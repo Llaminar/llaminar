@@ -1971,6 +1971,98 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
         << "CUDA verifier GDN graphs must snapshot recurrence state rows for cheap MTP rollback";
 }
 
+TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedStateCaptureWorkspace)
+{
+    auto mpi = std::make_shared<MockMPIContext>(0, 1);
+    GraphConfig config = tinyQwen35GDNConfig(DeviceId::cuda(0));
+    config.mtp.draft_tokens = 2;
+    config.mtp.max_request_batch = 2;
+    const int request_count = 2;
+    const int request_seq_len = 2;
+    const int total_tokens = request_count * request_seq_len;
+    const int expected_capture_rows =
+        resolveMTPMaxTargetQueryRows(config.mtp) * request_count;
+
+    CPUHybridRingKVCacheFP32 cache(
+        tinyGDNHybridConfig(),
+        *mpi,
+        config.n_layers,
+        /*batch_size=*/request_count,
+        config.max_seq_len,
+        config.n_kv_heads,
+        config.head_dim,
+        DeviceId::cpu());
+
+    Qwen35Graph graph_builder(config, mpi);
+    LayerWeights layer = tinyQwen35GDNLayerWeights(config);
+    ActivationBuffers buffers = tinyQwen35GDNActivationBuffers(config, total_tokens);
+
+    ComputeGraph graph = graph_builder.buildAttentionGraph(
+        layer,
+        buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/request_seq_len,
+        /*batch_size=*/request_count,
+        &cache,
+        /*position_ids=*/nullptr,
+        DeviceId::cuda(0),
+        /*sequence_lengths=*/nullptr);
+
+    const auto *short_conv_node = graph.getNode("layer0_short_conv");
+    ASSERT_NE(short_conv_node, nullptr);
+    const auto *short_conv = dynamic_cast<const ShortConv1dStage *>(short_conv_node->stage.get());
+    ASSERT_NE(short_conv, nullptr);
+    EXPECT_EQ(short_conv->getParams().request_count, request_count);
+    EXPECT_EQ(short_conv->getParams().request_seq_len, request_seq_len);
+    EXPECT_EQ(short_conv->getParams().seq_len, total_tokens);
+    EXPECT_EQ(short_conv->getParams().speculative_state_slot_rows, expected_capture_rows)
+        << "Request-batched verifier graphs use flat [request,row] snapshot slots.";
+
+    const WorkspaceRequirements short_conv_reqs =
+        short_conv->getWorkspaceRequirements(total_tokens);
+    const WorkspaceDescriptor *short_conv_slots =
+        short_conv_reqs.find("gdn_shortconv_speculative_state_slots_layer0");
+    ASSERT_NE(short_conv_slots, nullptr);
+    const WorkspaceDescriptor *short_conv_work =
+        short_conv_reqs.find("gdn_shortconv_speculative_state_work_layer0");
+    ASSERT_NE(short_conv_work, nullptr);
+    const size_t short_conv_state_floats =
+        static_cast<size_t>(short_conv->getParams().channels) *
+        static_cast<size_t>(short_conv->getParams().kernel_size - 1);
+    const int allocated_capture_rows = std::min(expected_capture_rows, total_tokens);
+    EXPECT_EQ(short_conv_slots->size_bytes,
+              static_cast<size_t>(allocated_capture_rows) * short_conv_state_floats * sizeof(float));
+    EXPECT_EQ(short_conv_work->size_bytes,
+              static_cast<size_t>(request_count) * short_conv_state_floats * sizeof(float));
+
+    const auto *recurrence_node = graph.getNode("layer0_gdn_recurrence");
+    ASSERT_NE(recurrence_node, nullptr);
+    const auto *recurrence = dynamic_cast<const GDNRecurrenceStage *>(recurrence_node->stage.get());
+    ASSERT_NE(recurrence, nullptr);
+    EXPECT_EQ(recurrence->getParams().request_count, request_count);
+    EXPECT_EQ(recurrence->getParams().request_seq_len, request_seq_len);
+    EXPECT_EQ(recurrence->getParams().seq_len, total_tokens);
+    EXPECT_EQ(recurrence->getParams().speculative_state_slot_rows, expected_capture_rows)
+        << "Request-batched verifier graphs use flat [request,row] snapshot slots.";
+
+    const WorkspaceRequirements recurrence_reqs =
+        recurrence->getWorkspaceRequirements(total_tokens);
+    const WorkspaceDescriptor *recurrence_slots =
+        recurrence_reqs.find("gdn_speculative_state_slots_layer0");
+    ASSERT_NE(recurrence_slots, nullptr);
+    const WorkspaceDescriptor *recurrence_work =
+        recurrence_reqs.find("gdn_speculative_state_work_layer0");
+    ASSERT_NE(recurrence_work, nullptr);
+    const size_t recurrence_state_floats =
+        static_cast<size_t>(recurrence->getParams().n_heads) *
+        static_cast<size_t>(recurrence->getParams().d_k) *
+        static_cast<size_t>(recurrence->getParams().d_v);
+    EXPECT_EQ(recurrence_slots->size_bytes,
+              static_cast<size_t>(allocated_capture_rows) * recurrence_state_floats * sizeof(float));
+    EXPECT_EQ(recurrence_work->size_bytes,
+              static_cast<size_t>(request_count) * recurrence_state_floats * sizeof(float));
+}
+
 TEST(Test__MTPGraphConstruction, RejectsIncompleteMoESidecarWeights)
 {
     DenseMTPGraphFixture fixture;

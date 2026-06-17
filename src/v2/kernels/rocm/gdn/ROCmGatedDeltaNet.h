@@ -17,6 +17,8 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 
+#include <algorithm>
+
 extern "C"
 {
     bool rocmGDN_recurrent_step(
@@ -72,6 +74,16 @@ extern "C"
         int state_size,
         int device_idx,
         void *stream);
+    bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
+        float *dst,
+        const float *capture,
+        const int *device_row_indices,
+        int request_count,
+        int row_index_stride,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream);
     // QKV deinterleave on device
     bool rocmGDN_deinterleave_qkv(
         const float *merged, float *out_q, float *out_k, float *out_v,
@@ -93,6 +105,7 @@ namespace llaminar2
         {
             rocmGDN_gpu_set_device(device_ordinal_);
             rocmGDN_gpu_free(gpu_state_);
+            rocmGDN_gpu_free(request_state_bank_);
             rocmGDN_gpu_free(deinterleave_scratch_);
         }
 
@@ -178,10 +191,49 @@ namespace llaminar2
             return true;
         }
 
+        bool restoreVerifierStateCaptureRowsFromDeviceIndices(
+            float *dst_states,
+            int dst_state_stride_floats,
+            const int *device_row_indices,
+            int request_count,
+            int row_index_stride,
+            void *stream) override
+        {
+            (void)dst_states;
+            (void)dst_state_stride_floats;
+            if (!request_state_bank_ ||
+                request_state_bank_state_size_ <= 0 ||
+                request_state_bank_capacity_ < request_count ||
+                !verifier_state_capture_ ||
+                !device_row_indices ||
+                request_count <= 0 ||
+                row_index_stride <= 0 ||
+                !stream ||
+                verifier_state_capture_size_ != request_state_bank_state_size_)
+            {
+                return false;
+            }
+
+            return rocmGDN_gpu_copy_capture_rows_from_device_indices(
+                request_state_bank_,
+                verifier_state_capture_,
+                device_row_indices,
+                request_count,
+                row_index_stride,
+                verifier_state_capture_rows_,
+                request_state_bank_state_size_,
+                device_ordinal_,
+                stream);
+        }
+
         bool supportsPaddedPrefillRealLength() const override { return true; }
         bool isGPUStateReady(int required_state_size) const override
         {
             return gpu_state_ != nullptr && state_size_ == required_state_size;
+        }
+        bool supportsRequestLiveStateBank(int request_count, int state_size) const override
+        {
+            return request_count > 0 && state_size > 0;
         }
         size_t stateBytes() const override
         {
@@ -218,6 +270,12 @@ namespace llaminar2
             {
                 void *stream = GPUDeviceContextPool::instance().getAMDContext(device_ordinal_).defaultStream();
                 rocmGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
+                if (request_state_bank_ && request_state_bank_capacity_ > 0)
+                    rocmGDN_gpu_memset_zero_async(
+                        request_state_bank_,
+                        static_cast<size_t>(request_state_bank_capacity_) *
+                            static_cast<size_t>(request_state_bank_state_size_),
+                        stream);
                 rocmGDN_stream_synchronize(stream);
             }
             if (deinterleave_scratch_)
@@ -314,6 +372,114 @@ namespace llaminar2
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
                 device_ordinal_, stream_);
+        }
+
+        bool chunkForwardBatchedRequests(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_heads, int head_dim_k, int head_dim_v,
+            int chunk_size, bool use_qk_l2norm) override
+        {
+            (void)state;
+            (void)chunk_size;
+            rocmGDN_gpu_set_device(device_ordinal_);
+            const int required_state_size = n_heads * head_dim_k * head_dim_v;
+            if (seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
+                seq_len != request_count * request_seq_len ||
+                required_state_size <= 0)
+            {
+                LOG_ERROR("[ROCmGatedDeltaNet] Invalid request-batched shape"
+                          << " seq_len=" << seq_len
+                          << " request_count=" << request_count
+                          << " request_seq_len=" << request_seq_len
+                          << " state_size=" << required_state_size);
+                return false;
+            }
+            if (!ensureRequestStateBank(request_count, required_state_size))
+                return false;
+
+            const bool capture_active =
+                verifier_state_capture_ != nullptr &&
+                verifier_state_capture_rows_ >= request_count * request_seq_len &&
+                verifier_state_capture_size_ == required_state_size;
+            if (capture_active &&
+                (!stream_ ||
+                 !speculative_state_work_ ||
+                 speculative_state_work_size_ < request_count * required_state_size))
+            {
+                LOG_ERROR("[ROCmGatedDeltaNet] Request-batched verifier requires "
+                          "one speculative recurrence-state work slot per request");
+                return false;
+            }
+
+            const int qk_stride = n_heads * head_dim_k;
+            const int v_stride = n_heads * head_dim_v;
+            for (int request = 0; request < request_count; ++request)
+            {
+                const size_t qk_offset =
+                    static_cast<size_t>(request) *
+                    static_cast<size_t>(request_seq_len) *
+                    static_cast<size_t>(qk_stride);
+                const size_t v_offset =
+                    static_cast<size_t>(request) *
+                    static_cast<size_t>(request_seq_len) *
+                    static_cast<size_t>(v_stride);
+                float *request_state =
+                    request_state_bank_ +
+                    static_cast<size_t>(request) *
+                        static_cast<size_t>(required_state_size);
+                float *snapshots = nullptr;
+                int snapshot_rows = 0;
+                if (capture_active)
+                {
+                    float *work_state =
+                        speculative_state_work_ +
+                        static_cast<size_t>(request) *
+                            static_cast<size_t>(required_state_size);
+                    rocmGDN_gpu_memcpy_async(
+                        work_state,
+                        request_state,
+                        static_cast<size_t>(required_state_size),
+                        stream_);
+                    request_state = work_state;
+
+                    const int snapshot_base = request * request_seq_len;
+                    snapshots =
+                        verifier_state_capture_ +
+                        static_cast<size_t>(snapshot_base) *
+                            static_cast<size_t>(required_state_size);
+                    snapshot_rows =
+                        std::min(request_seq_len, verifier_state_capture_rows_ - snapshot_base);
+                }
+
+                if (!rocmGDN_chunk_forward(
+                        Q + qk_offset,
+                        K + qk_offset,
+                        V + v_offset,
+                        alpha + static_cast<size_t>(request) *
+                                    static_cast<size_t>(request_seq_len) *
+                                    static_cast<size_t>(n_heads),
+                        beta_raw + static_cast<size_t>(request) *
+                                       static_cast<size_t>(request_seq_len) *
+                                       static_cast<size_t>(n_heads),
+                        A_log,
+                        dt_bias,
+                        output + v_offset,
+                        request_state,
+                        request_seq_len, n_heads, head_dim_k, head_dim_v,
+                        use_qk_l2norm,
+                        snapshots,
+                        required_state_size,
+                        snapshot_rows,
+                        device_ordinal_, stream_))
+                {
+                    return false;
+                }
+            }
+            return true;
         }
 
         bool recurrent_step(
@@ -485,6 +651,9 @@ namespace llaminar2
         void *stream_ = nullptr;
         float *gpu_state_ = nullptr;
         int state_size_ = 0;
+        float *request_state_bank_ = nullptr;
+        int request_state_bank_state_size_ = 0;
+        int request_state_bank_capacity_ = 0;
         float *deinterleave_scratch_ = nullptr;
         size_t deinterleave_scratch_size_ = 0;
         float *bound_deinterleave_scratch_ = nullptr;
@@ -509,7 +678,7 @@ namespace llaminar2
                 return nullptr;
             }
             if (!speculative_state_work_ ||
-                speculative_state_work_size_ != required_state_size)
+                speculative_state_work_size_ < required_state_size)
             {
                 LOG_ERROR("[ROCmGatedDeltaNet] Speculative verifier state workspace was not bound: need "
                           << required_state_size << " floats, have "
@@ -523,6 +692,67 @@ namespace llaminar2
                 static_cast<size_t>(required_state_size),
                 stream);
             return speculative_state_work_;
+        }
+
+        bool ensureRequestStateBank(int request_count, int required_state_size)
+        {
+            if (request_count <= 0 || required_state_size <= 0)
+                return false;
+
+            if (!gpu_state_ || state_size_ != required_state_size)
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmGatedDeltaNet] scalar recurrence state allocation during graph capture");
+                    return false;
+                }
+                allocateState(required_state_size);
+            }
+            if (!gpu_state_)
+                return false;
+
+            if (request_state_bank_ &&
+                request_state_bank_state_size_ == required_state_size &&
+                request_state_bank_capacity_ >= request_count)
+            {
+                return true;
+            }
+
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[ROCmGatedDeltaNet] request recurrence-state bank allocation during graph capture "
+                          "(requests=" << request_count
+                          << ", state_size=" << required_state_size << ")");
+                return false;
+            }
+
+            rocmGDN_gpu_set_device(device_ordinal_);
+            if (request_state_bank_)
+                rocmGDN_gpu_free(request_state_bank_);
+            request_state_bank_ = nullptr;
+            request_state_bank_state_size_ = required_state_size;
+            request_state_bank_capacity_ = request_count;
+
+            const size_t total_floats =
+                static_cast<size_t>(request_count) *
+                static_cast<size_t>(required_state_size);
+            if (!rocmGDN_gpu_malloc(&request_state_bank_, total_floats))
+            {
+                LOG_ERROR("[ROCmGatedDeltaNet] GPU malloc failed for request recurrence-state bank");
+                request_state_bank_state_size_ = 0;
+                request_state_bank_capacity_ = 0;
+                return false;
+            }
+
+            void *stream = GPUDeviceContextPool::instance().getAMDContext(device_ordinal_).defaultStream();
+            rocmGDN_gpu_memset_zero_async(request_state_bank_, total_floats, stream);
+            rocmGDN_gpu_memcpy_async(
+                request_state_bank_,
+                gpu_state_,
+                static_cast<size_t>(required_state_size),
+                stream);
+            rocmGDN_stream_synchronize(stream);
+            return true;
         }
     };
 

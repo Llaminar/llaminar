@@ -82,8 +82,10 @@ namespace llaminar2
                                     true});
             if (params_.device_id.is_gpu())
             {
+                const int work_slots =
+                    std::max(1, params_.request_count > 1 ? params_.request_count : 1);
                 reqs.buffers.push_back({speculativeStateWorkBufferName(),
-                                        state_floats * sizeof(float),
+                                        static_cast<size_t>(work_slots) * state_floats * sizeof(float),
                                         256,
                                         true});
             }
@@ -190,21 +192,30 @@ namespace llaminar2
             capture_state_size);
 
         float *speculative_work = nullptr;
+        int speculative_work_size = capture_state_size;
         if (bound_workspace_ && bound_workspace_->hasBuffer(speculativeStateWorkBufferName()))
         {
             const std::string work_name = speculativeStateWorkBufferName();
             const size_t available_floats =
                 bound_workspace_->getBufferSize(work_name) / sizeof(float);
-            if (available_floats >= static_cast<size_t>(std::max(0, capture_state_size)))
+            const int required_work_slots =
+                std::max(1, params_.request_count > 1 ? params_.request_count : 1);
+            const size_t required_floats =
+                static_cast<size_t>(required_work_slots) *
+                static_cast<size_t>(std::max(0, capture_state_size));
+            if (available_floats >= required_floats)
             {
                 speculative_work = static_cast<float *>(bound_workspace_->getBuffer(work_name));
+                speculative_work_size = static_cast<int>(std::min<size_t>(
+                    available_floats,
+                    static_cast<size_t>(std::numeric_limits<int>::max())));
             }
         }
         speculative_state_work_bound_ =
             speculative_work != nullptr || !params_.device_id.is_gpu();
         params_.kernel->bindSpeculativeStateWorkspace(
             speculative_work,
-            capture_state_size);
+            speculative_work_size);
     }
 
     void ShortConv1dStage::clearKernelVerifierStateWorkspace()
@@ -681,8 +692,27 @@ namespace llaminar2
             }
 
             bool ok = false;
+            const bool request_batched =
+                params_.request_count > 1 &&
+                params_.request_seq_len > 0 &&
+                params_.seq_len == params_.request_count * params_.request_seq_len;
+            if (params_.request_count > 1 && !request_batched)
+            {
+                LOG_ERROR("[ShortConv1dStage] Request-batched GPU short-conv requires flattened "
+                          "seq_len == request_count * request_seq_len"
+                          << " (seq_len=" << params_.seq_len
+                          << ", request_count=" << params_.request_count
+                          << ", request_seq_len=" << params_.request_seq_len << ")");
+                return false;
+            }
             if (use_real_length_contract)
             {
+                if (request_batched)
+                {
+                    LOG_ERROR("[ShortConv1dStage] Request-batched short-conv verifier does not support "
+                              "the scalar padded-prefill real-length contract");
+                    return false;
+                }
                 if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
                 {
                     LOG_ERROR("[ShortConv1dStage] Failed to update GPU effective length scalar");
@@ -693,6 +723,22 @@ namespace llaminar2
                     d_output, params_.conv_state,
                     params_.seq_len, params_.channels, params_.kernel_size,
                     gpu_effective_seq_len_state_->device_effective_seq_len,
+                    /*apply_silu=*/true);
+            }
+            else if (request_batched)
+            {
+                const int state_size = params_.channels * std::max(0, params_.kernel_size - 1);
+                if (!params_.kernel->supportsRequestLiveStateBank(params_.request_count, state_size))
+                {
+                    LOG_ERROR("[ShortConv1dStage] Backend lacks request-owned live conv-state bank for "
+                              << params_.request_count << " requests");
+                    return false;
+                }
+                ok = params_.kernel->forwardBatchedRequests(
+                    d_input, d_weight, d_bias,
+                    d_output, params_.conv_state,
+                    params_.seq_len, params_.request_count, params_.request_seq_len,
+                    params_.channels, params_.kernel_size,
                     /*apply_silu=*/true);
             }
             else

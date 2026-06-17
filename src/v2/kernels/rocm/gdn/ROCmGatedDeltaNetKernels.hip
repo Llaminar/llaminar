@@ -1098,6 +1098,45 @@ __global__ void rocm_gdn_copy_capture_row_from_device_index_kernel(
     }
 }
 
+/**
+ * Copy one captured verifier state row into each request's live-state slot.
+ *
+ * A negative row index leaves that request untouched. This lets the compact
+ * device-side MTP metadata publish only accepted requests without a host sync.
+ */
+__global__ void rocm_gdn_copy_capture_rows_from_device_indices_kernel(
+    float *__restrict__ dst,
+    const float *__restrict__ capture,
+    const int *__restrict__ row_indices,
+    int request_count,
+    int row_index_stride,
+    int rows,
+    int state_size)
+{
+    if (!dst || !capture || !row_indices ||
+        request_count <= 0 || row_index_stride <= 0 ||
+        rows <= 0 || state_size <= 0)
+    {
+        return;
+    }
+
+    const int total = request_count * state_size;
+    const int stride = blockDim.x * gridDim.x;
+    for (int linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += stride)
+    {
+        const int request = linear / state_size;
+        const int state_offset = linear - request * state_size;
+        const int row = row_indices[request * row_index_stride];
+        if (row < 0 || row >= rows)
+            continue;
+        dst[linear] =
+            capture[static_cast<size_t>(row) * static_cast<size_t>(state_size) +
+                    static_cast<size_t>(state_offset)];
+    }
+}
+
 } // anonymous namespace (deinterleave kernel)
 
 // =========================================================================
@@ -1195,6 +1234,55 @@ bool rocmGDN_gpu_copy_capture_row_from_device_index(
     {
         fprintf(stderr,
                 "[rocmGDN_gpu_copy_capture_row_from_device_index] %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
+    float *dst,
+    const float *capture,
+    const int *device_row_indices,
+    int request_count,
+    int row_index_stride,
+    int rows,
+    int state_size,
+    int device_idx,
+    void *stream)
+{
+    if (!dst || !capture || !device_row_indices ||
+        request_count <= 0 || row_index_stride <= 0 ||
+        rows <= 0 || state_size <= 0 || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    int blocks = ((request_count * state_size) + threads - 1) / threads;
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > 1024)
+        blocks = 1024;
+    hipLaunchKernelGGL(
+        rocm_gdn_copy_capture_rows_from_device_indices_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        (hipStream_t)stream,
+        dst,
+        capture,
+        device_row_indices,
+        request_count,
+        row_index_stride,
+        rows,
+        state_size);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGDN_gpu_copy_capture_rows_from_device_indices] %s\n",
                 hipGetErrorString(err));
         return false;
     }

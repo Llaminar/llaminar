@@ -32,8 +32,8 @@ tokens in device slots, removes the resident verifier token-row H2D fallback,
 snapshots base-cache counts D2D, keeps scalar GDN/short-conv device-index
 publication device-only, lets dense request batches pass the hybrid guard, and
 names remaining D2H as response materialization. GDN/short-conv request-batch
-restore now has a shared hard-fail stage/kernel API; backend live-state banks
-are still open. Publisher batch helper is wired; no lane is promoted yet.
+restore now has a hard-fail API plus CUDA/ROCm request-owned live-state banks.
+Publisher batch helper is wired; runner promotion smoke is still pending.
 
 | Lane | Baseline | Best MTP | RAG | Evidence |
 |---|---:|---:|:---:|---|
@@ -92,6 +92,6 @@ Target anchors from `ggml-org/llama.cpp@6ddc943`: CUDA dense no-MTP 41.83, d1
    with vLLM fused-MoE runner semantics before polishing controller policy.
 3. Move transaction-output adoption behind resident device metadata so response
    D2H is only an output flush.
-4. Add hybrid `[request,row,state]` GDN/short-conv capture and live-state banks.
+4. Promote and smoke hybrid request-batched GDN publication end-to-end.
 5. Refresh LocalTP CUDA2, LocalTP ROCm4, NodeLocalTP CPU, and ExpertOverlay
    matrices before rollout claims.

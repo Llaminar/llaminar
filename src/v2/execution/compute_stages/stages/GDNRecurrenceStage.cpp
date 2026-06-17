@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace llaminar2
@@ -165,8 +166,10 @@ namespace llaminar2
                                     true});
             if (params_.device_id.is_gpu())
             {
+                const int work_slots =
+                    std::max(1, params_.request_count > 1 ? params_.request_count : 1);
                 reqs.buffers.push_back({speculativeStateWorkBufferName(),
-                                        state_floats * sizeof(float),
+                                        static_cast<size_t>(work_slots) * state_floats * sizeof(float),
                                         256,
                                         true});
             }
@@ -278,21 +281,30 @@ namespace llaminar2
             capture_state_size);
 
         float *speculative_work = nullptr;
+        int speculative_work_size = capture_state_size;
         if (bound_workspace_ && bound_workspace_->hasBuffer(speculativeStateWorkBufferName()))
         {
             const std::string work_name = speculativeStateWorkBufferName();
             const size_t available_floats =
                 bound_workspace_->getBufferSize(work_name) / sizeof(float);
-            if (available_floats >= static_cast<size_t>(std::max(0, capture_state_size)))
+            const int required_work_slots =
+                std::max(1, params_.request_count > 1 ? params_.request_count : 1);
+            const size_t required_floats =
+                static_cast<size_t>(required_work_slots) *
+                static_cast<size_t>(std::max(0, capture_state_size));
+            if (available_floats >= required_floats)
             {
                 speculative_work = static_cast<float *>(bound_workspace_->getBuffer(work_name));
+                speculative_work_size = static_cast<int>(std::min<size_t>(
+                    available_floats,
+                    static_cast<size_t>(std::numeric_limits<int>::max())));
             }
         }
         speculative_state_work_bound_ =
             speculative_work != nullptr || !params_.device_id.is_gpu();
         params_.kernel->bindSpeculativeStateWorkspace(
             speculative_work,
-            capture_state_size);
+            speculative_work_size);
     }
 
     void GDNRecurrenceStage::clearKernelVerifierStateWorkspace()
@@ -969,6 +981,16 @@ namespace llaminar2
                                                                             << " effective_seq=" << effective_seq_len);
                 if (use_real_length_contract)
                 {
+                    const bool request_batched =
+                        params_.request_count > 1 &&
+                        params_.request_seq_len > 0 &&
+                        params_.seq_len == params_.request_count * params_.request_seq_len;
+                    if (request_batched)
+                    {
+                        LOG_ERROR("[GDNRecurrenceStage] Request-batched GDN verifier does not support "
+                                  "the scalar padded-prefill real-length contract");
+                        return false;
+                    }
                     if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
                     {
                         LOG_ERROR("[GDNRecurrenceStage] Failed to update GPU effective length scalar");
@@ -982,6 +1004,36 @@ namespace llaminar2
                         params_.seq_len, params_.n_heads, params_.d_k, params_.d_v,
                         params_.chunk_size, params_.use_qk_l2norm,
                         gpu_effective_seq_len_state_->device_effective_seq_len);
+                }
+                else if (params_.request_count > 1)
+                {
+                    const bool request_batched =
+                        params_.request_seq_len > 0 &&
+                        params_.seq_len == params_.request_count * params_.request_seq_len;
+                    if (!request_batched)
+                    {
+                        LOG_ERROR("[GDNRecurrenceStage] Request-batched GPU recurrence requires flattened "
+                                  "seq_len == request_count * request_seq_len"
+                                  << " (seq_len=" << params_.seq_len
+                                  << ", request_count=" << params_.request_count
+                                  << ", request_seq_len=" << params_.request_seq_len << ")");
+                        return false;
+                    }
+                    const int state_size = params_.n_heads * params_.d_k * params_.d_v;
+                    if (!params_.kernel->supportsRequestLiveStateBank(params_.request_count, state_size))
+                    {
+                        LOG_ERROR("[GDNRecurrenceStage] Backend lacks request-owned live recurrence-state bank for "
+                                  << params_.request_count << " requests");
+                        return false;
+                    }
+                    ok = params_.kernel->chunkForwardBatchedRequests(
+                        d_q, d_k, d_v,
+                        d_alpha, d_beta,
+                        d_alog, d_dtbias,
+                        d_output, params_.recurrence_state,
+                        params_.seq_len, params_.request_count, params_.request_seq_len,
+                        params_.n_heads, params_.d_k, params_.d_v,
+                        params_.chunk_size, params_.use_qk_l2norm);
                 }
                 else
                 {

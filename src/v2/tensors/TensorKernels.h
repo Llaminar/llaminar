@@ -2927,6 +2927,20 @@ namespace llaminar2
         }
 
         /**
+         * @brief Return true if this kernel can isolate live conv state per request.
+         *
+         * Batched MTP verifier publication is only correct when every request
+         * has its own live conv-state slot.  A single shared state pointer would
+         * let request N's verifier rows become request N+1's initial state.
+         */
+        virtual bool supportsRequestLiveStateBank(int request_count, int state_size) const
+        {
+            (void)request_count;
+            (void)state_size;
+            return false;
+        }
+
+        /**
          * @brief Restore a previously captured verifier-row conv state.
          *
          * CPU implementations copy into dst_state. GPU implementations may ignore
@@ -3123,6 +3137,37 @@ namespace llaminar2
             (void)apply_silu;
             return false;
         }
+
+        /**
+         * @brief Request-batched conv forward with request-owned live state.
+         *
+         * `seq_len` is the flattened row count, laid out as
+         * `[request_count, request_seq_len, channels]`. Implementations must
+         * update request-local live-state slots for ordinary decode/prefill and
+         * must use request-local speculative slots when verifier capture is
+         * active. Snapshot rows remain in the existing flat verifier namespace,
+         * so request `r`, row `t` writes slot `r * request_seq_len + t`.
+         */
+        virtual bool forwardBatchedRequests(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int request_count, int request_seq_len,
+            int channels, int kernel_size,
+            bool apply_silu = true)
+        {
+            (void)input;
+            (void)weight;
+            (void)bias;
+            (void)output;
+            (void)conv_state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)channels;
+            (void)kernel_size;
+            (void)apply_silu;
+            return false;
+        }
     };
 
     /**
@@ -3216,6 +3261,20 @@ namespace llaminar2
         {
             (void)workspace;
             (void)state_size;
+        }
+
+        /**
+         * @brief Return true if this kernel can isolate recurrence state per request.
+         *
+         * Request-batched verifier rows need one live recurrence state slot per
+         * request. This capability deliberately excludes scalar loops over a
+         * single shared state pointer.
+         */
+        virtual bool supportsRequestLiveStateBank(int request_count, int state_size) const
+        {
+            (void)request_count;
+            (void)state_size;
+            return false;
         }
 
         /**
@@ -3459,6 +3518,43 @@ namespace llaminar2
             (void)chunk_size;
             (void)use_qk_l2norm;
             (void)device_effective_seq_len;
+            return false;
+        }
+
+        /**
+         * @brief Request-batched GDN recurrence with request-owned live state.
+         *
+         * `seq_len` is flattened as `[request_count, request_seq_len]`.
+         * Implementations must process each request against its own live or
+         * speculative recurrence-state slot and write snapshots into the flat
+         * verifier-row namespace (`request * request_seq_len + row`).
+         */
+        virtual bool chunkForwardBatchedRequests(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)alpha;
+            (void)beta_raw;
+            (void)A_log;
+            (void)dt_bias;
+            (void)output;
+            (void)state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)n_heads;
+            (void)d_k;
+            (void)d_v;
+            (void)chunk_size;
+            (void)use_qk_l2norm;
             return false;
         }
 

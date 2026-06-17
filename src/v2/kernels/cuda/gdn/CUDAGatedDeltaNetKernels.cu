@@ -1101,6 +1101,47 @@ namespace
         }
     }
 
+    /**
+     * @brief Copy one accepted verifier state row into each request live slot.
+     *
+     * Row indices are already device-resident speculative metadata. Negative
+     * row indices mean "no accepted row for this request", so the live slot is
+     * left untouched. The capture buffer uses the flat verifier-row namespace
+     * shared by the transaction metadata.
+     */
+    __global__ void cuda_gdn_copy_capture_rows_from_device_indices_kernel(
+        float *__restrict__ dst,
+        const float *__restrict__ capture,
+        const int *__restrict__ row_indices,
+        int request_count,
+        int row_index_stride,
+        int rows,
+        int state_size)
+    {
+        if (!dst || !capture || !row_indices ||
+            request_count <= 0 || row_index_stride <= 0 ||
+            rows <= 0 || state_size <= 0)
+        {
+            return;
+        }
+
+        const int total = request_count * state_size;
+        const int stride = blockDim.x * gridDim.x;
+        for (int linear = blockIdx.x * blockDim.x + threadIdx.x;
+             linear < total;
+             linear += stride)
+        {
+            const int request = linear / state_size;
+            const int state_offset = linear - request * state_size;
+            const int row = row_indices[request * row_index_stride];
+            if (row < 0 || row >= rows)
+                continue;
+            dst[linear] =
+                capture[static_cast<size_t>(row) * static_cast<size_t>(state_size) +
+                        static_cast<size_t>(state_offset)];
+        }
+    }
+
 } // anonymous namespace (deinterleave kernel)
 
 // =========================================================================
@@ -1201,6 +1242,54 @@ extern "C"
         {
             fprintf(stderr,
                     "[cudaGDN_gpu_copy_capture_row_from_device_index] %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaGDN_gpu_copy_capture_rows_from_device_indices(
+        float *dst,
+        const float *capture,
+        const int *device_row_indices,
+        int request_count,
+        int row_index_stride,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream)
+    {
+        if (!dst || !capture || !device_row_indices ||
+            request_count <= 0 || row_index_stride <= 0 ||
+            rows <= 0 || state_size <= 0 || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads = 256;
+        int blocks = ((request_count * state_size) + threads - 1) / threads;
+        if (blocks < 1)
+            blocks = 1;
+        if (blocks > 1024)
+            blocks = 1024;
+        cuda_gdn_copy_capture_rows_from_device_indices_kernel<<<
+            blocks,
+            threads,
+            0,
+            (cudaStream_t)stream>>>(
+            dst,
+            capture,
+            device_row_indices,
+            request_count,
+            row_index_stride,
+            rows,
+            state_size);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_gpu_copy_capture_rows_from_device_indices] %s\n",
                     cudaGetErrorString(err));
             return false;
         }
