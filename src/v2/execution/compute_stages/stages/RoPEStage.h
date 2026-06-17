@@ -18,6 +18,7 @@ namespace llaminar2
 {
     // Forward declarations
     class ITensorRoPE;
+    class FP32Tensor;
 
     /**
      * @brief Rotary position encoding stage
@@ -58,6 +59,14 @@ namespace llaminar2
             // When set, this array should have seq_len elements (total_tokens for batched)
             // For batched mode with batch_size=2, seq_len=2: [pos0_t0, pos0_t1, pos1_t0, pos1_t1]
             const int *position_ids = nullptr; ///< Per-token position IDs array [seq_len]
+            /**
+             * @brief Device-resident INT32 position IDs for GPU graph replay.
+             *
+             * This is the resident counterpart to `position_ids`.  When it is
+             * set on a GPU stage, the RoPE kernel must read positions from
+             * this device buffer directly instead of uploading a host array.
+             */
+            const void *position_ids_device = nullptr;
 
             // Fixed-scale quantization for HybridQ16 mode (used when Q_out is Q16_1)
             // RoPE only processes K projections, so this is the K scale.
@@ -71,6 +80,17 @@ namespace llaminar2
             // When true, only Q gets RoPE applied. K will be stored pre-RoPE in the
             // KV cache and RoPE will be fused into the attention dequant path.
             bool skip_k = false;
+
+            /**
+             * @brief Force tiny verifier prefill to run as serial decode rows.
+             *
+             * MTP all-position verifier graphs use M=2..4 rows but must be
+             * numerically equivalent to running M one-token decode steps.
+             * Some CPU RoPE kernels intentionally use a different vectorized
+             * multi-row path for normal prefill, so verifier graphs request
+             * this mode to row-walk the exact decode contract.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
 
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> q_buffer_id;
@@ -97,11 +117,16 @@ namespace llaminar2
         /// Also pre-uploads the kernel's device params on the explicit stage
         /// stream so captured RoPE execution records kernels only.
         bool hasDynamicParams() const override { return true; }
+        bool supportsDeviceResidentDynamicPositionReplay() const override
+        {
+            return true;
+        }
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             params_.pos_offset = pos_offset;
             params_.seq_len = seq_len;
             params_.position_ids = nullptr;
+            params_.position_ids_device = nullptr;
             position_ids_cache_.clear();
             if (cached_kernel_)
             {
@@ -122,7 +147,7 @@ namespace llaminar2
          * stable host copy alive for CPU/eager execution and asks GPU kernels
          * to pre-upload the workspace-owned device copy before graph capture.
          */
-        void updateDynamicPositionIds(const int *position_ids, int seq_len)
+        void updateDynamicPositionIds(const int *position_ids, int seq_len) override
         {
             params_.seq_len = seq_len;
             position_ids_cache_.clear();
@@ -130,11 +155,13 @@ namespace llaminar2
             {
                 position_ids_cache_.assign(position_ids, position_ids + seq_len);
                 params_.position_ids = position_ids_cache_.data();
+                params_.position_ids_device = nullptr;
                 params_.pos_offset = position_ids_cache_.front();
             }
             else
             {
                 params_.position_ids = nullptr;
+                params_.position_ids_device = nullptr;
                 params_.pos_offset = 0;
             }
 
@@ -145,12 +172,35 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Update device-resident position IDs for cached graph reuse.
+         *
+         * The caller owns the device buffer lifetime and must publish it on a
+         * stream that is visible to this stage's stream before capture/replay.
+         * RoPEStage only records the pointer and forwards it to backend kernels;
+         * it never copies the positions through host memory.
+         */
+        void updateDynamicDevicePositionIds(const void *position_ids_device, int seq_len) override
+        {
+            params_.seq_len = seq_len;
+            params_.position_ids = nullptr;
+            params_.position_ids_device = position_ids_device;
+            position_ids_cache_.clear();
+
+            if (cached_kernel_)
+            {
+                cached_kernel_->setGPUStream(gpuStream());
+                cached_kernel_->setDynamicDevicePositionIds(position_ids_device, seq_len);
+            }
+        }
+
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
             params_.pos_offset = 0;
             params_.seq_len = 0;
             params_.position_ids = nullptr;
+            params_.position_ids_device = nullptr;
             position_ids_cache_.clear();
             if (cached_kernel_)
             {
@@ -166,6 +216,14 @@ namespace llaminar2
 
     private:
         ITensorRoPE *getOrCreateStageKernel(TensorBase *Q_base);
+        bool executeDecodeEquivalentVerifierRows(
+            ITensorRoPE *kernel,
+            TensorBase *Q_base,
+            TensorBase *K_base,
+            const int *position_ids_ptr,
+            int seq_len,
+            int n_kv_heads,
+            int rotary_dim);
 
         Params params_;
 
@@ -184,6 +242,11 @@ namespace llaminar2
 
         // Stable host-side position_ids for graph capture (copied to device each step).
         mutable std::vector<int> position_ids_cache_;
+
+        // CPU verifier row scratch. These are stage-owned so a tiny verifier
+        // graph can replay serial decode RoPE without allocating per layer.
+        std::shared_ptr<FP32Tensor> verifier_q_row_;
+        std::shared_ptr<FP32Tensor> verifier_k_row_;
     };
 
 } // namespace llaminar2

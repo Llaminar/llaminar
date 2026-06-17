@@ -16,6 +16,7 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include "../../kvcache/KVCacheDeviceParams.h"
 #include <cuda_runtime.h>
@@ -23,6 +24,7 @@
 #include <cuda_bf16.h>
 #include "../../../tensors/BlockStructures.h"
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 
@@ -102,6 +104,74 @@ namespace llaminar2
 
         d_K_cache[dst_offset] = d_K_new[src_offset];
         d_V_cache[dst_offset] = d_V_new[src_offset];
+    }
+
+    /**
+     * @brief Advance graph-captured KV sequence metadata on device.
+     *
+     * This runs after the append kernel on the same explicit stream. Keeping it
+     * separate avoids racing with append blocks that still need to read the
+     * pre-append head position.
+     */
+    __global__ void cuda_kv_sequence_state_advance_kernel(
+        int *__restrict__ d_head,
+        int *__restrict__ d_count,
+        int num_tokens,
+        int max_seq_len)
+    {
+        if (threadIdx.x != 0 || blockIdx.x != 0)
+            return;
+        const int old_head = *d_head;
+        const int old_count = *d_count;
+        *d_head = (old_head + num_tokens) % max_seq_len;
+        const int next_count = old_count + num_tokens;
+        *d_count = next_count > max_seq_len ? max_seq_len : next_count;
+    }
+
+    /**
+     * @brief Publish accepted verifier-row sequence metadata on device.
+     *
+     * Each block owns one [request, layer] pair.  The kernel intentionally
+     * advances the wrapped ring head from the live device head by the accepted
+     * verifier-row count; it does not try to infer the head from the target
+     * cached-token count, which is ambiguous once the ring has wrapped.
+     */
+    __global__ void cuda_kv_sequence_state_publish_kernel(
+        int *__restrict__ d_heads,
+        int *__restrict__ d_counts,
+        const int32_t *__restrict__ target_cached_tokens,
+        const int32_t *__restrict__ accepted_state_counts,
+        const int32_t *__restrict__ publication_ok_flags,
+        int batch_size,
+        int first_seq_idx,
+        int request_count,
+        int max_seq_len)
+    {
+        const int request_idx = static_cast<int>(blockIdx.x);
+        const int layer = static_cast<int>(blockIdx.y);
+        if (threadIdx.x != 0 || request_idx >= request_count)
+            return;
+
+        if (publication_ok_flags[request_idx] == 0)
+            return;
+
+        const int seq_idx = first_seq_idx + request_idx;
+        if (seq_idx < 0 || seq_idx >= batch_size)
+            return;
+
+        const int accepted_count = accepted_state_counts[request_idx];
+        const int target_count = target_cached_tokens[request_idx];
+        if (accepted_count < 0 ||
+            target_count < 0 ||
+            target_count > max_seq_len)
+        {
+            return;
+        }
+
+        const int entry_idx = layer * batch_size + seq_idx;
+        const int old_head = d_heads[entry_idx];
+        d_heads[entry_idx] = (old_head + accepted_count) % max_seq_len;
+        d_counts[entry_idx] = target_count;
     }
 
     /**
@@ -617,6 +687,54 @@ namespace llaminar2
             d_head, max_seq_len, kv_blocks, num_tokens);
     }
 
+    extern "C" void cuda_kv_sequence_state_advance(
+        int *d_head, int *d_count, int num_tokens, int max_seq_len,
+        cudaStream_t stream)
+    {
+        if (!d_head || !d_count || num_tokens <= 0 || max_seq_len <= 0)
+            return;
+        cuda_kv_sequence_state_advance_kernel<<<1, 1, 0, stream>>>(
+            d_head, d_count, num_tokens, max_seq_len);
+    }
+
+    extern "C" bool cuda_kv_sequence_state_publish(
+        int *d_heads,
+        int *d_counts,
+        const int32_t *target_cached_tokens,
+        const int32_t *accepted_state_counts,
+        const int32_t *publication_ok_flags,
+        int n_layers,
+        int batch_size,
+        int first_seq_idx,
+        int request_count,
+        int max_seq_len,
+        cudaStream_t stream)
+    {
+        if (!d_heads || !d_counts ||
+            !target_cached_tokens || !accepted_state_counts ||
+            !publication_ok_flags || !stream ||
+            n_layers <= 0 || batch_size <= 0 ||
+            first_seq_idx < 0 || request_count <= 0 ||
+            first_seq_idx + request_count > batch_size ||
+            max_seq_len <= 0)
+        {
+            return false;
+        }
+
+        cuda_kv_sequence_state_publish_kernel<<<
+            dim3(request_count, n_layers), dim3(1), 0, stream>>>(
+            d_heads,
+            d_counts,
+            target_cached_tokens,
+            accepted_state_counts,
+            publication_ok_flags,
+            batch_size,
+            first_seq_idx,
+            request_count,
+            max_seq_len);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
     // =========================================================================
     // CUDARingKVCache Implementation
     // =========================================================================
@@ -884,6 +1002,10 @@ namespace llaminar2
         {
             std::memset(h_head_params_, 0, static_cast<size_t>(num_entries) * sizeof(int));
         }
+        if (h_count_params_ && num_entries > 0)
+        {
+            std::memset(h_count_params_, 0, static_cast<size_t>(num_entries) * sizeof(int));
+        }
         if (d_head_params_ && num_entries > 0)
         {
             cudaError_t head_err = cudaMemsetAsync(d_head_params_, 0,
@@ -893,6 +1015,17 @@ namespace llaminar2
             {
                 LOG_WARN("[CUDARingKVCache::clear] head params memset failed: "
                          << cudaGetErrorString(head_err));
+            }
+        }
+        if (d_count_params_ && num_entries > 0)
+        {
+            cudaError_t count_err = cudaMemsetAsync(d_count_params_, 0,
+                                                    static_cast<size_t>(num_entries) * sizeof(int),
+                                                    clear_stream);
+            if (count_err != cudaSuccess)
+            {
+                LOG_WARN("[CUDARingKVCache::clear] count params memset failed: "
+                         << cudaGetErrorString(count_err));
             }
         }
 
@@ -1048,6 +1181,8 @@ namespace llaminar2
     extern "C" void cuda_ring_append_dynamic_q8_1(
         Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
         const int *, int, int, int, cudaStream_t);
+    extern "C" void cuda_kv_sequence_state_advance(
+        int *, int *, int, int, cudaStream_t);
 
     template <ActivationPrecision Precision>
     void CUDARingKVCache<Precision>::launch_append_kernel_dynamic(
@@ -1106,6 +1241,25 @@ namespace llaminar2
 
         EntryT &entry = entries_[layer][seq_idx];
         const bool capture_active = isGraphCaptureActive();
+        cudaStream_t effective_stream = stream;
+        if (!effective_stream)
+        {
+            if (capture_active)
+            {
+                LOG_ERROR("[CUDARingKVCache::append] Explicit CUDA stream required during graph capture");
+                return false;
+            }
+            // Keep sequence-state ownership coherent on device even for legacy
+            // callers that pass nullptr. This is an explicit worker stream, not
+            // CUDA's device-default stream, so later metadata uploads are ordered
+            // with the payload append instead of silently leaving stale counters.
+            effective_stream = device_ctx_
+                                   ? static_cast<cudaStream_t>(device_ctx_->defaultStream())
+                                   : static_cast<cudaStream_t>(
+                                         GPUDeviceContextPool::instance()
+                                             .getNvidiaContext(device_id_)
+                                             .defaultStream());
+        }
 
         // Check if we would exceed capacity (ring buffer overwrites oldest)
         if (!capture_active && entry.count + num_tokens > max_seq_len_)
@@ -1127,15 +1281,21 @@ namespace llaminar2
         // Captured graphs read the ring head from a stable device scalar that
         // updateDynamicParams()/setDynamicHead() uploads before capture/replay.
         // Do not record H2D copies in the captured graph.
-        if (capture_active && d_head_params_ && h_head_params_ && stream)
+        if (capture_active && d_head_params_ && h_head_params_)
         {
             int idx = layer * batch_size_ + seq_idx;
-            launch_append_kernel_dynamic(entry, d_k, d_v, &d_head_params_[idx], num_tokens, stream);
+            launch_append_kernel_dynamic(entry, d_k, d_v, &d_head_params_[idx], num_tokens, effective_stream);
+            if (d_count_params_)
+            {
+                cuda_kv_sequence_state_advance(
+                    &d_head_params_[idx], &d_count_params_[idx],
+                    num_tokens, max_seq_len_, effective_stream);
+            }
         }
         else
         {
             // Fallback: scalar head argument (non-graph path)
-            launch_append_kernel(entry, d_k, d_v, num_tokens, stream);
+            launch_append_kernel(entry, d_k, d_v, num_tokens, effective_stream);
         }
 
         if (!capture_active)
@@ -1146,6 +1306,8 @@ namespace llaminar2
             entry.head = (entry.head + num_tokens) % max_seq_len_;
             entry.count += num_tokens;
             entry.scratch_valid = false; // Scratch is stale after append
+            if (d_count_params_ && !uploadHostDeviceParamMirror(layer, seq_idx, effective_stream))
+                return false;
         }
 
         return true;
@@ -1441,6 +1603,8 @@ namespace llaminar2
         }
 
         auto &entry = entries_[local_layer][desc.seq_idx];
+        cudaStream_t stream = desc.stream ? static_cast<cudaStream_t>(desc.stream)
+                                          : getEffectiveStream(nullptr);
         if (desc.token_count == 0)
         {
             if (desc.logical_token_start == 0)
@@ -1448,6 +1612,8 @@ namespace llaminar2
                 entry.head = 0;
                 entry.count = 0;
                 entry.scratch_valid = false;
+                if (d_count_params_ && stream && !uploadHostDeviceParamMirror(local_layer, desc.seq_idx, stream))
+                    return false;
                 invalidateRoPEShadow(local_layer, desc.seq_idx);
             }
             return true;
@@ -1463,8 +1629,6 @@ namespace llaminar2
         }
 
         cudaSetDevice(device_id_);
-        cudaStream_t stream = desc.stream ? static_cast<cudaStream_t>(desc.stream)
-                                          : getEffectiveStream(nullptr);
         const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
         const size_t bytes = static_cast<size_t>(desc.token_count) * row_bytes;
         const size_t dst_offset = static_cast<size_t>(desc.logical_token_start) *
@@ -1493,6 +1657,12 @@ namespace llaminar2
             return false;
         }
 
+        entry.count = desc.logical_token_start + desc.token_count;
+        entry.head = entry.count % max_seq_len_;
+        entry.scratch_valid = false;
+        if (d_count_params_ && !uploadHostDeviceParamMirror(local_layer, desc.seq_idx, stream))
+            return false;
+
         const cudaError_t sync_err = cudaStreamSynchronize(stream);
         if (sync_err != cudaSuccess)
         {
@@ -1501,9 +1671,6 @@ namespace llaminar2
             return false;
         }
 
-        entry.count = desc.logical_token_start + desc.token_count;
-        entry.head = entry.count % max_seq_len_;
-        entry.scratch_valid = false;
         invalidateRoPEShadow(local_layer, desc.seq_idx);
         return true;
     }
@@ -1511,7 +1678,6 @@ namespace llaminar2
     template <ActivationPrecision Precision>
     bool CUDARingKVCache<Precision>::truncateSequence(int seq_idx, int cached_tokens, void *stream)
     {
-        (void)stream;
         if (seq_idx < 0 || seq_idx >= batch_size_ ||
             cached_tokens < 0 || cached_tokens > max_seq_len_)
         {
@@ -1531,6 +1697,8 @@ namespace llaminar2
             auto &entry = entries_[layer][seq_idx];
             if (entry.count == cached_tokens)
             {
+                if (d_count_params_ && stream && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
+                    return false;
                 continue;
             }
             if (cached_tokens == 0)
@@ -1544,6 +1712,8 @@ namespace llaminar2
             }
             entry.count = cached_tokens;
             entry.scratch_valid = false;
+            if (d_count_params_ && stream && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
+                return false;
             invalidateRoPEShadow(layer, seq_idx);
         }
         return true;

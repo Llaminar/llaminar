@@ -86,6 +86,25 @@ namespace llaminar2
             float *state_snapshots, int snapshot_stride_floats,
             int max_snapshot_rows);
 
+        /**
+         * @brief Run a tiny verifier chunk with exact decode-step semantics.
+         *
+         * MTP verifier publication restores one of the intermediate rows as
+         * live decode state. For those rows, "close enough" chunk-prefill math
+         * is not enough: a small FP-order drift can change later greedy ties.
+         * This helper intentionally mirrors recurrent_step() row by row while
+         * still parallelizing each row across heads.
+         */
+        bool chunkForwardVerifierDecodeEquivalent(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows);
+
         float *prepareSpeculativeState(float *live_state, int state_floats);
 
         // Reusable scratch buffers (grow-only, never shrink during lifetime)

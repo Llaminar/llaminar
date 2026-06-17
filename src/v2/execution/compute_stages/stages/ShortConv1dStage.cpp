@@ -249,9 +249,24 @@ namespace llaminar2
 
     std::string ShortConv1dStage::workspaceStableId() const
     {
+        const std::string role_prefix =
+            params_.workspace_namespace.empty()
+                ? std::string{}
+                : params_.workspace_namespace + "_";
         if (params_.layer_idx >= 0)
-            return std::string("layer") + std::to_string(params_.layer_idx);
-        return std::string("slice") + std::to_string(workspace_slice_id_);
+        {
+            const std::string layer_id = "layer" + std::to_string(params_.layer_idx);
+            /*
+             * Main GDN graphs historically name their buffers by layer only
+             * (`..._layer0`).  Role namespaces are for sidecar/verifier graph
+             * variants such as `MTP0_layer0`; when the namespace is already
+             * the same layer identity, keep the stable main-graph name.
+             */
+            if (params_.workspace_namespace == layer_id)
+                return layer_id;
+            return role_prefix + layer_id;
+        }
+        return role_prefix + "slice" + std::to_string(workspace_slice_id_);
     }
 
     std::string ShortConv1dStage::effectiveSeqLenScalarBufferName() const
@@ -327,14 +342,138 @@ namespace llaminar2
         return false;
     }
 
+    const float *ShortConv1dStage::cpuVerifierStateCaptureSource() const
+    {
+        if (params_.device_id.is_gpu() ||
+            verifier_capture_rows_bound_ <= 0 ||
+            verifier_capture_state_size_bound_ <= 0)
+        {
+            return nullptr;
+        }
+
+        if (bound_workspace_ &&
+            bound_workspace_->hasBuffer(speculativeStateSlotsBufferName()))
+        {
+            return static_cast<const float *>(
+                bound_workspace_->getBuffer(speculativeStateSlotsBufferName()));
+        }
+
+        return host_verifier_state_slots_.empty()
+                   ? nullptr
+                   : host_verifier_state_slots_.data();
+    }
+
+    bool ShortConv1dStage::restoreCPUVerifierStateCaptureRowDirect(int row)
+    {
+        if (!hasVerifierStateCapture() || params_.device_id.is_gpu())
+            return false;
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+        if (row < 0 || row >= verifier_capture_rows_bound_)
+            return false;
+
+        const float *capture = cpuVerifierStateCaptureSource();
+        if (!capture || !params_.conv_state)
+            return false;
+
+        /*
+         * CPU short-conv publication owns host capture slots at the stage
+         * level.  Copying directly keeps multi-layer publication parallel while
+         * avoiding races through the shared backend kernel binding.
+         */
+        std::memcpy(
+            params_.conv_state,
+            capture + static_cast<size_t>(row) *
+                          static_cast<size_t>(verifier_capture_state_size_bound_),
+            static_cast<size_t>(verifier_capture_state_size_bound_) * sizeof(float));
+        return true;
+    }
+
     bool ShortConv1dStage::restoreVerifierStateCaptureRow(int row, void *stream)
     {
         if (!hasVerifierStateCapture())
+            return false;
+        if (!params_.device_id.is_gpu())
+            return restoreCPUVerifierStateCaptureRowDirect(row);
+        /*
+         * The short-conv kernel is reused by verifier and normal decode graph
+         * paths.  Publication is allowed to run after a different graph has
+         * rebound or cleared the shared kernel workspace, so make the owning
+         * stage's capture/work buffers current immediately before restoring the
+         * accepted verifier row.
+         */
+        bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
         return params_.kernel->restoreVerifierStateCaptureRow(
             params_.conv_state,
             row,
             stream ? stream : gpuStream());
+    }
+
+    bool ShortConv1dStage::restoreVerifierStateCaptureRowFromDeviceIndex(
+        const int *device_row_index,
+        void *stream)
+    {
+        if (!hasVerifierStateCapture() || !device_row_index || !stream)
+            return false;
+        // Device-indexed publication must also re-establish this stage's
+        // workspace before the backend consumes the row index on stream.
+        bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+        /*
+         * Keep resident MTP publication entirely device-owned. The accepted
+         * row index lives in GPU metadata, and the short-conv kernel restores
+         * its implementation-owned live state on this stream. Passing the host
+         * conv-state mirror would make the backend perform a D2H refresh and
+         * synchronize the stream, which is not allowed in the hot path.
+         */
+        return params_.kernel->restoreVerifierStateCaptureRowFromDeviceIndex(
+            nullptr,
+            device_row_index,
+            stream);
+    }
+
+    bool ShortConv1dStage::restoreVerifierStateCaptureRowsFromDeviceIndices(
+        const int *device_row_indices,
+        int request_count,
+        int row_index_stride,
+        void *stream)
+    {
+        if (!hasVerifierStateCapture() ||
+            !device_row_indices ||
+            request_count <= 0 ||
+            row_index_stride <= 0 ||
+            !stream)
+        {
+            return false;
+        }
+        if (!params_.device_id.is_gpu())
+        {
+            /*
+             * CPU short-conv currently stores one live state vector per layer.
+             * A batched restore needs request-owned conv-state slots before it
+             * can publish multiple requests safely.
+             */
+            LOG_ERROR("[ShortConv1dStage] Batched verifier-state restore requires request-owned CPU conv-state banks");
+            return false;
+        }
+
+        // Batched restore has the same shared-kernel ownership requirement as
+        // scalar restore: bind this verifier graph's slots immediately before
+        // launching the backend copy on the explicit stream.
+        bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+
+        return params_.kernel->restoreVerifierStateCaptureRowsFromDeviceIndices(
+            nullptr,
+            0,
+            device_row_indices,
+            request_count,
+            row_index_stride,
+            stream);
     }
 
     void ShortConv1dStage::onGraphReplayed()

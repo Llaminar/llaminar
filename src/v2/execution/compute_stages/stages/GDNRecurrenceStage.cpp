@@ -336,9 +336,24 @@ namespace llaminar2
 
     std::string GDNRecurrenceStage::workspaceStableId() const
     {
+        const std::string role_prefix =
+            params_.workspace_namespace.empty()
+                ? std::string{}
+                : params_.workspace_namespace + "_";
         if (params_.layer_idx >= 0)
-            return std::string("layer") + std::to_string(params_.layer_idx);
-        return std::string("slice") + std::to_string(workspace_slice_id_);
+        {
+            const std::string layer_id = "layer" + std::to_string(params_.layer_idx);
+            /*
+             * Main GDN graphs historically name their buffers by layer only
+             * (`..._layer0`).  Role namespaces are for sidecar/verifier graph
+             * variants such as `MTP0_layer0`; when the namespace is already
+             * the same layer identity, keep the stable main-graph name.
+             */
+            if (params_.workspace_namespace == layer_id)
+                return layer_id;
+            return role_prefix + layer_id;
+        }
+        return role_prefix + "slice" + std::to_string(workspace_slice_id_);
     }
 
     std::string GDNRecurrenceStage::effectiveSeqLenScalarBufferName() const
@@ -398,14 +413,142 @@ namespace llaminar2
         return false;
     }
 
+    const float *GDNRecurrenceStage::cpuVerifierStateCaptureSource() const
+    {
+        if (params_.device_id.is_gpu() ||
+            verifier_capture_rows_bound_ <= 0 ||
+            verifier_capture_state_size_bound_ <= 0)
+        {
+            return nullptr;
+        }
+
+        if (bound_workspace_ &&
+            bound_workspace_->hasBuffer(speculativeStateSlotsBufferName()))
+        {
+            return static_cast<const float *>(
+                bound_workspace_->getBuffer(speculativeStateSlotsBufferName()));
+        }
+
+        return host_verifier_state_slots_.empty()
+                   ? nullptr
+                   : host_verifier_state_slots_.data();
+    }
+
+    bool GDNRecurrenceStage::restoreCPUVerifierStateCaptureRowDirect(int row)
+    {
+        if (!hasVerifierStateCapture() || params_.device_id.is_gpu())
+            return false;
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+        if (row < 0 || row >= verifier_capture_rows_bound_)
+            return false;
+
+        const float *capture = cpuVerifierStateCaptureSource();
+        if (!capture || !params_.recurrence_state)
+            return false;
+
+        /*
+         * CPU GDN kernels are shared backend objects.  Rebinding that shared
+         * object during parallel MTP publication is racy, so CPU publication
+         * copies from the stage-owned capture slot directly.  GPU stages still
+         * delegate to the backend restore kernel because their slots live on
+         * device and must stay ordered on the explicit capture stream.
+         */
+        std::memcpy(
+            params_.recurrence_state,
+            capture + static_cast<size_t>(row) *
+                          static_cast<size_t>(verifier_capture_state_size_bound_),
+            static_cast<size_t>(verifier_capture_state_size_bound_) * sizeof(float));
+        return true;
+    }
+
     bool GDNRecurrenceStage::restoreVerifierStateCaptureRow(int row, void *stream)
     {
         if (!hasVerifierStateCapture())
+            return false;
+        if (!params_.device_id.is_gpu())
+            return restoreCPUVerifierStateCaptureRowDirect(row);
+        /*
+         * The GDN kernel object can be shared across graph instances for the
+         * same layer.  Normal decode graphs clear speculative verifier slots,
+         * and another verifier stage can bind its own workspace before this
+         * publication call runs.  Rebind here so restoring an accepted verifier
+         * row is owned by this stage, not by whatever graph touched the shared
+         * kernel most recently.
+         */
+        bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
         return params_.kernel->restoreVerifierStateCaptureRow(
             params_.recurrence_state,
             row,
             stream ? stream : gpuStream());
+    }
+
+    bool GDNRecurrenceStage::restoreVerifierStateCaptureRowFromDeviceIndex(
+        const int *device_row_index,
+        void *stream)
+    {
+        if (!hasVerifierStateCapture() || !device_row_index || !stream)
+            return false;
+        // Device-resident publication has the same ownership requirement as
+        // host-row publication: the stage must make its verifier slots current
+        // before launching the backend restore kernel on the explicit stream.
+        bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+        /*
+         * Device-indexed publication is the vLLM-style hot path: the accepted
+         * verifier row is already resident in GPU metadata, and the backend
+         * kernel restores implementation-owned live state on the same stream.
+         * Do not pass the hybrid host mirror here. Refreshing that mirror would
+         * force a D2H synchronization and reintroduce the host/device coherence
+         * split Phase 9.5 is removing from MTP replay.
+         */
+        return params_.kernel->restoreVerifierStateCaptureRowFromDeviceIndex(
+            nullptr,
+            device_row_index,
+            stream);
+    }
+
+    bool GDNRecurrenceStage::restoreVerifierStateCaptureRowsFromDeviceIndices(
+        const int *device_row_indices,
+        int request_count,
+        int row_index_stride,
+        void *stream)
+    {
+        if (!hasVerifierStateCapture() ||
+            !device_row_indices ||
+            request_count <= 0 ||
+            row_index_stride <= 0 ||
+            !stream)
+        {
+            return false;
+        }
+        if (!params_.device_id.is_gpu())
+        {
+            /*
+             * CPU currently owns one host recurrence-state vector per layer.
+             * Batched publication needs a request-indexed state bank before it
+             * can update more than one request without overwriting another.
+             */
+            LOG_ERROR("[GDNRecurrenceStage] Batched verifier-state restore requires request-owned CPU recurrence state banks");
+            return false;
+        }
+
+        // Re-establish this verifier graph's capture/workspace binding before
+        // the backend consumes row indices on the explicit stream.
+        bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+
+        return params_.kernel->restoreVerifierStateCaptureRowsFromDeviceIndices(
+            nullptr,
+            0,
+            device_row_indices,
+            request_count,
+            row_index_stride,
+            stream);
     }
 
     void GDNRecurrenceStage::onGraphReplayed()

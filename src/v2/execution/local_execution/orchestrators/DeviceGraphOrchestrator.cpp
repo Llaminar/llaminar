@@ -159,6 +159,51 @@ namespace llaminar2
             std::string previous_;
         };
 
+        /**
+         * @brief Populate the public speculative outcome object from compact
+         *        sampler metadata.
+         *
+         * CPU, CUDA, and ROCm all use the same SamplingMath metadata layout.
+         * Keeping this decode in one place makes the host CPU reducer and the
+         * GPU device reducer structurally identical after they have produced
+         * `output_tokens` and `meta`.
+         */
+        bool fillSpeculativeVerifyOutcomeFromMeta(
+            const std::array<int32_t, sampling_math::kSpeculativeBatchMaxOutputTokens> &output_tokens,
+            const std::array<int, sampling_math::kSpeculativeBatchMetaCount> &meta,
+            DeviceSpeculativeVerifyBatchOutcome *out)
+        {
+            using namespace sampling_math;
+            if (!out ||
+                meta[kSpecBatchMetaOk] == 0 ||
+                meta[kSpecBatchMetaOutputCount] < 0 ||
+                meta[kSpecBatchMetaOutputCount] > kSpeculativeBatchMaxOutputTokens)
+            {
+                return false;
+            }
+            for (int i = 0; i < meta[kSpecBatchMetaOutputCount]; ++i)
+            {
+                if (output_tokens[static_cast<size_t>(i)] < 0)
+                    return false;
+            }
+
+            out->ok = true;
+            out->output_tokens = output_tokens;
+            out->output_token_count = meta[kSpecBatchMetaOutputCount];
+            out->accepted_speculative_prefix =
+                meta[kSpecBatchMetaAcceptedSpeculativePrefix];
+            out->target_verifier_state_commit_count =
+                meta[kSpecBatchMetaTargetVerifierStateCommitCount];
+            out->ready_token = meta[kSpecBatchMetaReadyToken];
+            out->rejected_verified_token = meta[kSpecBatchMetaRejectedVerifiedToken];
+            out->stopped_on_output = meta[kSpecBatchMetaStoppedOnOutput] != 0;
+            out->all_speculative_accepted =
+                meta[kSpecBatchMetaAllSpeculativeAccepted] != 0;
+            out->consumed_verifier_rows = meta[kSpecBatchMetaConsumedVerifierRows];
+            out->sampled_terminal = meta[kSpecBatchMetaSampledTerminal] != 0;
+            return true;
+        }
+
         /// @brief Emit a coarse VRAM checkpoint for orchestrator allocation phases.
         void logOrchestratorVramTrace(DeviceId device, const char *label)
         {
@@ -344,44 +389,41 @@ namespace llaminar2
                    (best.token < 0 || candidate.token < best.token);
         }
 
-        bool synchronizeGpuBackendsBeforeMmapRelease()
+        bool synchronizeDeviceBackendBeforeMmapRelease(const DeviceId &device)
         {
-            bool ok = true;
-            auto sync_backend = [&ok](const char *name, IBackend *backend)
+            if (!device.is_gpu())
+                return true;
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
             {
-                if (!backend)
-                    return;
+                LOG_ERROR("[DeviceGraphOrchestrator] No backend available for " << device
+                                                                                 << " before mmap DONTNEED");
+                return false;
+            }
 
-                const int device_count = backend->deviceCount();
-                for (int device_idx = 0; device_idx < device_count; ++device_idx)
-                {
-                    if (debugEnv().vram_trace)
-                    {
-                        LOG_INFO("[VRAM_TRACE] mmap_release.before_sync backend=" << name
-                                                                                  << " device=" << device_idx);
-                    }
-                    else
-                    {
-                        LOG_DEBUG("[DeviceGraphOrchestrator] Synchronizing " << name << ":" << device_idx
+            bool ok = true;
+            if (debugEnv().vram_trace)
+            {
+                LOG_INFO("[VRAM_TRACE] mmap_release.before_sync device=" << device);
+            }
+            else
+            {
+                LOG_DEBUG("[DeviceGraphOrchestrator] Synchronizing " << device
+                                                                     << " before mmap DONTNEED");
+            }
+
+            if (!backend->synchronize(device.gpu_ordinal()))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to synchronize " << device
                                                                              << " before mmap DONTNEED");
-                    }
-                    if (!backend->synchronize(device_idx))
-                    {
-                        LOG_ERROR("[DeviceGraphOrchestrator] Failed to synchronize " << name << ":"
-                                                                                     << device_idx
-                                                                                     << " before mmap DONTNEED");
-                        ok = false;
-                    }
-                    else if (debugEnv().vram_trace)
-                    {
-                        LOG_INFO("[VRAM_TRACE] mmap_release.after_sync backend=" << name
-                                                                                 << " device=" << device_idx);
-                    }
-                }
-            };
+                ok = false;
+            }
+            else if (debugEnv().vram_trace)
+            {
+                LOG_INFO("[VRAM_TRACE] mmap_release.after_sync device=" << device);
+            }
 
-            sync_backend("CUDA", getCUDABackend());
-            sync_backend("ROCm", getROCmBackend());
             return ok;
         }
 
@@ -1027,6 +1069,104 @@ namespace llaminar2
             return hybrid_layout;
         }
     }
+
+    /**
+     * @brief Persistent pinned host destination for compact stochastic outcomes.
+     *
+     * The host-visible compatibility path still needs to read compact outcome
+     * metadata, but CUDA/HIP async D2H copies only stay non-blocking when the
+     * destination is pinned.  This scratch lives for the orchestrator lifetime
+     * so decode steps do not allocate or pageable-stage tiny outcome arrays.
+     */
+    struct DeviceGraphOrchestrator::PinnedHostScratch
+    {
+        IBackend *backend = nullptr;       ///< Backend that owns the pinned allocation API.
+        int device_id = -1;                ///< Backend-local GPU ordinal used for freePinned().
+        int request_capacity = 0;          ///< Maximum request rows represented by this scratch.
+        size_t output_token_elements = 0;  ///< INT32 elements in output_tokens.
+        size_t meta_elements = 0;          ///< INT32 elements in meta.
+        int32_t *output_tokens = nullptr;  ///< Pinned INT32 [request, output-token stride].
+        int *meta = nullptr;               ///< Pinned INT32 [request, metadata stride].
+
+        PinnedHostScratch() = default;
+        PinnedHostScratch(const PinnedHostScratch &) = delete;
+        PinnedHostScratch &operator=(const PinnedHostScratch &) = delete;
+
+        ~PinnedHostScratch()
+        {
+            release();
+        }
+
+        /**
+         * @brief Allocate token and metadata buffers for the requested capacity.
+         *
+         * @return true when both buffers are pinned and ready for async D2H.
+         */
+        bool allocate(IBackend *owner_backend, int owner_device_id, int requests)
+        {
+            release();
+            if (!owner_backend || requests <= 0)
+                return false;
+
+            backend = owner_backend;
+            device_id = owner_device_id;
+            request_capacity = requests;
+            output_token_elements =
+                static_cast<size_t>(requests) *
+                static_cast<size_t>(sampling_math::kSpeculativeBatchMaxOutputTokens);
+            meta_elements =
+                static_cast<size_t>(requests) *
+                static_cast<size_t>(sampling_math::kSpeculativeBatchMetaCount);
+
+            output_tokens = static_cast<int32_t *>(
+                backend->allocatePinned(
+                    output_token_elements * sizeof(int32_t),
+                    device_id));
+            meta = static_cast<int *>(
+                backend->allocatePinned(
+                    meta_elements * sizeof(int),
+                    device_id));
+            if (!output_tokens || !meta)
+            {
+                release();
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief Return true when the scratch can hold the requested copy shape.
+         */
+        bool canServe(int requests, int output_stride, int meta_stride) const
+        {
+            if (requests < 0 || output_stride < 0 || meta_stride < 0)
+                return false;
+            return requests <= request_capacity &&
+                   static_cast<size_t>(requests) * static_cast<size_t>(output_stride) <= output_token_elements &&
+                   static_cast<size_t>(requests) * static_cast<size_t>(meta_stride) <= meta_elements;
+        }
+
+        /**
+         * @brief Release pinned memory through the backend that allocated it.
+         */
+        void release()
+        {
+            if (backend)
+            {
+                if (output_tokens)
+                    backend->freePinned(output_tokens, device_id);
+                if (meta)
+                    backend->freePinned(meta, device_id);
+            }
+            backend = nullptr;
+            device_id = -1;
+            request_capacity = 0;
+            output_token_elements = 0;
+            meta_elements = 0;
+            output_tokens = nullptr;
+            meta = nullptr;
+        }
+    };
 
     // =========================================================================
     // Shared Executor Configuration
@@ -1746,6 +1886,10 @@ namespace llaminar2
                 static_cast<size_t>(stochastic_target_row_capacity_) *
                 kStochasticTopKPartialBlocks *
                 kStochasticTopKSmallKCap;
+            const size_t stochastic_draft_topk_partial_capacity =
+                static_cast<size_t>(stochastic_draft_row_capacity_) *
+                kStochasticTopKPartialBlocks *
+                kStochasticTopKSmallKCap;
             constexpr size_t kArgmaxPartialCapacity = 1024;
             if (!arena_->registerBuffer(BufferId::ARGMAX_PARTIAL_VALS, 1, kArgmaxPartialCapacity,
                                         "FP32", state_.device_id))
@@ -1825,6 +1969,16 @@ namespace llaminar2
                                         stochastic_topk_partial_capacity,
                                         "INT32",
                                         state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS,
+                                        1,
+                                        stochastic_draft_topk_partial_capacity,
+                                        "FP32",
+                                        state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_IDXS,
+                                        1,
+                                        stochastic_draft_topk_partial_capacity,
+                                        "INT32",
+                                        state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_VERIFY_TOKENS,
                                         1,
                                         static_cast<size_t>(stochastic_target_row_capacity_),
@@ -1902,6 +2056,8 @@ namespace llaminar2
             arena_->isRegistered(BufferId::MTP_VERIFIER_INPUT_TOKENS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_IDXS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_VERIFY_TOKENS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_VERIFY_ACCEPTED) &&
             arena_->isRegistered(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS) &&
@@ -1922,6 +2078,8 @@ namespace llaminar2
             arena_->prepareForWrite(BufferId::MTP_VERIFIER_INPUT_TOKENS, state_.device_id);
             arena_->prepareForWrite(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS, state_.device_id);
             arena_->prepareForWrite(BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_IDXS, state_.device_id);
             arena_->prepareForWrite(BufferId::STOCHASTIC_VERIFY_TOKENS, state_.device_id);
             arena_->prepareForWrite(BufferId::STOCHASTIC_VERIFY_ACCEPTED, state_.device_id);
             arena_->prepareForWrite(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS, state_.device_id);
@@ -1960,6 +2118,14 @@ namespace llaminar2
             if (stochastic_topk_partial_vals_dev_ && stochastic_topk_partial_idxs_dev_)
                 stochastic_topk_partial_capacity_ =
                     static_cast<int>(arena_->getCols(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS));
+            stochastic_draft_topk_partial_vals_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS, state_.device_id);
+            stochastic_draft_topk_partial_idxs_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_IDXS, state_.device_id);
+            if (stochastic_draft_topk_partial_vals_dev_ &&
+                stochastic_draft_topk_partial_idxs_dev_)
+                stochastic_draft_topk_partial_capacity_ =
+                    static_cast<int>(arena_->getCols(BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS));
             stochastic_verify_tokens_dev_ =
                 arena_->getDevicePtr(BufferId::STOCHASTIC_VERIFY_TOKENS, state_.device_id);
             stochastic_verify_accepted_dev_ =
@@ -1972,6 +2138,28 @@ namespace llaminar2
                 arena_->getDevicePtr(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS, state_.device_id);
             stochastic_batch_output_meta_dev_ =
                 arena_->getDevicePtr(BufferId::STOCHASTIC_BATCH_OUTPUT_META, state_.device_id);
+            IBackend *backend = getBackendFor(state_.device_id);
+            if (!backend)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to resolve backend for stochastic pinned host scratch on "
+                          << state_.device_id.toString());
+                return false;
+            }
+            auto scratch = std::make_unique<PinnedHostScratch>();
+            if (!scratch->allocate(
+                    backend,
+                    state_.device_id.gpu_ordinal(),
+                    stochastic_batch_output_request_capacity_))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate pinned host scratch for stochastic MTP outcomes on "
+                          << state_.device_id.toString());
+                return false;
+            }
+            stochastic_batch_output_host_scratch_ = std::move(scratch);
+        }
+        else
+        {
+            stochastic_batch_output_host_scratch_.reset();
         }
 
         // Wire arena directly to graph builder (replaces bindArenaToManagedBuffers + setBuffers shim)
@@ -2581,7 +2769,7 @@ namespace llaminar2
             return;
 
         mmap_dontneed_advised_ = true;
-        if (!synchronizeGpuBackendsBeforeMmapRelease())
+        if (!synchronizeDeviceBackendBeforeMmapRelease(state_.device_id))
         {
             LOG_WARN("[DeviceGraphOrchestrator] Skipping mmap DONTNEED after prefill because GPU synchronization failed");
             return;
@@ -4379,10 +4567,18 @@ namespace llaminar2
             return false;
         }
 
+        const uint64_t current_workspace_generation =
+            state_.device_id.is_gpu() ? workspaceGeneration(state_.device_id) : 0;
+        const bool workspace_generation_changed =
+            state_.device_id.is_gpu() &&
+            cache.workspace_generation != 0 &&
+            current_workspace_generation != cache.workspace_generation;
+
         const bool rebuild =
             !cache.valid ||
             !cache.graph ||
             !cache.stage ||
+            workspace_generation_changed ||
             cache.input != input ||
             cache.output != output ||
             cache.device != state_.device_id ||
@@ -4422,6 +4618,7 @@ namespace llaminar2
             cache.input = input;
             cache.output = output;
             cache.device = state_.device_id;
+            cache.workspace_generation = 0;
             cache.seq_capacity = seq_capacity;
             cache.d_model = state_.d_model;
             cache.valid = true;
@@ -4450,6 +4647,9 @@ namespace llaminar2
 
         if (!execute(*cache.graph, ctx))
             return false;
+
+        if (state_.device_id.is_gpu())
+            cache.workspace_generation = workspaceGeneration(state_.device_id);
 
         if (owned_row_select_stream &&
             !synchronizeOwnedGPUHelperStream(
@@ -4609,10 +4809,18 @@ namespace llaminar2
             }
         }
 
+        const uint64_t current_workspace_generation =
+            state_.device_id.is_gpu() ? workspaceGeneration(state_.device_id) : 0;
+        const bool workspace_generation_changed =
+            state_.device_id.is_gpu() &&
+            cache.workspace_generation != 0 &&
+            current_workspace_generation != cache.workspace_generation;
+
         const bool rebuild =
             !cache.valid ||
             !cache.graph ||
             !cache.stage ||
+            workspace_generation_changed ||
             cache.input != input ||
             cache.output != output ||
             cache.device != state_.device_id ||
@@ -4654,9 +4862,12 @@ namespace llaminar2
             cache.input = input;
             cache.output = output;
             cache.device = state_.device_id;
+            cache.workspace_generation = 0;
             cache.seq_capacity = seq_capacity;
             cache.d_model = state_.d_model;
             cache.selected_row_count = static_cast<int>(selected_rows.size());
+            cache.row_buffer_name = params.workspace_buffer_name;
+            cache.external_row_metadata = false;
             cache.valid = true;
         }
 
@@ -4686,11 +4897,169 @@ namespace llaminar2
         if (!execute(*cache.graph, ctx))
             return false;
 
+        if (state_.device_id.is_gpu())
+            cache.workspace_generation = workspaceGeneration(state_.device_id);
+
         if (owned_rows_select_stream &&
             !synchronizeOwnedGPUHelperStream(
                 state_.device_id,
                 owned_rows_select_stream,
                 "mtp_hidden_rows_select"))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::executeMTPHiddenRowsSelectFromDeviceMetadata(
+        TensorBase *input,
+        BufferId input_buffer_id,
+        TensorBase *output,
+        BufferId output_buffer_id,
+        MTPTerminalHiddenRowsSelectGraphCache &cache,
+        const char *node_name,
+        const char *row_buffer_name,
+        int row_count,
+        int seq_len,
+        void *stream)
+    {
+        if (!state_.device_id.is_gpu())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-metadata hidden row selection requires a GPU device");
+            return false;
+        }
+        if (!row_buffer_name || row_buffer_name[0] == '\0')
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-metadata hidden row selection requires a workspace buffer name");
+            return false;
+        }
+        if (row_count <= 0 || row_count > 4)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-metadata hidden rows selection supports 1..4 rows, got "
+                      << row_count);
+            return false;
+        }
+        if (seq_len <= 0)
+            return false;
+        if (!input || !output)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select device-metadata MTP hidden rows without input/output buffer");
+            return false;
+        }
+        if (state_.d_model <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select device-metadata MTP hidden rows with invalid d_model="
+                      << state_.d_model);
+            return false;
+        }
+
+        const size_t hidden_rows = input->rows();
+        if (hidden_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hidden-state rows-select capacity exceeds int range: rows="
+                      << hidden_rows);
+            return false;
+        }
+        const int seq_capacity = static_cast<int>(hidden_rows);
+        if (seq_capacity < seq_len)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hidden-state rows-select capacity too small: capacity="
+                      << seq_capacity << " seq_len=" << seq_len);
+            return false;
+        }
+
+        const std::string stable_row_buffer(row_buffer_name);
+        const uint64_t current_workspace_generation = workspaceGeneration(state_.device_id);
+        const bool workspace_generation_changed =
+            cache.workspace_generation != 0 &&
+            current_workspace_generation != cache.workspace_generation;
+
+        const bool rebuild =
+            !cache.valid ||
+            !cache.graph ||
+            !cache.stage ||
+            workspace_generation_changed ||
+            cache.input != input ||
+            cache.output != output ||
+            cache.device != state_.device_id ||
+            cache.seq_capacity != seq_capacity ||
+            cache.d_model != state_.d_model ||
+            cache.selected_row_count != row_count ||
+            !cache.external_row_metadata ||
+            cache.row_buffer_name != stable_row_buffer;
+
+        if (rebuild)
+        {
+            HiddenStateRowsSelectStage::Params params;
+            params.device_id = state_.device_id;
+            params.input = input;
+            params.output = output;
+            params.seq_len = seq_capacity;
+            params.d_model = state_.d_model;
+            params.selected_row_count = row_count;
+            params.selected_row_indices.assign(static_cast<size_t>(row_count), 0);
+            params.input_buffer_id = input_buffer_id;
+            params.output_buffer_id = output_buffer_id;
+            params.workspace_buffer_name = stable_row_buffer;
+            params.declare_selected_rows_workspace = false;
+            params.upload_selected_rows_to_workspace = false;
+
+            auto stage = ComputeStageFactory::createHiddenStateRowsSelect(params);
+            auto *rows_select_stage = dynamic_cast<HiddenStateRowsSelectStage *>(stage.get());
+            if (!rows_select_stage)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] HiddenStateRowsSelect factory returned an incompatible external-metadata stage");
+                return false;
+            }
+
+            auto graph = std::make_unique<ComputeGraph>();
+            graph->addNode(node_name && node_name[0] != '\0'
+                               ? node_name
+                               : "mtp_hidden_rows_select_device_metadata",
+                           std::move(stage),
+                           state_.device_id);
+
+            cache.graph = std::move(graph);
+            cache.stage = rows_select_stage;
+            cache.input = input;
+            cache.output = output;
+            cache.device = state_.device_id;
+            cache.workspace_generation = 0;
+            cache.seq_capacity = seq_capacity;
+            cache.d_model = state_.d_model;
+            cache.selected_row_count = row_count;
+            cache.row_buffer_name = stable_row_buffer;
+            cache.external_row_metadata = true;
+            cache.valid = true;
+        }
+
+        void *owned_rows_select_stream = nullptr;
+        void *rows_select_stream = stream
+                                       ? stream
+                                       : explicitGPUStreamForOperation("mtp_hidden_rows_select_device_metadata");
+        if (!rows_select_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-metadata MTP hidden rows-select requires an explicit GPU stream");
+            return false;
+        }
+        cache.stage->setGPUStream(rows_select_stream);
+        if (!stream)
+            owned_rows_select_stream = rows_select_stream;
+
+        IDeviceContext *ctx = getDeviceContext(state_.device_id);
+        if (!ctx)
+            return false;
+
+        if (!execute(*cache.graph, ctx))
+            return false;
+
+        cache.workspace_generation = workspaceGeneration(state_.device_id);
+
+        if (owned_rows_select_stream &&
+            !synchronizeOwnedGPUHelperStream(
+                state_.device_id,
+                owned_rows_select_stream,
+                "mtp_hidden_rows_select_device_metadata"))
         {
             return false;
         }
@@ -4715,7 +5084,7 @@ namespace llaminar2
             return false;
         state_.mtp_terminal_hidden_current = false;
         if (row_count == 1)
-            return executeMTPTerminalHiddenRowSelect(row_start, seq_len);
+            return selectMTPTerminalHiddenRow(row_start, seq_len, stream);
         if (!state_.hidden)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP terminal hidden rows without hidden-state buffer");
@@ -4723,17 +5092,22 @@ namespace llaminar2
         }
         if (!ensureMTPTerminalHiddenBuffer(row_count))
             return false;
-        return executeMTPHiddenRowsSelect(
-            state_.hidden.get(),
-            BufferId::HIDDEN_STATE,
-            state_.prefix_terminal_hidden.get(),
-            BufferId::PREFIX_TERMINAL_HIDDEN,
-            mtp_terminal_hidden_rows_select_cache_,
-            "mtp_terminal_hidden_rows_select",
-            row_start,
-            row_count,
-            seq_len,
-            stream);
+        if (!executeMTPHiddenRowsSelect(
+                state_.hidden.get(),
+                BufferId::HIDDEN_STATE,
+                state_.prefix_terminal_hidden.get(),
+                BufferId::PREFIX_TERMINAL_HIDDEN,
+                mtp_terminal_hidden_rows_select_cache_,
+                "mtp_terminal_hidden_rows_select",
+                row_start,
+                row_count,
+                seq_len,
+                stream))
+        {
+            return false;
+        }
+        state_.mtp_terminal_hidden_current = true;
+        return true;
     }
 
     bool DeviceGraphOrchestrator::selectMTPTerminalHiddenRows(
@@ -4773,6 +5147,62 @@ namespace llaminar2
         {
             return false;
         }
+        state_.mtp_terminal_hidden_current = true;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::selectMTPTerminalHiddenRowsFromDeviceAcceptedState(
+        int row_count,
+        int seq_len,
+        void *stream)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        state_.mtp_terminal_hidden_current = false;
+        PerfStatsCollector::ScopedTimer timer(
+            "mtp",
+            "terminal_hidden_rows_select",
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"rows", std::to_string(row_count)},
+             {"selection", "device_accepted_state"}});
+
+        if (!state_.device_id.is_gpu())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device accepted-state terminal-hidden selection requires a GPU runner");
+            return false;
+        }
+        if (seq_len <= 0 || row_count <= 0 || row_count > 4)
+            return false;
+        if (!state_.hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select device accepted-state terminal hidden without hidden-state buffer");
+            return false;
+        }
+        if (!mtp_spec_decode_metadata_binding_.hasWorkspace() ||
+            !mtp_spec_decode_metadata_binding_.devicePointers().accepted_state_slot_indices)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device accepted-state terminal-hidden selection requires bound MTP metadata workspace");
+            return false;
+        }
+        if (!ensureMTPTerminalHiddenBuffer(row_count))
+            return false;
+
+        if (!executeMTPHiddenRowsSelectFromDeviceMetadata(
+                state_.hidden.get(),
+                BufferId::HIDDEN_STATE,
+                state_.prefix_terminal_hidden.get(),
+                BufferId::PREFIX_TERMINAL_HIDDEN,
+                mtp_terminal_hidden_rows_select_cache_,
+                "mtp_terminal_hidden_rows_select_device_accepted_state",
+                MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_SLOT_INDICES,
+                row_count,
+                seq_len,
+                stream))
+        {
+            return false;
+        }
+
         state_.mtp_terminal_hidden_current = true;
         return true;
     }
@@ -4981,6 +5411,32 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::ensureMTPCheckpointTerminalHidden()
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (state_.prefix_terminal_hidden && state_.mtp_terminal_hidden_current)
+            return true;
+        if (!state_.hidden ||
+            state_.last_forward_seq_len <= 0 ||
+            state_.last_forward_batch_size <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot materialize MTP checkpoint terminal hidden"
+                      << " without a live main-forward hidden row");
+            return false;
+        }
+
+        /*
+         * Keep the capture contract explicit: live MTP checkpoints must carry
+         * a terminal hidden row that was selected from the latest main forward
+         * on the runner's own stream.  That prevents restore from combining
+         * fresh KV/GDN with a stale PREFIX_TERMINAL_HIDDEN buffer.
+         */
+        return refreshMTPTerminalHiddenState(
+            state_.last_forward_seq_len,
+            state_.last_forward_batch_size);
+    }
+
     bool DeviceGraphOrchestrator::selectMTPTerminalHiddenRow(int row_idx, int seq_len, void *stream)
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
@@ -5033,13 +5489,15 @@ namespace llaminar2
         int draft_condition_ready_slot,
         bool draft_condition_ready_is_target,
         int request_batch,
-        const int *position_ids_override)
+        const int *position_ids_override,
+        const void *position_ids_device_override)
     {
         const int seq_len = token_count;
         const int total_rows =
             (token_count > 0 && request_batch > 0)
                 ? token_count * request_batch
                 : 0;
+        const bool use_device_position_ids = position_ids_device_override != nullptr;
         const std::string device_key = state_.device_id.toString();
         const std::string phase = perfPhaseName();
         const std::string sidecar_context =
@@ -5072,9 +5530,21 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Request-batched MTP sidecar supports exactly one token per request");
             return false;
         }
-        if (request_batch > 1 && !position_ids_override)
+        if (request_batch > 1 &&
+            !position_ids_override &&
+            !use_device_position_ids)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Request-batched MTP sidecar requires per-request position ids");
+            return false;
+        }
+        if (position_ids_override && use_device_position_ids)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar received both host and device position overrides");
+            return false;
+        }
+        if (use_device_position_ids && !state_.device_id.is_gpu())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-position MTP sidecar requires a GPU device");
             return false;
         }
         if (external_device_condition_tokens && total_rows != 1)
@@ -5115,6 +5585,7 @@ namespace llaminar2
             {{"context", sidecar_context},
              {"depth", "0"},
              {"device_tokens", boolTag(use_device_condition_tokens)},
+             {"device_positions", boolTag(use_device_position_ids)},
              {"kv_cache_only", boolTag(kv_cache_only)},
              {"seq_len", std::to_string(token_count)},
              {"batch", std::to_string(request_batch)}});
@@ -5127,6 +5598,7 @@ namespace llaminar2
             {{"context", sidecar_context},
              {"depth", "0"},
              {"device_tokens", boolTag(use_device_condition_tokens)},
+             {"device_positions", boolTag(use_device_position_ids)},
              {"kv_cache_only", boolTag(kv_cache_only)},
              {"seq_len", std::to_string(token_count)},
              {"batch", std::to_string(request_batch)}});
@@ -5353,6 +5825,7 @@ namespace llaminar2
         input.terminal_hidden = terminal_hidden;
         input.kv_cache = state_.mtp_kv_caches[0].get();
         input.position_ids = &position_id;
+        input.position_ids_device = position_ids_device_override;
         input.sequence_lengths = nullptr;
         input.batch_size = request_batch;
         input.seq_len = token_count;
@@ -5371,8 +5844,10 @@ namespace llaminar2
             sidecar_cache.seq_len != token_count ||
             sidecar_cache.batch_size != request_batch ||
             sidecar_cache.uses_device_token_ids != use_device_condition_tokens ||
+            sidecar_cache.uses_device_position_ids != use_device_position_ids ||
             sidecar_cache.condition_token_slot != condition_token_slot ||
             sidecar_cache.condition_token_device != condition_token_device ||
+            sidecar_cache.position_ids_device != position_ids_device_override ||
             sidecar_cache.moe_epoch_sensitive != sidecar_moe_epoch_sensitive ||
             sidecar_cache.moe_placement_epoch != sidecar_moe_epoch_key;
 
@@ -5388,8 +5863,10 @@ namespace llaminar2
             sidecar_cache.seq_len = token_count;
             sidecar_cache.batch_size = request_batch;
             sidecar_cache.uses_device_token_ids = use_device_condition_tokens;
+            sidecar_cache.uses_device_position_ids = use_device_position_ids;
             sidecar_cache.condition_token_slot = condition_token_slot;
             sidecar_cache.condition_token_device = condition_token_device;
+            sidecar_cache.position_ids_device = position_ids_device_override;
             sidecar_cache.terminal_hidden = terminal_hidden;
             sidecar_cache.moe_placement_epoch = sidecar_moe_epoch_key;
             sidecar_cache.moe_epoch_sensitive = sidecar_moe_epoch_sensitive;
@@ -5399,6 +5876,7 @@ namespace llaminar2
             cached_input.draft_token_ids_device =
                 use_device_condition_tokens ? condition_token_device : nullptr;
             cached_input.position_ids = sidecar_cache.position_ids.data();
+            cached_input.position_ids_device = position_ids_device_override;
 
             PerfStatsCollector::ScopedTimer timer(
                 "mtp",
@@ -5456,6 +5934,7 @@ namespace llaminar2
                 {{"context", sidecar_context},
                  {"depth", "0"},
                  {"device_tokens", boolTag(use_device_condition_tokens)},
+                 {"device_positions", boolTag(use_device_position_ids)},
                  {"kv_cache_only", boolTag(kv_cache_only)},
                  {"seq_len", std::to_string(token_count)},
                  {"moe_placement_epoch", std::to_string(sidecar_moe_epoch_key)}});
@@ -5471,6 +5950,7 @@ namespace llaminar2
                 {{"context", sidecar_context},
                  {"depth", "0"},
                  {"device_tokens", boolTag(use_device_condition_tokens)},
+                 {"device_positions", boolTag(use_device_position_ids)},
                  {"kv_cache_only", boolTag(kv_cache_only)},
                  {"seq_len", std::to_string(token_count)},
                  {"moe_placement_epoch", std::to_string(sidecar_moe_epoch_key)}});
@@ -5530,6 +6010,26 @@ namespace llaminar2
             !waitForPendingAcceptedSpecPublicationReady(
                 sidecar_dynamic_stream,
                 "mtp_sidecar_before_execute"))
+        {
+            return false;
+        }
+        /*
+         * Prefix restore/truncate helpers also queue asynchronous state writes.
+         * A sidecar can be the first graph to consume that restored state, so
+         * it must participate in the same explicit stream handoff as main
+         * decode graphs.
+         */
+        if (state_.device_id.is_gpu() &&
+            !waitForPendingLivePrefixMutationReady(
+                sidecar_dynamic_stream,
+                "mtp_sidecar_live_prefix_mutation"))
+        {
+            return false;
+        }
+        if (state_.device_id.is_gpu() &&
+            !waitForDeviceResidentLogicalSequenceStateMailbox(
+                sidecar_dynamic_stream,
+                "mtp_sidecar_logical_state_consumer"))
         {
             return false;
         }
@@ -5758,6 +6258,22 @@ namespace llaminar2
             if (!stage)
                 continue;
 
+            if (use_device_position_ids)
+            {
+                if (!stage->supportsDeviceResidentDynamicPositionReplay())
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar cannot replay with device-resident positions because stage "
+                              << stage->name()
+                              << " still requires host scalar dynamic position state");
+                    return false;
+                }
+                stage->updateDynamicDevicePositionIds(
+                    position_ids_device_override,
+                    total_rows);
+                if (stage->type() == ComputeStageType::ROPE)
+                    continue;
+            }
+
             if (request_batch > 1 &&
                 position_ids_override &&
                 stage->type() == ComputeStageType::ROPE)
@@ -5784,7 +6300,16 @@ namespace llaminar2
                 continue;
             }
 
-            stage->updateDynamicParams(position_id, token_count);
+            /*
+             * When device position rows are active, every remaining dynamic
+             * stage has explicitly declared that the scalar position argument
+             * is ignored or replaced by device-resident metadata.  Use a
+             * neutral value so resident replay cannot accidentally depend on
+             * state_.positions while direct publication is being promoted.
+             */
+            const int scalar_position_for_dynamic_params =
+                use_device_position_ids ? 0 : position_id;
+            stage->updateDynamicParams(scalar_position_for_dynamic_params, token_count);
         }
         sidecar_cache.graph->reset();
 
@@ -5831,6 +6356,33 @@ namespace llaminar2
                     ctx,
                     sidecar_cache.segment_cache.consecutive_failures);
                 capture_policy.defer_final_sync = can_defer_sidecar_sync;
+                const char *sidecar_recapture_context_filter =
+                    DebugEnv::envValue("LLAMINAR_MTP_FORCE_SIDECAR_GRAPH_RECAPTURE_CONTEXT");
+                const bool force_this_sidecar_context =
+                    DebugEnv::isTruthyEnv("LLAMINAR_MTP_FORCE_SIDECAR_GRAPH_RECAPTURE") &&
+                    (!sidecar_recapture_context_filter ||
+                     sidecar_context == sidecar_recapture_context_filter);
+                if (force_this_sidecar_context)
+                {
+                    /*
+                     * Diagnostic-only recapture splitter: force just the MTP
+                     * sidecar graph, or one named sidecar context, through
+                     * recapture while leaving the target verifier graph on its
+                     * normal replay path.  If acceptance recovers for only one
+                     * context, that context owns stale persistent device inputs
+                     * or stage replay callbacks.
+                     */
+                    capture_policy.force_recapture = true;
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "sidecar_force_recapture_diagnostic",
+                        1.0,
+                        phase,
+                        device_key,
+                        {{"context", sidecar_context},
+                         {"filter", sidecar_recapture_context_filter ? sidecar_recapture_context_filter : "<all>"},
+                         {"seq_len", std::to_string(token_count)}});
+                }
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "sidecar_decode_capture_policy",
@@ -6425,6 +6977,89 @@ namespace llaminar2
             /*draft_condition_ready_is_target=*/true);
     }
 
+    bool DeviceGraphOrchestrator::forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+        const DeviceResidentLogicalSequenceStateHandle &logical_state,
+        int request_index)
+    {
+        if (!supportsMTPDeviceDraftTokenInput())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP sidecar is not supported by this runner");
+            return false;
+        }
+        if (!logical_state.valid())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP sidecar received an invalid handle");
+            return false;
+        }
+        if (logical_state.device != state_.device_id)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP sidecar device mismatch: handle="
+                      << logical_state.device.toString()
+                      << " runner=" << state_.device_id.toString());
+            return false;
+        }
+        if (logical_state.live_state_epoch != live_replay_state_epoch_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP sidecar received a stale live-state epoch");
+            return false;
+        }
+        if (!logical_state.coversRequest(request_index))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP sidecar received request_index="
+                      << request_index << " for request_count="
+                      << logical_state.request_count);
+            return false;
+        }
+
+        const auto &mailbox = device_resident_logical_sequence_state_mailbox_;
+        if (!mailbox.ownsHandle(logical_state, live_replay_state_epoch_))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP sidecar refuses a non-owned mailbox handle");
+            return false;
+        }
+
+        TensorBase *terminal_hidden = nullptr;
+        BufferId terminal_hidden_buffer_id = BufferId::HIDDEN_STATE;
+        if (!resolveMTPTerminalHiddenInput(
+                &terminal_hidden,
+                &terminal_hidden_buffer_id,
+                "forwardMTPFromDeviceResidentLogicalStateForDeviceSampling"))
+        {
+            return false;
+        }
+
+        /*
+         * These pointers name one row in the runner-owned mailbox.  The sidecar
+         * executor will wait on the mailbox event after selecting its explicit
+         * stream, then copy the token into the persistent condition-token slot
+         * and bind the position row directly to device-aware RoPE stages.
+         */
+        const int32_t *next_condition_token_device =
+            logical_state.nextConditionTokenDeviceForRequest(request_index);
+        const int32_t *target_position_device =
+            logical_state.targetPositionDeviceForRequest(request_index);
+        if (!next_condition_token_device || !target_position_device)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP sidecar could not derive request-local device rows");
+            return false;
+        }
+        return executeMTPDepth0Batched(
+            /*draft_condition_tokens=*/nullptr,
+            /*token_count=*/1,
+            terminal_hidden,
+            /*position_id=*/0,
+            "mtp_decode_sidecar_resident_logical_state",
+            /*kv_cache_only=*/false,
+            terminal_hidden_buffer_id,
+            /*defer_final_sync=*/true,
+            next_condition_token_device,
+            /*draft_condition_ready_slot=*/-1,
+            /*draft_condition_ready_is_target=*/false,
+            /*request_batch=*/1,
+            /*position_ids_override=*/nullptr,
+            target_position_device);
+    }
+
     bool DeviceGraphOrchestrator::forwardMTPAndSampleGreedy(
         int32_t draft_condition_token,
         int32_t *out_token)
@@ -6473,6 +7108,55 @@ namespace llaminar2
             return false;
         *out_token = token;
         return true;
+    }
+
+    bool DeviceGraphOrchestrator::forwardMTPAndSampleGreedyToDeviceDraftSlot(
+        int32_t draft_condition_token,
+        int draft_sample_slot,
+        int32_t *out_token)
+    {
+        if (!out_token)
+            return false;
+        *out_token = -1;
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        {
+            return false;
+        }
+        if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardMTPAndSampleGreedyToDeviceDraftSlot requires an initialized MTP KV cache");
+            return false;
+        }
+        if (!frozen_weight_set_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardMTPAndSampleGreedyToDeviceDraftSlot requires frozen MTP weight bindings");
+            return false;
+        }
+
+        int position_id = state_.positions.empty() ? 0 : state_.positions[0];
+        TensorBase *terminal_hidden = nullptr;
+        BufferId terminal_hidden_buffer_id = BufferId::HIDDEN_STATE;
+        if (!resolveMTPTerminalHiddenInput(
+                &terminal_hidden,
+                &terminal_hidden_buffer_id,
+                "forwardMTPAndSampleGreedyToDeviceDraftSlot"))
+            return false;
+
+        if (!executeMTPDepth0(
+                draft_condition_token,
+                terminal_hidden,
+                position_id,
+                "mtp_decode_sidecar",
+                false,
+                terminal_hidden_buffer_id,
+                /*defer_final_sync=*/true))
+        {
+            return false;
+        }
+
+        return sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+            draft_sample_slot,
+            out_token);
     }
 
     bool DeviceGraphOrchestrator::forwardMTPBatchAndSampleGreedy(
@@ -6612,6 +7296,245 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::sampleMTPBatchGreedyLogitsToDeviceDraftSlots(
+        int request_batch,
+        int first_draft_slot,
+        int slot_stride,
+        const char *context,
+        int32_t *out_tokens)
+    {
+        const int last_draft_slot =
+            first_draft_slot +
+            (request_batch > 0 ? (request_batch - 1) * slot_stride : 0);
+        if (!supportsDeviceStochasticMTPVerification() ||
+            !state_.device_id.is_gpu() ||
+            request_batch <= 0 ||
+            request_batch > 4 ||
+            first_draft_slot < 0 ||
+            slot_stride <= 0 ||
+            last_draft_slot >= stochastic_draft_row_capacity_ ||
+            !stochastic_draft_sample_tokens_dev_ ||
+            !stochastic_draft_sample_probs_dev_ ||
+            !argmax_partial_vals_dev_ ||
+            !argmax_partial_idxs_dev_ ||
+            argmax_partial_capacity_ <= 0)
+        {
+            return false;
+        }
+
+        auto logits_it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        TensorBase *mtp_logits =
+            (logits_it == state_.extension_buffers.end() || !logits_it->second)
+                ? nullptr
+                : logits_it->second.get();
+        if (!mtp_logits || !mtp_logits->deviceValid() || !mtp_logits->gpu_data_ptr())
+            return false;
+
+        const auto &shape = mtp_logits->shape();
+        if (shape.empty())
+            return false;
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+        if (cols == 0 ||
+            rows < static_cast<size_t>(request_batch) ||
+            cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        const int token_offset = graph_builder_
+                                     ? vocabOffsetForTPConfig(graph_builder_->config())
+                                     : 0;
+        if (token_offset != 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP device draft-slot sampling currently requires unsharded logits");
+            return false;
+        }
+
+        auto device_opt = mtp_logits->current_device();
+        if (!device_opt.has_value() ||
+            !device_opt->is_gpu() ||
+            *device_opt != state_.device_id)
+        {
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(*device_opt);
+        void *stream = consumePendingLogitsStream(
+            PendingLogitsStreamRole::MTPSidecar,
+            context ? context : "sampleMTPBatchGreedyLogitsToDeviceDraftSlots");
+        if (!stream)
+        {
+            stream = explicitGPUStreamForOperation(
+                context ? context : "sampleMTPBatchGreedyLogitsToDeviceDraftSlots");
+        }
+        if (!backend || !stream)
+            return false;
+
+        for (int row = 0; row < request_batch; ++row)
+            clearStochasticDraftSampleReadySlot(first_draft_slot + row * slot_stride);
+
+        auto *out_values_dev =
+            static_cast<float *>(stochastic_draft_sample_probs_dev_) +
+            first_draft_slot;
+        auto *out_tokens_dev =
+            static_cast<int32_t *>(stochastic_draft_sample_tokens_dev_) +
+            first_draft_slot;
+
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "request_batch_sidecar_device_draft_argmax_enqueue",
+                "decode",
+                state_.device_id.toString(),
+                {{"requests", std::to_string(request_batch)},
+                 {"first_slot", std::to_string(first_draft_slot)},
+                 {"slot_stride", std::to_string(slot_stride)}});
+            if (!backend->enqueueArgmaxF32BatchedRowsDevice(
+                    mtp_logits->gpu_data_ptr(),
+                    request_batch,
+                    static_cast<int>(cols),
+                    state_.device_id.gpu_ordinal(),
+                    stream,
+                    out_values_dev,
+                    out_tokens_dev,
+                    argmax_partial_vals_dev_,
+                    argmax_partial_idxs_dev_,
+                    argmax_partial_capacity_,
+                    slot_stride))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP device draft-slot argmax failed");
+                return false;
+            }
+        }
+
+        for (int row = 0; row < request_batch; ++row)
+        {
+            if (!recordStochasticDraftSampleReady(first_draft_slot + row * slot_stride, stream))
+                return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "request_batch_sidecar_device_draft_slots",
+            static_cast<double>(request_batch),
+            "decode",
+            state_.device_id.toString(),
+            {{"first_slot", std::to_string(first_draft_slot)},
+             {"slot_stride", std::to_string(slot_stride)},
+             {"host_shadow", out_tokens ? "true" : "false"}});
+
+        if (!out_tokens)
+            return true;
+
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "request_batch_sidecar_device_draft_shadow_d2h_sync",
+                "decode",
+                state_.device_id.toString(),
+                {{"requests", std::to_string(request_batch)},
+                 {"first_slot", std::to_string(first_draft_slot)},
+                 {"slot_stride", std::to_string(slot_stride)}});
+            std::array<int32_t, 16> shadow_slots{};
+            shadow_slots.fill(-1);
+            const size_t shadow_span =
+                static_cast<size_t>(last_draft_slot - first_draft_slot + 1);
+            if (shadow_span > shadow_slots.size())
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP device draft-slot shadow span exceeds testable stack buffer");
+                return false;
+            }
+            if (!backend->deviceToHostFast(
+                    shadow_slots.data(),
+                    out_tokens_dev,
+                    sizeof(int32_t) * shadow_span,
+                    state_.device_id.gpu_ordinal(),
+                    stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP device draft-slot shadow copy failed");
+                return false;
+            }
+            for (int row = 0; row < request_batch; ++row)
+            {
+                out_tokens[row] = shadow_slots[static_cast<size_t>(row * slot_stride)];
+            }
+        }
+
+        for (int row = 0; row < request_batch; ++row)
+        {
+            if (out_tokens[row] < 0)
+                return false;
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::forwardMTPBatchAndSampleGreedyToDeviceDraftSlots(
+        const int32_t *draft_condition_tokens,
+        const int *position_ids,
+        int request_batch,
+        int first_draft_slot,
+        int slot_stride,
+        int32_t *out_tokens)
+    {
+        if (!draft_condition_tokens || !position_ids ||
+            request_batch <= 1 || request_batch > 4 ||
+            first_draft_slot < 0 || slot_stride <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP device-slot sidecar requires 2..4 requests");
+            return false;
+        }
+        if (!state_.device_id.is_gpu())
+            return false;
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return false;
+        if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP device-slot sidecar requires an initialized MTP KV cache");
+            return false;
+        }
+        if (static_cast<int>(state_.positions.size()) < request_batch)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP device-slot sidecar requires per-request live positions");
+            return false;
+        }
+
+        TensorBase *terminal_hidden = nullptr;
+        BufferId terminal_hidden_buffer_id = BufferId::HIDDEN_STATE;
+        if (!resolveMTPTerminalHiddenInput(
+                &terminal_hidden,
+                &terminal_hidden_buffer_id,
+                "forwardMTPBatchAndSampleGreedyToDeviceDraftSlots"))
+        {
+            return false;
+        }
+
+        if (!executeMTPDepth0Batched(
+                draft_condition_tokens,
+                /*token_count=*/1,
+                terminal_hidden,
+                position_ids[0],
+                "mtp_decode_sidecar_request_batch_device_drafts",
+                /*kv_cache_only=*/false,
+                terminal_hidden_buffer_id,
+                /*defer_final_sync=*/true,
+                /*draft_condition_tokens_device=*/nullptr,
+                /*draft_condition_ready_slot=*/-1,
+                /*draft_condition_ready_is_target=*/false,
+                request_batch,
+                position_ids))
+        {
+            return false;
+        }
+
+        return sampleMTPBatchGreedyLogitsToDeviceDraftSlots(
+            request_batch,
+            first_draft_slot,
+            slot_stride,
+            "forwardMTPBatchAndSampleGreedyToDeviceDraftSlots",
+            out_tokens);
+    }
+
     bool DeviceGraphOrchestrator::forwardMTPBatchFromLastDraftAndSampleGreedy(
         const int32_t *draft_condition_tokens,
         const int *position_ids,
@@ -6741,6 +7664,63 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::forwardMTPBatchFromLastDraftAndSampleGreedyToDeviceDraftSlots(
+        const int32_t *draft_condition_tokens,
+        const int *position_ids,
+        int request_batch,
+        int first_draft_slot,
+        int slot_stride,
+        int32_t *out_tokens)
+    {
+        if (!draft_condition_tokens || !position_ids ||
+            request_batch <= 1 || request_batch > 4 ||
+            first_draft_slot < 0 || slot_stride <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched chained MTP device-slot sidecar requires 2..4 requests");
+            return false;
+        }
+        if (!state_.device_id.is_gpu())
+            return false;
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return false;
+
+        auto hidden_it = state_.extension_buffers.find(BufferId::MTP_HIDDEN);
+        TensorBase *mtp_hidden =
+            (hidden_it == state_.extension_buffers.end() || !hidden_it->second)
+                ? nullptr
+                : hidden_it->second.get();
+        if (!mtp_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched chained MTP device-slot sidecar requires previous MTP hidden rows");
+            return false;
+        }
+
+        if (!executeMTPDepth0Batched(
+                draft_condition_tokens,
+                /*token_count=*/1,
+                mtp_hidden,
+                position_ids[0],
+                "mtp_decode_sidecar_request_batch_chain_device_drafts",
+                /*kv_cache_only=*/false,
+                BufferId::MTP_HIDDEN,
+                /*defer_final_sync=*/true,
+                /*draft_condition_tokens_device=*/nullptr,
+                /*draft_condition_ready_slot=*/-1,
+                /*draft_condition_ready_is_target=*/false,
+                request_batch,
+                position_ids))
+        {
+            return false;
+        }
+
+        return sampleMTPBatchGreedyLogitsToDeviceDraftSlots(
+            request_batch,
+            first_draft_slot,
+            slot_stride,
+            "forwardMTPBatchFromLastDraftAndSampleGreedyToDeviceDraftSlots",
+            out_tokens);
+    }
+
     bool DeviceGraphOrchestrator::forwardMTPFromLastDraftAndSampleGreedy(
         int32_t draft_condition_token,
         int position_id,
@@ -6785,6 +7765,51 @@ namespace llaminar2
             return false;
         *out_token = token;
         return true;
+    }
+
+    bool DeviceGraphOrchestrator::forwardMTPFromLastDraftAndSampleGreedyToDeviceDraftSlot(
+        int32_t draft_condition_token,
+        int position_id,
+        int draft_sample_slot,
+        int32_t *out_token)
+    {
+        if (!out_token)
+            return false;
+        *out_token = -1;
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        {
+            return false;
+        }
+        if (position_id < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Chained MTP sidecar+device-slot sample requires a non-negative position_id");
+            return false;
+        }
+
+        auto it = state_.extension_buffers.find(BufferId::MTP_HIDDEN);
+        TensorBase *mtp_hidden =
+            (it == state_.extension_buffers.end() || !it->second) ? nullptr : it->second.get();
+        if (!mtp_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Chained MTP sidecar+device-slot sample requires previous MTP hidden state");
+            return false;
+        }
+
+        if (!executeMTPDepth0(
+                draft_condition_token,
+                mtp_hidden,
+                position_id,
+                "mtp_decode_sidecar_chain",
+                false,
+                BufferId::MTP_HIDDEN,
+                /*defer_final_sync=*/true))
+        {
+            return false;
+        }
+
+        return sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+            draft_sample_slot,
+            out_token);
     }
 
     bool DeviceGraphOrchestrator::flushPendingMTPWork()
@@ -6944,6 +7969,51 @@ namespace llaminar2
         return stream;
     }
 
+    bool DeviceGraphOrchestrator::waitForPendingLogitsStream(
+        PendingLogitsStreamRole role,
+        void *consumer_stream,
+        const char *consumer)
+    {
+        void *producer_stream = consumePendingLogitsStream(role, consumer);
+        if (!producer_stream)
+            return true;
+        if (!state_.device_id.is_gpu())
+            return true;
+        if (!consumer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Pending logits stream wait for role "
+                      << pendingLogitsStreamRoleName(role)
+                      << " requires an explicit consumer stream");
+            return false;
+        }
+
+        const bool same_stream = producer_stream == consumer_stream;
+        if (!same_stream)
+        {
+            /*
+             * Queue a device-side dependency instead of synchronizing the
+             * producer stream on the CPU.  This mirrors the segmented graph
+             * collective handoff: the verifier graph can launch immediately,
+             * but GPU execution waits until all sidecar work already enqueued
+             * on the producer stream is complete.
+             */
+            GPUDeviceContextPool::instance()
+                .getContext(state_.device_id)
+                .insertStreamDependency(consumer_stream, producer_stream);
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "pending_logits_stream_waits",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"role", pendingLogitsStreamRoleName(role)},
+             {"consumer", consumer ? consumer : "unknown"},
+             {"same_stream", boolTag(same_stream)}});
+        return true;
+    }
+
     void *DeviceGraphOrchestrator::peekPendingLogitsStream(
         PendingLogitsStreamRole role) const
     {
@@ -6976,11 +8046,123 @@ namespace llaminar2
         clearPendingLogitsStream(PendingLogitsStreamRole::AllPositionVerifier, reason);
     }
 
+    bool DeviceGraphOrchestrator::waitForPendingLiveGraphProducersBeforePrefixMutation(
+        void *mutation_stream,
+        const char *mutation_name)
+    {
+        const char *consumer =
+            mutation_name && mutation_name[0] != '\0'
+                ? mutation_name
+                : "live_prefix_mutation";
+
+        /*
+         * These handoffs are producer-order tokens, not semantic ownership of
+         * logits.  Consuming them here is correct because a prefix restore or
+         * truncate invalidates any logits from the abandoned timeline.
+         */
+        if (!waitForPendingLogitsStream(
+                PendingLogitsStreamRole::MTPSidecar,
+                mutation_stream,
+                consumer))
+        {
+            return false;
+        }
+        if (!waitForPendingLogitsStream(
+                PendingLogitsStreamRole::MainDecode,
+                mutation_stream,
+                consumer))
+        {
+            return false;
+        }
+        if (!waitForPendingLogitsStream(
+                PendingLogitsStreamRole::AllPositionVerifier,
+                mutation_stream,
+                consumer))
+        {
+            return false;
+        }
+        if (!waitForPendingShiftedMTPKVReady(
+                mutation_stream,
+                consumer))
+        {
+            return false;
+        }
+        if (!waitForPendingAllPositionVerifierStateReady(
+                mutation_stream,
+                consumer))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::clearLivePrefixRestoreTransientHandoffs(const char *reason)
+    {
+        const char *clear_reason =
+            reason && reason[0] != '\0' ? reason : "restore_live_prefix_state";
+
+        clearAllPendingLogitsStreams(clear_reason);
+        clearPendingAllPositionVerifierStateReady();
+        clearPendingAcceptedSpecPublicationReady();
+        clearPendingLivePrefixCheckpointReady();
+
+        shifted_mtp_kv_ready_.valid = false;
+        shifted_mtp_kv_ready_.producer_stream = nullptr;
+        shifted_mtp_kv_ready_.event.reset();
+
+        pending_mtp_verifier_device_token_plan_.reset();
+        request_batched_prefill_logits_row_count_ = 0;
+        request_batched_prefill_logit_rows_.clear();
+        if (graph_builder_)
+        {
+            /*
+             * Prefix restore returns the runner to an ordinary continuation
+             * boundary.  All-position and row-indexed verifier mode describe
+             * the abandoned speculative verifier graph, not the restored
+             * timeline, so clear both the builder-owned row list and the local
+             * mode mirrors even when restore happens while verifier mode is
+             * still enabled.
+             */
+            (void)graph_builder_->setRowIndexedAllPositionLogitRows({});
+            (void)setComputeRowIndexedAllPositionLogits(false, 0);
+            (void)setComputeAllPositionLogits(false);
+        }
+        else
+        {
+            compute_all_position_logits_ = false;
+            compute_row_indexed_all_position_logits_ = false;
+            row_indexed_all_position_logits_row_count_ = 0;
+        }
+
+        defer_next_mtp_main_decode_sync_ = false;
+        defer_all_position_verifier_sync_ = false;
+        std::fill(stochastic_target_distribution_streams_.begin(),
+                  stochastic_target_distribution_streams_.end(),
+                  nullptr);
+        std::fill(stochastic_draft_distribution_streams_.begin(),
+                  stochastic_draft_distribution_streams_.end(),
+                  nullptr);
+        clearStochasticTargetSampleReadySlots();
+        clearStochasticDraftSampleReadySlots();
+        clearDeviceResidentLogicalSequenceStateMailbox();
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "live_prefix_restore_transient_handoff_clears",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"reason", clear_reason}});
+    }
+
     void DeviceGraphOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled)
     {
         defer_all_position_verifier_sync_ = enabled;
         if (!enabled)
         {
+            // Only the one-shot logits handoff belongs to the deferral toggle.
+            // Accepted-state publication may still need the verifier-row state
+            // event after sampling has consumed logits and turned deferral off.
             clearPendingLogitsStream(
                 PendingLogitsStreamRole::AllPositionVerifier,
                 "setMTPAllPositionVerifierSyncDeferralEnabled(false)");
@@ -7022,6 +8204,18 @@ namespace llaminar2
             PendingLogitsStreamRole::AllPositionVerifier,
             stream,
             "setPendingAllPositionVerifierStream");
+        if (!stream)
+        {
+            clearPendingAllPositionVerifierStateReady();
+            return;
+        }
+        if (!recordAllPositionVerifierStateReady(
+                stream,
+                "setPendingAllPositionVerifierStream"))
+        {
+            throw std::runtime_error(
+                "Failed to record all-position verifier state readiness");
+        }
         if (stream)
         {
             PerfStatsCollector::addCounter(
@@ -7069,8 +8263,1070 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::supportsMTPSpecStatePublication() const
     {
-        return graph_builder_ && graph_builder_->config().mtp.enabled &&
-               state_.kv_cache != nullptr && !state_.mtp_kv_caches.empty();
+        if (!graph_builder_)
+            return false;
+
+        const auto &mtp = graph_builder_->config().mtp;
+        const int requested_rows =
+            std::max(1, mtp.depth_policy.max_depth > 0
+                            ? mtp.depth_policy.max_depth
+                            : mtp.draft_tokens);
+        const MTPVerifierRowCapability capability =
+            mtpVerifierRowCapability();
+        const auto &config = graph_builder_->config();
+        if (config.isMoE() || isPrefixCacheMoEModel())
+        {
+            return capability.supportsMoEDirectAllPositionRows(
+                requested_rows,
+                mtp.verify_mode == MTPVerifyMode::SpeculativeSampling);
+        }
+        return capability.supportsDenseDirectAllPositionRows(
+            requested_rows,
+            mtp.verify_mode == MTPVerifyMode::SpeculativeSampling);
+    }
+
+    MTPVerifierRowCapability DeviceGraphOrchestrator::mtpVerifierRowCapability() const
+    {
+        MTPVerifierRowCapability capability;
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled ||
+            state_.kv_cache == nullptr || state_.mtp_kv_caches.empty())
+        {
+            return capability;
+        }
+
+        constexpr int kPhase97ProvenVerifierRows = 4;
+        const auto &config = graph_builder_->config();
+        const bool model_is_moe = config.isMoE() || isPrefixCacheMoEModel();
+        if (model_is_moe)
+        {
+            capability.moe_decode_equivalent =
+                MTPVerifierRowEquivalenceSpec::proven(kPhase97ProvenVerifierRows);
+            /*
+             * Qwen3.6 MoE remains on shared decode-equivalent replay.  Phase
+             * 9.7 found the direct all-position candidate numerically wrong on
+             * CUDA, and ROCm follows the same fail-closed contract.
+             */
+            return capability;
+        }
+
+        capability.dense_decode_equivalent =
+            MTPVerifierRowEquivalenceSpec::proven(kPhase97ProvenVerifierRows);
+
+        /*
+         * Dense direct all-position publication stays fail-closed for every
+         * backend until it has a dedicated continuation-equivalence proof.
+         * The Phase 9.7 M=1..4 tests prove the shared decode-equivalent path;
+         * the broader Qwen3.6 benchmark-prompt regression caught a real
+         * GDN/short-conv state mismatch when GPU runners published state
+         * directly from all-position verifier rows.
+         */
+        return capability;
+    }
+
+    MTPVerifierEconomyCapability DeviceGraphOrchestrator::mtpVerifierEconomyCapability() const
+    {
+        MTPVerifierEconomyCapability economy;
+        const MTPVerifierRowCapability correctness = mtpVerifierRowCapability();
+
+        /*
+         * Phase 9.8 starts by recording the real production status rather than
+         * promoting a fast path prematurely.  The Phase 9.7 proofs make the
+         * shared serial verifier correct for M=1..4, but it is still a
+         * correctness fallback until grouped verifier, resident metadata,
+         * row-indexed LM-head, and host-bridge-free publication are proven.
+         */
+        if (correctness.dense_decode_equivalent.enabled)
+        {
+            economy.dense = MTPVerifierEconomyLane::serialFallbackCorrect(
+                correctness.dense_decode_equivalent.max_rows);
+        }
+        if (correctness.moe_decode_equivalent.enabled)
+        {
+            economy.moe = MTPVerifierEconomyLane::serialFallbackCorrect(
+                correctness.moe_decode_equivalent.max_rows);
+        }
+        return economy;
+    }
+
+    void DeviceGraphOrchestrator::clearDeviceResidentLogicalSequenceStateMailbox()
+    {
+        device_resident_logical_sequence_state_mailbox_.clear();
+        device_resident_logical_sequence_host_adopted_epoch_ = 0;
+    }
+
+    DeviceResidentLogicalSequenceStateHandle
+    DeviceGraphOrchestrator::deviceResidentLogicalSequenceState() const
+    {
+        DeviceResidentLogicalSequenceStateHandle handle;
+        const auto &mailbox = device_resident_logical_sequence_state_mailbox_;
+        if (!mailbox.valid())
+            return handle;
+        if (mailbox.live_state_epoch != live_replay_state_epoch_)
+            return handle;
+
+        handle.target_positions_device = mailbox.target_positions_device;
+        handle.target_sequence_lengths_device =
+            mailbox.target_sequence_lengths_device;
+        handle.accepted_state_counts_device =
+            mailbox.accepted_state_counts_device;
+        handle.next_condition_tokens_device =
+            mailbox.next_condition_tokens_device;
+        handle.all_drafts_accepted_flags_device =
+            mailbox.all_drafts_accepted_flags_device;
+        handle.stopped_flags_device = mailbox.stopped_flags_device;
+        handle.publication_ok_flags_device =
+            mailbox.publication_ok_flags_device;
+        handle.request_count = mailbox.request_count;
+        handle.device = state_.device_id;
+        handle.stream = mailbox.producer_stream;
+        handle.ready_event = mailbox.ready_event.get();
+        handle.live_state_epoch = mailbox.live_state_epoch;
+        return handle;
+    }
+
+    bool DeviceGraphOrchestrator::hostLogicalStateMirrorsDeviceResidentState() const
+    {
+        const auto &mailbox = device_resident_logical_sequence_state_mailbox_;
+        if (!mailbox.valid() ||
+            mailbox.live_state_epoch != live_replay_state_epoch_)
+        {
+            return true;
+        }
+
+        return device_resident_logical_sequence_host_adopted_epoch_ ==
+               mailbox.live_state_epoch;
+    }
+
+    bool DeviceGraphOrchestrator::recordDeviceResidentLogicalSequenceStateMailbox(
+        const MTPSpecDecodeMetadataDevicePointers &ptrs,
+        int request_count,
+        void *producer_stream,
+        std::string *error)
+    {
+        if (request_count <= 0)
+        {
+            if (error)
+                *error = "device logical-state mailbox requires a positive request count";
+            return false;
+        }
+        if (!producer_stream)
+        {
+            if (error)
+                *error = "device logical-state mailbox requires an explicit producer stream";
+            return false;
+        }
+        if (!ptrs.target_cached_tokens ||
+            !ptrs.accepted_state_counts ||
+            !ptrs.next_condition_tokens ||
+            !ptrs.all_drafts_accepted_flags ||
+            !ptrs.stopped_flags ||
+            !ptrs.publication_ok_flags)
+        {
+            if (error)
+            {
+                *error =
+                    "device logical-state mailbox requires target positions, "
+                    "accepted-state counts, next-condition tokens, and "
+                    "transaction predicate/publication-ok flags";
+            }
+            return false;
+        }
+
+        if (!state_.device_id.is_gpu())
+        {
+            if (error)
+                *error = "device logical-state mailbox requires a GPU device";
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+        {
+            if (error)
+                *error = "device logical-state mailbox could not resolve backend";
+            return false;
+        }
+
+        void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
+        if (!raw_event)
+        {
+            if (error)
+                *error = "device logical-state mailbox could not create readiness event";
+            return false;
+        }
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+        std::shared_ptr<void> ready_event(
+            raw_event,
+            [backend, device_ordinal](void *event)
+            {
+                if (event)
+                    backend->destroyEvent(event, device_ordinal);
+            });
+        if (!backend->recordEvent(
+                ready_event.get(),
+                state_.device_id.gpu_ordinal(),
+                producer_stream))
+        {
+            if (error)
+                *error = "device logical-state mailbox could not record readiness event";
+            return false;
+        }
+
+        DeviceResidentLogicalSequenceStateMailbox mailbox;
+        mailbox.request_count = request_count;
+        mailbox.target_positions_device = ptrs.target_cached_tokens;
+        mailbox.target_sequence_lengths_device = ptrs.target_cached_tokens;
+        mailbox.accepted_state_counts_device = ptrs.accepted_state_counts;
+        mailbox.next_condition_tokens_device = ptrs.next_condition_tokens;
+        mailbox.all_drafts_accepted_flags_device =
+            ptrs.all_drafts_accepted_flags;
+        mailbox.stopped_flags_device = ptrs.stopped_flags;
+        mailbox.publication_ok_flags_device = ptrs.publication_ok_flags;
+        mailbox.producer_stream = producer_stream;
+        mailbox.ready_event = std::move(ready_event);
+        mailbox.live_state_epoch = live_replay_state_epoch_;
+        if (!mailbox.valid())
+        {
+            if (error)
+                *error = "device logical-state mailbox is incomplete";
+            return false;
+        }
+
+        device_resident_logical_sequence_state_mailbox_ = mailbox;
+        device_resident_logical_sequence_host_adopted_epoch_ = 0;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_resident_logical_state_mailboxes",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"requests", std::to_string(request_count)}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::waitForDeviceResidentLogicalSequenceStateMailbox(
+        void *consumer_stream,
+        const char *consumer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+
+        auto &mailbox = device_resident_logical_sequence_state_mailbox_;
+        if (!mailbox.valid())
+            return true;
+        if (mailbox.live_state_epoch != live_replay_state_epoch_)
+        {
+            mailbox.clear();
+            return true;
+        }
+        if (!consumer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox consumer requires an explicit stream");
+            return false;
+        }
+        if (!mailbox.ready_event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox is valid without a readiness event");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const bool same_stream = mailbox.producer_stream == consumer_stream;
+        if (!same_stream &&
+            !backend->streamWaitEvent(
+                consumer_stream,
+                mailbox.ready_event.get(),
+                state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue resident logical-state mailbox wait for consumer="
+                      << (consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_resident_logical_state_mailbox_waits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"consumer", consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"},
+             {"same_stream", boolTag(same_stream)},
+             {"live_state_epoch", std::to_string(mailbox.live_state_epoch)}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(
+        const DeviceResidentLogicalSequenceStateHandle &handle,
+        void *producer_stream,
+        const char *producer_name)
+    {
+        auto &mailbox = device_resident_logical_sequence_state_mailbox_;
+        if (!state_.device_id.is_gpu() || !mailbox.valid())
+            return true;
+        if (!producer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget requires an explicit producer stream");
+            return false;
+        }
+
+        /*
+         * This helper is deliberately stricter than deviceResidentLogicalSequenceState():
+         * it only refreshes a mailbox that the just-finished shifted-KV commit used
+         * before recordShiftedMTPKVReplayStateMutation() advanced the live epoch.
+         * Pointer identity plus the previous epoch prevents an unrelated mutation
+         * from laundering a stale handle into the next sidecar.
+         */
+        const uint64_t previous_epoch =
+            live_replay_state_epoch_ > 0 ? live_replay_state_epoch_ - 1 : 0;
+        if (!mailbox.ownsHandle(handle, previous_epoch))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget received a non-owned pre-mutation handle");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget could not resolve backend");
+            return false;
+        }
+
+        void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
+        if (!raw_event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget could not create readiness event");
+            return false;
+        }
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+        std::shared_ptr<void> ready_event(
+            raw_event,
+            [backend, device_ordinal](void *event)
+            {
+                if (event)
+                    backend->destroyEvent(event, device_ordinal);
+            });
+        if (!backend->recordEvent(
+                ready_event.get(),
+                state_.device_id.gpu_ordinal(),
+                producer_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state mailbox retarget could not record readiness event");
+            return false;
+        }
+
+        const uint64_t old_host_adopted_epoch =
+            device_resident_logical_sequence_host_adopted_epoch_;
+        mailbox.producer_stream = producer_stream;
+        mailbox.ready_event = std::move(ready_event);
+        mailbox.live_state_epoch = live_replay_state_epoch_;
+        if (old_host_adopted_epoch == previous_epoch)
+        {
+            /*
+             * The shifted-MTP KV append changes verifier input state only.  The
+             * host-visible logical positions/sequence lengths still mirror the
+             * device rows that were adopted immediately after publication.
+             */
+            device_resident_logical_sequence_host_adopted_epoch_ =
+                live_replay_state_epoch_;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_resident_logical_state_mailbox_retargets",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"producer", producer_name && producer_name[0] != '\0'
+                              ? producer_name
+                              : "unknown"},
+             {"previous_live_state_epoch", std::to_string(previous_epoch)},
+             {"live_state_epoch", std::to_string(mailbox.live_state_epoch)}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::supportsDeviceResidentMTPSpecStatePublication() const
+    {
+        /*
+         * Direct publication is safe only when both halves of the handoff are
+         * present: the cache can update device-visible head/count mirrors from
+         * device metadata, and DGO can expose the resulting logical state through
+         * a resident mailbox until the compatibility host bridge adopts matching
+         * host mirrors.  Callers still roll back from the live prefix checkpoint
+         * if any later part of the transaction fails.
+         */
+        return supportsMTPSpecStatePublication() &&
+               supportsDeviceResidentLogicalSequenceStatePublication();
+    }
+
+    bool DeviceGraphOrchestrator::supportsLogicalMTPVerifierBaseCheckpoint() const
+    {
+        /*
+         * A token-count-only verifier base can be replayed exactly for KV-only
+         * decoder state. Hybrid/GDN models need the recurrent and short-conv
+         * payload captured in PrefixStateSnapshot; otherwise replay checkers
+         * restore positions while leaving live recurrent state from a later row.
+         */
+        return graph_builder_ &&
+               graph_builder_->config().mtp.enabled &&
+               state_.kv_cache != nullptr &&
+               !mtpSpecStatePublicationRequiresCapturedStage();
+    }
+
+    bool DeviceGraphOrchestrator::supportsDeviceResidentLogicalSequenceStatePublication() const
+    {
+        /*
+         * This is intentionally split from IKVCache device publication.  A cache
+         * can update its device head/count mirrors only when DGO also records a
+         * resident logical-state mailbox and refuses stale host-position reads
+         * until adoption.  Host graph signatures are safe after adoption because
+         * adoptDeviceResidentMTPSpecPublishedHostState() refreshes both DGO
+         * position mirrors and KV cache host head/count mirrors from the same
+         * validated step plan.
+         */
+        return state_.device_id.is_gpu() &&
+               state_.kv_cache != nullptr &&
+               state_.kv_cache->supportsDeviceResidentSequenceStatePublication();
+    }
+
+    bool DeviceGraphOrchestrator::publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
+        const DeviceSpeculativePublicationRequest &request,
+        std::string *error)
+    {
+        std::string prepare_error;
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "device_resident_publication_prepare_metadata",
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"request_count", std::to_string(request.request_count)},
+                 {"max_draft_tokens", std::to_string(request.max_draft_tokens)}});
+            if (!prepareDeviceResidentMTPSpecPublicationMetadata(
+                    request,
+                    &prepare_error))
+            {
+                if (error)
+                {
+                    *error =
+                        "device-resident MTP publication metadata preflight failed: " +
+                        prepare_error;
+                }
+                return false;
+            }
+        }
+
+        if (!state_.kv_cache)
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication is not supported yet: "
+                    "runner has no live KV cache";
+            }
+            return false;
+        }
+
+        const MTPSpecDecodeMetadataDevicePointers &ptrs =
+            mtp_spec_decode_metadata_binding_.devicePointers();
+        auto verifier_graph = forward_engine_
+                                  ? forward_engine_->lastAllPositionVerifierForwardGraph()
+                                  : decltype(forward_engine_->lastAllPositionVerifierForwardGraph()){};
+        if (!verifier_graph || !*verifier_graph || !verifier_graph->graph)
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication requires the verifier graph that produced the compact outcome";
+            }
+            return false;
+        }
+        if (!verifier_graph->is_decode || !verifier_graph->all_position_logits)
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication requires the last forward to be an all-position verifier graph";
+            }
+            return false;
+        }
+        if (request.request_count != 1 &&
+            mtpSpecStatePublicationRequiresCapturedStage())
+        {
+            if (error)
+            {
+                // GDN and short-conv live state is still one backend-owned
+                // state buffer per layer. Batched resident publication must
+                // first introduce per-request recurrent state storage; looping
+                // this scalar restore would silently publish the wrong state.
+                *error =
+                    "device-resident MTP hybrid recurrent-state publication currently supports one request; "
+                    "per-request GDN/short-conv live-state storage and batched device-indexed verifier "
+                    "state restore are not implemented";
+            }
+            return false;
+        }
+        if (!state_.kv_cache->supportsDeviceResidentSequenceStatePublication())
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication is not supported yet: "
+                    "KV cache cannot consume target cache counts and accepted "
+                    "state counts from device metadata";
+            }
+            return false;
+        }
+
+        if (!supportsDeviceResidentLogicalSequenceStatePublication())
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication is not supported yet: "
+                    "DGO logical positions/sequence lengths and graph "
+                    "signatures are still host-owned";
+            }
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication is not supported yet: "
+                    "runner could not resolve a backend for shifted-cache metadata derivation";
+            }
+            return false;
+        }
+
+        if (request.publish_mtp_shifted_kv &&
+            !waitForPendingShiftedMTPKVReady(
+                request.outcome.stream,
+                "mtp_spec_state_publication_device_resident"))
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication could not order after deferred shifted MTP KV append";
+            }
+            return false;
+        }
+        if (!waitForPendingAllPositionVerifierStateReady(
+                request.outcome.stream,
+                "mtp_spec_state_publication_device_resident"))
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication could not order after deferred all-position verifier state capture";
+            }
+            return false;
+        }
+
+        IKVCache::DeviceSequenceStatePublicationRequest kv_request;
+        kv_request.request_count = request.request_count;
+        kv_request.first_seq_idx = 0;
+        kv_request.target_cached_tokens_device = ptrs.target_cached_tokens;
+        kv_request.accepted_state_counts_device = ptrs.accepted_state_counts;
+        kv_request.publication_ok_flags_device = ptrs.publication_ok_flags;
+        kv_request.stream = request.outcome.stream;
+
+        std::string kv_error;
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "device_resident_publication_main_kv",
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"request_count", std::to_string(request.request_count)}});
+            if (!state_.kv_cache->publishSequenceStateFromDeviceMetadata(
+                    kv_request,
+                    &kv_error))
+            {
+                if (error)
+                {
+                    *error =
+                        "device-resident MTP state publication is not supported yet: " +
+                        (kv_error.empty()
+                             ? std::string("KV cache rejected device-resident sequence-state publication")
+                             : kv_error);
+                }
+                return false;
+            }
+        }
+
+        if (request.publish_mtp_shifted_kv)
+        {
+            if (!ptrs.shifted_target_cached_tokens ||
+                !ptrs.shifted_accepted_state_counts)
+            {
+                if (error)
+                {
+                    *error =
+                        "device-resident MTP state publication is not supported yet: "
+                        "shifted MTP KV publication buffers are not bound";
+                }
+                return false;
+            }
+            if (state_.mtp_kv_caches.empty())
+            {
+                if (error)
+                {
+                    *error =
+                        "device-resident MTP state publication requires initialized shifted MTP KV caches";
+                }
+                return false;
+            }
+
+            for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
+            {
+                auto &cache = state_.mtp_kv_caches[depth];
+                if (!cache)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "device-resident MTP state publication encountered an uninitialized shifted MTP KV cache";
+                    }
+                    return false;
+                }
+                if (!cache->supportsDeviceResidentSequenceStatePublication())
+                {
+                    if (error)
+                    {
+                        *error =
+                            "device-resident MTP state publication requires every shifted MTP KV cache to consume device metadata";
+                    }
+                    return false;
+                }
+
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "device_resident_publication_shifted_kv_metadata",
+                        perfPhaseName(),
+                        state_.device_id.toString(),
+                        {{"request_count", std::to_string(request.request_count)},
+                         {"depth", std::to_string(depth)}});
+                    if (!backend->enqueueDeriveShiftedSpeculativePublicationMetadata(
+                            request.outcome.meta_device,
+                            request.outcome.meta_stride,
+                            ptrs.base_cached_tokens,
+                            request.request_count,
+                            request.max_draft_tokens,
+                            request.max_draft_tokens,
+                            static_cast<int>(depth),
+                            state_.device_id.gpu_ordinal(),
+                            request.outcome.stream,
+                            ptrs.shifted_target_cached_tokens,
+                            ptrs.shifted_accepted_state_counts,
+                            ptrs.publication_ok_flags))
+                    {
+                        if (error)
+                        {
+                            *error =
+                                "device-resident MTP state publication could not derive shifted MTP KV counts for depth " +
+                                std::to_string(depth);
+                        }
+                        return false;
+                    }
+                }
+
+                IKVCache::DeviceSequenceStatePublicationRequest shifted_request;
+                shifted_request.request_count = request.request_count;
+                shifted_request.first_seq_idx = 0;
+                shifted_request.target_cached_tokens_device =
+                    ptrs.shifted_target_cached_tokens;
+                shifted_request.accepted_state_counts_device =
+                    ptrs.shifted_accepted_state_counts;
+                shifted_request.publication_ok_flags_device =
+                    ptrs.publication_ok_flags;
+                shifted_request.stream = request.outcome.stream;
+
+                std::string shifted_error;
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "device_resident_publication_shifted_kv",
+                        perfPhaseName(),
+                        state_.device_id.toString(),
+                        {{"request_count", std::to_string(request.request_count)},
+                         {"depth", std::to_string(depth)}});
+                    if (!cache->publishSequenceStateFromDeviceMetadata(
+                            shifted_request,
+                            &shifted_error))
+                    {
+                        if (error)
+                        {
+                            *error =
+                                "device-resident MTP state publication could not publish shifted MTP KV depth " +
+                                std::to_string(depth) + ": " +
+                                (shifted_error.empty()
+                                     ? std::string("cache rejected device-resident sequence-state publication")
+                                     : shifted_error);
+                        }
+                        return false;
+                    }
+                }
+            }
+        }
+
+        /*
+         * Device-resident publication must leave every piece of live verifier
+         * state at the accepted row before the next sidecar runs.  The compact
+         * stochastic reducer already derived the accepted verifier row into
+         * `accepted_state_slot_indices`; restore GDN/short-conv state and
+         * terminal hidden directly from that device metadata instead of waiting
+         * for the compatibility host outcome bridge to rebuild a host plan.
+         */
+        MTPSpecStepPlan direct_state_plan;
+        direct_state_plan.request_index = 0;
+        direct_state_plan.request_id = 0;
+        direct_state_plan.draft_count = request.max_draft_tokens - 1;
+        direct_state_plan.target_rows = request.max_draft_tokens;
+        /*
+         * Device-indexed recurrent-state publication restores from
+         * ptrs.accepted_state_slot_indices, not from host-visible token counts.
+         * Keep these legacy plan fields neutral so the hot path cannot quietly
+         * depend on a host base-cache shadow.
+         */
+        direct_state_plan.base_cached_tokens = 0;
+        direct_state_plan.target_cached_tokens =
+            direct_state_plan.base_cached_tokens;
+        direct_state_plan.accepted_count = 0;
+        direct_state_plan.publish_mtp_shifted_kv = request.publish_mtp_shifted_kv;
+
+        MTPSpecStatePublicationResult state_result;
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "device_resident_publication_recurrent_state",
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"request_count", std::to_string(request.request_count)},
+                 {"max_draft_tokens", std::to_string(request.max_draft_tokens)}});
+            state_result =
+                llaminar2::publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+                    direct_state_plan,
+                    ptrs.accepted_state_slot_indices,
+                    *verifier_graph->graph,
+                    state_.device_id,
+                    request.outcome.stream,
+                    /*require_captured_stage=*/mtpSpecStatePublicationRequiresCapturedStage());
+        }
+        if (!state_result.ok)
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication could not restore accepted verifier recurrent state: " +
+                    state_result.error;
+            }
+            return false;
+        }
+
+        if (request.publish_mtp_shifted_kv)
+        {
+            const int total_graph_rows =
+                verifier_graph->signature.seq_len *
+                verifier_graph->signature.batch_size;
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "device_resident_publication_terminal_hidden",
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"request_count", std::to_string(request.request_count)},
+                 {"total_graph_rows", std::to_string(total_graph_rows)}});
+            if (!selectMTPTerminalHiddenRowsFromDeviceAcceptedState(
+                    request.request_count,
+                    total_graph_rows,
+                    request.outcome.stream))
+            {
+                if (error)
+                {
+                    *error =
+                        "device-resident MTP state publication could not restore accepted terminal hidden row";
+                }
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "spec_state_terminal_hidden_publications",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"implementation", "device_resident"},
+                 {"requests", std::to_string(request.request_count)},
+                 {"target_rows", std::to_string(verifier_graph->signature.seq_len)}});
+        }
+
+        handleLivePrefixReplayStateAfterMutation(
+            LivePrefixMutationReason::AcceptedSpecPublication,
+            "mtp_spec_state_publication_device_resident",
+            /*preserve_gpu_replay_state=*/false);
+
+        {
+            std::string mailbox_error;
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "device_resident_publication_record_mailbox",
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"request_count", std::to_string(request.request_count)}});
+            if (!recordDeviceResidentLogicalSequenceStateMailbox(
+                    ptrs,
+                    request.request_count,
+                    request.outcome.stream,
+                    &mailbox_error))
+            {
+                if (error)
+                {
+                    *error =
+                        mailbox_error.empty()
+                            ? "device-resident MTP state publication could not record logical-state mailbox"
+                            : "device-resident MTP state publication could not record logical-state mailbox: " +
+                                  mailbox_error;
+                }
+                return false;
+            }
+        }
+        if (!recordLivePrefixMutationReady(
+                request.outcome.stream,
+                "mtp_spec_state_publication_device_resident"))
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication could not record live-prefix mutation readiness";
+            }
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_resident_kv_sequence_state_publications",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"request_count", std::to_string(request.request_count)}});
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "spec_state_publications",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"implementation", "device_resident"},
+             {"requests", std::to_string(request.request_count)},
+             {"publishes_mtp_shifted_kv",
+              request.publish_mtp_shifted_kv ? "true" : "false"},
+	             {"restored_stages", std::to_string(state_result.restored_stage_count)},
+	             {"skipped_stages", std::to_string(state_result.skipped_stage_count)}});
+        if (forward_engine_)
+            forward_engine_->clearLastAllPositionVerifierForwardGraph();
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::adoptDeviceResidentMTPSpecPublishedHostState(
+        const MTPSpecStepPlanBatch &plans,
+        std::string *error)
+    {
+        auto fail = [&](std::string reason) -> bool
+        {
+            if (error)
+                *error = reason;
+            LOG_ERROR("[DeviceGraphOrchestrator] " << reason);
+            return false;
+        };
+
+        if (!plans.ok)
+        {
+            return fail("device-resident host-state adoption received an invalid plan batch: " +
+                        plans.error);
+        }
+        if (plans.request_count <= 0 ||
+            static_cast<int>(plans.steps.size()) != plans.request_count)
+        {
+            return fail("device-resident host-state adoption received inconsistent request count");
+        }
+
+        const auto &mailbox =
+            device_resident_logical_sequence_state_mailbox_;
+        if (!mailbox.valid() ||
+            mailbox.live_state_epoch != live_replay_state_epoch_)
+        {
+            return fail("device-resident host-state adoption requires the current logical-state mailbox");
+        }
+        if (mailbox.request_count != plans.request_count)
+        {
+            std::ostringstream msg;
+            msg << "device-resident host-state adoption request-count mismatch: mailbox="
+                << mailbox.request_count << " plan=" << plans.request_count;
+            return fail(msg.str());
+        }
+        if (plans.request_count > state_.batch_size)
+        {
+            return fail("device-resident host-state adoption exceeds initialized runner batch size");
+        }
+        if (static_cast<int>(state_.positions.size()) < plans.request_count ||
+            static_cast<int>(state_.sequence_lengths.size()) < plans.request_count)
+        {
+            return fail("device-resident host-state adoption requires per-request host mirrors");
+        }
+
+        std::vector<bool> seen_request(static_cast<size_t>(plans.request_count), false);
+        std::vector<int32_t> target_cached_tokens(
+            static_cast<size_t>(plans.request_count),
+            0);
+        std::vector<int32_t> accepted_state_counts(
+            static_cast<size_t>(plans.request_count),
+            0);
+        std::vector<int32_t> publication_ok_flags(
+            static_cast<size_t>(plans.request_count),
+            0);
+        for (const MTPSpecStepPlan &step : plans.steps)
+        {
+            if (step.request_index < 0 ||
+                step.request_index >= plans.request_count)
+            {
+                return fail("device-resident host-state adoption received an out-of-range request index");
+            }
+            if (seen_request[static_cast<size_t>(step.request_index)])
+            {
+                return fail("device-resident host-state adoption received a duplicate request index");
+            }
+            seen_request[static_cast<size_t>(step.request_index)] = true;
+            if (step.target_cached_tokens !=
+                step.base_cached_tokens + step.accepted_count)
+            {
+                return fail("device-resident host-state adoption target cache count drifted from base plus accepted");
+            }
+            target_cached_tokens[static_cast<size_t>(step.request_index)] =
+                step.target_cached_tokens;
+            accepted_state_counts[static_cast<size_t>(step.request_index)] =
+                step.accepted_count;
+            publication_ok_flags[static_cast<size_t>(step.request_index)] = 1;
+        }
+
+        for (bool seen : seen_request)
+        {
+            if (!seen)
+                return fail("device-resident host-state adoption plan is missing a request index");
+        }
+
+        if (!state_.kv_cache)
+        {
+            return fail("device-resident host-state adoption requires a live KV cache");
+        }
+        IKVCache::HostSequenceStatePublicationRequest kv_host_request;
+        kv_host_request.request_count = plans.request_count;
+        kv_host_request.first_seq_idx = 0;
+        kv_host_request.target_cached_tokens = target_cached_tokens;
+        kv_host_request.accepted_state_counts = accepted_state_counts;
+        kv_host_request.publication_ok_flags = publication_ok_flags;
+
+        std::string kv_host_error;
+        if (!state_.kv_cache->adoptSequenceStateFromHostMetadata(
+                kv_host_request,
+                &kv_host_error))
+        {
+            return fail(
+                kv_host_error.empty()
+                    ? "device-resident host-state adoption could not update KV host mirrors"
+                    : "device-resident host-state adoption could not update KV host mirrors: " +
+                          kv_host_error);
+        }
+
+        /*
+         * Device publication advanced every shifted MTP KV cache on the
+         * verifier stream.  Refresh the matching host mirrors from the same
+         * step plan before exposing host-visible positions.  Depth d owns the
+         * sequence shifted by d + 1 rows, so its target is
+         * max(0, main_target - d - 1) and its wrapped-head delta is the
+         * difference from the prior shifted length.
+         */
+        for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
+        {
+            auto &cache = state_.mtp_kv_caches[depth];
+            if (!cache)
+                return fail("device-resident host-state adoption encountered an uninitialized shifted MTP KV cache");
+
+            std::vector<int32_t> shifted_target_cached_tokens(
+                static_cast<size_t>(plans.request_count),
+                0);
+            std::vector<int32_t> shifted_accepted_state_counts(
+                static_cast<size_t>(plans.request_count),
+                0);
+
+            for (const MTPSpecStepPlan &step : plans.steps)
+            {
+                const int shift = static_cast<int>(depth) + 1;
+                const int base_shifted =
+                    std::max(0, step.base_cached_tokens - shift);
+                const int target_shifted =
+                    computeMTPShiftedKVTargetCachedTokens(
+                        step,
+                        static_cast<int>(depth));
+                if (target_shifted < base_shifted)
+                {
+                    return fail("device-resident host-state adoption computed a negative shifted MTP KV delta");
+                }
+
+                const size_t idx =
+                    static_cast<size_t>(step.request_index);
+                shifted_target_cached_tokens[idx] = target_shifted;
+                shifted_accepted_state_counts[idx] =
+                    target_shifted - base_shifted;
+            }
+
+            IKVCache::HostSequenceStatePublicationRequest shifted_host_request;
+            shifted_host_request.request_count = plans.request_count;
+            shifted_host_request.first_seq_idx = 0;
+            shifted_host_request.target_cached_tokens =
+                std::move(shifted_target_cached_tokens);
+            shifted_host_request.accepted_state_counts =
+                std::move(shifted_accepted_state_counts);
+            shifted_host_request.publication_ok_flags = publication_ok_flags;
+
+            std::string shifted_host_error;
+            if (!cache->adoptSequenceStateFromHostMetadata(
+                    shifted_host_request,
+                    &shifted_host_error))
+            {
+                return fail(
+                    shifted_host_error.empty()
+                        ? "device-resident host-state adoption could not update shifted MTP KV host mirrors"
+                        : "device-resident host-state adoption could not update shifted MTP KV host mirrors: " +
+                              shifted_host_error);
+            }
+        }
+
+        for (const MTPSpecStepPlan &step : plans.steps)
+        {
+            state_.positions[static_cast<size_t>(step.request_index)] =
+                step.target_cached_tokens;
+            state_.sequence_lengths[static_cast<size_t>(step.request_index)] =
+                step.target_cached_tokens;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_resident_host_state_adoptions",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"request_count", std::to_string(plans.request_count)}});
+        device_resident_logical_sequence_host_adopted_epoch_ =
+            mailbox.live_state_epoch;
+        return true;
     }
 
     bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(
@@ -7085,6 +9341,11 @@ namespace llaminar2
             return false;
         };
 
+        if (!supportsMTPSpecStatePublication())
+        {
+            return fail(
+                "MTP spec-state publication is not advertised for this runner");
+        }
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
         {
             return fail("MTP spec-state publication requires an MTP-enabled graph builder");
@@ -7094,7 +9355,7 @@ namespace llaminar2
             return fail("MTP spec-state publication requires an initialized forward engine");
         }
 
-        auto verifier_graph = forward_engine_->lastExecutedForwardGraph();
+        auto verifier_graph = forward_engine_->lastAllPositionVerifierForwardGraph();
         if (!verifier_graph || !*verifier_graph || !verifier_graph->graph)
         {
             return fail("MTP spec-state publication has no cached verifier graph from the last forward");
@@ -7128,6 +9389,13 @@ namespace llaminar2
                 "mtp_spec_state_publication"))
         {
             return fail("MTP spec-state publication could not order after deferred shifted MTP KV append");
+        }
+        if (state_.device_id.is_gpu() &&
+            !waitForPendingAllPositionVerifierStateReady(
+                stream,
+                "mtp_spec_state_publication"))
+        {
+            return fail("MTP spec-state publication could not order after deferred all-position verifier state capture");
         }
 
         if (!state_.kv_cache)
@@ -7231,6 +9499,13 @@ namespace llaminar2
         {
             return fail("MTP spec-state publication could not record live-state readiness");
         }
+        if (state_.device_id.is_gpu() &&
+            !recordLivePrefixMutationReady(
+                stream,
+                "mtp_spec_state_publication"))
+        {
+            return fail("MTP spec-state publication could not record live-prefix mutation readiness");
+        }
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -7241,9 +9516,11 @@ namespace llaminar2
             {{"accepted_count", std::to_string(result.accepted_count)},
              {"main_kv_tokens", std::to_string(kv_result.main_truncated_tokens)},
              {"publishes_mtp_shifted_kv", plan.publish_mtp_shifted_kv ? "true" : "false"},
-             {"restored_stages", std::to_string(result.restored_stage_count)},
-             {"skipped_stages", std::to_string(result.skipped_stage_count)},
-             {"target_rows", std::to_string(plan.target_rows)}});
+	             {"restored_stages", std::to_string(result.restored_stage_count)},
+	             {"skipped_stages", std::to_string(result.skipped_stage_count)},
+	             {"target_rows", std::to_string(plan.target_rows)}});
+        if (forward_engine_)
+            forward_engine_->clearLastAllPositionVerifierForwardGraph();
         return true;
     }
 
@@ -7259,6 +9536,11 @@ namespace llaminar2
             return false;
         };
 
+        if (!supportsMTPSpecStatePublication())
+        {
+            return fail(
+                "MTP batched spec-state publication is not advertised for this runner");
+        }
         if (!plans.ok)
             return fail("MTP batched spec-state publication received an invalid plan batch: " + plans.error);
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
@@ -7280,7 +9562,7 @@ namespace llaminar2
             return fail("MTP batched spec-state publication requires per-request position state");
         }
 
-        auto verifier_graph = forward_engine_->lastExecutedForwardGraph();
+        auto verifier_graph = forward_engine_->lastAllPositionVerifierForwardGraph();
         if (!verifier_graph || !*verifier_graph || !verifier_graph->graph)
             return fail("MTP batched spec-state publication has no cached verifier graph from the last forward");
         if (!verifier_graph->is_decode || !verifier_graph->all_position_logits)
@@ -7365,6 +9647,13 @@ namespace llaminar2
                 "mtp_spec_state_publication_batch"))
         {
             return fail("MTP batched spec-state publication could not order after deferred shifted MTP KV append");
+        }
+        if (state_.device_id.is_gpu() &&
+            !waitForPendingAllPositionVerifierStateReady(
+                stream,
+                "mtp_spec_state_publication_batch"))
+        {
+            return fail("MTP batched spec-state publication could not order after deferred all-position verifier state capture");
         }
         if (!state_.kv_cache)
             return fail("MTP batched spec-state publication requires an initialized main KV cache");
@@ -7457,6 +9746,13 @@ namespace llaminar2
         {
             return fail("MTP batched spec-state publication could not record live-state readiness");
         }
+        if (state_.device_id.is_gpu() &&
+            !recordLivePrefixMutationReady(
+                stream,
+                "mtp_spec_state_publication_batch"))
+        {
+            return fail("MTP batched spec-state publication could not record live-prefix mutation readiness");
+        }
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -7466,9 +9762,219 @@ namespace llaminar2
             state_.device_id.toString(),
             {{"requests", std::to_string(plans.request_count)},
              {"padded_seq_len", std::to_string(padded_seq_len)},
-             {"publishes_mtp_shifted_kv", any_shifted_kv_publication ? "true" : "false"},
-             {"restored_stages", std::to_string(restored_stage_total)},
-             {"skipped_stages", std::to_string(skipped_stage_total)}});
+	             {"publishes_mtp_shifted_kv", any_shifted_kv_publication ? "true" : "false"},
+	             {"restored_stages", std::to_string(restored_stage_total)},
+	             {"skipped_stages", std::to_string(skipped_stage_total)}});
+        if (forward_engine_)
+            forward_engine_->clearLastAllPositionVerifierForwardGraph();
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::prepareDeviceResidentMTPSpecPublicationMetadata(
+        const DeviceSpeculativePublicationRequest &request,
+        std::string *error)
+    {
+        clearDeviceResidentLogicalSequenceStateMailbox();
+
+        auto fail = [&](std::string reason) -> bool
+        {
+            if (error)
+                *error = reason;
+            LOG_ERROR("[DeviceGraphOrchestrator] " << reason);
+            return false;
+        };
+
+        if (!request.valid())
+            return fail("device-resident MTP publication metadata request is invalid");
+        if (!state_.device_id.is_gpu())
+            return fail("device-resident MTP publication metadata requires a GPU runner");
+        if (request.outcome.device != state_.device_id)
+            return fail("device-resident MTP publication metadata device does not match runner device");
+        if (!request.outcome.stream)
+            return fail("device-resident MTP publication metadata requires an explicit verifier stream");
+        if (!forward_engine_)
+            return fail("device-resident MTP publication metadata requires an initialized forward engine");
+
+        auto verifier_graph = forward_engine_->lastAllPositionVerifierForwardGraph();
+        if (!verifier_graph || !*verifier_graph || !verifier_graph->graph)
+            return fail("device-resident MTP publication metadata has no cached verifier graph");
+        if (!verifier_graph->is_decode || !verifier_graph->all_position_logits)
+            return fail("device-resident MTP publication metadata requires the last forward to be an all-position verifier graph");
+        if (verifier_graph->signature.batch_size != request.request_count)
+        {
+            std::ostringstream msg;
+            msg << "device-resident MTP publication metadata request-count mismatch: request="
+                << request.request_count
+                << " graph=" << verifier_graph->signature.batch_size;
+            return fail(msg.str());
+        }
+        if (verifier_graph->signature.seq_len != request.max_draft_tokens)
+        {
+            std::ostringstream msg;
+            msg << "device-resident MTP publication metadata verifier row mismatch: request="
+                << request.max_draft_tokens
+                << " graph=" << verifier_graph->signature.seq_len;
+            return fail(msg.str());
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return fail("device-resident MTP publication metadata could not resolve backend");
+
+        MTPSpecDecodeMetadataShape shape;
+        shape.max_requests = request.request_count;
+        shape.max_draft_tokens = request.max_draft_tokens;
+
+        /*
+         * Hot stochastic decode publishes after every verifier step. The
+         * metadata binding is persistent runner state, so if the existing
+         * workspace already covers this request shape we can reuse the bound
+         * device pointers directly. Falling back to the full graph workspace
+         * allocator scans and rebinds hundreds of verifier stages, which is a
+         * multi-millisecond per-step tax on MoE fixed-depth lanes.
+         */
+        const MTPSpecDecodeMetadataShape current_shape =
+            mtp_spec_decode_metadata_binding_.shape();
+        const bool metadata_workspace_covers_request =
+            mtp_spec_decode_metadata_binding_.hasWorkspace() &&
+            current_shape.max_requests >= shape.max_requests &&
+            current_shape.max_draft_tokens >= shape.max_draft_tokens;
+        if (metadata_workspace_covers_request)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "device_resident_publication_metadata_workspace_reuses",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"requests", std::to_string(request.request_count)},
+                 {"max_draft_tokens", std::to_string(request.max_draft_tokens)}});
+        }
+        else
+        {
+            mtp_spec_decode_metadata_binding_.setShape(shape);
+            if (!ensureDeviceWorkspaceAllocated(
+                    *verifier_graph->graph,
+                    verifier_graph->signature.seq_len))
+            {
+                return fail("device-resident MTP publication metadata could not allocate metadata workspace");
+            }
+        }
+        if (!mtp_spec_decode_metadata_binding_.hasWorkspace())
+        {
+            const std::string &binding_error =
+                mtp_spec_decode_metadata_binding_.bindingError();
+            return fail(
+                binding_error.empty()
+                    ? "device-resident MTP publication metadata workspace is not bound"
+                    : "device-resident MTP publication metadata workspace is invalid: " +
+                          binding_error);
+        }
+
+        const MTPSpecDecodeMetadataDevicePointers &ptrs =
+            mtp_spec_decode_metadata_binding_.devicePointers();
+        if (!ptrs.base_cached_tokens ||
+            !ptrs.target_cached_tokens ||
+            !ptrs.shifted_target_cached_tokens ||
+            !ptrs.shifted_accepted_state_counts ||
+            !ptrs.accepted_state_counts ||
+            !ptrs.accepted_state_slot_indices ||
+            !ptrs.next_condition_tokens ||
+            !ptrs.all_drafts_accepted_flags ||
+            !ptrs.stopped_flags ||
+            !ptrs.publication_ok_flags)
+        {
+            return fail("device-resident MTP publication metadata workspace is missing required buffers");
+        }
+
+        /*
+         * The compact reducer owns accepted counts, but the base cache length
+         * must be captured before verifier replay mutates the live KV count.
+         * prepareAllPositionVerifierGraphMetadata() snapshots that device-owned
+         * count into ptrs.base_cached_tokens.  Future batched callers may provide
+         * a compact device array directly, but host vectors are deliberately not
+         * uploaded here: resident publication must stay free of hot H2D state
+         * mutation.
+         */
+        const size_t base_bytes =
+            sizeof(int32_t) *
+            static_cast<size_t>(request.request_count);
+        if (request.base_cached_tokens_device)
+        {
+            if (!backend->deviceCopyAsync(
+                    ptrs.base_cached_tokens,
+                    request.base_cached_tokens_device,
+                    base_bytes,
+                    state_.device_id.gpu_ordinal(),
+                    request.outcome.stream))
+            {
+                return fail("device-resident MTP publication metadata could not stage device base cache counts");
+            }
+            mtp_publication_base_cache_snapshot_ready_ = true;
+            mtp_publication_base_cache_snapshot_request_count_ =
+                request.request_count;
+        }
+        if (!mtp_publication_base_cache_snapshot_ready_ ||
+            mtp_publication_base_cache_snapshot_request_count_ <
+                request.request_count)
+        {
+            return fail(
+                "device-resident MTP publication metadata requires a "
+                "pre-verifier device base-cache snapshot; host base-cache "
+                "uploads are forbidden");
+        }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_resident_publication_base_cache_device_snapshots_consumed",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"requests", std::to_string(request.request_count)}});
+
+        /*
+         * Derivation is graph-capturable and stream ordered: later KV/state
+         * publication stages can consume these workspace buffers without first
+         * flushing compact stochastic metadata to the CPU.
+         */
+        {
+            PerfStatsCollector::ScopedTimer derive_timer(
+                "mtp",
+                "device_resident_publication_metadata_derive_enqueue",
+                "decode",
+                state_.device_id.toString(),
+                {{"requests", std::to_string(request.request_count)},
+                 {"padded_rows", std::to_string(verifier_graph->signature.seq_len)}});
+            if (!backend->enqueueDeriveSpeculativePublicationMetadata(
+                    request.outcome.meta_device,
+                    request.outcome.meta_stride,
+                    ptrs.base_cached_tokens,
+                    request.request_count,
+                    verifier_graph->signature.seq_len,
+                    request.max_draft_tokens,
+                    state_.device_id.gpu_ordinal(),
+                    request.outcome.stream,
+                    ptrs.accepted_state_slot_indices,
+                    ptrs.target_cached_tokens,
+                    ptrs.accepted_state_counts,
+                    ptrs.publication_ok_flags,
+                    ptrs.next_condition_tokens,
+                    request.outcome.output_tokens_device,
+                    request.outcome.output_token_stride,
+                    ptrs.all_drafts_accepted_flags,
+                    ptrs.stopped_flags))
+            {
+                return fail("device-resident MTP publication metadata derivation failed");
+            }
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "device_resident_publication_metadata_prepares",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"requests", std::to_string(request.request_count)},
+             {"max_draft_tokens", std::to_string(request.max_draft_tokens)}});
         return true;
     }
 
@@ -7532,6 +10038,29 @@ namespace llaminar2
             return false;
         }
 
+        void *stream = nullptr;
+        if (state_.device_id.is_gpu())
+        {
+            stream = explicitGPUStreamForOperation("commitMTPShiftedRowFromCurrentTerminalHidden");
+            if (!stream)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit requires an explicit GPU stream");
+                return false;
+            }
+            /*
+             * Deferred sidecar graph replay can publish its shifted-KV append
+             * through an event instead of a host sync.  Join that producer
+             * before reading cache metadata, otherwise a stale host-side row
+             * count can skip the discard path and over-advance shifted KV.
+             */
+            if (!waitForPendingShiftedMTPKVReady(
+                    stream,
+                    "shifted_row_sequential_metadata"))
+            {
+                return false;
+            }
+        }
+
         const int expected_cached_tokens =
             std::max(0, position_offset - 1 + already_appended_tokens);
         int current_cached_tokens =
@@ -7544,19 +10073,6 @@ namespace llaminar2
                           << current_cached_tokens << " expected=" << expected_cached_tokens
                           << " position_offset=" << position_offset
                           << " already_appended=" << already_appended_tokens);
-                return false;
-            }
-            void *stream = explicitGPUStreamForOperation("commitMTPShiftedRowFromCurrentTerminalHidden");
-            if (state_.device_id.is_gpu() && !stream)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit requires an explicit GPU stream");
-                return false;
-            }
-            if (state_.device_id.is_gpu() &&
-                !waitForPendingShiftedMTPKVReady(
-                    stream,
-                    "shifted_row_sequential_truncate"))
-            {
                 return false;
             }
             if (!cache->truncateSequence(0, expected_cached_tokens, stream))
@@ -7634,6 +10150,11 @@ namespace llaminar2
                     LivePrefixMutationReason::Unknown,
                     "mtp_shifted_row_sequential_commit_workspace_rebind");
             }
+            else
+            {
+                recordShiftedMTPKVReplayStateMutation(
+                    "mtp_shifted_row_sequential_commit");
+            }
         }
         return true;
     }
@@ -7693,6 +10214,19 @@ namespace llaminar2
             return false;
         }
 
+        void *stream = explicitGPUStreamForOperation("commitMTPShiftedRowFromDeviceTargetSample");
+        if (!stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-target MTP shifted-row commit requires an explicit GPU stream");
+            return false;
+        }
+        if (!waitForPendingShiftedMTPKVReady(
+                stream,
+                "shifted_row_device_target_metadata"))
+        {
+            return false;
+        }
+
         const int expected_cached_tokens =
             std::max(0, position_offset - 1 + already_appended_tokens);
         int current_cached_tokens =
@@ -7705,18 +10239,6 @@ namespace llaminar2
                           << current_cached_tokens << " expected=" << expected_cached_tokens
                           << " position_offset=" << position_offset
                           << " already_appended=" << already_appended_tokens);
-                return false;
-            }
-            void *stream = explicitGPUStreamForOperation("commitMTPShiftedRowFromDeviceTargetSample");
-            if (!stream)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Device-target MTP shifted-row commit requires an explicit GPU stream");
-                return false;
-            }
-            if (!waitForPendingShiftedMTPKVReady(
-                    stream,
-                    "shifted_row_device_target_truncate"))
-            {
                 return false;
             }
             if (!cache->truncateSequence(0, expected_cached_tokens, stream))
@@ -7801,6 +10323,222 @@ namespace llaminar2
                 LivePrefixMutationReason::Unknown,
                 "mtp_shifted_row_device_target_commit_workspace_rebind");
         }
+        else
+        {
+            recordShiftedMTPKVReplayStateMutation(
+                "mtp_shifted_row_device_target_commit");
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::commitMTPShiftedRowFromDeviceResidentLogicalState(
+        const DeviceResidentLogicalSequenceStateHandle &logical_state,
+        int request_index,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (!state_.device_id.is_gpu())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit requires a GPU runner");
+            return false;
+        }
+        if (!supportsMTPDeviceDraftTokenInput())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit requires device-token sidecar input support");
+            return false;
+        }
+        if (!logical_state.coversRequest(request_index) ||
+            !device_resident_logical_sequence_state_mailbox_.ownsHandle(
+                logical_state,
+                live_replay_state_epoch_))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit received a stale or foreign mailbox handle");
+            return false;
+        }
+        if (already_appended_tokens < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit received negative already_appended_tokens");
+            return false;
+        }
+        if (position_offset_override < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit requires a device-derived position_offset_override; stale host logical mirrors must not be used");
+            return false;
+        }
+        const int position_offset = position_offset_override;
+
+        IKVCache *cache = state_.mtp_kv_caches.empty() ? nullptr : state_.mtp_kv_caches[0].get();
+        if (!cache)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit requires an initialized MTP KV cache");
+            return false;
+        }
+
+        void *stream = explicitGPUStreamForOperation("commitMTPShiftedRowFromDeviceResidentLogicalState");
+        if (!stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit requires an explicit GPU stream");
+            return false;
+        }
+        if (!waitForDeviceResidentLogicalSequenceStateMailbox(
+                stream,
+                "shifted_row_resident_logical_state_commit"))
+        {
+            return false;
+        }
+        if (!waitForPendingShiftedMTPKVReady(
+                stream,
+                "shifted_row_resident_logical_state_metadata"))
+        {
+            return false;
+        }
+
+        const int expected_cached_tokens =
+            std::max(0, position_offset - 1 + already_appended_tokens);
+        int current_cached_tokens =
+            cache->get_cached_tokens(cache->first_layer_index(), 0);
+        if (current_cached_tokens > expected_cached_tokens)
+        {
+            if (!allow_speculative_discard)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit cache has unexpected extra rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens
+                          << " position_offset=" << position_offset
+                          << " already_appended=" << already_appended_tokens);
+                return false;
+            }
+            if (!cache->truncateSequence(0, expected_cached_tokens, stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit failed to discard speculative rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens);
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "speculative_shifted_rows_discarded",
+                static_cast<double>(current_cached_tokens - expected_cached_tokens),
+                perfPhaseName(),
+                state_.device_id.toString());
+            current_cached_tokens = expected_cached_tokens;
+        }
+        if (current_cached_tokens < expected_cached_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit cache mismatch: current="
+                      << current_cached_tokens << " expected=" << expected_cached_tokens
+                      << " position_offset=" << position_offset
+                      << " already_appended=" << already_appended_tokens);
+            return false;
+        }
+
+        TensorBase *terminal_hidden = nullptr;
+        BufferId terminal_hidden_buffer_id = BufferId::HIDDEN_STATE;
+        if (!resolveMTPTerminalHiddenInput(
+                &terminal_hidden,
+                &terminal_hidden_buffer_id,
+                "commitMTPShiftedRowFromDeviceResidentLogicalState"))
+            return false;
+
+        const int32_t *next_condition_token_device =
+            logical_state.nextConditionTokenDeviceForRequest(request_index);
+        if (!next_condition_token_device)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit has no next-condition token for request="
+                      << request_index);
+            return false;
+        }
+
+        PerfStatsCollector::ScopedTimer timer(
+            "mtp",
+            "shifted_row_resident_logical_state_commit",
+            perfPhaseName(),
+            state_.device_id.toString());
+        const uint64_t workspace_generation_before_commit =
+            workspaceGeneration(state_.device_id);
+        const int verifier_total_rows_before_sidecar =
+            state_.last_forward_seq_len * state_.last_forward_batch_size;
+
+        if (!executeMTPDepth0Batched(
+                /*draft_condition_tokens=*/nullptr,
+                /*token_count=*/1,
+                terminal_hidden,
+                position_offset + already_appended_tokens,
+                kMTPDecodeCatchupContext,
+                /*kv_cache_only=*/true,
+                terminal_hidden_buffer_id,
+                /*defer_final_sync=*/true,
+                next_condition_token_device,
+                /*draft_condition_ready_slot=*/-1,
+                /*draft_condition_ready_is_target=*/false))
+        {
+            return false;
+        }
+
+        /*
+         * executeMTPDepth0Batched() consumes PREFIX_TERMINAL_HIDDEN as the
+         * shifted-KV input, but MoE sidecar stages are free to reuse graph
+         * scratch around that handoff.  The accepted-state publication
+         * contract is stronger: after the correction shifted row is appended,
+         * PREFIX_TERMINAL_HIDDEN must still name the accepted verifier row.
+         * Reselect from the resident device metadata before publishing the
+         * shifted-KV epoch so the next verifier observes the same state that a
+         * serial replay would have restored.
+         */
+        if (verifier_total_rows_before_sidecar <= 0 ||
+            !selectMTPTerminalHiddenRowsFromDeviceAcceptedState(
+                /*row_count=*/1,
+                verifier_total_rows_before_sidecar,
+                stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit failed to restore accepted terminal hidden after sidecar append");
+            return false;
+        }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "shifted_row_resident_terminal_hidden_reselects",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"request_index", std::to_string(request_index)},
+             {"verifier_rows", std::to_string(verifier_total_rows_before_sidecar)}});
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "shifted_rows_committed",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString());
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "shifted_row_resident_logical_state_commits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"request_index", std::to_string(request_index)},
+             {"already_appended", std::to_string(already_appended_tokens)}});
+
+        const uint64_t workspace_generation_after_commit =
+            workspaceGeneration(state_.device_id);
+        if (workspace_generation_after_commit != workspace_generation_before_commit)
+        {
+            handleLivePrefixReplayStateAfterMutation(
+                LivePrefixMutationReason::Unknown,
+                "mtp_shifted_row_resident_logical_state_commit_workspace_rebind");
+        }
+        else
+        {
+            recordShiftedMTPKVReplayStateMutation(
+                "mtp_shifted_row_resident_logical_state_commit");
+            if (!retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(
+                    logical_state,
+                    stream,
+                    "mtp_shifted_row_resident_logical_state_commit"))
+            {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -7810,7 +10548,8 @@ namespace llaminar2
         int already_appended_tokens,
         int main_forward_token_count,
         bool allow_speculative_discard,
-        int position_offset_override)
+        int position_offset_override,
+        int already_appended_shifted_kv_tokens)
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
@@ -7837,6 +10576,18 @@ namespace llaminar2
             return false;
         }
         const int catchup_token_count = token_count - already_appended_tokens;
+        const int resident_shifted_kv_tokens =
+            already_appended_shifted_kv_tokens >= 0
+                ? already_appended_shifted_kv_tokens
+                : already_appended_tokens;
+        if (resident_shifted_kv_tokens < 0 ||
+            resident_shifted_kv_tokens > already_appended_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit received invalid resident shifted-KV count="
+                      << resident_shifted_kv_tokens
+                      << " already_appended_tokens=" << already_appended_tokens);
+            return false;
+        }
         const int hidden_source_row_start = already_appended_tokens - 1;
         const int hidden_source_row_end = hidden_source_row_start + catchup_token_count;
         if (main_forward_token_count <= 0 ||
@@ -7872,8 +10623,25 @@ namespace llaminar2
             return false;
         }
 
+        void *stream = nullptr;
+        if (state_.device_id.is_gpu())
+        {
+            stream = explicitGPUStreamForOperation("commitMTPShiftedRowsFromPartialForward");
+            if (!stream)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit requires an explicit GPU stream");
+                return false;
+            }
+            if (!waitForPendingShiftedMTPKVReady(
+                    stream,
+                    "shifted_row_partial_metadata"))
+            {
+                return false;
+            }
+        }
+
         const int expected_cached_tokens =
-            std::max(0, position_offset - 1 + already_appended_tokens);
+            std::max(0, position_offset - 1 + resident_shifted_kv_tokens);
         int current_cached_tokens =
             cache->get_cached_tokens(cache->first_layer_index(), 0);
         if (current_cached_tokens > expected_cached_tokens)
@@ -7885,26 +10653,15 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit cache has unexpected extra rows: current="
                           << current_cached_tokens << " expected=" << expected_cached_tokens
                           << " position_offset=" << position_offset
-                          << " already_appended=" << already_appended_tokens);
-                return false;
-            }
-            void *stream = explicitGPUStreamForOperation("commitMTPShiftedRowsFromPartialForward");
-            if (state_.device_id.is_gpu() && !stream)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit requires an explicit GPU stream");
-                return false;
-            }
-            if (state_.device_id.is_gpu() &&
-                !waitForPendingShiftedMTPKVReady(
-                    stream,
-                    "shifted_row_partial_truncate"))
-            {
+                          << " already_appended=" << already_appended_tokens
+                          << " resident_shifted_kv=" << resident_shifted_kv_tokens);
                 return false;
             }
             if (!cache->truncateSequence(0, expected_cached_tokens, stream))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit failed to discard speculative rows: current="
-                          << current_cached_tokens << " expected=" << expected_cached_tokens);
+                          << current_cached_tokens << " expected=" << expected_cached_tokens
+                          << " resident_shifted_kv=" << resident_shifted_kv_tokens);
                 return false;
             }
             PerfStatsCollector::addCounter(
@@ -7920,7 +10677,8 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit cache mismatch: current="
                       << current_cached_tokens << " expected=" << expected_cached_tokens
                       << " position_offset=" << position_offset
-                      << " already_appended=" << already_appended_tokens);
+                      << " already_appended=" << already_appended_tokens
+                      << " resident_shifted_kv=" << resident_shifted_kv_tokens);
             return false;
         }
 
@@ -8007,6 +10765,11 @@ namespace llaminar2
                 handleLivePrefixReplayStateAfterMutation(
                     LivePrefixMutationReason::Unknown,
                     "mtp_shifted_row_commit_workspace_rebind");
+            }
+            else
+            {
+                recordShiftedMTPKVReplayStateMutation(
+                    "mtp_shifted_row_commit");
             }
         }
         return true;
@@ -8105,6 +10868,9 @@ namespace llaminar2
 
         mtp_spec_decode_metadata_binding_.setShape(plan.shape);
         pending_mtp_spec_verifier_input_plan_ = plan;
+        mtp_publication_base_cache_snapshot_ready_ = false;
+        mtp_publication_base_cache_snapshot_request_count_ = 0;
+        materialized_mtp_verifier_device_token_row_ = {};
         return true;
     }
 
@@ -8112,6 +10878,13 @@ namespace llaminar2
     {
         pending_mtp_spec_verifier_input_plan_.reset();
         pending_mtp_verifier_device_token_plan_.reset();
+        /*
+         * The scoped verifier plan is cleared immediately after the verifier
+         * forward, but direct publication still needs the pre-verifier
+         * BASE_CACHED_TOKENS snapshot.  The next setMTPSpecVerifierInputPlan()
+         * invalidates this marker before staging another verifier graph.
+         */
+        materialized_mtp_verifier_device_token_row_ = {};
         if (graph_builder_)
             graph_builder_->setRowIndexedAllPositionLogitRows({});
     }
@@ -8231,6 +11004,11 @@ namespace llaminar2
             token_device.toString(),
             {{"total_tokens", std::to_string(plan.total_verifier_input_tokens)},
              {"draft_tokens", std::to_string(plan.draft_token_count)}});
+        materialized_mtp_verifier_device_token_row_.valid = true;
+        materialized_mtp_verifier_device_token_row_.total_verifier_input_tokens =
+            plan.total_verifier_input_tokens;
+        materialized_mtp_verifier_device_token_row_.draft_token_count =
+            plan.draft_token_count;
         return true;
     }
 
@@ -8406,6 +11184,148 @@ namespace llaminar2
             state_.device_id.toString(),
             {{"slot", std::to_string(slot)}});
         return true;
+    }
+
+    bool DeviceGraphOrchestrator::beginPendingGpuTimingMeasurement(
+        const std::string &name,
+        void *stream,
+        std::shared_ptr<void> *out_start_event,
+        std::shared_ptr<void> *out_stop_event)
+    {
+        if (out_start_event)
+            out_start_event->reset();
+        if (out_stop_event)
+            out_stop_event->reset();
+        if (!PerfStatsCollector::isEnabled() || !state_.device_id.is_gpu())
+            return true;
+        if (!stream || !out_start_event || !out_stop_event)
+            return false;
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+        void *raw_start = backend->createTimingEvent(device_ordinal);
+        void *raw_stop = backend->createTimingEvent(device_ordinal);
+        if (!raw_start || !raw_stop)
+        {
+            if (raw_start)
+                backend->destroyEvent(raw_start, device_ordinal);
+            if (raw_stop)
+                backend->destroyEvent(raw_stop, device_ordinal);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "pending_gpu_timing_event_failures",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"name", name}});
+            return true;
+        }
+
+        auto event_deleter =
+            [backend, device_ordinal](void *event)
+        {
+            if (event)
+                backend->destroyEvent(event, device_ordinal);
+        };
+        std::shared_ptr<void> start(raw_start, event_deleter);
+        std::shared_ptr<void> stop(raw_stop, event_deleter);
+        if (!backend->recordEvent(start.get(), device_ordinal, stream))
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "pending_gpu_timing_record_failures",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"name", name}, {"event", "start"}});
+            return true;
+        }
+
+        *out_start_event = std::move(start);
+        *out_stop_event = std::move(stop);
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::finishPendingGpuTimingMeasurement(
+        const std::string &name,
+        void *stream,
+        std::map<std::string, std::string> tags,
+        std::shared_ptr<void> start_event,
+        std::shared_ptr<void> stop_event)
+    {
+        if (!start_event || !stop_event || !stream || !state_.device_id.is_gpu())
+            return;
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return;
+
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+        if (!backend->recordEvent(stop_event.get(), device_ordinal, stream))
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "pending_gpu_timing_record_failures",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"name", name}, {"event", "stop"}});
+            return;
+        }
+
+        pending_gpu_timing_measurements_.push_back(
+            PendingGpuTimingMeasurement{
+                name,
+                std::move(tags),
+                std::move(start_event),
+                std::move(stop_event)});
+    }
+
+    void DeviceGraphOrchestrator::drainPendingGpuTimingMeasurements(
+        IBackend *backend)
+    {
+        if (!backend || !state_.device_id.is_gpu() ||
+            pending_gpu_timing_measurements_.empty())
+        {
+            return;
+        }
+
+        std::vector<PendingGpuTimingMeasurement> pending;
+        pending.swap(pending_gpu_timing_measurements_);
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+        for (const auto &measurement : pending)
+        {
+            float elapsed_ms = 0.0f;
+            if (backend->eventElapsedTimeMs(
+                    measurement.start_event.get(),
+                    measurement.stop_event.get(),
+                    device_ordinal,
+                    &elapsed_ms))
+            {
+                const double clamped_ms =
+                    std::max(0.0, static_cast<double>(elapsed_ms));
+                PerfStatsCollector::recordTimingNs(
+                    "mtp",
+                    measurement.name,
+                    static_cast<uint64_t>(clamped_ms * 1000000.0),
+                    "decode",
+                    state_.device_id.toString(),
+                    measurement.tags);
+            }
+            else
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "pending_gpu_timing_read_failures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"name", measurement.name}});
+            }
+        }
     }
 
     bool DeviceGraphOrchestrator::waitForStochasticDraftSampleReadyRange(
@@ -8725,6 +11645,125 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::recordAllPositionVerifierStateReady(
+        void *producer_stream,
+        const char *producer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+        if (!producer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Deferred all-position verifier state readiness requires an explicit producer stream");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        auto &ready = all_position_verifier_state_ready_;
+        if (!ready.event)
+        {
+            void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
+            if (!raw_event)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create all-position verifier state readiness event");
+                return false;
+            }
+            const int device_ordinal = state_.device_id.gpu_ordinal();
+            ready.event = std::shared_ptr<void>(
+                raw_event,
+                [backend, device_ordinal](void *event)
+                {
+                    if (event)
+                        backend->destroyEvent(event, device_ordinal);
+                });
+        }
+
+        if (!backend->recordEvent(
+                ready.event.get(),
+                state_.device_id.gpu_ordinal(),
+                producer_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to record all-position verifier state readiness event");
+            ready.valid = false;
+            ready.producer_stream = nullptr;
+            return false;
+        }
+
+        ready.valid = true;
+        ready.producer_stream = producer_stream;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "all_position_verifier_state_ready_events",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"producer", producer_name && producer_name[0] != '\0'
+                              ? producer_name
+                              : "unknown"}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::waitForPendingAllPositionVerifierStateReady(
+        void *consumer_stream,
+        const char *consumer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+
+        auto &ready = all_position_verifier_state_ready_;
+        if (!ready.valid)
+            return true;
+        if (!consumer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Deferred all-position verifier state consumer requires an explicit stream");
+            return false;
+        }
+        if (!ready.event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Deferred all-position verifier state is marked valid without an event");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const bool same_stream = ready.producer_stream == consumer_stream;
+        if (!same_stream &&
+            !backend->streamWaitEvent(
+                consumer_stream,
+                ready.event.get(),
+                state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue all-position verifier state wait for consumer="
+                      << (consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "all_position_verifier_state_ready_waits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"consumer", consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"},
+             {"same_stream", boolTag(same_stream)}});
+        clearPendingAllPositionVerifierStateReady();
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::clearPendingAllPositionVerifierStateReady()
+    {
+        all_position_verifier_state_ready_.valid = false;
+        all_position_verifier_state_ready_.producer_stream = nullptr;
+    }
+
     bool DeviceGraphOrchestrator::recordAcceptedSpecPublicationReady(
         void *producer_stream,
         const char *producer_name)
@@ -8848,11 +11887,427 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::waitForPendingAcceptedSpecPublicationReadyForObservation(
+        void *consumer_stream,
+        const char *consumer_name) const
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+        const auto &ready = accepted_spec_publication_ready_;
+        if (!ready.valid)
+            return true;
+        if (!consumer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Accepted spec-state publication observation requires an explicit stream");
+            return false;
+        }
+        if (!ready.event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Accepted spec-state publication observation is marked valid without an event");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const bool same_stream = ready.producer_stream == consumer_stream;
+        if (!same_stream &&
+            !backend->streamWaitEvent(
+                consumer_stream,
+                ready.event.get(),
+                state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue accepted spec-state publication observation wait for consumer="
+                      << (consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "accepted_spec_publication_observation_waits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"consumer", consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"},
+             {"same_stream", boolTag(same_stream)},
+             {"live_state_epoch", std::to_string(ready.live_state_epoch)}});
+        return true;
+    }
+
     void DeviceGraphOrchestrator::clearPendingAcceptedSpecPublicationReady()
     {
         accepted_spec_publication_ready_.valid = false;
         accepted_spec_publication_ready_.producer_stream = nullptr;
         accepted_spec_publication_ready_.live_state_epoch = 0;
+    }
+
+    bool DeviceGraphOrchestrator::recordLivePrefixCheckpointReady(
+        PrefixStateSnapshot *snapshot,
+        void *producer_stream,
+        const char *producer_name) const
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+        if (!snapshot || !snapshot->valid)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Live prefix checkpoint readiness requires a valid snapshot");
+            return false;
+        }
+        if (!producer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Live prefix checkpoint readiness requires an explicit producer stream");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
+        if (!raw_event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to create live prefix checkpoint readiness event");
+            return false;
+        }
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+        std::shared_ptr<void> event(
+            raw_event,
+            [backend, device_ordinal](void *evt)
+            {
+                if (evt)
+                    backend->destroyEvent(evt, device_ordinal);
+            });
+
+        if (!backend->recordEvent(event.get(), device_ordinal, producer_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to record live prefix checkpoint readiness event");
+            return false;
+        }
+
+        snapshot->ready_event = event;
+        snapshot->ready_producer_stream = producer_stream;
+        snapshot->ready_device = state_.device_id;
+        snapshot->ready_event_valid = true;
+
+        live_prefix_checkpoint_ready_.event = std::move(event);
+        live_prefix_checkpoint_ready_.producer_stream = producer_stream;
+        live_prefix_checkpoint_ready_.valid = true;
+        live_prefix_checkpoint_ready_.live_state_epoch = live_replay_state_epoch_;
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "live_prefix_checkpoint_ready_events",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"producer", producer_name && producer_name[0] != '\0'
+                              ? producer_name
+                              : "unknown"},
+             {"live_state_epoch", std::to_string(live_prefix_checkpoint_ready_.live_state_epoch)}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::waitForSnapshotReady(
+        const PrefixStateSnapshot &snapshot,
+        void *consumer_stream,
+        const char *consumer_name) const
+    {
+        if (!state_.device_id.is_gpu() || !snapshot.ready_event_valid)
+            return true;
+        if (!consumer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prefix snapshot readiness wait requires an explicit consumer stream");
+            return false;
+        }
+        if (!snapshot.ready_event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prefix snapshot readiness is marked valid without an event");
+            return false;
+        }
+        if (snapshot.ready_device != state_.device_id)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prefix snapshot readiness belongs to "
+                      << snapshot.ready_device.toString()
+                      << " but restore is running on " << state_.device_id.toString());
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const bool same_stream = snapshot.ready_producer_stream == consumer_stream;
+        if (!same_stream &&
+            !backend->streamWaitEvent(
+                consumer_stream,
+                snapshot.ready_event.get(),
+                state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue prefix snapshot readiness wait for consumer="
+                      << (consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "live_prefix_checkpoint_snapshot_waits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"consumer", consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"},
+             {"same_stream", boolTag(same_stream)}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::waitForPendingLivePrefixCheckpointReady(
+        void *consumer_stream,
+        const char *consumer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+        auto &ready = live_prefix_checkpoint_ready_;
+        if (!ready.valid)
+            return true;
+        if (!consumer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Pending live prefix checkpoint consumer requires an explicit stream");
+            return false;
+        }
+        if (!ready.event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Pending live prefix checkpoint is marked valid without an event");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const bool same_stream = ready.producer_stream == consumer_stream;
+        if (!same_stream &&
+            !backend->streamWaitEvent(
+                consumer_stream,
+                ready.event.get(),
+                state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue live prefix checkpoint source wait for consumer="
+                      << (consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "live_prefix_checkpoint_source_waits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"consumer", consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"},
+             {"same_stream", boolTag(same_stream)},
+             {"live_state_epoch", std::to_string(ready.live_state_epoch)}});
+        clearPendingLivePrefixCheckpointReady();
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::clearPendingLivePrefixCheckpointReady()
+    {
+        live_prefix_checkpoint_ready_.valid = false;
+        live_prefix_checkpoint_ready_.producer_stream = nullptr;
+        live_prefix_checkpoint_ready_.live_state_epoch = 0;
+        live_prefix_checkpoint_ready_.event.reset();
+    }
+
+    bool DeviceGraphOrchestrator::recordLivePrefixMutationReady(
+        void *producer_stream,
+        const char *producer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+        if (!producer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Live prefix mutation readiness requires an explicit producer stream");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        auto &ready = live_prefix_mutation_ready_;
+        if (ready.valid && ready.producer_stream != producer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Live prefix mutation attempted to overwrite an unconsumed event from a different stream");
+            return false;
+        }
+        if (!ready.event)
+        {
+            void *raw_event = backend->createEvent(state_.device_id.gpu_ordinal());
+            if (!raw_event)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create live prefix mutation readiness event");
+                return false;
+            }
+            const int device_ordinal = state_.device_id.gpu_ordinal();
+            ready.event = std::shared_ptr<void>(
+                raw_event,
+                [backend, device_ordinal](void *event)
+                {
+                    if (event)
+                        backend->destroyEvent(event, device_ordinal);
+                });
+        }
+
+        if (!backend->recordEvent(
+                ready.event.get(),
+                state_.device_id.gpu_ordinal(),
+                producer_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to record live prefix mutation readiness event");
+            ready.valid = false;
+            ready.producer_stream = nullptr;
+            ready.live_state_epoch = 0;
+            return false;
+        }
+
+        ready.valid = true;
+        ready.producer_stream = producer_stream;
+        ready.live_state_epoch = live_replay_state_epoch_;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "live_prefix_mutation_ready_events",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"producer", producer_name && producer_name[0] != '\0'
+                              ? producer_name
+                              : "unknown"},
+             {"live_state_epoch", std::to_string(ready.live_state_epoch)}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::waitForPendingLivePrefixMutationReady(
+        void *consumer_stream,
+        const char *consumer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+        auto &ready = live_prefix_mutation_ready_;
+        if (!ready.valid)
+            return true;
+        if (!consumer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Pending live prefix mutation consumer requires an explicit stream");
+            return false;
+        }
+        if (!ready.event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Pending live prefix mutation is marked valid without an event");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const bool same_stream = ready.producer_stream == consumer_stream;
+        if (!same_stream &&
+            !backend->streamWaitEvent(
+                consumer_stream,
+                ready.event.get(),
+                state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue live prefix mutation wait for consumer="
+                      << (consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "live_prefix_mutation_ready_waits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"consumer", consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"},
+             {"same_stream", boolTag(same_stream)},
+             {"live_state_epoch", std::to_string(ready.live_state_epoch)}});
+        clearPendingLivePrefixMutationReady();
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::waitForPendingLivePrefixMutationReadyForObservation(
+        void *consumer_stream,
+        const char *consumer_name) const
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+        const auto &ready = live_prefix_mutation_ready_;
+        if (!ready.valid)
+            return true;
+        if (!consumer_stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Pending live prefix mutation observation requires an explicit stream");
+            return false;
+        }
+        if (!ready.event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Pending live prefix mutation observation is marked valid without an event");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const bool same_stream = ready.producer_stream == consumer_stream;
+        if (!same_stream &&
+            !backend->streamWaitEvent(
+                consumer_stream,
+                ready.event.get(),
+                state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue live prefix mutation observation wait for consumer="
+                      << (consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "live_prefix_mutation_observation_waits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"consumer", consumer_name && consumer_name[0] != '\0'
+                              ? consumer_name
+                              : "unknown"},
+             {"same_stream", boolTag(same_stream)},
+             {"live_state_epoch", std::to_string(ready.live_state_epoch)}});
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::clearPendingLivePrefixMutationReady()
+    {
+        live_prefix_mutation_ready_.valid = false;
+        live_prefix_mutation_ready_.producer_stream = nullptr;
+        live_prefix_mutation_ready_.live_state_epoch = 0;
+        live_prefix_mutation_ready_.event.reset();
     }
 
     bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(
@@ -8889,6 +12344,21 @@ namespace llaminar2
             return false;
         }
 
+        /*
+         * The all-position verifier reads both the main live state and the
+         * shifted MTP KV cache prepared by the immediately preceding sidecar
+         * catch-up step.  Full sidecar forwards publish a logits-stream
+         * handoff, but KV-only catch-up intentionally publishes a narrower
+         * shifted-KV event.  Consume that event here so cached verifier graph
+         * replay cannot race a deferred shifted-cache append.
+         */
+        if (!waitForPendingShiftedMTPKVReady(
+                execution_stream,
+                "all_position_verifier_shifted_mtp_kv"))
+        {
+            return false;
+        }
+
         const DeviceId metadata_device =
             execution_device.is_gpu() ? execution_device : state_.device_id;
         IBackend *backend = getBackendFor(metadata_device);
@@ -8896,6 +12366,13 @@ namespace llaminar2
         {
             LOG_ERROR("[DeviceGraphOrchestrator] No backend for verifier metadata upload on "
                       << metadata_device.toString());
+            return false;
+        }
+        if (!waitForPendingLogitsStream(
+                PendingLogitsStreamRole::MTPSidecar,
+                execution_stream,
+                "all_position_verifier_graph"))
+        {
             return false;
         }
 
@@ -8983,12 +12460,57 @@ namespace llaminar2
             return false;
         }
 
+        const auto &ptrs = mtp_spec_decode_metadata_binding_.devicePointers();
+        if (!ptrs.base_cached_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Verifier metadata workspace has no base-cache snapshot buffer");
+            return false;
+        }
+        if (!state_.kv_cache)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot snapshot verifier base cache count without a KV cache");
+            return false;
+        }
+        const int request_count = std::max(1, plan.shape.max_requests);
+        const int32_t *base_count_device =
+            state_.kv_cache->deviceSequenceCachedTokenCountPtr(/*seq_idx=*/0);
+        if (!base_count_device)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] KV cache cannot expose a device-owned base cached-token count for verifier publication");
+            return false;
+        }
+        /*
+         * Snapshot before verifier graph replay.  The same stream later executes
+         * the verifier, so this D2D copy is ordered before the append/state stages
+         * advance the live KV count.  Publication can then consume
+         * BASE_CACHED_TOKENS after the verifier without any host-side scalar copy.
+         */
+        if (!backend->deviceCopyAsync(
+                ptrs.base_cached_tokens,
+                base_count_device,
+                sizeof(int32_t) * static_cast<size_t>(request_count),
+                metadata_device.gpu_ordinal(),
+                execution_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to snapshot device-owned verifier base cache count");
+            return false;
+        }
+        mtp_publication_base_cache_snapshot_ready_ = true;
+        mtp_publication_base_cache_snapshot_request_count_ = request_count;
+
         PerfStatsCollector::addCounter(
             "mtp",
             "verifier_row_metadata_upload_bytes",
             static_cast<double>(upload.bytes_uploaded),
             "decode",
             metadata_device.toString());
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "verifier_base_cache_device_snapshots",
+            1.0,
+            "decode",
+            metadata_device.toString(),
+            {{"requests", std::to_string(request_count)}});
         PerfStatsCollector::addCounter(
             "mtp",
             "verifier_row_metadata_path",
@@ -9014,11 +12536,22 @@ namespace llaminar2
         (void)input;
         if (!state_.device_id.is_gpu())
             return true;
-        if (!accepted_spec_publication_ready_.valid)
+        const bool has_accepted_publication =
+            accepted_spec_publication_ready_.valid;
+        const bool has_live_checkpoint =
+            live_prefix_checkpoint_ready_.valid;
+        const bool has_live_mutation =
+            live_prefix_mutation_ready_.valid;
+        const bool has_logical_mailbox =
+            device_resident_logical_sequence_state_mailbox_.valid();
+        if (!has_accepted_publication &&
+            !has_live_checkpoint &&
+            !has_live_mutation &&
+            !has_logical_mailbox)
             return true;
         if (!execution_stream)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Pending accepted spec-state publication requires an explicit forward stream");
+            LOG_ERROR("[DeviceGraphOrchestrator] Pending resident live-state handoff requires an explicit forward stream");
             return false;
         }
 
@@ -9026,14 +12559,32 @@ namespace llaminar2
             execution_device.is_gpu() ? execution_device : state_.device_id;
         if (consumer_device != state_.device_id)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Accepted spec-state publication wait requested on "
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident live-state handoff wait requested on "
                       << consumer_device.toString()
                       << " but live state belongs to " << state_.device_id.toString());
             return false;
         }
-        return waitForPendingAcceptedSpecPublicationReady(
+        if (!waitForPendingLivePrefixCheckpointReady(
+                execution_stream,
+                "forward_graph_live_checkpoint_source"))
+        {
+            return false;
+        }
+        if (!waitForPendingAcceptedSpecPublicationReady(
+                execution_stream,
+                "forward_graph_live_state_consumer"))
+        {
+            return false;
+        }
+        if (!waitForPendingLivePrefixMutationReady(
+                execution_stream,
+                "forward_graph_live_prefix_mutation"))
+        {
+            return false;
+        }
+        return waitForDeviceResidentLogicalSequenceStateMailbox(
             execution_stream,
-            "forward_graph_live_state_consumer");
+            "forward_graph_logical_state_consumer");
     }
 
     const float *DeviceGraphOrchestrator::getAllPositionLogits() const
@@ -9089,7 +12640,16 @@ namespace llaminar2
         }
 
         const auto &config = graph_builder_->config();
-        if (!config.isMoE())
+        /*
+         * Treat either the parsed graph config or the architecture name as
+         * authoritative evidence of MoE.  Some Qwen3.6 MoE fixtures share the
+         * qwen35 graph family and can arrive here before every per-graph MoE
+         * field is populated; advertising dense sidecar semantics for those
+         * models lets the verifier skip a required base restore.
+         */
+        const bool model_is_moe =
+            config.isMoE() || isPrefixCacheMoEModel();
+        if (!model_is_moe)
         {
             /*
              * Dense Qwen MTP sidecars are graph-native fragments that write
@@ -9101,24 +12661,34 @@ namespace llaminar2
         }
 
         /*
-         * SingleDevice GPU MoE with replicated experts now has the same
-         * preservation proof as dense: CUDA/ROCm real-model parity runs compare
-         * verifier rows from the post-sidecar state against rows from the
-         * restored verifier-base state. Advertising this lets the verifier keep
-         * its segmented graph replay state warm instead of restoring the base
-         * checkpoint before every draft.
-         *
-         * CPU and sparse-overlay MoE stay conservative here. CPU gets no GPU
-         * graph replay benefit from this shortcut, and sparse collectives have
-         * separate scratch/participant ownership contracts that need their own
-         * equivalence guard before they can skip restores.
+         * MoE sidecars still run a full routed FFN fragment before the target
+         * verifier.  All-position verifier-row parity proves the verifier math,
+         * but it does not prove that the preceding sidecar left every main-model
+         * live-state surface untouched.  Keep the verifier-base restore until a
+         * dedicated MoE sidecar-preservation test covers KV, GDN/conv state,
+         * terminal hidden, routed scratch, and overlay collectives.
          */
-        const bool owns_all_routed_experts =
-            !config.moe.expert_parallel_plan &&
-            config.moe.local_expert_start == 0 &&
-            config.moe.local_expert_count < 0;
-        return state_.device_id.is_gpu() &&
-               owns_all_routed_experts;
+        return false;
+    }
+
+    bool DeviceGraphOrchestrator::supportsMTPShiftedRowReuseFromSidecar() const
+    {
+        if (!supportsMTPSidecarPreservesMainState() || !graph_builder_)
+        {
+            return false;
+        }
+
+        /*
+         * Dense sidecars append a shifted row that is equivalent to the first
+         * accepted target-row commit. MoE sidecars keep verifier-base state
+         * isolated, but the accepted shifted row must come from the target
+         * verifier publication path so routed expert state and shifted MTP KV are
+         * committed from the same accepted row.
+         */
+        const auto &config = graph_builder_->config();
+        const bool model_is_moe =
+            config.isMoE() || isPrefixCacheMoEModel();
+        return !model_is_moe;
     }
 
     IGlobalTPContext *DeviceGraphOrchestrator::globalTPContextForMTPCoordination() const
@@ -9177,6 +12747,158 @@ namespace llaminar2
                                             pending_stream,
                                             "mtp_logits"),
             globalTPContextForMTPCoordination());
+    }
+
+    bool DeviceGraphOrchestrator::sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+        int draft_sample_slot,
+        int32_t *out_token)
+    {
+        if (!out_token)
+            return false;
+        *out_token = -1;
+        if (globalTPContextForMTPCoordination())
+        {
+            /*
+             * Multi-rank vocab-sharded MTP logits need a coordinated winner
+             * before a single participant can write the verifier draft slot.
+             * Keep those lanes on the existing host-visible coordinated path
+             * until the TP device-slot contract is implemented domain-wide.
+             */
+            return false;
+        }
+
+        SamplingParams greedy_params;
+        greedy_params.temperature = 0.0f;
+        const int vocab = vocab_size();
+        return sampleStochasticDraftProposalOnDeviceImpl(
+            DeviceLogitsSource::MTP,
+            /*row=*/0,
+            draft_sample_slot,
+            greedy_params,
+            vocab,
+            /*threshold=*/0.0f,
+            out_token);
+    }
+
+    bool DeviceGraphOrchestrator::sampleGreedyFromMainLogitsToDeviceTargetSlot(
+        int target_sample_slot,
+        int32_t *out_token)
+    {
+        if (!supportsDeviceStochasticMTPVerification() ||
+            globalTPContextForMTPCoordination() ||
+            !state_.logits ||
+            !state_.logits->deviceValid() ||
+            !state_.logits->gpu_data_ptr() ||
+            target_sample_slot < 0 ||
+            target_sample_slot >= stochastic_target_row_capacity_ ||
+            !stochastic_target_sample_tokens_dev_ ||
+            !stochastic_verify_accept_probs_dev_ ||
+            !argmax_partial_vals_dev_ ||
+            !argmax_partial_idxs_dev_ ||
+            argmax_partial_capacity_ <= 0)
+        {
+            return false;
+        }
+
+        /*
+         * The first target-token slot is the device-resident owner for this
+         * token until the compact verifier summary returns.  Clear any stale
+         * readiness marker before enqueueing a new argmax into the slot.
+         */
+        stochastic_target_top_k_[static_cast<size_t>(target_sample_slot)] = 0;
+        stochastic_target_distribution_streams_[static_cast<size_t>(target_sample_slot)] = nullptr;
+        clearStochasticTargetSampleReadySlot(target_sample_slot);
+
+        const auto &shape = state_.logits->shape();
+        if (shape.empty())
+            return false;
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+        if (cols == 0 ||
+            rows == 0 ||
+            cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        void *stream = consumePendingLogitsStream(
+            PendingLogitsStreamRole::MainDecode,
+            "sampleGreedyFromMainLogitsToDeviceTargetSlot");
+        if (!stream)
+            stream = explicitGPUStreamForOperation(
+                "sampleGreedyFromMainLogitsToDeviceTargetSlot");
+        if (!stream)
+            return false;
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const float *row_ptr = static_cast<const float *>(state_.logits->gpu_data_ptr());
+        auto *out_token_dev =
+            static_cast<int *>(stochastic_target_sample_tokens_dev_) +
+            target_sample_slot;
+        auto *out_value_dev =
+            static_cast<float *>(stochastic_verify_accept_probs_dev_) +
+            target_sample_slot;
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "first_token_greedy_device_target_slot_enqueue",
+                "decode",
+                state_.device_id.toString(),
+                {{"slot", std::to_string(target_sample_slot)},
+                 {"vocab", std::to_string(cols)}});
+            if (!backend->enqueueArgmaxF32BatchedRowsDevice(
+                    row_ptr,
+                    /*rows=*/1,
+                    static_cast<int>(cols),
+                    state_.device_id.gpu_ordinal(),
+                    stream,
+                    out_value_dev,
+                    out_token_dev,
+                    argmax_partial_vals_dev_,
+                    argmax_partial_idxs_dev_,
+                    argmax_partial_capacity_))
+            {
+                return false;
+            }
+        }
+
+        if (!recordStochasticTargetSampleReady(target_sample_slot, stream))
+            return false;
+
+        if (!out_token)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "first_token_greedy_deferred_host_reads",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"slot", std::to_string(target_sample_slot)}});
+            return true;
+        }
+
+        int32_t token = -1;
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "first_token_greedy_device_target_slot_d2h_sync",
+                "decode",
+                state_.device_id.toString(),
+                {{"slot", std::to_string(target_sample_slot)}});
+            if (!backend->deviceToHostFast(&token,
+                                           out_token_dev,
+                                           sizeof(int),
+                                           state_.device_id.gpu_ordinal(),
+                                           stream))
+            {
+                return false;
+            }
+        }
+        *out_token = token;
+        return token >= 0;
     }
 
     int DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(int row)
@@ -9406,35 +13128,30 @@ namespace llaminar2
             start_row, row_count, out_tokens);
     }
 
-    bool DeviceGraphOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDevice(
+    bool DeviceGraphOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
         const int32_t *draft_tokens,
         int draft_token_count,
         const int32_t *stop_tokens,
         int stop_token_count,
-        DeviceSpeculativeVerifyBatchOutcome *out)
+        DeviceSpeculativeOutcomeHandle *out_handle)
     {
         using namespace sampling_math;
-        if (!out)
+        if (out_handle)
+            *out_handle = DeviceSpeculativeOutcomeHandle{};
+
+        if (!out_handle)
             return false;
-        *out = DeviceSpeculativeVerifyBatchOutcome{};
 
         const int compare_rows = draft_token_count - 1;
         if (!draft_tokens ||
             draft_token_count <= 0 ||
-            draft_token_count > stochastic_target_row_capacity_ ||
+            draft_token_count > kSpeculativeBatchMaxRows ||
             compare_rows < 0 ||
-            compare_rows > stochastic_draft_row_capacity_ ||
+            compare_rows > kSpeculativeBatchMaxRows ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens) ||
-            !state_.device_id.is_gpu() ||
-            !state_.all_position_logits ||
-            !state_.all_position_logits->deviceValid() ||
-            !mtp_verifier_input_tokens_dev_ ||
-            !stochastic_verify_tokens_dev_ ||
-            !stochastic_verify_accept_probs_dev_ ||
-            !stochastic_batch_output_tokens_dev_ ||
-            !stochastic_batch_output_meta_dev_)
+            !state_.all_position_logits)
         {
             return false;
         }
@@ -9465,9 +13182,26 @@ namespace llaminar2
             return false;
         }
 
+        std::array<int, kSpeculativeBatchMaxStopTokens> packed_stop_tokens =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            packed_stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
+
         auto device_opt = tensor->current_device();
-        if (!device_opt.has_value() || !device_opt->is_gpu())
+        if (!state_.device_id.is_gpu() ||
+            draft_token_count > stochastic_target_row_capacity_ ||
+            compare_rows > stochastic_draft_row_capacity_ ||
+            !state_.all_position_logits->deviceValid() ||
+            !mtp_verifier_input_tokens_dev_ ||
+            !stochastic_verify_tokens_dev_ ||
+            !stochastic_verify_accept_probs_dev_ ||
+            !stochastic_batch_output_tokens_dev_ ||
+            !stochastic_batch_output_meta_dev_ ||
+            !device_opt.has_value() ||
+            !device_opt->is_gpu())
+        {
             return false;
+        }
 
         IBackend *backend = getBackendFor(*device_opt);
         const void *gpu_ptr = tensor->gpu_data_ptr();
@@ -9492,24 +13226,52 @@ namespace llaminar2
             return false;
 
         /*
-         * Greedy sidecar sampling still returns host token ids today. Copy the
-         * compact verifier input row to the persistent workspace on the same
-         * stream that produced verifier logits, then the reducer can compare
-         * device tokens without a verifier-row D2H handoff. A later pure
-         * device-token greedy sampler can replace this tiny H2D without
-         * changing the summary contract.
+         * Prefer the device verifier-token row that the verifier graph already
+         * consumed.  Fixed-depth greedy MTP now samples sidecar drafts into
+         * runner-owned device slots, so rebuilding the same row from host token
+         * shadows would add a pure hot-path H2D dependency.  If the caller
+         * installed a device-token plan, a missing or mismatched materialized
+         * row is a coherence bug, not a compatibility fallback.
          */
-        if (!backend->hostToDeviceOnStream(
-                mtp_verifier_input_tokens_dev_,
-                draft_tokens,
-                sizeof(int32_t) * static_cast<size_t>(draft_token_count),
-                device_opt->gpu_ordinal(),
-                stream))
+        const bool prepared_device_tokens_expected =
+            pending_mtp_verifier_device_token_plan_.has_value();
+        const bool use_prepared_device_tokens =
+            materialized_mtp_verifier_device_token_row_.valid &&
+            materialized_mtp_verifier_device_token_row_.total_verifier_input_tokens ==
+                draft_token_count &&
+            materialized_mtp_verifier_device_token_row_.draft_token_count ==
+                compare_rows;
+        if (!use_prepared_device_tokens)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload greedy MTP verifier token row on "
-                      << device_opt->toString());
+            LOG_ERROR("[DeviceGraphOrchestrator] Greedy MTP resident outcome requires a materialized device verifier token row"
+                      << " prepared_plan="
+                      << (prepared_device_tokens_expected ? "true" : "false")
+                      << " expected_tokens=" << draft_token_count
+                      << " expected_drafts=" << compare_rows
+                      << " materialized_valid="
+                      << (materialized_mtp_verifier_device_token_row_.valid ? "true" : "false")
+                      << " materialized_tokens="
+                      << materialized_mtp_verifier_device_token_row_.total_verifier_input_tokens
+                      << " materialized_drafts="
+                      << materialized_mtp_verifier_device_token_row_.draft_token_count);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "greedy_verifier_missing_device_token_rows",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"expected_tokens", std::to_string(draft_token_count)},
+                 {"expected_drafts", std::to_string(compare_rows)}});
             return false;
         }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "greedy_verifier_prepared_device_token_rows",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"tokens", std::to_string(draft_token_count)}});
+        const void *summary_draft_tokens_device = mtp_verifier_input_tokens_dev_;
 
         const auto *base = static_cast<const float *>(gpu_ptr);
         const bool argmax_ok = backend->enqueueArgmaxF32BatchedRowsDevice(
@@ -9530,14 +13292,65 @@ namespace llaminar2
             return false;
         }
 
-        std::array<int, kSpeculativeBatchMaxStopTokens> packed_stop_tokens =
-            {-1, -1, -1, -1, -1, -1, -1, -1};
-        for (int i = 0; i < stop_token_count; ++i)
-            packed_stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
+        std::shared_ptr<void> producer_start_timing_event;
+        std::shared_ptr<void> producer_stop_timing_event;
+        const bool collect_producer_gpu_timing =
+            PerfStatsCollector::isEnabled() && state_.device_id.is_gpu();
+        if (collect_producer_gpu_timing)
+        {
+            const int device_ordinal = device_opt->gpu_ordinal();
+            void *raw_start_event = backend->createTimingEvent(device_ordinal);
+            void *raw_stop_event = backend->createTimingEvent(device_ordinal);
+            if (raw_start_event && raw_stop_event)
+            {
+                producer_start_timing_event.reset(
+                    raw_start_event,
+                    [backend, device_ordinal](void *event)
+                    {
+                        if (event)
+                            backend->destroyEvent(event, device_ordinal);
+                    });
+                producer_stop_timing_event.reset(
+                    raw_stop_event,
+                    [backend, device_ordinal](void *event)
+                    {
+                        if (event)
+                            backend->destroyEvent(event, device_ordinal);
+                    });
+                if (!backend->recordEvent(
+                        producer_start_timing_event.get(),
+                        device_ordinal,
+                        stream))
+                {
+                    producer_start_timing_event.reset();
+                    producer_stop_timing_event.reset();
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "greedy_request_batch_summary_gpu_timing_record_failures",
+                        1.0,
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"event", "start"}});
+                }
+            }
+            else
+            {
+                if (raw_start_event)
+                    backend->destroyEvent(raw_start_event, device_ordinal);
+                if (raw_stop_event)
+                    backend->destroyEvent(raw_stop_event, device_ordinal);
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "greedy_request_batch_summary_gpu_timing_event_failures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString());
+            }
+        }
 
         if (!backend->enqueueSummarizeGreedySpeculativeVerifyBatch(
                 stochastic_verify_tokens_dev_,
-                mtp_verifier_input_tokens_dev_,
+                summary_draft_tokens_device,
                 compare_rows,
                 draft_tokens[0],
                 packed_stop_tokens.data(),
@@ -9552,50 +13365,217 @@ namespace llaminar2
             return false;
         }
 
-        std::array<int32_t, kSpeculativeBatchMaxOutputTokens> output_tokens{};
-        std::array<int, kSpeculativeBatchMetaCount> meta{};
-        if (!backend->deviceToHostFast(output_tokens.data(),
-                                       stochastic_batch_output_tokens_dev_,
-                                       sizeof(int32_t) * output_tokens.size(),
-                                       device_opt->gpu_ordinal(),
-                                       stream) ||
-            !backend->deviceToHostFast(meta.data(),
-                                       stochastic_batch_output_meta_dev_,
-                                       sizeof(int) * meta.size(),
-                                       device_opt->gpu_ordinal(),
-                                       stream))
+        if (producer_stop_timing_event)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Greedy all-position verifier compact summary D2H failed on "
-                      << device_opt->toString());
+            if (!backend->recordEvent(
+                    producer_stop_timing_event.get(),
+                    device_opt->gpu_ordinal(),
+                    stream))
+            {
+                producer_start_timing_event.reset();
+                producer_stop_timing_event.reset();
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "greedy_request_batch_summary_gpu_timing_record_failures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"event", "stop"}});
+            }
+        }
+
+        void *raw_response_ready_event =
+            backend->createEvent(device_opt->gpu_ordinal());
+        if (!raw_response_ready_event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to create greedy outcome response-ready event");
+            return false;
+        }
+        const int device_ordinal = device_opt->gpu_ordinal();
+        std::shared_ptr<void> response_ready_event(
+            raw_response_ready_event,
+            [backend, device_ordinal](void *event)
+            {
+                if (event)
+                    backend->destroyEvent(event, device_ordinal);
+            });
+        if (!backend->recordEvent(
+                response_ready_event.get(),
+                device_ordinal,
+                stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to record greedy outcome response-ready event");
             return false;
         }
 
-        if (meta[kSpecBatchMetaOk] == 0 ||
-            meta[kSpecBatchMetaOutputCount] < 0 ||
-            meta[kSpecBatchMetaOutputCount] > kSpeculativeBatchMaxOutputTokens)
+        if (use_prepared_device_tokens &&
+            pending_mtp_verifier_device_token_plan_ &&
+            pending_mtp_verifier_device_token_plan_->first_token_from_device)
+        {
+            clearStochasticTargetSampleReadySlot(
+                pending_mtp_verifier_device_token_plan_->first_target_sample_slot);
+        }
+
+        out_handle->output_tokens_device =
+            static_cast<const int32_t *>(stochastic_batch_output_tokens_dev_);
+        out_handle->meta_device =
+            static_cast<const int *>(stochastic_batch_output_meta_dev_);
+        out_handle->request_count = 1;
+        out_handle->output_token_stride = kSpeculativeBatchMaxOutputTokens;
+        out_handle->meta_stride = kSpeculativeBatchMetaCount;
+        out_handle->device = state_.device_id;
+        out_handle->stream = stream;
+        out_handle->response_ready_event = std::move(response_ready_event);
+        out_handle->producer_start_timing_event =
+            std::move(producer_start_timing_event);
+        out_handle->producer_stop_timing_event =
+            std::move(producer_stop_timing_event);
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "all_position_greedy_device_resident_outcomes",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"compare_rows", std::to_string(compare_rows)}});
+        return out_handle->valid();
+    }
+
+    bool DeviceGraphOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDevice(
+        const int32_t *draft_tokens,
+        int draft_token_count,
+        const int32_t *stop_tokens,
+        int stop_token_count,
+        DeviceSpeculativeVerifyBatchOutcome *out)
+    {
+        using namespace sampling_math;
+        if (!out)
+            return false;
+        *out = DeviceSpeculativeVerifyBatchOutcome{};
+
+        const int compare_rows = draft_token_count - 1;
+        if (!draft_tokens ||
+            draft_token_count <= 0 ||
+            draft_token_count > kSpeculativeBatchMaxRows ||
+            compare_rows < 0 ||
+            compare_rows > kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens) ||
+            !state_.all_position_logits)
         {
             return false;
         }
-        for (int i = 0; i < meta[kSpecBatchMetaOutputCount]; ++i)
+
+        /*
+         * This first implementation is deliberately full-vocabulary only.
+         * Column-parallel all-position logits need a domain-wide argmax and
+         * summary contract; treating a local shard as global would accept or
+         * reject the wrong draft token.
+         */
+        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel)
+            return false;
+
+        const IGlobalTPContext *global_ctx = globalTPContextForMTPCoordination();
+        if (global_ctx && global_ctx->degree() > 1)
+            return false;
+
+        TensorBase *tensor = state_.all_position_logits.get();
+        const auto &shape = tensor->shape();
+        if (shape.empty())
+            return false;
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+        if (cols == 0 ||
+            static_cast<size_t>(draft_token_count) > rows ||
+            cols > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
-            if (output_tokens[static_cast<size_t>(i)] < 0)
+            return false;
+        }
+
+        std::array<int, kSpeculativeBatchMaxStopTokens> packed_stop_tokens =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            packed_stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
+
+        if (state_.device_id.is_cpu())
+        {
+            /*
+             * CPU runners keep verifier logits host-visible already, so the
+             * compact vLLM-style greedy outcome can use the same shared summary
+             * math without pretending to have a GPU-side reducer. This keeps
+             * the SingleDevice CPU correctness gate symmetric with CUDA/ROCm
+             * while still excluding sharded TP logits above.
+             */
+            const float *logits = tensor->fp32_data();
+            if (!logits)
                 return false;
+
+            std::array<int, kSpeculativeBatchMaxRows> verifier_tokens{};
+            for (int row = 0; row < draft_token_count; ++row)
+            {
+                const float *row_logits =
+                    logits + static_cast<size_t>(row) * static_cast<size_t>(cols);
+                int best = 0;
+                float best_value = row_logits[0];
+                for (int col = 1; col < static_cast<int>(cols); ++col)
+                {
+                    if (row_logits[col] > best_value)
+                    {
+                        best = col;
+                        best_value = row_logits[col];
+                    }
+                }
+                verifier_tokens[static_cast<size_t>(row)] = best;
+            }
+
+            std::array<int, kSpeculativeBatchMaxRows> packed_draft_tokens{};
+            for (int i = 0; i < draft_token_count; ++i)
+                packed_draft_tokens[static_cast<size_t>(i)] = draft_tokens[i];
+
+            std::array<int, kSpeculativeBatchMaxOutputTokens> output_tokens_int{};
+            std::array<int, kSpeculativeBatchMetaCount> meta{};
+            summarize_greedy_speculative_verify_batch(
+                draft_tokens[0],
+                verifier_tokens.data(),
+                packed_draft_tokens.data(),
+                compare_rows,
+                packed_stop_tokens.data(),
+                stop_token_count,
+                output_tokens_int.data(),
+                meta.data());
+
+            std::array<int32_t, kSpeculativeBatchMaxOutputTokens> output_tokens{};
+            for (size_t i = 0; i < output_tokens.size(); ++i)
+                output_tokens[i] = static_cast<int32_t>(output_tokens_int[i]);
+
+            if (!fillSpeculativeVerifyOutcomeFromMeta(output_tokens, meta, out))
+                return false;
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "all_position_greedy_device_batched_rows",
+                static_cast<double>(draft_token_count),
+                "decode",
+                state_.device_id.toString(),
+                {{"compare_rows", std::to_string(compare_rows)},
+                 {"implementation", "cpu_compact_outcome"}});
+            return true;
         }
 
-        out->ok = true;
-        out->output_tokens = output_tokens;
-        out->output_token_count = meta[kSpecBatchMetaOutputCount];
-        out->accepted_speculative_prefix =
-            meta[kSpecBatchMetaAcceptedSpeculativePrefix];
-        out->target_verifier_state_commit_count =
-            meta[kSpecBatchMetaTargetVerifierStateCommitCount];
-        out->ready_token = meta[kSpecBatchMetaReadyToken];
-        out->rejected_verified_token = meta[kSpecBatchMetaRejectedVerifiedToken];
-        out->stopped_on_output = meta[kSpecBatchMetaStoppedOnOutput] != 0;
-        out->all_speculative_accepted =
-            meta[kSpecBatchMetaAllSpeculativeAccepted] != 0;
-        out->consumed_verifier_rows = meta[kSpecBatchMetaConsumedVerifierRows];
-        out->sampled_terminal = meta[kSpecBatchMetaSampledTerminal] != 0;
+        DeviceSpeculativeOutcomeHandle handle;
+        if (!verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
+                draft_tokens,
+                draft_token_count,
+                stop_tokens,
+                stop_token_count,
+                &handle))
+        {
+            return false;
+        }
+
+        if (!copyDeviceSpeculativeOutcomesToHost(handle, out))
+            return false;
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -9612,14 +13592,29 @@ namespace llaminar2
     {
         /*
          * The compact reducer consumes one device's all-position logits tensor.
-         * CPU runners and rank-level sharded TP need different reduction
-         * contracts, so only a concrete GPU device runner advertises this path.
+         * SingleDevice CPU can execute the same reducer contract over
+         * host-visible logits. Rank-level sharded TP still needs a domain-wide
+         * reduction contract, so only concrete CPU/GPU device runners advertise
+         * this path.
          */
-        return state_.device_id.is_gpu();
+        return state_.device_id.is_cpu() || state_.device_id.is_gpu();
     }
 
     PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const
     {
+        void *probe_stream = explicitGPUStreamForOperation("prefixStateProbe");
+        if (state_.device_id.is_gpu() &&
+            (!probe_stream ||
+             !waitForPendingAcceptedSpecPublicationReadyForObservation(
+                 probe_stream,
+                 "prefix_state_probe") ||
+             !waitForPendingLivePrefixMutationReadyForObservation(
+                 probe_stream,
+                 "prefix_state_probe")))
+        {
+            return {};
+        }
+
         PrefixRuntimeStateSnapshot snapshot;
         snapshot.initialized = state_.isInitialized();
         snapshot.has_hidden = static_cast<bool>(state_.hidden);
@@ -9687,8 +13682,12 @@ namespace llaminar2
         if (state_.kv_cache)
         {
             auto cache_probe = inspectKVCacheForPrefixProbe(
-                *state_.kv_cache, "primary", state_.device_id, sequence_count);
-            auto gdn_probes = inspectHybridGDNForPrefixProbe(*state_.kv_cache);
+                *state_.kv_cache,
+                "primary",
+                state_.device_id,
+                sequence_count,
+                probe_stream);
+            auto gdn_probes = inspectHybridGDNForPrefixProbe(*state_.kv_cache, probe_stream);
             snapshot.gdn_layers.insert(snapshot.gdn_layers.end(),
                                        gdn_probes.begin(), gdn_probes.end());
             snapshot.kv_caches.push_back(std::move(cache_probe));
@@ -9701,8 +13700,12 @@ namespace llaminar2
                 continue;
             }
             auto cache_probe = inspectKVCacheForPrefixProbe(
-                *cache, "pp:" + device.to_string(), device, sequence_count);
-            auto gdn_probes = inspectHybridGDNForPrefixProbe(*cache);
+                *cache,
+                "pp:" + device.to_string(),
+                device,
+                sequence_count,
+                probe_stream);
+            auto gdn_probes = inspectHybridGDNForPrefixProbe(*cache, probe_stream);
             snapshot.gdn_layers.insert(snapshot.gdn_layers.end(),
                                        gdn_probes.begin(), gdn_probes.end());
             snapshot.kv_caches.push_back(std::move(cache_probe));
@@ -9719,7 +13722,8 @@ namespace llaminar2
                 *cache,
                 "mtp:" + std::to_string(depth),
                 state_.device_id,
-                sequence_count));
+                sequence_count,
+                probe_stream));
         }
 
         return snapshot;
@@ -9816,6 +13820,8 @@ namespace llaminar2
             return "prefix_restore";
         case LivePrefixMutationReason::PrefixTruncate:
             return "prefix_truncate";
+        case LivePrefixMutationReason::ShiftedMTPKVUpdate:
+            return "shifted_mtp_kv_update";
         case LivePrefixMutationReason::SessionReset:
             return "session_reset";
         case LivePrefixMutationReason::Unknown:
@@ -9850,6 +13856,9 @@ namespace llaminar2
         case LivePrefixMutationReason::PrefixTruncate:
             ++live_state_prefix_truncates_;
             break;
+        case LivePrefixMutationReason::ShiftedMTPKVUpdate:
+            ++live_state_shifted_mtp_kv_updates_;
+            break;
         case LivePrefixMutationReason::SessionReset:
             ++live_state_session_resets_;
             break;
@@ -9866,6 +13875,7 @@ namespace llaminar2
 
     void DeviceGraphOrchestrator::recordLivePrefixSessionReset(const char *operation)
     {
+        clearPendingAllPositionVerifierStateReady();
         clearPendingAcceptedSpecPublicationReady();
         PerfStatsCollector::Tags tags{{"operation", operation ? operation : "unknown"}};
         const LivePrefixMutationRecord mutation =
@@ -9895,11 +13905,148 @@ namespace llaminar2
                                        std::move(tags));
     }
 
+    void DeviceGraphOrchestrator::resetMTPSidecarDepth0ReplayState()
+    {
+        mtp_sidecar_depth0_cache_.resetReplayState();
+        mtp_sidecar_depth0_device_token_cache_.resetReplayState();
+        mtp_sidecar_depth0_chained_cache_.resetReplayState();
+        mtp_sidecar_depth0_chained_device_token_cache_.resetReplayState();
+        mtp_sidecar_depth0_kv_only_cache_.resetReplayState();
+        mtp_sidecar_depth0_kv_only_device_token_cache_.resetReplayState();
+        for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
+        {
+            cache.resetReplayState();
+        }
+    }
+
+    bool DeviceGraphOrchestrator::preservesMTPSidecarReplayAfterSpecPublication() const
+    {
+        if (!state_.device_id.is_gpu() ||
+            !graph_builder_ ||
+            !graph_builder_->config().mtp.enabled)
+        {
+            return false;
+        }
+
+        const auto &config = graph_builder_->config();
+        const bool model_is_moe =
+            config.isMoE() || isPrefixCacheMoEModel();
+        if (!model_is_moe)
+        {
+            /*
+             * Dense sidecars bind fixed stage topology and refresh dynamic
+             * token/position buffers before every replay.  Their replay state
+             * can stay warm across accepted-state publication because the
+             * sidecar-owned first shifted row is decode-equivalent to the
+             * verifier-owned accepted-row commit.
+             */
+            return true;
+        }
+
+        /*
+         * MoE sidecar replay safety is narrower than MoE main-state
+         * preservation.  Qwen35MoEGraph gives MTP sidecars depth-scoped
+         * MoERuntimeTable instances and MTP-owned activation buffers, so routed
+         * top-k metadata and expert grouping scratch are persistent sidecar
+         * metadata rather than shared main-decode state.  That lets the sidecar
+         * graph stay warm across accepted-state publication.  The first shifted
+         * MTP row still comes from verifier publication, so
+         * supportsMTPSidecarPreservesMainState() and
+         * supportsMTPShiftedRowReuseFromSidecar() intentionally remain stricter.
+         */
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::recordShiftedMTPKVReplayStateMutation(
+        const char *operation)
+    {
+        if (!state_.device_id.is_gpu())
+            return;
+
+        if (isPrefixCacheMoEModel())
+        {
+            /*
+             * Qwen MoE shifted-row commits currently reuse depth-0 sidecar
+             * graphs that own routed metadata and expert scratch outside the
+             * main live-state snapshot.  The CUDA depth-1 replay regression
+             * proved that preserving those captured bindings can diverge even
+             * when the public KV/GDN probe matches serial decode.  Treat MoE
+             * shifted KV as a full replay boundary until a dedicated
+             * sidecar-preservation test proves the narrower contract.
+             */
+            handleLivePrefixReplayStateAfterMutation(
+                LivePrefixMutationReason::ShiftedMTPKVUpdate,
+                operation ? operation : "shifted_mtp_kv_update_moe");
+            return;
+        }
+
+        /*
+         * This is deliberately narrower than
+         * handleLivePrefixReplayStateAfterMutation(): shifted MTP KV is sidecar
+         * input state for the next draft, not live main-verifier state.  The
+         * verifier launch still consumes the shifted-KV readiness event in
+         * prepareAllPositionVerifierGraphMetadata(), so the GPU ordering edge
+         * remains explicit without destroying the captured main-verifier graph
+         * on every accepted row.
+         *
+         * Do not clear all_position_verifier_state_ready_ here.  The accepted
+         * state publisher may run after a shifted-row commit and still needs
+         * the verifier event to order recurrent/KV row-snapshot restores after
+         * the all-position verifier graph.  Reset and prefix-restore paths own
+         * abandoned verifier handoff cleanup explicitly.
+         */
+        PerfStatsCollector::Tags tags{
+            {"operation", operation ? operation : "shifted_mtp_kv_update"}};
+        const LivePrefixMutationRecord mutation =
+            recordLivePrefixMutation(
+                LivePrefixMutationReason::ShiftedMTPKVUpdate,
+                operation);
+        tags["mutation_reason"] = mutation.reason_name;
+        tags["previous_live_state_epoch"] =
+            std::to_string(mutation.previous_epoch);
+        tags["live_state_epoch"] = std::to_string(mutation.live_state_epoch);
+        tags["live_state_mutation_count"] =
+            std::to_string(live_state_mutation_count_);
+        tags["shifted_mtp_kv_update_count"] =
+            std::to_string(live_state_shifted_mtp_kv_updates_);
+        tags["forward_replay_reset_scope"] = "shifted_mtp_kv_sidecar_only";
+        tags["replay_state"] = "preserved";
+        tags["sidecar_replay_state"] = "preserved";
+        tags["kernel_dynamic_state"] = "preserved";
+        if (isPrefixCacheMoEModel())
+        {
+            tags["model"] = "moe";
+            tags["moe_placement_epoch"] = std::to_string(moePlacementEpoch());
+        }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "live_prefix_replay_state_after_mutation",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            std::move(tags));
+    }
+
     void DeviceGraphOrchestrator::handleLivePrefixReplayStateAfterMutation(
         LivePrefixMutationReason reason,
         const char *operation,
         bool preserve_gpu_replay_state)
     {
+        if (reason == LivePrefixMutationReason::PrefixRestore)
+        {
+            /*
+             * Prefix restore is a full live-state replacement.  Clearing every
+             * transient handoff here makes the next forward depend only on the
+             * freshly imported snapshot plus the mutation-ready event recorded by
+             * the caller, not on any stream/mailbox token from the discarded
+             * timeline.
+             */
+            clearLivePrefixRestoreTransientHandoffs(operation);
+        }
+        else
+        {
+            clearPendingAllPositionVerifierStateReady();
+        }
         if (reason != LivePrefixMutationReason::AcceptedSpecPublication &&
             reason != LivePrefixMutationReason::RejectedCorrection)
         {
@@ -9921,19 +14068,34 @@ namespace llaminar2
             tags["moe_placement_epoch"] = std::to_string(moePlacementEpoch());
         }
         bool preserves_correction_graph_replay = false;
-        if (state_.device_id.is_gpu() && forward_engine_ && !preserve_gpu_replay_state)
+        if (forward_engine_ && !preserve_gpu_replay_state)
         {
             const bool correction_replay_boundary =
                 reason == LivePrefixMutationReason::AcceptedSpecPublication ||
                 reason == LivePrefixMutationReason::RejectedCorrection;
             if (correction_replay_boundary)
             {
+                const bool preserve_single_token_decode_replay =
+                    !isPrefixCacheMoEModel();
                 const ForwardExecutionEngine::ReplayStateResetSummary summary =
                     forward_engine_->resetCapturedReplayStateForCorrectionReplay(
-                        live_replay_state_epoch_);
+                        live_replay_state_epoch_,
+                        preserve_single_token_decode_replay);
+                /*
+                 * Publication mutates live KV/GDN/terminal state while cached
+                 * graph objects remain alive. GPU dense decode has an
+                 * equivalence proof for rebinding preserved single-token
+                 * replay; CPU MoE does not, and the real-model regression
+                 * proved stale replay can survive even when byte-level model
+                 * state matches serial decode.
+                 */
                 preserves_correction_graph_replay =
-                    summary.preserved_for_stream_rebind > 0 || state_.device_id.is_gpu();
+                    summary.preserved_for_stream_rebind > 0;
                 tags["forward_replay_reset_scope"] = "correction_replay_decode_only";
+                tags["forward_replay_single_token_decode_replay"] =
+                    preserve_single_token_decode_replay
+                        ? "preserved_when_safe"
+                        : "reset_for_moe";
                 tags["forward_replay_reset_cache_count"] =
                     std::to_string(summary.reset_replay_state);
                 tags["forward_replay_stream_rebind_cache_count"] =
@@ -9947,32 +14109,71 @@ namespace llaminar2
             }
             else
             {
-                forward_engine_->resetCapturedReplayState();
-                tags["forward_replay_reset_scope"] = "all";
+                if (reason == LivePrefixMutationReason::PrefixRestore)
+                {
+                    /*
+                     * Prefix restore is a complete replacement of the live
+                     * request state: main KV, hybrid recurrent buffers,
+                     * terminal hidden/logits, MTP KV, positions, and sequence
+                     * lengths all move to a previously captured point. A cached
+                     * ComputeGraph may still own stage objects with
+                     * request-scoped metadata or stable host/device buffer
+                     * bindings from the pre-restore timeline. Rebuilding the
+                     * forward graph on the next token is a small cost at a
+                     * prefix-hit boundary and gives restore the same atomic
+                     * semantics as a fresh continuation.
+                     */
+                    forward_engine_->discardAllCachedGraphs();
+                    tags["forward_replay_reset_scope"] =
+                        "prefix_restore_discard_cached_graphs";
+                }
+                else
+                {
+                    forward_engine_->resetCapturedReplayState();
+                    tags["forward_replay_reset_scope"] = "all";
+                }
             }
 
             /*
-             * Accepted-state publication mutates live KV/position state, but
-             * depth-0 sidecar graphs are shaped exactly like ordinary decode:
-             * they update position/token dynamic params before each launch and
-             * read from stable arena buffers.  Resetting their segmented replay
-             * state here forced every speculative step back through warmup and
-             * erased GPU graph speedups.  Hard restores/truncates still reset
-             * sidecar replay below through the non-publication path.
+             * Sidecar main-state preservation and sidecar graph-replay
+             * preservation are separate contracts.  Dense sidecars can keep
+             * replay warm here, but MoE sidecars must recapture after
+             * accepted-state publication until their full router/expert
+             * metadata path is vLLM-style persistent and equivalence-tested.
              */
-            if (!correction_replay_boundary)
+            const bool preserve_sidecar_replay =
+                state_.device_id.is_gpu() &&
+                correction_replay_boundary &&
+                preservesMTPSidecarReplayAfterSpecPublication();
+            if (!preserve_sidecar_replay)
             {
-                mtp_sidecar_depth0_cache_.resetReplayState();
-                mtp_sidecar_depth0_device_token_cache_.resetReplayState();
-                mtp_sidecar_depth0_chained_cache_.resetReplayState();
-                mtp_sidecar_depth0_chained_device_token_cache_.resetReplayState();
-                mtp_sidecar_depth0_kv_only_cache_.resetReplayState();
-                mtp_sidecar_depth0_kv_only_device_token_cache_.resetReplayState();
-                for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
-                {
-                    cache.resetReplayState();
-                }
-                tags["sidecar_replay_state"] = "reset";
+                /*
+                 * Resetting sidecar graph replay tears down captured segments.
+                 * GraphSegmentCache::reset() synchronizes the explicit capture
+                 * stream before resources are discarded, so this timer makes
+                 * the real recapture/synchronization tax visible in Phase 10
+                 * tuning runs instead of hiding it inside publication latency.
+                 */
+                PerfStatsCollector::ScopedTimer reset_timer(
+                    "mtp",
+                    "sidecar_replay_reset",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"operation", operation ? operation : "unknown"},
+                     {"mutation_reason", tags["mutation_reason"]},
+                     {"correction_replay_boundary",
+                      boolTag(correction_replay_boundary)},
+                     {"reset_scope",
+                      correction_replay_boundary
+                          ? "after_spec_publication"
+                          : "all"},
+                     {"preservation_capability",
+                      boolTag(preservesMTPSidecarReplayAfterSpecPublication())}});
+                resetMTPSidecarDepth0ReplayState();
+                tags["sidecar_replay_state"] =
+                    correction_replay_boundary
+                        ? "reset_after_spec_publication"
+                        : "reset";
             }
             else
             {
@@ -10912,6 +15113,18 @@ namespace llaminar2
         {
             return {};
         }
+        if (!waitForPendingAcceptedSpecPublicationReadyForObservation(
+                stream,
+                "capture_live_prefix_state"))
+        {
+            return {};
+        }
+        if (!waitForPendingLivePrefixMutationReadyForObservation(
+                stream,
+                "capture_live_prefix_state"))
+        {
+            return {};
+        }
 
         snapshot.valid = true;
         snapshot.provenance = PrefixStateProvenance::PayloadCheckpoint;
@@ -10952,8 +15165,36 @@ namespace llaminar2
             handle.kv_payload = handle.kv_storage->data();
             if (layout.includes_hybrid_state && layout.hybrid_state_bytes > 0)
             {
-                handle.hybrid_storage = std::make_shared<std::vector<uint8_t>>(layout.hybrid_state_bytes, 0);
-                handle.hybrid_payload = handle.hybrid_storage->data();
+                /*
+                 * A live payload checkpoint is a replay/rollback primitive,
+                 * not a portable prefix-cache archive.  Keep GPU-owned GDN
+                 * kernel state on the device so restore is a device-to-device
+                 * handoff on the same explicit stream.  The host section is
+                 * still captured because graph setup and diagnostics can
+                 * inspect the hybrid cache mirrors, but those mirrors must not
+                 * be the source of truth for device recurrent state.
+                 */
+                if (state_.device_id.is_gpu() && layout.hybrid_device_state_bytes > 0)
+                {
+                    if (layout.hybrid_host_state_bytes > 0)
+                    {
+                        handle.hybrid_storage =
+                            std::make_shared<std::vector<uint8_t>>(layout.hybrid_host_state_bytes, 0);
+                        handle.hybrid_payload = handle.hybrid_storage->data();
+                    }
+                    handle.device_hybrid_storage =
+                        allocateDeviceByteStorage(layout.hybrid_device_state_bytes, state_.device_id);
+                    if (!handle.device_hybrid_storage)
+                    {
+                        return {};
+                    }
+                }
+                else
+                {
+                    handle.hybrid_storage =
+                        std::make_shared<std::vector<uint8_t>>(layout.hybrid_state_bytes, 0);
+                    handle.hybrid_payload = handle.hybrid_storage->data();
+                }
             }
 
             for (int local_layer = 0; local_layer < layout.fa_layers; ++local_layer)
@@ -11225,6 +15466,18 @@ namespace llaminar2
         {
             return {};
         }
+        if (!waitForPendingAcceptedSpecPublicationReadyForObservation(
+                stream,
+                "capture_live_prefix_checkpoint"))
+        {
+            return {};
+        }
+        if (!waitForPendingLivePrefixMutationReadyForObservation(
+                stream,
+                "capture_live_prefix_checkpoint"))
+        {
+            return {};
+        }
 
         const int draft_tokens =
             graph_builder_ ? std::max(1, graph_builder_->config().mtp.draft_tokens) : 1;
@@ -11242,6 +15495,7 @@ namespace llaminar2
         snapshot.provenance = PrefixStateProvenance::LogicalCheckpoint;
         snapshot.cached_tokens = cached_tokens;
         snapshot.mtp_cached_tokens.assign(state_.mtp_kv_caches.size(), -1);
+        bool queued_async_device_checkpoint_payload = false;
 
         PrefixPayloadLayout main_layout;
         if (cached_tokens > 0)
@@ -11312,8 +15566,15 @@ namespace llaminar2
             handle.key.block_index = 0;
             handle.key.token_start = 0;
             handle.key.token_count = cached_tokens;
-            const bool device_only_checkpoint =
-                state_.device_id.is_gpu() && main_layout.hybrid_device_state_bytes > 0;
+            /*
+             * GPU hybrid checkpoints must keep the host-side GDN mirrors as
+             * well as device kernel state.  The decode graph itself uses the
+             * device payload, but graph setup, recapture, and debug replay can
+             * still consult the host recurrence/conv vectors.  Dropping them
+             * made all-position verifier rows look correct while full replay
+             * restored a mixed old/new recurrent state.
+             */
+            const bool device_only_checkpoint = false;
             handle.layout = liveHybridCheckpointLayout(main_layout, device_only_checkpoint);
             if (live_terminal_hidden_bytes > 0)
             {
@@ -11367,6 +15628,9 @@ namespace llaminar2
                 {
                     return {};
                 }
+                queued_async_device_checkpoint_payload =
+                    state_.device_id.is_gpu() &&
+                    handle.layout.hybrid_device_state_bytes > 0;
             }
             if (live_terminal_hidden_bytes > 0)
             {
@@ -11410,6 +15674,14 @@ namespace llaminar2
                     {{"bytes", std::to_string(live_terminal_hidden_bytes)}});
             }
             snapshot.blocks.push_back(std::move(handle));
+            if (queued_async_device_checkpoint_payload &&
+                !recordLivePrefixCheckpointReady(
+                    &snapshot,
+                    stream,
+                    "capture_live_prefix_checkpoint"))
+            {
+                return {};
+            }
             if (main_layout.includes_hybrid_state && main_layout.hybrid_state_bytes > 0)
             {
                 PerfStatsCollector::addCounter("mtp", "live_prefix_checkpoint_hybrid_state_captures", 1.0, "decode",
@@ -11487,6 +15759,43 @@ namespace llaminar2
         if (state_.device_id.is_gpu() && !stream)
         {
             return fail("missing explicit GPU stream");
+        }
+        if (!waitForPendingLivePrefixCheckpointReady(
+                stream,
+                "restore_live_prefix_state_source"))
+        {
+            return fail("pending live prefix checkpoint source wait failed");
+        }
+        if (!waitForPendingLivePrefixMutationReady(
+                stream,
+                "restore_live_prefix_state_previous_mutation"))
+        {
+            return fail("pending live prefix mutation wait failed");
+        }
+        if (!waitForSnapshotReady(
+                snapshot,
+                stream,
+                "restore_live_prefix_state_snapshot"))
+        {
+            return fail("prefix snapshot readiness wait failed");
+        }
+        if (!waitForPendingLiveGraphProducersBeforePrefixMutation(
+                stream,
+                "restore_live_prefix_state"))
+        {
+            return fail("pending live graph producer wait failed");
+        }
+
+        /*
+         * Restoring KV/GDN/position state invalidates any previously current
+         * terminal-hidden sidecar input unless this snapshot explicitly
+         * carries a matching terminal-hidden payload.  Leaving the flag set
+         * after a hidden-less restore can combine fresh restored caches with an
+         * old PREFIX_TERMINAL_HIDDEN row on the next MTP sidecar step.
+         */
+        if (graph_builder_ && graph_builder_->config().mtp.enabled)
+        {
+            state_.mtp_terminal_hidden_current = false;
         }
 
         if (snapshot.logical_checkpoint)
@@ -11638,6 +15947,12 @@ namespace llaminar2
             handleLivePrefixReplayStateAfterMutation(
                 LivePrefixMutationReason::PrefixRestore,
                 "restore_logical_checkpoint");
+            if (!recordLivePrefixMutationReady(
+                    stream,
+                    "restore_logical_checkpoint"))
+            {
+                return fail("logical checkpoint restore could not record live-state readiness");
+            }
             return true;
         }
 
@@ -11673,6 +15988,12 @@ namespace llaminar2
             handleLivePrefixReplayStateAfterMutation(
                 LivePrefixMutationReason::PrefixRestore,
                 "restore_payload_checkpoint_zero");
+            if (!recordLivePrefixMutationReady(
+                    stream,
+                    "restore_payload_checkpoint_zero"))
+            {
+                return fail("zero-token payload checkpoint restore could not record live-state readiness");
+            }
             return true;
         }
 
@@ -11843,6 +16164,12 @@ namespace llaminar2
         handleLivePrefixReplayStateAfterMutation(
             LivePrefixMutationReason::PrefixRestore,
             "restore_payload_checkpoint");
+        if (!recordLivePrefixMutationReady(
+                stream,
+                "restore_payload_checkpoint"))
+        {
+            return fail("payload checkpoint restore could not record live-state readiness");
+        }
         return true;
     }
 
@@ -11854,6 +16181,24 @@ namespace llaminar2
         }
         void *stream = explicitGPUStreamForOperation("truncateLivePrefixState");
         if (state_.device_id.is_gpu() && !stream)
+        {
+            return false;
+        }
+        if (!waitForPendingLivePrefixCheckpointReady(
+                stream,
+                "truncate_live_prefix_source"))
+        {
+            return false;
+        }
+        if (!waitForPendingLivePrefixMutationReady(
+                stream,
+                "truncate_live_prefix_previous_mutation"))
+        {
+            return false;
+        }
+        if (!waitForPendingLiveGraphProducersBeforePrefixMutation(
+                stream,
+                "truncate_live_prefix"))
         {
             return false;
         }
@@ -11882,6 +16227,12 @@ namespace llaminar2
         handleLivePrefixReplayStateAfterMutation(
             LivePrefixMutationReason::PrefixTruncate,
             "truncate_live_prefix");
+        if (!recordLivePrefixMutationReady(
+                stream,
+                "truncate_live_prefix"))
+        {
+            return false;
+        }
         return true;
     }
 
@@ -12062,6 +16413,39 @@ namespace llaminar2
             return -1;
         }
         return token;
+    }
+
+    bool DeviceGraphOrchestrator::requiresMPICoordinatedDecodeSampling(
+        const SamplingParams &params) const
+    {
+        /*
+         * Greedy sampling on a vocab-sharded GlobalTP LM head allgathers the
+         * local winning candidate from every MPI rank.  Worker ranks must enter
+         * that same sampling method or rank 0 blocks in candidate coordination.
+         * CPU GlobalTP already materializes gathered logits through the graph
+         * allgather stage, so rank 0 can sample the authoritative row without a
+         * second sampling-time collective.  Keeping CPU out of this hook also
+         * prevents divergent root/worker fallback paths when a worker has only
+         * a local logits shard.
+         * Penalty and non-greedy column-parallel sampling currently can fall
+         * back to root-local host logic, so advertising participation there
+         * would create the exact command-stream deadlock this hook is meant to
+         * avoid.
+         */
+        if (!state_.device_id.is_gpu())
+        {
+            return false;
+        }
+        if (!params.is_greedy() || params.has_penalties())
+        {
+            return false;
+        }
+        if (!graph_builder_ || !graph_builder_->config().lm_head_column_parallel)
+        {
+            return false;
+        }
+        IGlobalTPContext *global_ctx = globalTPContextForMTPCoordination();
+        return global_ctx && global_ctx->degree() > 1;
     }
 
     bool DeviceGraphOrchestrator::sampleMainLogitsBatchRowsOnDevice(
@@ -12435,6 +16819,12 @@ namespace llaminar2
                stochastic_target_sample_tokens_dev_ &&
                stochastic_draft_sample_tokens_dev_ &&
                stochastic_draft_sample_probs_dev_ &&
+               stochastic_topk_partial_vals_dev_ &&
+               stochastic_topk_partial_idxs_dev_ &&
+               stochastic_topk_partial_capacity_ > 0 &&
+               stochastic_draft_topk_partial_vals_dev_ &&
+               stochastic_draft_topk_partial_idxs_dev_ &&
+               stochastic_draft_topk_partial_capacity_ > 0 &&
                argmax_partial_vals_dev_ &&
                argmax_partial_idxs_dev_ &&
                argmax_partial_capacity_ > 0 &&
@@ -12520,17 +16910,50 @@ namespace llaminar2
         auto *processed_rows =
             static_cast<float *>(stochastic_processed_logits_dev_) +
             static_cast<size_t>(first_slot) * cols;
+        /*
+         * Target/verifier distributions and MTP draft distributions may be
+         * produced on different explicit streams.  Keep their partial top-k
+         * workspaces disjoint so graph-captured stochastic verification cannot
+         * race through a shared scratch buffer.
+         */
+        void *partial_vals =
+            buffer == DeviceDistributionBuffer::Target
+                ? stochastic_topk_partial_vals_dev_
+                : stochastic_draft_topk_partial_vals_dev_;
+        void *partial_idxs =
+            buffer == DeviceDistributionBuffer::Target
+                ? stochastic_topk_partial_idxs_dev_
+                : stochastic_draft_topk_partial_idxs_dev_;
+        const int partial_capacity =
+            buffer == DeviceDistributionBuffer::Target
+                ? stochastic_topk_partial_capacity_
+                : stochastic_draft_topk_partial_capacity_;
+        if (!partial_vals || !partial_idxs || partial_capacity <= 0)
+            return false;
 
+        const std::map<std::string, std::string> processed_tags = {
+            {"operation", operation_name ? operation_name : "unknown"},
+            {"rows", std::to_string(row_count)},
+            {"top_k", std::to_string(params.top_k)}};
+        std::shared_ptr<void> gpu_timing_start;
+        std::shared_ptr<void> gpu_timing_stop;
+        if (!beginPendingGpuTimingMeasurement(
+                "stochastic_processed_rows_build_gpu",
+                stream,
+                &gpu_timing_start,
+                &gpu_timing_stop))
+        {
+            return false;
+        }
+        bool ok = false;
         {
             PerfStatsCollector::ScopedTimer timer(
                 "mtp",
                 "stochastic_processed_rows_build_enqueue",
                 "decode",
                 state_.device_id.toString(),
-                {{"operation", operation_name ? operation_name : "unknown"},
-                 {"rows", std::to_string(row_count)},
-                 {"top_k", std::to_string(params.top_k)}});
-            if (!backend->enqueueBuildTopKTopPProcessedLogitsF32Device(
+                processed_tags);
+            ok = backend->enqueueBuildTopKTopPProcessedLogitsF32Device(
                     row_ptr,
                     row_count,
                     static_cast<int>(cols),
@@ -12542,13 +16965,18 @@ namespace llaminar2
                     stream,
                     processed_rows,
                     static_cast<int>(cols),
-                    stochastic_topk_partial_vals_dev_,
-                    stochastic_topk_partial_idxs_dev_,
-                    stochastic_topk_partial_capacity_))
-            {
-                return false;
-            }
+                    partial_vals,
+                    partial_idxs,
+                    partial_capacity);
         }
+        if (!ok)
+            return false;
+        finishPendingGpuTimingMeasurement(
+            "stochastic_processed_rows_build_gpu",
+            stream,
+            processed_tags,
+            std::move(gpu_timing_start),
+            std::move(gpu_timing_stop));
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -12746,20 +17174,46 @@ namespace llaminar2
 
         const size_t slot_offset =
             static_cast<size_t>(slot) * kStochasticDistributionMaxK;
+        void *partial_vals =
+            buffer == DeviceDistributionBuffer::Target
+                ? stochastic_topk_partial_vals_dev_
+                : stochastic_draft_topk_partial_vals_dev_;
+        void *partial_idxs =
+            buffer == DeviceDistributionBuffer::Target
+                ? stochastic_topk_partial_idxs_dev_
+                : stochastic_draft_topk_partial_idxs_dev_;
+        const int partial_capacity =
+            buffer == DeviceDistributionBuffer::Target
+                ? stochastic_topk_partial_capacity_
+                : stochastic_draft_topk_partial_capacity_;
+        if (!partial_vals || !partial_idxs || partial_capacity <= 0)
+            return false;
         bool ok = false;
+        const std::map<std::string, std::string> distribution_tags = {
+            {"slot", std::to_string(slot)},
+            {"source", source == DeviceLogitsSource::Main
+                           ? "main"
+                           : (source == DeviceLogitsSource::MTP
+                                  ? "mtp"
+                                  : "all_position")},
+            {"top_k", std::to_string(params.top_k)}};
+        std::shared_ptr<void> gpu_timing_start;
+        std::shared_ptr<void> gpu_timing_stop;
+        if (!beginPendingGpuTimingMeasurement(
+                "stochastic_distribution_build_gpu",
+                stream,
+                &gpu_timing_start,
+                &gpu_timing_stop))
+        {
+            return false;
+        }
         {
             PerfStatsCollector::ScopedTimer timer(
                 "mtp",
                 "stochastic_distribution_build_enqueue",
                 "decode",
                 state_.device_id.toString(),
-                {{"slot", std::to_string(slot)},
-                 {"source", source == DeviceLogitsSource::Main
-                                ? "main"
-                                : (source == DeviceLogitsSource::MTP
-                                       ? "mtp"
-                                       : "all_position")},
-                 {"top_k", std::to_string(params.top_k)}});
+                distribution_tags);
             ok = backend->enqueueBuildTopKTopPDistributionF32Device(
                 row_ptr,
                 static_cast<int>(cols),
@@ -12770,9 +17224,18 @@ namespace llaminar2
                 stream,
                 token_ids + slot_offset,
                 probs + slot_offset,
-                stochastic_topk_partial_vals_dev_,
-                stochastic_topk_partial_idxs_dev_,
-                stochastic_topk_partial_capacity_);
+                partial_vals,
+                partial_idxs,
+                partial_capacity);
+        }
+        if (ok)
+        {
+            finishPendingGpuTimingMeasurement(
+                "stochastic_distribution_build_gpu",
+                stream,
+                distribution_tags,
+                std::move(gpu_timing_start),
+                std::move(gpu_timing_stop));
         }
         if (ok)
         {
@@ -12807,9 +17270,9 @@ namespace llaminar2
                 state_.device_id.is_gpu() &&
                 effective_top_k > 0 &&
                 effective_top_k <= static_cast<int>(kStochasticTopKSmallKCap) &&
-                stochastic_topk_partial_vals_dev_ &&
-                stochastic_topk_partial_idxs_dev_ &&
-                stochastic_topk_partial_capacity_ >=
+                partial_vals &&
+                partial_idxs &&
+                partial_capacity >=
                     static_cast<int>(partial_blocks * static_cast<size_t>(effective_top_k));
             if (used_gpu_smallk_scratch)
             {
@@ -12932,16 +17395,28 @@ namespace llaminar2
             static_cast<size_t>(first_slot) * kStochasticDistributionMaxK;
 
         bool ok = false;
+        const std::map<std::string, std::string> distribution_tags = {
+            {"first_slot", std::to_string(first_slot)},
+            {"rows", std::to_string(row_count)},
+            {"source", "all_position"},
+            {"top_k", std::to_string(params.top_k)}};
+        std::shared_ptr<void> gpu_timing_start;
+        std::shared_ptr<void> gpu_timing_stop;
+        if (!beginPendingGpuTimingMeasurement(
+                "stochastic_distribution_batch_build_gpu",
+                stream,
+                &gpu_timing_start,
+                &gpu_timing_stop))
+        {
+            return false;
+        }
         {
             PerfStatsCollector::ScopedTimer timer(
                 "mtp",
                 "stochastic_distribution_batch_build_enqueue",
                 "decode",
                 state_.device_id.toString(),
-                {{"first_slot", std::to_string(first_slot)},
-                 {"rows", std::to_string(row_count)},
-                 {"source", "all_position"},
-                 {"top_k", std::to_string(params.top_k)}});
+                distribution_tags);
             ok = backend->enqueueBuildTopKTopPDistributionsF32Device(
                 row_ptr,
                 row_count,
@@ -12958,6 +17433,15 @@ namespace llaminar2
                 stochastic_topk_partial_vals_dev_,
                 stochastic_topk_partial_idxs_dev_,
                 stochastic_topk_partial_capacity_);
+        }
+        if (ok)
+        {
+            finishPendingGpuTimingMeasurement(
+                "stochastic_distribution_batch_build_gpu",
+                stream,
+                distribution_tags,
+                std::move(gpu_timing_start),
+                std::move(gpu_timing_stop));
         }
 
         if (!ok)
@@ -13153,6 +17637,7 @@ namespace llaminar2
                 return false;
             }
         }
+        drainPendingGpuTimingMeasurements(backend);
         *out_token_host = token;
         return true;
     }
@@ -13523,6 +18008,7 @@ namespace llaminar2
         if (!supportsDeviceStochasticMTPVerification() ||
             first_target_slot < 0 || first_draft_slot < 0 ||
             row_count <= 0 ||
+            row_count > 4 ||
             first_target_slot + row_count > stochastic_target_row_capacity_ ||
             first_draft_slot + row_count > stochastic_draft_row_capacity_ ||
             !draft_tokens || !accept_thresholds || !residual_thresholds || !out)
@@ -13533,7 +18019,20 @@ namespace llaminar2
         IBackend *backend = getBackendFor(state_.device_id);
         if (!backend)
             return false;
-        void *stream = explicitGPUStreamForOperation("verifyStochasticDistributionsBatchOnDevice");
+        /*
+         * The verifier consumes compact target distributions built immediately
+         * after the main decode row.  Prefer that producer stream so the verifier
+         * is naturally ordered behind the distribution build without a host sync.
+         * A null producer stream means the row was either rebuilt through a
+         * synchronized path or is being exercised by a non-graph unit runner.
+         */
+        void *stream =
+            stochastic_target_distribution_streams_[static_cast<size_t>(first_target_slot)];
+        if (!stream)
+        {
+            stream = explicitGPUStreamForOperation(
+                "verifyStochasticDistributionsBatchOnDevice");
+        }
         if (!stream)
             return false;
 
@@ -13544,17 +18043,46 @@ namespace llaminar2
         {
             return false;
         }
+        bool uses_one_hot_draft_tokens = false;
+        bool uses_draft_distribution_rows = false;
         for (int row = 0; row < row_count; ++row)
         {
             const int target_slot = first_target_slot + row;
             const int draft_slot = first_draft_slot + row;
             const int draft_top_k =
                 stochastic_draft_top_k_[static_cast<size_t>(draft_slot)];
-            if (stochastic_target_top_k_[static_cast<size_t>(target_slot)] != target_top_k ||
-                draft_top_k != target_top_k)
+            if (stochastic_target_top_k_[static_cast<size_t>(target_slot)] != target_top_k)
             {
                 return false;
             }
+            if (draft_top_k == target_top_k)
+            {
+                uses_draft_distribution_rows = true;
+            }
+            else if (draft_top_k <= 0)
+            {
+                uses_one_hot_draft_tokens = true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        if (uses_one_hot_draft_tokens == uses_draft_distribution_rows)
+        {
+            return false;
+        }
+
+        if (uses_one_hot_draft_tokens &&
+            !waitForRequiredStochasticDraftSampleReadyRange(
+                first_draft_slot,
+                row_count,
+                stream,
+                "decode_equivalent_stochastic_verifier"))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to order decode-equivalent stochastic verifier after sampled draft tokens");
+            return false;
         }
 
         auto *target_ids =
@@ -13583,23 +18111,52 @@ namespace llaminar2
         auto *out_threshold_dev =
             static_cast<float *>(stochastic_verify_thresholds_dev_) + first_target_slot;
 
-        if (!backend->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatch(
-                target_ids,
-                target_probs,
-                draft_ids,
-                draft_probs,
-                target_top_k,
-                static_cast<int>(kStochasticDistributionMaxK),
-                draft_tokens,
-                accept_thresholds,
-                residual_thresholds,
-                row_count,
-                state_.device_id.gpu_ordinal(),
-                stream,
-                out_token_dev,
-                out_accepted_dev,
-                out_accept_prob_dev,
-                out_threshold_dev))
+        bool verify_enqueued = false;
+        if (uses_one_hot_draft_tokens)
+        {
+            if (!sampled_draft_tokens)
+                return false;
+            verify_enqueued =
+                backend->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+                    target_ids,
+                    target_probs,
+                    /*draft_token_ids_device=*/nullptr,
+                    /*draft_probs_device=*/nullptr,
+                    target_top_k,
+                    static_cast<int>(kStochasticDistributionMaxK),
+                    sampled_draft_tokens,
+                    accept_thresholds,
+                    residual_thresholds,
+                    row_count,
+                    state_.device_id.gpu_ordinal(),
+                    stream,
+                    out_token_dev,
+                    out_accepted_dev,
+                    out_accept_prob_dev,
+                    out_threshold_dev);
+        }
+        else
+        {
+            verify_enqueued =
+                backend->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatch(
+                    target_ids,
+                    target_probs,
+                    draft_ids,
+                    draft_probs,
+                    target_top_k,
+                    static_cast<int>(kStochasticDistributionMaxK),
+                    draft_tokens,
+                    accept_thresholds,
+                    residual_thresholds,
+                    row_count,
+                    state_.device_id.gpu_ordinal(),
+                    stream,
+                    out_token_dev,
+                    out_accepted_dev,
+                    out_accept_prob_dev,
+                    out_threshold_dev);
+        }
+        if (!verify_enqueued)
         {
             return false;
         }
@@ -13639,7 +18196,8 @@ namespace llaminar2
             static_cast<double>(row_count),
             "decode",
             state_.device_id.toString(),
-            {{"top_k", std::to_string(target_top_k)}});
+            {{"top_k", std::to_string(target_top_k)},
+             {"draft", uses_one_hot_draft_tokens ? "one_hot" : "distribution"}});
         return true;
     }
 
@@ -13784,6 +18342,62 @@ namespace llaminar2
         if (!stream)
             return false;
 
+        std::shared_ptr<void> producer_start_timing_event;
+        std::shared_ptr<void> producer_stop_timing_event;
+        const bool collect_producer_gpu_timing =
+            PerfStatsCollector::isEnabled() && state_.device_id.is_gpu();
+        if (collect_producer_gpu_timing)
+        {
+            const int device_ordinal = state_.device_id.gpu_ordinal();
+            void *raw_start_event = backend->createTimingEvent(device_ordinal);
+            void *raw_stop_event = backend->createTimingEvent(device_ordinal);
+            if (raw_start_event && raw_stop_event)
+            {
+                producer_start_timing_event.reset(
+                    raw_start_event,
+                    [backend, device_ordinal](void *event)
+                    {
+                        if (event)
+                            backend->destroyEvent(event, device_ordinal);
+                    });
+                producer_stop_timing_event.reset(
+                    raw_stop_event,
+                    [backend, device_ordinal](void *event)
+                    {
+                        if (event)
+                            backend->destroyEvent(event, device_ordinal);
+                    });
+                if (!backend->recordEvent(
+                        producer_start_timing_event.get(),
+                        device_ordinal,
+                        stream))
+                {
+                    producer_start_timing_event.reset();
+                    producer_stop_timing_event.reset();
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_request_batch_summary_gpu_timing_record_failures",
+                        1.0,
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"event", "start"}});
+                }
+            }
+            else
+            {
+                if (raw_start_event)
+                    backend->destroyEvent(raw_start_event, device_ordinal);
+                if (raw_stop_event)
+                    backend->destroyEvent(raw_stop_event, device_ordinal);
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "stochastic_request_batch_summary_gpu_timing_event_failures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString());
+            }
+        }
+
         for (int request_idx = 0; request_idx < request_count; ++request_idx)
         {
             const DeviceStochasticBatchOutcomeRequest &request =
@@ -13801,6 +18415,18 @@ namespace llaminar2
                     ? request.stop_tokens.data()
                     : nullptr;
             const int32_t *draft_tokens = request.hostDraftTokensOrNull();
+            const bool derive_thresholds_from_seed =
+                request.derive_thresholds_from_seed &&
+                request.use_vllm_probability_rejection &&
+                request.inverse_sample_seed != 0;
+            const float *accept_thresholds =
+                derive_thresholds_from_seed
+                    ? nullptr
+                    : request.accept_thresholds.data();
+            const float *residual_thresholds =
+                derive_thresholds_from_seed
+                    ? nullptr
+                    : request.residual_thresholds.data();
             DeviceSpeculativeVerifyBatchOutcome ignored_host_outcome;
 
             const bool ok =
@@ -13808,8 +18434,8 @@ namespace llaminar2
                     request.first_target_slot,
                     request.first_draft_slot,
                     draft_tokens,
-                    request.accept_thresholds.data(),
-                    request.residual_thresholds.data(),
+                    accept_thresholds,
+                    residual_thresholds,
                     request.row_count,
                     request.first_token,
                     request.first_target_sample_slot,
@@ -13829,6 +18455,55 @@ namespace llaminar2
                 return false;
         }
 
+        if (producer_stop_timing_event)
+        {
+            if (!backend->recordEvent(
+                    producer_stop_timing_event.get(),
+                    state_.device_id.gpu_ordinal(),
+                    stream))
+            {
+                producer_start_timing_event.reset();
+                producer_stop_timing_event.reset();
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "stochastic_request_batch_summary_gpu_timing_record_failures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"event", "stop"}});
+            }
+        }
+
+        void *raw_response_ready_event =
+            backend->createEvent(state_.device_id.gpu_ordinal());
+        if (!raw_response_ready_event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to create stochastic outcome response-ready event");
+            return false;
+        }
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+        std::shared_ptr<void> response_ready_event(
+            raw_response_ready_event,
+            [backend, device_ordinal](void *event)
+            {
+                if (event)
+                    backend->destroyEvent(event, device_ordinal);
+            });
+        /*
+         * Record before any caller enqueues state publication on this producer
+         * stream.  The compact outcome rows are immutable after the verifier
+         * summary kernels above, so the response bridge can wait only for this
+         * event and avoid draining later live-state publication work.
+         */
+        if (!backend->recordEvent(
+                response_ready_event.get(),
+                state_.device_id.gpu_ordinal(),
+                stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to record stochastic outcome response-ready event");
+            return false;
+        }
+
         out_handle->output_tokens_device =
             static_cast<const int32_t *>(stochastic_batch_output_tokens_dev_);
         out_handle->meta_device =
@@ -13838,6 +18513,11 @@ namespace llaminar2
         out_handle->meta_stride = kSpeculativeBatchMetaCount;
         out_handle->device = state_.device_id;
         out_handle->stream = stream;
+        out_handle->response_ready_event = std::move(response_ready_event);
+        out_handle->producer_start_timing_event =
+            std::move(producer_start_timing_event);
+        out_handle->producer_stop_timing_event =
+            std::move(producer_stop_timing_event);
         return out_handle->valid();
     }
 
@@ -13859,45 +18539,176 @@ namespace llaminar2
             return false;
 
         const int request_count = handle.request_count;
-        std::vector<int32_t> output_tokens(
+        const size_t output_token_elements =
             static_cast<size_t>(request_count) *
-            static_cast<size_t>(handle.output_token_stride),
-            -1);
-        std::vector<int> meta(
+            static_cast<size_t>(handle.output_token_stride);
+        const size_t meta_elements =
             static_cast<size_t>(request_count) *
-            static_cast<size_t>(handle.meta_stride),
-            0);
+            static_cast<size_t>(handle.meta_stride);
+        std::vector<int32_t> fallback_output_tokens;
+        std::vector<int> fallback_meta;
+        int32_t *output_tokens = nullptr;
+        int *meta = nullptr;
+
+        if (handle.device.is_gpu())
         {
-            PerfStatsCollector::ScopedTimer timer(
+            if (!stochastic_batch_output_host_scratch_ ||
+                !stochastic_batch_output_host_scratch_->canServe(
+                    request_count,
+                    handle.output_token_stride,
+                    handle.meta_stride))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Missing pinned stochastic outcome host scratch for "
+                          << request_count << " requests on " << state_.device_id.toString());
+                return false;
+            }
+            output_tokens = stochastic_batch_output_host_scratch_->output_tokens;
+            meta = stochastic_batch_output_host_scratch_->meta;
+        }
+        else
+        {
+            fallback_output_tokens.assign(output_token_elements, -1);
+            fallback_meta.assign(meta_elements, 0);
+            output_tokens = fallback_output_tokens.data();
+            meta = fallback_meta.data();
+        }
+
+        {
+            PerfStatsCollector::ScopedTimer total_timer(
                 "mtp",
                 "stochastic_request_batch_summary_d2h_sync",
                 "decode",
                 state_.device_id.toString(),
                 {{"requests", std::to_string(request_count)}});
             /*
-             * Queue both compact copies on the verifier stream and synchronize
-             * exactly once at the ownership boundary.  Calling deviceToHostFast()
-             * twice would perform two stream synchronizations; that is tiny for
-             * the copy bytes but painful when this boundary is waiting for the
-             * preceding stochastic verifier kernels.
+             * Queue both compact copies on a dedicated response bridge stream.
+             * The bridge waits for the compact-outcome event recorded before
+             * live-state publication, so materializing emitted tokens does not
+             * drain later publication work that may share the verifier stream.
              */
-            if (!backend->deviceToHostOnStream(
-                    output_tokens.data(),
-                    handle.output_tokens_device,
-                    sizeof(int32_t) * output_tokens.size(),
-                    state_.device_id.gpu_ordinal(),
-                    handle.stream) ||
-                !backend->deviceToHostOnStream(
-                    meta.data(),
-                    handle.meta_device,
-                    sizeof(int) * meta.size(),
-                    state_.device_id.gpu_ordinal(),
-                    handle.stream) ||
-                !backend->synchronizeStream(
-                    handle.stream,
-                    state_.device_id.gpu_ordinal()))
+            void *copy_stream = handle.stream;
+            if (handle.device.is_gpu())
             {
-                return false;
+                if (!stochastic_outcome_response_bridge_stream_)
+                {
+                    void *raw_copy_stream = nullptr;
+                    {
+                        PerfStatsCollector::ScopedTimer create_timer(
+                            "mtp",
+                            "stochastic_request_batch_summary_bridge_stream_create",
+                            "decode",
+                            state_.device_id.toString(),
+                            {{"requests", std::to_string(request_count)}});
+                        raw_copy_stream =
+                            backend->createStream(state_.device_id.gpu_ordinal());
+                    }
+                    if (!raw_copy_stream)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Failed to create explicit stochastic outcome D2H bridge stream");
+                        return false;
+                    }
+                    const int device_ordinal = state_.device_id.gpu_ordinal();
+                    stochastic_outcome_response_bridge_stream_.reset(
+                        raw_copy_stream,
+                        [backend, device_ordinal](void *stream)
+                        {
+                            if (stream)
+                                backend->destroyStream(stream, device_ordinal);
+                        });
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_request_batch_summary_bridge_stream_creations",
+                        1.0,
+                        "decode",
+                        state_.device_id.toString());
+                }
+                else
+                {
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_request_batch_summary_bridge_stream_reuses",
+                        1.0,
+                        "decode",
+                        state_.device_id.toString());
+                }
+                copy_stream = stochastic_outcome_response_bridge_stream_.get();
+                if (!backend->streamWaitEvent(
+                        copy_stream,
+                        handle.response_ready_event.get(),
+                        state_.device_id.gpu_ordinal()))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue stochastic outcome D2H bridge wait");
+                    return false;
+                }
+            }
+            {
+                PerfStatsCollector::ScopedTimer enqueue_timer(
+                    "mtp",
+                    "stochastic_request_batch_summary_d2h_enqueue",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"requests", std::to_string(request_count)}});
+                if (!backend->deviceToHostOnStream(
+                        output_tokens,
+                        handle.output_tokens_device,
+                        sizeof(int32_t) * output_token_elements,
+                        state_.device_id.gpu_ordinal(),
+                        copy_stream) ||
+                    !backend->deviceToHostOnStream(
+                        meta,
+                        handle.meta_device,
+                        sizeof(int) * meta_elements,
+                        state_.device_id.gpu_ordinal(),
+                        copy_stream))
+                {
+                    return false;
+                }
+            }
+            {
+                PerfStatsCollector::ScopedTimer wait_timer(
+                    "mtp",
+                    "stochastic_request_batch_summary_d2h_wait",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"requests", std::to_string(request_count)}});
+                if (!backend->synchronizeStream(
+                        copy_stream,
+                        state_.device_id.gpu_ordinal()))
+                {
+                    return false;
+                }
+            }
+            drainPendingGpuTimingMeasurements(backend);
+            if (handle.producer_start_timing_event &&
+                handle.producer_stop_timing_event)
+            {
+                float elapsed_ms = 0.0f;
+                if (backend->eventElapsedTimeMs(
+                        handle.producer_start_timing_event.get(),
+                        handle.producer_stop_timing_event.get(),
+                        state_.device_id.gpu_ordinal(),
+                        &elapsed_ms))
+                {
+                    const double clamped_ms =
+                        std::max(0.0, static_cast<double>(elapsed_ms));
+                    PerfStatsCollector::recordTimingNs(
+                        "mtp",
+                        "stochastic_request_batch_summary_gpu_reducer",
+                        static_cast<uint64_t>(clamped_ms * 1000000.0),
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"requests", std::to_string(request_count)}});
+                }
+                else
+                {
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_request_batch_summary_gpu_timing_read_failures",
+                        1.0,
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"requests", std::to_string(request_count)}});
+                }
             }
         }
 
@@ -13909,7 +18720,7 @@ namespace llaminar2
             const auto meta_base =
                 static_cast<size_t>(request_idx) *
                 static_cast<size_t>(handle.meta_stride);
-            const int *request_meta = meta.data() + meta_base;
+            const int *request_meta = meta + meta_base;
             if (request_meta[kSpecBatchMetaOk] == 0 ||
                 request_meta[kSpecBatchMetaOutputCount] < 0 ||
                 request_meta[kSpecBatchMetaOutputCount] >
@@ -13994,6 +18805,14 @@ namespace llaminar2
         *out = DeviceSpeculativeVerifyBatchOutcome{};
 
         const bool has_bonus = bonus_target_slot >= 0;
+        const bool derive_thresholds_from_seed =
+            accept_thresholds == nullptr &&
+            residual_thresholds == nullptr &&
+            use_vllm_probability_rejection &&
+            inverse_sample_seed != 0 &&
+            inverse_sample_first_logical_position >= 0;
+        const bool has_host_thresholds =
+            accept_thresholds != nullptr && residual_thresholds != nullptr;
         if (!supportsDeviceStochasticMTPVerification() ||
             first_target_slot < 0 || first_draft_slot < 0 ||
             row_count <= 0 ||
@@ -14011,7 +18830,7 @@ namespace llaminar2
              bonus_target_slot >= stochastic_target_row_capacity_) ||
             output_request_slot < 0 ||
             output_request_slot >= stochastic_batch_output_request_capacity_ ||
-            !accept_thresholds || !residual_thresholds)
+            (!has_host_thresholds && !derive_thresholds_from_seed))
         {
             return false;
         }
@@ -14088,8 +18907,6 @@ namespace llaminar2
                 : nullptr;
         const int full_vocab_size =
             graph_builder_ ? graph_builder_->config().vocab_size : state_.vocab_size;
-        auto *target_processed_logits =
-            static_cast<float *>(stochastic_processed_logits_dev_);
         auto *out_token_dev =
             static_cast<int *>(stochastic_verify_tokens_dev_) + first_target_slot;
         auto *out_accepted_dev =
@@ -14153,41 +18970,43 @@ namespace llaminar2
         {
             if (use_vllm_probability_rejection)
             {
-                if (!target_processed_logits ||
-                    full_vocab_size <= 0 ||
-                    first_target_slot + row_count > stochastic_target_row_capacity_ ||
+                if (first_target_slot + row_count > stochastic_target_row_capacity_ ||
                     first_draft_slot + row_count > stochastic_draft_row_capacity_)
                 {
-                    LOG_ERROR("[DeviceGraphOrchestrator] vLLM stochastic verifier requested without processed target rows");
+                    LOG_ERROR("[DeviceGraphOrchestrator] vLLM stochastic verifier requested invalid compact target rows");
                     return false;
                 }
 
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
-                    "stochastic_vllm_processed_batch_verify_enqueue",
+                    "stochastic_vllm_compact_batch_verify_enqueue",
                     "decode",
                     state_.device_id.toString(),
                     {{"rows", std::to_string(row_count)},
-                     {"vocab", std::to_string(full_vocab_size)}});
+                     {"top_k", std::to_string(target_top_k)},
+                     {"draft", "one_hot"}});
                 verify_enqueued =
-                    backend->enqueueSpeculativeVerifyProcessedTargetDraftProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
-                        target_processed_logits + static_cast<size_t>(first_target_slot) * full_vocab_size,
-                        /*draft_probabilities_device=*/nullptr,
-                        row_count,
-                        full_vocab_size,
-                        full_vocab_size,
-                        /*draft_row_stride=*/0,
+                    backend->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+                        target_ids,
+                        target_probs,
+                        /*draft_token_ids_device=*/nullptr,
+                        /*draft_probs_device=*/nullptr,
+                        target_top_k,
+                        static_cast<int>(kStochasticDistributionMaxK),
                         sampled_draft_tokens,
                         accept_thresholds,
-                        inverse_sample_seed,
-                        inverse_sample_first_logical_position,
+                        residual_thresholds,
+                        row_count,
                         state_.device_id.gpu_ordinal(),
                         stream,
                         out_token_dev,
                         out_accepted_dev,
                         out_accept_prob_dev,
                         out_threshold_dev,
-                        /*no_draft_probabilities=*/true);
+                        /*draft_token_probabilities_device=*/nullptr,
+                        inverse_sample_seed,
+                        inverse_sample_first_logical_position,
+                        full_vocab_size);
             }
             else
             {
@@ -14227,7 +19046,7 @@ namespace llaminar2
         PerfStatsCollector::addCounter(
             "mtp",
             use_vllm_probability_rejection
-                ? "stochastic_vllm_processed_verify_batch_device_token_rows"
+                ? "stochastic_vllm_compact_one_hot_verify_batch_device_token_rows"
                 : "stochastic_verify_batch_device_token_rows",
             static_cast<double>(row_count),
             "decode",
@@ -14302,52 +19121,22 @@ namespace llaminar2
                     "decode",
                     state_.device_id.toString(),
                     {{"top_k", std::to_string(target_top_k)},
-                     {"lazy", use_vllm_probability_rejection ? "true" : "false"}});
-                if (use_vllm_probability_rejection)
-                {
-                    auto *bonus_logits =
-                        static_cast<float *>(stochastic_processed_logits_dev_) +
-                        static_cast<size_t>(bonus_target_slot) * full_vocab_size;
-                    bonus_enqueued =
-                        backend->enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
-                            bonus_logits,
-                            full_vocab_size,
-                            full_vocab_size,
-                            bonus_threshold,
-                            out_token_dev,
-                            out_accepted_dev,
-                            row_count,
-                            first_token_from_device ? -1 : first_token,
-                            first_token_dev,
-                            packed_stop_tokens.data(),
-                            stop_token_count,
-                            state_.device_id.gpu_ordinal(),
-                            stream,
-                            bonus_out);
-                }
-                else
-                {
-                    /*
-                     * Compact top-k/top-p distributions do not have a guarded
-                     * bonus sampler yet. Keep the legacy eager behavior here;
-                     * the vLLM processed-logit path above is the production
-                     * stochastic MTP path for GPU backends.
-                     */
-                    auto *bonus_ids =
-                        static_cast<int *>(stochastic_target_token_ids_dev_) +
-                        static_cast<size_t>(bonus_target_slot) * kStochasticDistributionMaxK;
-                    auto *bonus_probs =
-                        static_cast<float *>(stochastic_target_probs_dev_) +
-                        static_cast<size_t>(bonus_target_slot) * kStochasticDistributionMaxK;
-                    bonus_enqueued = backend->enqueueSampleDistributionF32Device(
-                        bonus_ids,
-                        bonus_probs,
-                        target_top_k,
-                        bonus_threshold,
-                        state_.device_id.gpu_ordinal(),
-                        stream,
-                        bonus_out);
-                }
+                     {"lazy", "false"},
+                     {"verifier", "compact_draft_table"}});
+                auto *bonus_ids =
+                    static_cast<int *>(stochastic_target_token_ids_dev_) +
+                    static_cast<size_t>(bonus_target_slot) * kStochasticDistributionMaxK;
+                auto *bonus_probs =
+                    static_cast<float *>(stochastic_target_probs_dev_) +
+                    static_cast<size_t>(bonus_target_slot) * kStochasticDistributionMaxK;
+                bonus_enqueued = backend->enqueueSampleDistributionF32Device(
+                    bonus_ids,
+                    bonus_probs,
+                    target_top_k,
+                    bonus_threshold,
+                    state_.device_id.gpu_ordinal(),
+                    stream,
+                    bonus_out);
             }
             if (!bonus_enqueued)
             {
@@ -14488,6 +19277,10 @@ namespace llaminar2
         if (!copied_summary)
         {
             return false;
+        }
+        if (copy_summary_to_host)
+        {
+            drainPendingGpuTimingMeasurements(backend);
         }
         if (!copy_summary_to_host)
         {
@@ -14800,6 +19593,7 @@ namespace llaminar2
     {
         request_batched_prefill_logits_row_count_ = 0;
         request_batched_prefill_logit_rows_.clear();
+        clearDeviceResidentLogicalSequenceStateMailbox();
         state_.clear();
 
         if (forward_engine_)
@@ -14812,8 +19606,8 @@ namespace llaminar2
         mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionState();
         for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
             cache.resetSessionState();
-        mtp_terminal_hidden_row_select_cache_.resetSessionState();
-        mtp_terminal_hidden_rows_select_cache_.resetSessionState();
+        mtp_terminal_hidden_row_select_cache_.invalidate();
+        mtp_terminal_hidden_rows_select_cache_.invalidate();
         defer_next_mtp_main_decode_sync_ = false;
         defer_all_position_verifier_sync_ = false;
         clearAllPendingLogitsStreams("clearInferenceState");
@@ -16237,6 +21031,14 @@ namespace llaminar2
     }
 
     DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::withDevicePositionIds(
+        const void *position_ids_device)
+    {
+        explicit_position_ids_device_ = position_ids_device;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
     DeviceGraphOrchestrator::GraphBuildSession::withExternalHiddenState(TensorBase *hidden_state)
     {
         external_hidden_state_ = hidden_state;
@@ -16506,6 +21308,10 @@ namespace llaminar2
         {
             prepared.position_ids = explicit_position_ids_;
         }
+        if (explicit_position_ids_device_)
+        {
+            prepared.position_ids_device = explicit_position_ids_device_;
+        }
 
         // Set external hidden state for PP middle/final stages
         if (external_hidden_state_)
@@ -16592,6 +21398,14 @@ namespace llaminar2
     }
 
     DeviceGraphOrchestrator::AttentionGraphSession &
+    DeviceGraphOrchestrator::AttentionGraphSession::withDevicePositionIds(
+        const void *position_ids_device)
+    {
+        position_ids_device_ = position_ids_device;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::AttentionGraphSession &
     DeviceGraphOrchestrator::AttentionGraphSession::withSequenceLengths(const std::vector<int> *lengths)
     {
         sequence_lengths_ = lengths;
@@ -16648,7 +21462,8 @@ namespace llaminar2
 
         ComputeGraph graph = graph_builder->buildAttentionGraph(
             *layer_, *buffers_, layer_idx_, seq_len_, batch_size_,
-            kv_cache_, position_ids_, device_.value(), sequence_lengths_);
+            kv_cache_, position_ids_, device_.value(), sequence_lengths_,
+            position_ids_device_);
 
         if (graph.size() == 0)
         {

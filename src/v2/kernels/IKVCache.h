@@ -14,6 +14,8 @@
 #include "../tensors/TensorLayout.h"
 #include "../utils/Logger.h"
 #include <cstddef>
+#include <cstdint>
+#include <string>
 #include <vector>
 
 namespace llaminar2
@@ -75,6 +77,73 @@ namespace llaminar2
             int cached_tokens = 0;
             int implementation_head = 0;
             bool wrapped = false;
+        };
+
+        /**
+         * @brief Device-resident sequence-state publication request.
+         *
+         * vLLM-style MTP publication derives accepted verifier rows and target
+         * cache lengths in GPU memory.  A cache implementation may consume this
+         * request to update its device-side sequence metadata without first
+         * copying accepted counts back to the CPU.
+         *
+         * Long-context ring caches must treat @p target_cached_tokens_device as
+         * the target valid-token count and @p accepted_state_counts_device as
+         * the number of verifier rows committed from the current device-visible
+         * head.  The target count alone is not enough to reconstruct a wrapped
+         * ring head, so implementations need a live base-head mirror or an
+         * equivalent device-side state source.
+         *
+         * The stream is mandatory for GPU implementations.  Work enqueued by
+         * this call must be ordered after the verifier outcome producer and
+         * before any graph replay that consumes the updated KV state.
+         */
+        struct DeviceSequenceStatePublicationRequest
+        {
+            int request_count = 0;
+            int first_seq_idx = 0;
+            const int32_t *target_cached_tokens_device = nullptr;
+            const int32_t *accepted_state_counts_device = nullptr;
+            const int32_t *publication_ok_flags_device = nullptr;
+            void *stream = nullptr;
+
+            bool valid() const
+            {
+                return request_count > 0 &&
+                       first_seq_idx >= 0 &&
+                       target_cached_tokens_device != nullptr &&
+                       accepted_state_counts_device != nullptr &&
+                       publication_ok_flags_device != nullptr &&
+                       stream != nullptr;
+            }
+        };
+
+        /**
+         * @brief Host mirror update paired with device-resident publication.
+         *
+         * DeviceSequenceStatePublicationRequest updates GPU-visible KV
+         * head/count mirrors on an explicit stream.  Graph signatures and legacy
+         * diagnostics still read host cache state through get_cached_tokens() and
+         * ring_head(), so callers that later synchronize compact verifier metadata
+         * can use this host-only request to make those mirrors match the already
+         * enqueued device publication.  This method must not enqueue device work.
+         */
+        struct HostSequenceStatePublicationRequest
+        {
+            int request_count = 0;
+            int first_seq_idx = 0;
+            std::vector<int32_t> target_cached_tokens;
+            std::vector<int32_t> accepted_state_counts;
+            std::vector<int32_t> publication_ok_flags;
+
+            bool valid() const
+            {
+                return request_count > 0 &&
+                       first_seq_idx >= 0 &&
+                       static_cast<int>(target_cached_tokens.size()) == request_count &&
+                       static_cast<int>(accepted_state_counts.size()) == request_count &&
+                       static_cast<int>(publication_ok_flags.size()) == request_count;
+            }
         };
 
         // =================================================================
@@ -229,6 +298,115 @@ namespace llaminar2
             (void)seq_idx;
             (void)cached_tokens;
             (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Device pointer to the live cached-token count mirror.
+         *
+         * GPU graph-captured stages can use this pointer once they are taught
+         * to compute dynamic attention/KV parameters on device.  The pointer is
+         * only a mirror unless supportsDeviceResidentSequenceStatePublication()
+         * also returns true; callers must not treat it as authoritative for
+         * host-visible state before that point.
+         */
+        virtual const int *deviceCachedTokenCountPtr(int layer, int seq_idx = 0) const
+        {
+            (void)layer;
+            (void)seq_idx;
+            return nullptr;
+        }
+
+        /**
+         * @brief Device pointer to the canonical live cached-token count for a request.
+         *
+         * Verifier publication needs the cache length before the verifier appends
+         * target rows.  GPU caches expose that value through per-layer device
+         * mirrors; hybrid models may not have attention state at model layer zero.
+         * This helper returns the first available per-layer count so callers can
+         * consume a device-owned sequence length without knowing the model's
+         * attention/GDN layout.
+         */
+        virtual const int *deviceSequenceCachedTokenCountPtr(int seq_idx = 0) const
+        {
+            const int first_layer = first_layer_index();
+            const int layer_count = n_layers();
+            for (int layer = first_layer; layer < first_layer + layer_count; ++layer)
+            {
+                if (const int *ptr = deviceCachedTokenCountPtr(layer, seq_idx))
+                    return ptr;
+            }
+            return nullptr;
+        }
+
+        /**
+         * @brief Device pointer to the live ring-head mirror.
+         *
+         * Wrapped ring-cache publication requires both the target cached-token
+         * count and the current ring head.  This accessor gives future Phase 10
+         * kernels a backend-neutral way to consume that head without reaching
+         * into CUDA/HIP cache internals.
+         */
+        virtual const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const
+        {
+            (void)layer;
+            (void)seq_idx;
+            return nullptr;
+        }
+
+        /**
+         * @brief Whether this cache can publish sequence metadata from device buffers.
+         *
+         * Returning true means the cache can consume
+         * DeviceSequenceStatePublicationRequest without a D2H sync and future
+         * graph-dynamic KV consumers will observe the published state from
+         * device-owned metadata.  Implementations must not return true if they
+         * only update an auxiliary device buffer while get_cached_tokens(),
+         * attention dynamic params, or graph signatures still depend on stale
+         * host counters.
+         */
+        virtual bool supportsDeviceResidentSequenceStatePublication() const
+        {
+            return false;
+        }
+
+        /**
+         * @brief Publish accepted verifier cache counts from device metadata.
+         *
+         * The default hard-fails so callers cannot accidentally hide the host
+         * synchronization that Phase 10 is trying to remove.  GPU backends
+         * should implement this only together with device-readable count/head
+         * metadata for subsequent attention and append stages.
+         */
+        virtual bool publishSequenceStateFromDeviceMetadata(
+            const DeviceSequenceStatePublicationRequest &request,
+            std::string *error = nullptr)
+        {
+            (void)request;
+            if (error)
+            {
+                *error =
+                    "KV cache does not support device-resident sequence-state publication";
+            }
+            return false;
+        }
+
+        /**
+         * @brief Adopt host KV head/count mirrors after direct device publication.
+         *
+         * The default hard-fails because only caches that understand their
+         * wrapped-head transition can mirror device publication safely.
+         */
+        virtual bool adoptSequenceStateFromHostMetadata(
+            const HostSequenceStatePublicationRequest &request,
+            std::string *error = nullptr)
+        {
+            (void)request;
+            if (error)
+            {
+                *error =
+                    "KV cache does not support host mirror adoption after device-resident publication";
+            }
             return false;
         }
 

@@ -70,6 +70,35 @@ namespace
     //   Q8_1: K/V are Q8_1Block* (36 bytes/32 elements) — ~3.5× BW savings
     enum class KVTypeTag { FP32, FP16, Q8_1 };
 
+    /**
+     * @brief Derive graph-captured attention params from live KV cache count.
+     *
+     * This tiny helper runs in graph order immediately before attention, after
+     * KV append has advanced the device-owned cache count. It avoids the old
+     * host-built `AttentionDeviceParams` upload for resident MTP replay.
+     */
+    __global__ void hip_derive_attention_params_from_cached_tokens_kernel(
+        llaminar2::attention::AttentionDeviceParams *__restrict__ out,
+        const int *__restrict__ post_append_cached_tokens,
+        int seq_len,
+        int query_rows)
+    {
+        const int row = static_cast<int>(threadIdx.x);
+        if (!out || !post_append_cached_tokens || row >= query_rows)
+            return;
+
+        const int raw_kv_len = *post_append_cached_tokens;
+        const int kv_len = raw_kv_len > 1 ? raw_kv_len : 1;
+        const int logical_seq_len = seq_len > 1 ? seq_len : 1;
+        const int base_position_raw = kv_len - logical_seq_len;
+        const int base_position = base_position_raw > 0 ? base_position_raw : 0;
+        const int row_kv_len_raw = kv_len - (query_rows - 1 - row);
+        const int row_kv_len = row_kv_len_raw > 1 ? row_kv_len_raw : 1;
+        out[row].kv_len = row_kv_len;
+        out[row].position_offset = base_position + row;
+        out[row].mask_stride = kv_len;
+    }
+
     // =========================================================================
     // Flash Attention 2 Configuration for MI50
     // =========================================================================
@@ -2672,6 +2701,38 @@ extern "C"
             batch_size, kv_len, n_heads, n_kv_heads, head_dim,
             num_splits, device_params, static_cast<hipStream_t>(stream),
             head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Derive AttentionDeviceParams from device-owned KV cache count.
+     */
+    int hipFlashAttn_prepare_device_params_from_count(
+        void *device_params,
+        const int *post_append_cached_tokens,
+        int seq_len,
+        int query_rows,
+        void *stream)
+    {
+        if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
+            query_rows <= 0 || !stream)
+        {
+            return -1;
+        }
+
+        hipLaunchKernelGGL(hip_derive_attention_params_from_cached_tokens_kernel,
+                           dim3(1), dim3(query_rows), 0, static_cast<hipStream_t>(stream),
+                           static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
+                           post_append_cached_tokens,
+                           seq_len,
+                           query_rows);
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            printf("[hipFlashAttn_prepare_device_params_from_count] Kernel launch failed: %s\n",
+                   hipGetErrorString(err));
+            return -1;
+        }
+        return 0;
     }
 
     /**

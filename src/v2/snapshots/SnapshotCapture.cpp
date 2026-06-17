@@ -292,6 +292,27 @@ namespace llaminar2
             return;
         }
 
+        // Handle shared-expert gate. In the ordinary path the stage has one
+        // output, the gated shared contribution. In the fused gate-add path it
+        // publishes both that gated contribution and the final routed+shared
+        // combined row. Route by output name so both paths keep the same
+        // semantic snapshot keys.
+        if (name.find("_shared_expert_gate") != std::string::npos)
+        {
+            size_t pos = name.find("_shared_expert_gate");
+            std::string prefix = name.substr(0, pos);
+
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name = output.name ? output.name : "";
+                if (output_name == "shared_output" && output.data)
+                    storeOutput(prefix + "_MOE_SHARED_GATE_OUTPUT", output);
+                else if (output_name == "combined_output" && output.data)
+                    storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
+            }
+            return;
+        }
+
         // Handle standalone MoE routing stage — split router logits, indices, and weights
         if (name.find("_moe_routing") != std::string::npos && dump.outputs.size() >= 3)
         {

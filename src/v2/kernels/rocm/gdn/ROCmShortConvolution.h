@@ -50,6 +50,14 @@ extern "C"
     void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void rocmGDN_gpu_set_device(int ordinal);
     void rocmGDN_stream_synchronize(void *stream);
+    bool rocmGDN_gpu_copy_capture_row_from_device_index(
+        float *dst,
+        const float *capture,
+        const int *device_row_index,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream);
 }
 
 namespace llaminar2
@@ -85,7 +93,6 @@ namespace llaminar2
 
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
         {
-            (void)dst_state;
             if (!gpu_state_ || !verifier_state_capture_ ||
                 row < 0 || row >= verifier_state_capture_rows_ ||
                 verifier_state_capture_size_ != state_size_)
@@ -98,9 +105,56 @@ namespace llaminar2
                 verifier_state_capture_ +
                 static_cast<size_t>(row) * static_cast<size_t>(verifier_state_capture_size_);
             if (stream)
+            {
                 rocmGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
+                if (dst_state)
+                {
+                    /*
+                     * Keep the host conv-state mirror aligned with the HIP
+                     * state restored for graph replay.  This makes publication
+                     * atomic across graph rebuilds and captured replays.
+                     */
+                    rocmGDN_gpu_memcpy_d2h_async(dst_state, src, static_cast<size_t>(state_size_), stream);
+                    rocmGDN_stream_synchronize(stream);
+                }
+            }
             else
+            {
                 rocmGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
+                if (dst_state)
+                    rocmGDN_gpu_memcpy_d2h(dst_state, src, static_cast<size_t>(state_size_));
+            }
+            return true;
+        }
+
+        bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            float *dst_state,
+            const int *device_row_index,
+            void *stream) override
+        {
+            /*
+             * Device-indexed MTP publication is a device-owned state handoff.
+             * Host mirror refresh is deliberately excluded so replay can stay
+             * ordered on the explicit HIP stream without a D2H synchronization.
+             */
+            (void)dst_state;
+            if (!gpu_state_ || !verifier_state_capture_ || !device_row_index ||
+                !stream ||
+                verifier_state_capture_size_ != state_size_)
+            {
+                return false;
+            }
+
+            const bool ok = rocmGDN_gpu_copy_capture_row_from_device_index(
+                gpu_state_,
+                verifier_state_capture_,
+                device_row_index,
+                verifier_state_capture_rows_,
+                state_size_,
+                device_ordinal_,
+                stream);
+            if (!ok)
+                return false;
             return true;
         }
 

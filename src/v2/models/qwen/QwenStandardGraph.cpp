@@ -88,7 +88,8 @@ namespace llaminar2
         IKVCache *kv_cache,
         const int *position_ids,
         DeviceId device,
-        const std::vector<int> *sequence_lengths)
+        const std::vector<int> *sequence_lengths,
+        const void *position_ids_device)
     {
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
@@ -119,6 +120,12 @@ namespace llaminar2
             int q_n = static_cast<int>(layer.wq->shape()[0]);
             int k_n = static_cast<int>(layer.wk->shape()[0]);
             int v_n = static_cast<int>(layer.wv->shape()[0]);
+            const bool force_decode_equivalent_qkv_verifier_prefill =
+                (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+                total_tokens > 1 &&
+                total_tokens <= 4 &&
+                config_.compute_all_position_logits &&
+                config_.mtp.enabled;
 
             LOG_DEBUG("[QwenStandardGraph] Layer " << layer_idx << " QKV dims: q_n=" << q_n
                                             << " k_n=" << k_n << " v_n=" << v_n
@@ -147,6 +154,7 @@ namespace llaminar2
                               .output_q_buffer_id = BufferId::Q_PROJ,
                               .output_k_buffer_id = BufferId::K_PROJ,
                               .output_v_buffer_id = BufferId::V_PROJ,
+                              .force_decode_equivalent_verifier_prefill = force_decode_equivalent_qkv_verifier_prefill,
                               .prepared_ref_q = preparedRefForGraphWeight(layer_bindings.wq, device),
                               .prepared_ref_k = preparedRefForGraphWeight(layer_bindings.wk, device),
                               .prepared_ref_v = preparedRefForGraphWeight(layer_bindings.wv, device),
@@ -170,7 +178,7 @@ namespace llaminar2
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, device);
+            position_ids, position_ids_device, device);
 
         // Wire RoPE dependencies
         if (has_qk_norms)
@@ -187,7 +195,7 @@ namespace llaminar2
         std::string attn_node = addKVCacheAndAttention(
             graph, prefix, buffers, layer_idx,
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
-            kv_cache, position_ids, device, has_qkv_proj, rope_node);
+            kv_cache, position_ids, position_ids_device, device, has_qkv_proj, rope_node);
 
         // Stage 5: Wo projection + optional TP allreduce
         std::string terminal = addWoProjectionAndAllreduce(

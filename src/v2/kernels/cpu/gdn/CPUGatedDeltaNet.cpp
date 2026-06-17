@@ -938,6 +938,13 @@ namespace llaminar2
             if (!state)
                 return false;
         }
+        if (state_snapshots && seq_len > 1 && seq_len <= 4)
+        {
+            return chunkForwardVerifierDecodeEquivalent(
+                Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
+                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+                state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+        }
         return chunkForwardImpl(
             Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
             seq_len, n_heads, d_k, d_v, chunk_size, use_qk_l2norm,
@@ -956,6 +963,13 @@ namespace llaminar2
         float *state_snapshots, int snapshot_stride_floats,
         int max_snapshot_rows)
     {
+        if (state_snapshots && seq_len > 1 && seq_len <= 4)
+        {
+            return chunkForwardVerifierDecodeEquivalent(
+                Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
+                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+                state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+        }
         return chunkForwardImpl(
             Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
             seq_len, n_heads, d_k, d_v, chunk_size, use_qk_l2norm,
@@ -975,6 +989,87 @@ namespace llaminar2
         std::memcpy(state,
                     state_snapshots + static_cast<size_t>(snapshot_row) * snapshot_stride_floats,
                     static_cast<size_t>(state_floats) * sizeof(float));
+        return true;
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardVerifierDecodeEquivalent(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        const int state_floats = n_heads * d_k * d_v;
+        if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
+            !output || !state || !state_snapshots ||
+            seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+            snapshot_stride_floats < state_floats || max_snapshot_rows <= 0)
+        {
+            return false;
+        }
+
+        const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
+        constexpr float l2_eps = 1e-6f;
+        const int qk_stride = n_heads * d_k;
+        const int v_stride = n_heads * d_v;
+
+        for (int t = 0; t < seq_len; ++t)
+        {
+            const float *q_t = Q + static_cast<size_t>(t) * qk_stride;
+            const float *k_t = K + static_cast<size_t>(t) * qk_stride;
+            const float *v_t = V + static_cast<size_t>(t) * v_stride;
+            const float *alpha_t = alpha + static_cast<size_t>(t) * n_heads;
+            const float *beta_t = beta_raw + static_cast<size_t>(t) * n_heads;
+            float *output_t = output + static_cast<size_t>(t) * v_stride;
+
+            // This mirrors recurrent_step() exactly: each row observes the
+            // state left by the prior row, then snapshots that post-row state.
+            auto do_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    alignas(64) float q_local[512];
+                    alignas(64) float k_local[512];
+
+                    const float *q_src = q_t + h * d_k;
+                    const float *k_src = k_t + h * d_k;
+
+                    if (use_qk_l2norm)
+                    {
+                        gdn_preprocess_qk_l2norm(q_src, k_src, q_local, k_local, d_k, scale_val, l2_eps);
+                    }
+                    else
+                    {
+                        gdn_preprocess_qk_scale(q_src, k_src, q_local, k_local, d_k, scale_val);
+                    }
+
+                    const float x = alpha_t[h] + dt_bias[h];
+                    const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
+                    const float decay = std::exp(A_log[h] * sp);
+                    const float beta_h = 1.0f / (1.0f + std::exp(-beta_t[h]));
+
+                    float *S = state + static_cast<size_t>(h) * d_k * d_v;
+                    const float *v_h = v_t + h * d_v;
+                    float *o_h = output_t + h * d_v;
+
+                    gdn_delta_recurrence(S, q_local, k_local, v_h, o_h, decay, beta_h, d_k, d_v);
+                }
+            };
+            OMP_WORKSHARE_REGION(do_work);
+
+            if (t < max_snapshot_rows)
+            {
+                std::memcpy(
+                    state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats,
+                    state,
+                    static_cast<size_t>(state_floats) * sizeof(float));
+            }
+        }
+
         return true;
     }
 

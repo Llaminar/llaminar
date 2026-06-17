@@ -180,6 +180,137 @@ TEST(Test__CUDARingKVCache, BasicAppendRetrieve_FP32)
     LOG_INFO("[BasicAppendRetrieve_FP32] PASSED");
 }
 
+/**
+ * @brief Device publication advances GPU-visible KV metadata before host adoption.
+ *
+ * Phase 9.5 makes GPU KV head/count metadata the source of truth for MTP live
+ * state.  This regression proves the split explicitly: the publication kernel
+ * updates the device count/head mirrors on an explicit stream, while legacy host
+ * getters remain stale until the compatibility adoption call runs.
+ */
+TEST(Test__CUDARingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirrorStaleUntilAdoption)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    constexpr int n_layers = 1;
+    constexpr int batch_size = 1;
+    constexpr int max_seq_len = 8;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 16;
+    constexpr int kv_dim = n_kv_heads * head_dim;
+    constexpr int initial_tokens = 6;
+    constexpr int target_cached_tokens = 5;
+    constexpr int accepted_state_count = 1;
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP32,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
+    ASSERT_TRUE(cache->supportsDeviceResidentSequenceStatePublication());
+    ScopedCudaStream stream;
+
+    auto h_K = generateRandomFP32(initial_tokens * kv_dim, 20260615);
+    auto h_V = generateRandomFP32(initial_tokens * kv_dim, 20260616);
+
+    float *d_K = nullptr;
+    float *d_V = nullptr;
+    ASSERT_EQ(cudaMalloc(&d_K, initial_tokens * kv_dim * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_V, initial_tokens * kv_dim * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  d_K,
+                  h_K.data(),
+                  initial_tokens * kv_dim * sizeof(float),
+                  cudaMemcpyHostToDevice,
+                  stream.stream()),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  d_V,
+                  h_V.data(),
+                  initial_tokens * kv_dim * sizeof(float),
+                  cudaMemcpyHostToDevice,
+                  stream.stream()),
+              cudaSuccess);
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, initial_tokens, stream.stream()));
+    stream.synchronize();
+
+    const int host_count_before = cache->get_cached_tokens(0, 0);
+    const int host_head_before = cache->ring_head(0, 0);
+    ASSERT_EQ(host_count_before, initial_tokens);
+
+    int32_t *d_target = nullptr;
+    int32_t *d_accepted = nullptr;
+    int32_t *d_ok = nullptr;
+    const int32_t h_target = target_cached_tokens;
+    const int32_t h_accepted = accepted_state_count;
+    const int32_t h_ok = 1;
+    ASSERT_EQ(cudaMalloc(&d_target, sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_accepted, sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_ok, sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_target, &h_target, sizeof(int32_t), cudaMemcpyHostToDevice, stream.stream()), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_accepted, &h_accepted, sizeof(int32_t), cudaMemcpyHostToDevice, stream.stream()), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_ok, &h_ok, sizeof(int32_t), cudaMemcpyHostToDevice, stream.stream()), cudaSuccess);
+
+    IKVCache::DeviceSequenceStatePublicationRequest device_request;
+    device_request.request_count = 1;
+    device_request.first_seq_idx = 0;
+    device_request.target_cached_tokens_device = d_target;
+    device_request.accepted_state_counts_device = d_accepted;
+    device_request.publication_ok_flags_device = d_ok;
+    device_request.stream = stream.opaque();
+    std::string device_error;
+    ASSERT_TRUE(cache->publishSequenceStateFromDeviceMetadata(device_request, &device_error))
+        << device_error;
+    stream.synchronize();
+
+    const int expected_device_head =
+        (host_head_before + accepted_state_count) % max_seq_len;
+    int device_count = -1;
+    int device_head = -1;
+    ASSERT_NE(cache->deviceCachedTokenCountPtr(0, 0), nullptr);
+    ASSERT_NE(cache->deviceRingHeadPtr(0, 0), nullptr);
+    ASSERT_EQ(cudaMemcpyAsync(&device_count,
+                              cache->deviceCachedTokenCountPtr(0, 0),
+                              sizeof(int),
+                              cudaMemcpyDeviceToHost,
+                              stream.stream()),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(&device_head,
+                              cache->deviceRingHeadPtr(0, 0),
+                              sizeof(int),
+                              cudaMemcpyDeviceToHost,
+                              stream.stream()),
+              cudaSuccess);
+    stream.synchronize();
+
+    EXPECT_EQ(device_count, target_cached_tokens);
+    EXPECT_EQ(device_head, expected_device_head);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), host_count_before)
+        << "Device publication must not silently adopt host KV mirrors.";
+    EXPECT_EQ(cache->ring_head(0, 0), host_head_before)
+        << "Host ring-head mirrors are stale until adoption is explicit.";
+
+    IKVCache::HostSequenceStatePublicationRequest host_request;
+    host_request.request_count = 1;
+    host_request.first_seq_idx = 0;
+    host_request.target_cached_tokens = {target_cached_tokens};
+    host_request.accepted_state_counts = {accepted_state_count};
+    host_request.publication_ok_flags = {1};
+    std::string host_error;
+    ASSERT_TRUE(cache->adoptSequenceStateFromHostMetadata(host_request, &host_error))
+        << host_error;
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), target_cached_tokens);
+    EXPECT_EQ(cache->ring_head(0, 0), expected_device_head);
+
+    cudaFree(d_ok);
+    cudaFree(d_accepted);
+    cudaFree(d_target);
+    cudaFree(d_V);
+    cudaFree(d_K);
+}
+
 // =============================================================================
 // Test: Ring Buffer Wrap-Around
 // =============================================================================

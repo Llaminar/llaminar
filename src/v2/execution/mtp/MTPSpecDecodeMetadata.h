@@ -28,6 +28,11 @@ namespace llaminar2
         constexpr const char *NEXT_CONDITION_TOKENS = "mtp_spec_decode_next_condition_tokens";
         constexpr const char *ALL_DRAFTS_ACCEPTED_FLAGS = "mtp_spec_decode_all_drafts_accepted_flags";
         constexpr const char *STOPPED_FLAGS = "mtp_spec_decode_stopped_flags";
+        constexpr const char *BASE_CACHED_TOKENS = "mtp_spec_decode_base_cached_tokens";
+        constexpr const char *TARGET_CACHED_TOKENS = "mtp_spec_decode_target_cached_tokens";
+        constexpr const char *SHIFTED_TARGET_CACHED_TOKENS = "mtp_spec_decode_shifted_target_cached_tokens";
+        constexpr const char *SHIFTED_ACCEPTED_STATE_COUNTS = "mtp_spec_decode_shifted_accepted_state_counts";
+        constexpr const char *PUBLICATION_OK_FLAGS = "mtp_spec_decode_publication_ok_flags";
         constexpr const char *QUERY_START_LOCS = "mtp_spec_decode_query_start_locs";
         constexpr const char *STATE_INDICES = "mtp_spec_decode_state_indices";
         constexpr const char *ACCEPTED_STATE_COUNTS = "mtp_spec_decode_accepted_state_counts";
@@ -316,6 +321,11 @@ namespace llaminar2
         int32_t *next_condition_tokens = nullptr;
         int32_t *all_drafts_accepted_flags = nullptr;
         int32_t *stopped_flags = nullptr;
+        int32_t *base_cached_tokens = nullptr;
+        int32_t *target_cached_tokens = nullptr;
+        int32_t *shifted_target_cached_tokens = nullptr;
+        int32_t *shifted_accepted_state_counts = nullptr;
+        int32_t *publication_ok_flags = nullptr;
         int32_t *query_start_locs = nullptr;
         int32_t *state_indices = nullptr;
         int32_t *accepted_state_counts = nullptr;

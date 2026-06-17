@@ -229,7 +229,8 @@ __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
     int num_partials,
     int row_partial_capacity,
     float *__restrict__ out_values,
-    int *__restrict__ out_indices)
+    int *__restrict__ out_indices,
+    int output_stride)
 {
     extern __shared__ char shared_mem[];
     float *smax = reinterpret_cast<float *>(shared_mem);
@@ -272,8 +273,9 @@ __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
 
     if (tid == 0)
     {
-        out_values[row] = smax[0];
-        out_indices[row] = sidx[0];
+        const int out_row = row * output_stride;
+        out_values[out_row] = smax[0];
+        out_indices[out_row] = sidx[0];
     }
 }
 
@@ -380,11 +382,13 @@ bool rocmOps_argmax_f32_batched_rows(
     int *partial_idxs,
     int partial_capacity,
     int device_idx,
-    void *stream)
+    void *stream,
+    int output_stride)
 {
     if (rows <= 0 || cols <= 0 || row_stride < cols ||
         !data || !out_values || !out_indices ||
-        !partial_vals || !partial_idxs || partial_capacity < rows)
+        !partial_vals || !partial_idxs || partial_capacity < rows ||
+        output_stride <= 0)
     {
         return false;
     }
@@ -418,7 +422,7 @@ bool rocmOps_argmax_f32_batched_rows(
         rocm_argmax_finalize_f32_batched_rows_kernel,
         dim3(rows), dim3(fthreads), smem2, s,
         partial_vals, partial_idxs, num_blocks, row_partial_capacity,
-        out_values, out_indices);
+        out_values, out_indices, output_stride);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)

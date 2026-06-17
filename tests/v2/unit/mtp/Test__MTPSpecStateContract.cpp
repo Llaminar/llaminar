@@ -15,10 +15,14 @@ namespace
     class FakeVerifierStateStage : public IComputeStage
     {
     public:
-        explicit FakeVerifierStateStage(bool captures, bool restore_ok = true)
+        explicit FakeVerifierStateStage(
+            bool captures,
+            bool restore_ok = true,
+            bool required_for_publication = false)
             : IComputeStage(DeviceId::cpu()),
               captures_(captures),
-              restore_ok_(restore_ok)
+              restore_ok_(restore_ok),
+              required_for_publication_(required_for_publication)
         {
         }
 
@@ -44,10 +48,37 @@ namespace
             return captures_;
         }
 
+        bool requiresVerifierStateCaptureForPublication() const override
+        {
+            return required_for_publication_;
+        }
+
         bool restoreVerifierStateCaptureRow(int row, void *stream) override
         {
             restored_rows.push_back(row);
             streams.push_back(stream);
+            return restore_ok_;
+        }
+
+        bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            const int *device_row_index,
+            void *stream) override
+        {
+            device_restored_rows.push_back(device_row_index);
+            device_streams.push_back(stream);
+            return restore_ok_;
+        }
+
+        bool restoreVerifierStateCaptureRowsFromDeviceIndices(
+            const int *device_row_indices,
+            int request_count,
+            int row_index_stride,
+            void *stream) override
+        {
+            batch_device_restored_rows.push_back(device_row_indices);
+            batch_request_counts.push_back(request_count);
+            batch_row_index_strides.push_back(row_index_stride);
+            batch_streams.push_back(stream);
             return restore_ok_;
         }
 
@@ -58,10 +89,17 @@ namespace
 
         std::vector<int> restored_rows;
         std::vector<void *> streams;
+        std::vector<const int *> device_restored_rows;
+        std::vector<void *> device_streams;
+        std::vector<const int *> batch_device_restored_rows;
+        std::vector<int> batch_request_counts;
+        std::vector<int> batch_row_index_strides;
+        std::vector<void *> batch_streams;
 
     private:
         bool captures_ = false;
         bool restore_ok_ = true;
+        bool required_for_publication_ = false;
     };
 
     MTPSpecDecodeMetadataShape shapeFor(int requests = 1, int draft_tokens = 3)
@@ -106,6 +144,15 @@ namespace
             plan.bonus_ready_state_slot_index = 3;
         }
         return plan;
+    }
+
+    MTPSpecStepPlanBatch planBatch(std::initializer_list<MTPSpecStepPlan> steps)
+    {
+        MTPSpecStepPlanBatch batch;
+        batch.ok = true;
+        batch.request_count = static_cast<int>(steps.size());
+        batch.steps.assign(steps.begin(), steps.end());
+        return batch;
     }
 } // namespace
 
@@ -761,6 +808,28 @@ TEST(Test__MTPSpecStateContract, PublisherCanRequireCapturedState)
     EXPECT_THAT(result.error, HasSubstr("required"));
 }
 
+TEST(Test__MTPSpecStateContract, PublisherRejectsMissingMandatoryVerifierStateStage)
+{
+    FakeVerifierStateStage optional_skipped(/*captures=*/false);
+    FakeVerifierStateStage mandatory_skipped(
+        /*captures=*/false,
+        /*restore_ok=*/true,
+        /*required_for_publication=*/true);
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecState(
+            publishPlan(/*accepted_count=*/1),
+            {&optional_skipped, &mandatory_skipped},
+            DeviceId::cpu(),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("required verifier capture"));
+    EXPECT_TRUE(optional_skipped.restored_rows.empty());
+    EXPECT_TRUE(mandatory_skipped.restored_rows.empty());
+}
+
 TEST(Test__MTPSpecStateContract, PublisherFailsAtomicallyWhenStageRestoreFails)
 {
     FakeVerifierStateStage failed(/*captures=*/true, /*restore_ok=*/false);
@@ -778,7 +847,256 @@ TEST(Test__MTPSpecStateContract, PublisherFailsAtomicallyWhenStageRestoreFails)
     EXPECT_THAT(failed.restored_rows, ElementsAre(0));
 }
 
-TEST(Test__MTPSpecStateContract, PublisherReportsFirstFailedStageOnCPUParallelRestore)
+TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRestoresCapturedStagesOnExplicitGpuStream)
+{
+    FakeVerifierStateStage captured0(/*captures=*/true);
+    FakeVerifierStateStage skipped(/*captures=*/false);
+    FakeVerifierStateStage captured1(/*captures=*/true);
+    int device_row = 2;
+    int explicit_stream = 0;
+
+    /*
+     * The device-indexed path receives a pointer to a GPU-resident row index.
+     * Unit tests use an ordinary int address as a stable sentinel; the contract
+     * here is that the publisher forwards the pointer and stream untouched to
+     * the stages, not that it dereferences device memory on the host.
+     */
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+            publishPlan(/*accepted_count=*/3),
+            &device_row,
+            {&captured0, &skipped, &captured1},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.restored_stage_count, 2);
+    EXPECT_EQ(result.skipped_stage_count, 1);
+    EXPECT_TRUE(captured0.restored_rows.empty())
+        << "Device-indexed publication must not fall back to host row restore.";
+    EXPECT_TRUE(captured1.restored_rows.empty())
+        << "Device-indexed publication must not fall back to host row restore.";
+    EXPECT_TRUE(skipped.device_restored_rows.empty());
+    EXPECT_THAT(captured0.device_restored_rows, ElementsAre(&device_row));
+    EXPECT_THAT(captured1.device_restored_rows, ElementsAre(&device_row));
+    EXPECT_THAT(captured0.device_streams, ElementsAre(&explicit_stream));
+    EXPECT_THAT(captured1.device_streams, ElementsAre(&explicit_stream));
+}
+
+TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsMissingMandatoryVerifierStateStage)
+{
+    FakeVerifierStateStage mandatory_skipped(
+        /*captures=*/false,
+        /*restore_ok=*/true,
+        /*required_for_publication=*/true);
+    int device_row = 0;
+    int explicit_stream = 0;
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+            publishPlan(/*accepted_count=*/1),
+            &device_row,
+            {&mandatory_skipped},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("required verifier capture"));
+    EXPECT_TRUE(mandatory_skipped.device_restored_rows.empty());
+}
+
+TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsCpuDevice)
+{
+    FakeVerifierStateStage captured(/*captures=*/true);
+    int device_row = 0;
+    int explicit_stream = 0;
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+            publishPlan(/*accepted_count=*/1),
+            &device_row,
+            {&captured},
+            DeviceId::cpu(),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("requires a GPU device"));
+    EXPECT_TRUE(captured.device_restored_rows.empty());
+}
+
+TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsNullStreamAndRow)
+{
+    FakeVerifierStateStage captured(/*captures=*/true);
+    int device_row = 0;
+    int explicit_stream = 0;
+
+    MTPSpecStatePublicationResult null_stream =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+            publishPlan(/*accepted_count=*/1),
+            &device_row,
+            {&captured},
+            DeviceId::cuda(0),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+    EXPECT_FALSE(null_stream.ok);
+    EXPECT_THAT(null_stream.error, HasSubstr("explicit non-null stream"));
+
+    MTPSpecStatePublicationResult null_row =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+            publishPlan(/*accepted_count=*/1),
+            /*device_verifier_restore_row=*/nullptr,
+            {&captured},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+    EXPECT_FALSE(null_row.ok);
+    EXPECT_THAT(null_row.error, HasSubstr("null row pointer"));
+    EXPECT_TRUE(captured.device_restored_rows.empty());
+}
+
+TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherUsesBatchRestoreHook)
+{
+    FakeVerifierStateStage captured0(/*captures=*/true);
+    FakeVerifierStateStage skipped(/*captures=*/false);
+    FakeVerifierStateStage captured1(/*captures=*/true);
+    int device_rows[4] = {0, -1, 2, 3};
+    int explicit_stream = 0;
+
+    MTPSpecStepPlan first = participantPlan(/*participant_id=*/0, /*accepted_count=*/2);
+    MTPSpecStepPlan second = participantPlan(/*participant_id=*/1, /*accepted_count=*/0);
+    second.target_cached_tokens = second.base_cached_tokens;
+    second.accepted_state_slot_index = kMTPSpecDecodeInvalidToken;
+    MTPSpecStepPlanBatch batch = planBatch({first, second});
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+            batch,
+            device_rows,
+            /*row_index_stride=*/2,
+            {&captured0, &skipped, &captured1},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.restored_stage_count, 2);
+    EXPECT_EQ(result.skipped_stage_count, 1);
+    EXPECT_TRUE(captured0.device_restored_rows.empty())
+        << "Batched publication must not loop the scalar device-index restore.";
+    EXPECT_TRUE(captured1.device_restored_rows.empty())
+        << "Batched publication must not loop the scalar device-index restore.";
+    EXPECT_THAT(captured0.batch_device_restored_rows, ElementsAre(device_rows));
+    EXPECT_THAT(captured1.batch_device_restored_rows, ElementsAre(device_rows));
+    EXPECT_THAT(captured0.batch_request_counts, ElementsAre(2));
+    EXPECT_THAT(captured1.batch_request_counts, ElementsAre(2));
+    EXPECT_THAT(captured0.batch_row_index_strides, ElementsAre(2));
+    EXPECT_THAT(captured1.batch_row_index_strides, ElementsAre(2));
+    EXPECT_THAT(captured0.batch_streams, ElementsAre(&explicit_stream));
+    EXPECT_THAT(captured1.batch_streams, ElementsAre(&explicit_stream));
+    EXPECT_TRUE(skipped.batch_device_restored_rows.empty());
+}
+
+TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherRejectsCpuAndNullStream)
+{
+    FakeVerifierStateStage captured(/*captures=*/true);
+    int device_rows[2] = {0, 1};
+    int explicit_stream = 0;
+    MTPSpecStepPlanBatch batch =
+        planBatch({participantPlan(/*participant_id=*/0, /*accepted_count=*/1)});
+
+    MTPSpecStatePublicationResult cpu_result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+            batch,
+            device_rows,
+            /*row_index_stride=*/1,
+            {&captured},
+            DeviceId::cpu(),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+    EXPECT_FALSE(cpu_result.ok);
+    EXPECT_THAT(cpu_result.error, HasSubstr("requires a GPU device"));
+
+    MTPSpecStatePublicationResult null_stream_result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+            batch,
+            device_rows,
+            /*row_index_stride=*/1,
+            {&captured},
+            DeviceId::cuda(0),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+    EXPECT_FALSE(null_stream_result.ok);
+    EXPECT_THAT(null_stream_result.error, HasSubstr("explicit non-null stream"));
+    EXPECT_TRUE(captured.batch_device_restored_rows.empty());
+}
+
+TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherFailsWhenBatchHookFails)
+{
+    FakeVerifierStateStage captured(/*captures=*/true, /*restore_ok=*/false);
+    int device_rows[2] = {0, 1};
+    int explicit_stream = 0;
+    MTPSpecStepPlanBatch batch =
+        planBatch({participantPlan(/*participant_id=*/0, /*accepted_count=*/1)});
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+            batch,
+            device_rows,
+            /*row_index_stride=*/1,
+            {&captured},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("failed restoring verifier rows"));
+    EXPECT_THAT(captured.batch_device_restored_rows, ElementsAre(device_rows));
+    EXPECT_TRUE(captured.device_restored_rows.empty())
+        << "Failure must still come from the batch contract, not a scalar fallback.";
+}
+
+TEST(Test__MTPSpecStateContract, DeviceIndexedGraphPublisherRestoresExecutionOrder)
+{
+    auto captured0 = std::make_unique<FakeVerifierStateStage>(/*captures=*/true);
+    auto skipped = std::make_unique<FakeVerifierStateStage>(/*captures=*/false);
+    auto captured1 = std::make_unique<FakeVerifierStateStage>(/*captures=*/true);
+
+    FakeVerifierStateStage *captured0_ptr = captured0.get();
+    FakeVerifierStateStage *skipped_ptr = skipped.get();
+    FakeVerifierStateStage *captured1_ptr = captured1.get();
+
+    ComputeGraph graph;
+    graph.addNode("captured0", std::move(captured0), DeviceId::cuda(0));
+    graph.addNode("skipped", std::move(skipped), DeviceId::cuda(0));
+    graph.addNode("captured1", std::move(captured1), DeviceId::cuda(0));
+    graph.addDependency("skipped", "captured0");
+    graph.addDependency("captured1", "skipped");
+
+    int device_row = 3;
+    int explicit_stream = 0;
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+            publishPlan(/*accepted_count=*/3),
+            &device_row,
+            graph,
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.restored_stage_count, 2);
+    EXPECT_EQ(result.skipped_stage_count, 1);
+    EXPECT_THAT(captured0_ptr->device_restored_rows, ElementsAre(&device_row));
+    EXPECT_TRUE(skipped_ptr->device_restored_rows.empty());
+    EXPECT_THAT(captured1_ptr->device_restored_rows, ElementsAre(&device_row));
+    EXPECT_THAT(captured0_ptr->device_streams, ElementsAre(&explicit_stream));
+    EXPECT_THAT(captured1_ptr->device_streams, ElementsAre(&explicit_stream));
+}
+
+TEST(Test__MTPSpecStateContract, PublisherReportsFirstFailedStageAndStops)
 {
     FakeVerifierStateStage captured0(/*captures=*/true);
     FakeVerifierStateStage failed1(/*captures=*/true, /*restore_ok=*/false);
@@ -799,7 +1117,12 @@ TEST(Test__MTPSpecStateContract, PublisherReportsFirstFailedStageOnCPUParallelRe
     EXPECT_THAT(captured0.restored_rows, ElementsAre(2));
     EXPECT_THAT(failed1.restored_rows, ElementsAre(2));
     EXPECT_TRUE(skipped.restored_rows.empty());
-    EXPECT_THAT(failed2.restored_rows, ElementsAre(2));
+    /*
+     * Publication is a fail-fast transaction.  Once a captured stage rejects
+     * the restore row, later stages must not observe a partial live-state
+     * mutation from an already-failed publication attempt.
+     */
+    EXPECT_TRUE(failed2.restored_rows.empty());
 }
 
 TEST(Test__MTPSpecStateContract, GraphPublisherRestoresCapturedStagesInExecutionOrder)

@@ -452,10 +452,14 @@ namespace llaminar2
         if (execution_plan.buildsRootGraph())
             return std::nullopt;
 
-        const auto &rank_plan = execution_plan.currentRankPlan();
-        return std::string("MoE overlay rank ") + std::to_string(rank_plan.world_rank) +
-               " has role " + toString(rank_plan.role) +
-               " but sidecar endpoint ranks were removed by graph-native MoE productionization";
+        const auto &rank = execution_plan.currentRankPlan();
+        return "MoE overlay rank " + std::to_string(rank.world_rank) +
+               " has role " + toString(rank.role) +
+               ", but production graph-native overlay currently supports only "
+               "the root-owned local sparse execution path. Remote warm/cold "
+               "participant graph execution must be implemented with matched "
+               "MPI sparse dispatch/local-expert/return-reduce stages before "
+               "this topology can run.";
     }
 
     MoEExpertOverlayExecutionPlan buildMoEExpertOverlayExecutionPlan(

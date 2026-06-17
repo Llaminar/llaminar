@@ -126,6 +126,34 @@ namespace llaminar2
             return Base::get_cached_tokens(kv_idx, seq_idx);
         }
 
+        /**
+         * @brief Device pointer to the compressed FA slot's live cached-token count.
+         *
+         * Hybrid caches allocate CUDA KV entries only for full-attention layers,
+         * so model-layer ids must be remapped before exposing device-owned
+         * sequence metadata.  Attention and graph replay use this pointer to
+         * derive dynamic KV lengths on device; returning the un-remapped base
+         * pointer would make the payload path and metadata path disagree.
+         */
+        const int *deviceCachedTokenCountPtr(int layer, int seq_idx = 0) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return nullptr;
+            return Base::deviceCachedTokenCountPtr(kv_idx, seq_idx);
+        }
+
+        /**
+         * @brief Device pointer to the compressed FA slot's live ring head.
+         */
+        const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return nullptr;
+            return Base::deviceRingHeadPtr(kv_idx, seq_idx);
+        }
+
         bool get_kv(int layer, int seq_idx,
                     ITensor **out_k, ITensor **out_v,
                     int *out_kv_len = nullptr) override

@@ -28,4 +28,19 @@ namespace llaminar2
         int seq_idx,
         void *stream);
 
+    /**
+     * @brief Compute the publish target for one shifted MTP KV depth.
+     *
+     * The main verifier cache advances by `accepted_count` rows.  Shifted MTP
+     * cache depth zero is ordinarily one row behind the main model, depth one
+     * is two rows behind, and so on.  Some sidecar paths have already appended
+     * the verifier row-zero shifted KV row before publication; paths that do
+     * not set `reuse_initial_mtp_shifted_kv_row` have restored that sidecar row
+     * away and must start one additional row behind before publishing only
+     * verifier rows strictly beyond the row-zero boundary.
+     */
+    int computeMTPShiftedKVTargetCachedTokens(
+        const MTPSpecStepPlan &plan,
+        int mtp_depth);
+
 } // namespace llaminar2

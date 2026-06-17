@@ -165,6 +165,41 @@ namespace llaminar2
             int k = 0;
         };
 
+        auto requirementsForGraphBinding = [](const ConsumerBinding &binding) -> WorkspaceRequirements
+        {
+            WorkspaceRequirements combined;
+            if (!binding.consumer)
+                return combined;
+
+            /**
+             * Production graphs are often allocated with a prefill-sized M but
+             * later replayed for one-row decode. Several CUDA fused projection
+             * stages need decode-only side-stream GEMV buffers that are not
+             * visible from a large-M sizing request. Merge an explicit M=1
+             * request so a single graph workspace covers both regimes.
+             *
+             * Query the auxiliary decode shape first, then the active graph
+             * shape. Some tests and diagnostic consumers record the last sizing
+             * request they saw; leaving the graph shape last keeps that
+             * observability meaningful while preserving the merged decode-only
+             * buffers.
+             */
+            if (binding.m != 1)
+            {
+                combined.merge(binding.consumer->getWorkspaceRequirements(
+                    1,
+                    binding.n,
+                    binding.k));
+            }
+
+            combined.merge(binding.consumer->getWorkspaceRequirements(
+                binding.m,
+                binding.n,
+                binding.k));
+
+            return combined;
+        };
+
         auto clampDimToInt = [](size_t value) -> int
         {
             if (value > static_cast<size_t>(std::numeric_limits<int>::max()))
@@ -335,10 +370,7 @@ namespace llaminar2
                 bool needs_realloc = false;
                 for (const auto &consumer_binding : consumers)
                 {
-                    auto reqs = consumer_binding.consumer->getWorkspaceRequirements(
-                        consumer_binding.m,
-                        consumer_binding.n,
-                        consumer_binding.k);
+                    auto reqs = requirementsForGraphBinding(consumer_binding);
                     for (const auto &buf : reqs.buffers)
                     {
                         if (!existing->second->hasBuffer(buf.name) ||
@@ -398,11 +430,7 @@ namespace llaminar2
                 WorkspaceRequirements combined = existing_reqs;
                 for (const auto &consumer_binding : consumers)
                 {
-                    auto reqs = consumer_binding.consumer->getWorkspaceRequirements(
-                        consumer_binding.m,
-                        consumer_binding.n,
-                        consumer_binding.k);
-                    combined.merge(reqs);
+                    combined.merge(requirementsForGraphBinding(consumer_binding));
                 }
 
                 size_t budget = device.is_gpu()
@@ -463,11 +491,7 @@ namespace llaminar2
             WorkspaceRequirements combined;
             for (const auto &consumer_binding : consumers)
             {
-                auto reqs = consumer_binding.consumer->getWorkspaceRequirements(
-                    consumer_binding.m,
-                    consumer_binding.n,
-                    consumer_binding.k);
-                combined.merge(reqs);
+                combined.merge(requirementsForGraphBinding(consumer_binding));
             }
 
             if (combined.buffers.empty())
@@ -576,8 +600,8 @@ namespace llaminar2
             WorkspaceRequirements combined;
             for (auto *consumer : consumers)
             {
-                auto reqs = consumer->getWorkspaceRequirements(/*max_m=*/4096);
-                combined.merge(reqs);
+                combined.merge(consumer->getWorkspaceRequirements(/*max_m=*/4096));
+                combined.merge(consumer->getWorkspaceRequirements(/*decode_m=*/1));
             }
 
             if (combined.buffers.empty())

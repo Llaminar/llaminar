@@ -20,6 +20,11 @@ namespace llaminar2
         int seq_idx = 0;
         int cached_tokens = 0;
         int ring_head = 0;
+        bool payload_hash_available = false;
+        size_t k_payload_bytes = 0;
+        size_t v_payload_bytes = 0;
+        uint64_t k_payload_hash = 0;
+        uint64_t v_payload_hash = 0;
     };
 
     struct PrefixKVCacheProbe
@@ -45,8 +50,24 @@ namespace llaminar2
         size_t conv_values = 0;
         uint64_t recurrence_hash = 0;
         uint64_t conv_hash = 0;
+        bool device_state_hash_available = false;
+        size_t recurrence_device_bytes = 0;
+        size_t conv_device_bytes = 0;
+        uint64_t recurrence_device_hash = 0;
+        uint64_t conv_device_hash = 0;
         bool recurrence_all_zero = true;
         bool conv_all_zero = true;
+        /**
+         * @brief Optional raw state copies for deep verifier-state diagnostics.
+         *
+         * Normal prefix probes only carry hashes so request summaries stay
+         * cheap.  Setting LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES=1 asks the
+         * probe to copy full FP32 GDN state into these vectors, which is useful
+         * for parity tests that need tolerance-aware comparisons between
+         * decode-equivalent state publication and serial decode.
+         */
+        std::vector<float> recurrence_sample_values;
+        std::vector<float> conv_sample_values;
     };
 
     struct PrefixRuntimeStateSnapshot
@@ -143,12 +164,15 @@ namespace llaminar2
         const IKVCache &cache,
         std::string owner,
         DeviceId device,
-        int sequence_count = 1);
+        int sequence_count = 1,
+        void *stream = nullptr);
 
     std::vector<PrefixGDNLayerProbe> inspectHybridGDNForPrefixProbe(
-        const IKVCache &cache);
+        const IKVCache &cache,
+        void *stream = nullptr);
 
     uint64_t hashFloatBufferForPrefixProbe(const float *values, size_t count);
+    uint64_t hashByteBufferForPrefixProbe(const void *values, size_t bytes);
     bool floatBufferAllZeroForPrefixProbe(const float *values, size_t count);
 
 } // namespace llaminar2

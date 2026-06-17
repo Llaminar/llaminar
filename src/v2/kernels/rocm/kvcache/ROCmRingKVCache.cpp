@@ -129,6 +129,8 @@ namespace llaminar2
     extern "C" void hip_ring_append_dynamic_q8_1(
         Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
         const int *, int, int, int, hipStream_t);
+    extern "C" void hip_kv_sequence_state_advance(
+        int *, int *, int, int, hipStream_t);
 
     extern "C" bool hip_convert_tensor_to_fp16(
         const void *d_src,
@@ -866,6 +868,25 @@ namespace llaminar2
 
         EntryT &entry = entries_[layer][seq_idx];
         const bool capture_active = isGraphCaptureActive();
+        hipStream_t effective_stream = stream;
+        if (!effective_stream)
+        {
+            if (capture_active)
+            {
+                LOG_ERROR("[ROCmRingKVCache::append] Explicit HIP stream required during graph capture");
+                return false;
+            }
+            // Keep sequence-state ownership coherent on device even for legacy
+            // callers that pass nullptr. This is an explicit worker stream, not
+            // HIP's device-default stream, so later metadata uploads are ordered
+            // with the payload append instead of silently leaving stale counters.
+            effective_stream = device_ctx_
+                                   ? static_cast<hipStream_t>(device_ctx_->defaultStream())
+                                   : static_cast<hipStream_t>(
+                                         GPUDeviceContextPool::instance()
+                                             .getAMDContext(device_id_)
+                                             .defaultStream());
+        }
 
         // Track how many tokens to skip from input (earliest tokens that would be overwritten)
         int tokens_to_skip = 0;
@@ -908,16 +929,22 @@ namespace llaminar2
             // value at launch time. Captured graphs read a stable device scalar
             // uploaded by updateDynamicParams()/setDynamicHead() before
             // capture/replay; do not record H2D copies in the captured graph.
-            if (capture_active && d_head_params_ && h_head_params_ && stream)
+            if (capture_active && d_head_params_ && h_head_params_)
             {
                 int idx = layer * batch_size_ + seq_idx;
                 launch_append_kernel_dynamic(entry, d_k_adjusted, d_v_adjusted,
-                                             &d_head_params_[idx], tokens_to_write, stream);
+                                             &d_head_params_[idx], tokens_to_write, effective_stream);
+                if (d_count_params_)
+                {
+                    hip_kv_sequence_state_advance(
+                        &d_head_params_[idx], &d_count_params_[idx],
+                        tokens_to_write, max_seq_len_, effective_stream);
+                }
             }
             else
             {
                 // Fallback: scalar head argument (non-graph path)
-                launch_append_kernel(entry, d_k_adjusted, d_v_adjusted, tokens_to_write, stream);
+                launch_append_kernel(entry, d_k_adjusted, d_v_adjusted, tokens_to_write, effective_stream);
             }
         }
 
@@ -927,6 +954,8 @@ namespace llaminar2
             // launches use replay callbacks to advance by real (unpadded) tokens.
             entry.head = (entry.head + tokens_to_write) % max_seq_len_;
             entry.count += tokens_to_write;
+            if (d_count_params_ && !uploadHostDeviceParamMirror(layer, seq_idx, effective_stream))
+                return false;
         }
 
         return true;
@@ -1293,12 +1322,16 @@ namespace llaminar2
         }
 
         auto &entry = entries_[local_layer][desc.seq_idx];
+        hipStream_t stream = desc.stream ? static_cast<hipStream_t>(desc.stream)
+                                         : getEffectiveStream(nullptr);
         if (desc.token_count == 0)
         {
             if (desc.logical_token_start == 0)
             {
                 entry.head = 0;
                 entry.count = 0;
+                if (d_count_params_ && stream && !uploadHostDeviceParamMirror(local_layer, desc.seq_idx, stream))
+                    return false;
                 invalidateRoPEShadow(local_layer, desc.seq_idx);
             }
             return true;
@@ -1314,8 +1347,6 @@ namespace llaminar2
         }
 
         hipSetDevice(device_id_);
-        hipStream_t stream = desc.stream ? static_cast<hipStream_t>(desc.stream)
-                                         : getEffectiveStream(nullptr);
         const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
         const size_t bytes = static_cast<size_t>(desc.token_count) * row_bytes;
         const size_t dst_offset = static_cast<size_t>(desc.logical_token_start) *
@@ -1344,6 +1375,11 @@ namespace llaminar2
             return false;
         }
 
+        entry.count = desc.logical_token_start + desc.token_count;
+        entry.head = entry.count % max_seq_len_;
+        if (d_count_params_ && !uploadHostDeviceParamMirror(local_layer, desc.seq_idx, stream))
+            return false;
+
         const hipError_t sync_err = hipStreamSynchronize(stream);
         if (sync_err != hipSuccess)
         {
@@ -1352,8 +1388,6 @@ namespace llaminar2
             return false;
         }
 
-        entry.count = desc.logical_token_start + desc.token_count;
-        entry.head = entry.count % max_seq_len_;
         invalidateRoPEShadow(local_layer, desc.seq_idx);
         return true;
     }
@@ -1361,7 +1395,6 @@ namespace llaminar2
     template <ActivationPrecision Precision>
     bool ROCmRingKVCache<Precision>::truncateSequence(int seq_idx, int cached_tokens, void *stream)
     {
-        (void)stream;
         if (seq_idx < 0 || seq_idx >= batch_size_ ||
             cached_tokens < 0 || cached_tokens > max_seq_len_)
         {
@@ -1381,6 +1414,8 @@ namespace llaminar2
             auto &entry = entries_[layer][seq_idx];
             if (entry.count == cached_tokens)
             {
+                if (d_count_params_ && stream && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
+                    return false;
                 continue;
             }
             if (cached_tokens == 0)
@@ -1393,6 +1428,8 @@ namespace llaminar2
                 entry.head = (tail + cached_tokens) % max_seq_len_;
             }
             entry.count = cached_tokens;
+            if (d_count_params_ && stream && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
+                return false;
             invalidateRoPEShadow(layer, seq_idx);
         }
         return true;
@@ -1592,6 +1629,10 @@ namespace llaminar2
         {
             std::memset(h_head_params_, 0, static_cast<size_t>(num_entries) * sizeof(int));
         }
+        if (h_count_params_ && num_entries > 0)
+        {
+            std::memset(h_count_params_, 0, static_cast<size_t>(num_entries) * sizeof(int));
+        }
         if (d_head_params_ && num_entries > 0)
         {
             hipError_t head_err = hipMemsetAsync(d_head_params_, 0,
@@ -1601,6 +1642,17 @@ namespace llaminar2
             {
                 LOG_WARN("[ROCmRingKVCache::clear] head params memset failed: "
                          << hipGetErrorString(head_err));
+            }
+        }
+        if (d_count_params_ && num_entries > 0)
+        {
+            hipError_t count_err = hipMemsetAsync(d_count_params_, 0,
+                                                  static_cast<size_t>(num_entries) * sizeof(int),
+                                                  clear_stream);
+            if (count_err != hipSuccess)
+            {
+                LOG_WARN("[ROCmRingKVCache::clear] count params memset failed: "
+                         << hipGetErrorString(count_err));
             }
         }
 

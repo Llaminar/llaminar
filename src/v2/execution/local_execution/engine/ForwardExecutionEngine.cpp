@@ -295,6 +295,7 @@ namespace llaminar2
                 {"all_position_logits", boolTag(signature.all_position_logits)},
                 {"all_position_logit_rows", std::to_string(signature.all_position_logit_rows)},
                 {"uses_device_token_ids", boolTag(signature.uses_device_token_ids)},
+                {"uses_device_position_ids", boolTag(signature.uses_device_position_ids)},
                 {"moe_placement_epoch", std::to_string(signature.moe_placement_epoch)}};
         }
 
@@ -596,6 +597,7 @@ namespace llaminar2
 
     void ForwardExecutionEngine::invalidateAll()
     {
+        all_position_verifier_recapture_pending_ = false;
         for (auto &[_, cache] : cache_)
         {
             cache.invalidate();
@@ -610,6 +612,7 @@ namespace llaminar2
 
     void ForwardExecutionEngine::resetCapturedReplayState()
     {
+        all_position_verifier_recapture_pending_ = false;
         for (auto &entry : cache_)
         {
             entry.second.resetReplayState();
@@ -618,17 +621,24 @@ namespace llaminar2
 
     ForwardExecutionEngine::ReplayStateResetSummary
     ForwardExecutionEngine::resetCapturedReplayStateForCorrectionReplay(
-        uint64_t live_state_epoch)
+        uint64_t live_state_epoch,
+        bool preserve_single_token_decode_replay)
     {
         ReplayStateResetSummary summary;
         for (auto &[signature, cache] : cache_)
         {
             const ForwardReplayStateCacheClass cache_class =
                 classifyForwardReplayStateCache(signature);
-            const ForwardReplayStateAction action =
+            ForwardReplayStateAction action =
                 chooseForwardReplayStateAction(
                     ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
-                    cache_class);
+                    signature);
+            if (!preserve_single_token_decode_replay &&
+                (cache_class == ForwardReplayStateCacheClass::OrdinaryDecode ||
+                 cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode))
+            {
+                action = ForwardReplayStateAction::ResetReplayState;
+            }
             if (action == ForwardReplayStateAction::ResetReplayState)
             {
                 cache.resetReplayState();
@@ -646,6 +656,34 @@ namespace llaminar2
                     ++summary.all_position_verifier_preserved;
                 else
                     ++summary.other_preserved;
+            }
+        }
+        return summary;
+    }
+
+    ForwardExecutionEngine::ReplayStateResetSummary
+    ForwardExecutionEngine::resetAllPositionVerifierReplayState()
+    {
+        ReplayStateResetSummary summary;
+        all_position_verifier_recapture_pending_ = true;
+        summary.all_position_verifier_recapture_requested = true;
+        for (auto &[signature, cache] : cache_)
+        {
+            const ForwardReplayStateCacheClass cache_class =
+                classifyForwardReplayStateCache(signature);
+            if (cache_class == ForwardReplayStateCacheClass::AllPositionVerifier)
+            {
+                cache.resetReplayState();
+                ++summary.reset_replay_state;
+                continue;
+            }
+
+            cache.markGPUStreamBindingsDirty();
+            ++summary.preserved_for_stream_rebind;
+            if (cache_class == ForwardReplayStateCacheClass::OrdinaryDecode ||
+                cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode)
+            {
+                ++summary.other_preserved;
             }
         }
         return summary;
@@ -739,6 +777,15 @@ namespace llaminar2
         // decode graph path rather than the prompt-prefill path.
         const int decode_max_seq_len = std::max(1, config_.cache_config.decode_seq_len);
         const bool all_position_logits = host.computeAllPositionLogitsEnabled();
+        if (all_position_logits)
+        {
+            /*
+             * A new verifier attempt owns the publication handle. Clear any
+             * earlier row-snapshot producer before execution so a failed verifier
+             * cannot leave stale snapshots publishable.
+             */
+            clearLastAllPositionVerifierForwardGraph();
+        }
         const bool mtp_spec_verifier_decode =
             all_position_logits &&
             host.mtpSpecVerifierInputPlanActive() &&
@@ -779,10 +826,13 @@ namespace llaminar2
         // (position_ids for RoPE, hidden state via setHiddenState).
         const bool is_pp_non_embedding_stage =
             config_.pp_stage_config.has_value() && !config_.pp_stage_config->has_embedding;
+        const bool has_position_input =
+            input.position_ids != nullptr ||
+            (input.position_ids_device != nullptr && input.device.is_gpu());
         const bool has_stable_forward_inputs =
             (((input.token_ids != nullptr) || (input.token_ids_device != nullptr)) &&
-             (input.position_ids != nullptr)) ||
-            (is_pp_non_embedding_stage && (input.position_ids != nullptr));
+             has_position_input) ||
+            (is_pp_non_embedding_stage && has_position_input);
 
         const auto &env = debugEnv();
         const int input_real_seq_len = effectiveRealSeqLen(input);
@@ -926,6 +976,7 @@ namespace llaminar2
                 all_position_logits,
                 all_position_logits ? std::max(0, host.allPositionLogitRows()) : 0,
                 input.token_ids_device != nullptr,
+                input.position_ids_device != nullptr,
                 is_standard_path,
                 config_.pp_stage_config.has_value(),
                 pp_first_layer,
@@ -1008,24 +1059,48 @@ namespace llaminar2
         last_executed_forward_graph_.valid = true;
         last_executed_forward_graph_.signature = signature;
         last_executed_forward_graph_.cache_hit = cache_hit;
+        if (signature.decode && signature.all_position_logits)
+        {
+            last_all_position_verifier_graph_.valid = true;
+            last_all_position_verifier_graph_.signature = signature;
+            last_all_position_verifier_graph_.cache_hit = cache_hit;
+        }
     }
 
     std::optional<ForwardExecutionEngine::LastExecutedForwardGraphView>
     ForwardExecutionEngine::lastExecutedForwardGraph()
     {
-        if (!last_executed_forward_graph_.valid)
+        return viewForLastExecutedForwardGraphState(last_executed_forward_graph_);
+    }
+
+    std::optional<ForwardExecutionEngine::LastExecutedForwardGraphView>
+    ForwardExecutionEngine::lastAllPositionVerifierForwardGraph()
+    {
+        return viewForLastExecutedForwardGraphState(last_all_position_verifier_graph_);
+    }
+
+    void ForwardExecutionEngine::clearLastAllPositionVerifierForwardGraph()
+    {
+        last_all_position_verifier_graph_ = {};
+    }
+
+    std::optional<ForwardExecutionEngine::LastExecutedForwardGraphView>
+    ForwardExecutionEngine::viewForLastExecutedForwardGraphState(
+        const LastExecutedForwardGraphState &state)
+    {
+        if (!state.valid)
             return std::nullopt;
 
-        auto it = cache_.find(last_executed_forward_graph_.signature);
+        auto it = cache_.find(state.signature);
         if (it == cache_.end() || !it->second.valid || !it->second.graph)
             return std::nullopt;
 
         LastExecutedForwardGraphView view;
         view.graph = it->second.graph.get();
-        view.signature = last_executed_forward_graph_.signature;
+        view.signature = state.signature;
         view.device = view.signature.device;
         view.stream = executionStreamForCache(it->second);
-        view.cache_hit = last_executed_forward_graph_.cache_hit;
+        view.cache_hit = state.cache_hit;
         view.is_decode = view.signature.decode;
         view.all_position_logits = view.signature.all_position_logits;
         return view;
@@ -1052,10 +1127,11 @@ namespace llaminar2
                 cache.segmented_capture_live_state_epoch;
             observation.requires_live_state_epoch_recapture =
                 cache.requiresLiveStateEpochRecapture(
-                    classifyForwardReplayStateCache(signature) ==
-                        ForwardReplayStateCacheClass::OrdinaryDecode,
+                    isLiveStateVersionedReplayCache(signature),
                     /*segmented_capture_allowed=*/true,
                     live_state_epoch);
+            observation.all_position_verifier_recapture_pending =
+                all_position_verifier_recapture_pending_;
             observations.push_back(observation);
         }
         return observations;
@@ -1422,9 +1498,25 @@ namespace llaminar2
         {
             updatePrefillReplayParamStages(input, forward_cache.prefill_replay_param_stages);
         }
+        const int *cached_position_ids =
+            !forward_cache.position_ids.empty()
+                ? forward_cache.position_ids.data()
+                : input.position_ids;
         for (auto *stage : forward_cache.dynamic_param_stages)
         {
             stage->updateDynamicParams(input.position_offset, input.seq_len);
+            if (input.position_ids_device)
+            {
+                stage->updateDynamicDevicePositionIds(
+                    input.position_ids_device,
+                    input.seq_len);
+            }
+            else if (cached_position_ids)
+            {
+                stage->updateDynamicPositionIds(
+                    cached_position_ids,
+                    input.seq_len);
+            }
         }
 
         if (profiling_setup)
@@ -1507,6 +1599,48 @@ namespace llaminar2
 
             const bool all_position_verifier =
                 host.computeAllPositionLogitsEnabled();
+            const bool pending_all_position_verifier_recapture =
+                all_position_verifier &&
+                input.seq_len > 1 &&
+                all_position_verifier_recapture_pending_;
+            if (all_position_verifier &&
+                DebugEnv::isTruthyEnv("LLAMINAR_MTP_FORCE_VERIFIER_GRAPH_RECAPTURE"))
+            {
+                /*
+                 * Diagnostic-only recapture splitter: Phase 10 tuning needs to
+                 * distinguish stale all-position verifier graph inputs from
+                 * stale MTP sidecar graph inputs.  This switch deliberately
+                 * affects only verifier graphs so the benchmark matrix can
+                 * identify the stale replay owner without disabling GPU graphs
+                 * globally.
+                 */
+                capture_policy.force_recapture = true;
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "main_verifier_force_recapture_diagnostic",
+                    1.0,
+                    "decode",
+                    input.device.toString());
+            }
+            if (pending_all_position_verifier_recapture)
+            {
+                /*
+                 * Shifted-MTP-KV catch-up changes verifier input state without
+                 * broadly invalidating ordinary decode or sidecar replay.  The
+                 * next all-position verifier must therefore refresh its GPU
+                 * executable before publication consumes verifier rows.  Keep
+                 * this as a one-shot structural recapture instead of relying on
+                 * the diagnostic LLAMINAR_MTP_FORCE_VERIFIER_GRAPH_RECAPTURE
+                 * environment switch.
+                 */
+                capture_policy.force_recapture = true;
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "main_verifier_pending_recapture",
+                    1.0,
+                    "decode",
+                    input.device.toString());
+            }
             const bool wants_all_position_sync_defer =
                 all_position_verifier &&
                 host.shouldDeferAllPositionVerifierFinalSync();
@@ -1558,14 +1692,20 @@ namespace llaminar2
                 }
             }
 
-            const bool main_decode_replay =
-                !host.computeAllPositionLogitsEnabled();
-            const bool multi_token_ordinary_decode_replay =
-                main_decode_replay &&
-                input.seq_len > 1;
+            const bool main_decode_replay = !all_position_verifier;
+            /*
+             * Multi-token ordinary decode captures are live-state-versioned:
+             * their graph mutates live KV/recurrent state inline.  All-position
+             * verifier captures are deliberately not epoch-versioned here.
+             * Verifier row state is published through stage-owned capture slots
+             * and row metadata is refreshed before each launch, so preserving the
+             * verifier executable is the canonical vLLM-style fast path.
+             */
+            const bool live_state_versioned_replay =
+                main_decode_replay && input.seq_len > 1;
             const uint64_t live_state_epoch = host.liveReplayStateEpoch();
             if (forward_cache.requiresLiveStateEpochRecapture(
-                    multi_token_ordinary_decode_replay,
+                    live_state_versioned_replay,
                     capture_policy.allow_segmented_capture,
                     live_state_epoch))
             {
@@ -1575,7 +1715,7 @@ namespace llaminar2
                     1.0,
                     "decode",
                     input.device.toString(),
-                    {{"context", "main_decode"},
+                    {{"context", all_position_verifier ? "main_verifier" : "main_decode"},
                      {"old_epoch", std::to_string(forward_cache.segmented_capture_live_state_epoch)},
                      {"new_epoch", std::to_string(live_state_epoch)}});
                 forward_cache.resetReplayState();
@@ -1603,9 +1743,36 @@ namespace llaminar2
             // Phase 3 replay doesn't call markCompleted(), so we can
             // skip graph.reset() on subsequent steps.
             forward_cache.phase3_active = true;
-            if (is_decode && !host.computeAllPositionLogitsEnabled())
-                forward_cache.segmented_capture_live_state_epoch =
-                    host.liveReplayStateEpoch();
+            if (is_decode)
+            {
+                const bool all_position_verifier =
+                    host.computeAllPositionLogitsEnabled();
+                const bool main_decode_replay = !all_position_verifier;
+                const bool live_state_versioned_replay =
+                    main_decode_replay && input.seq_len > 1;
+                if (live_state_versioned_replay)
+                {
+                    forward_cache.segmented_capture_live_state_epoch =
+                        host.liveReplayStateEpoch();
+                }
+                if (all_position_verifier &&
+                    all_position_verifier_recapture_pending_)
+                {
+                    /*
+                     * Consume the request only once the cache is replay-ready.
+                     * Warmup and capture phases are allowed to run after the
+                     * request, but they are not sufficient evidence that later
+                     * replay will use a fresh executable.
+                     */
+                    all_position_verifier_recapture_pending_ = false;
+                    PerfStatsCollector::addCounter(
+                        "forward_graph",
+                        "main_verifier_pending_recapture_consumed",
+                        1.0,
+                        "decode",
+                        input.device.toString());
+                }
+            }
         }
         else
         {
@@ -1931,6 +2098,37 @@ namespace llaminar2
             }
         };
 
+        auto preparePrefillGraphLaunchMetadata = [&](void *stream,
+                                                     const char *phase_name) -> bool
+        {
+            const auto &order = forward_cache.graph->getExecutionOrder();
+            for (const auto &node_name : order)
+            {
+                ComputeNode *node = forward_cache.graph->getNode(node_name);
+                if (!node || !node->stage || !node->stage->needsGraphLaunchPreparation())
+                    continue;
+
+                /*
+                 * Monolithic prefill graphs have the same mutable-metadata
+                 * contract as segmented decode graphs: tiny device-side
+                 * scalars such as row-select indices must be uploaded on the
+                 * explicit capture/replay stream before the graph is recorded
+                 * or launched. The stage hook owns that upload; recording an
+                 * H2D inside capture is a correctness bug because future graph
+                 * replays would bake the first request's metadata.
+                 */
+                if (!node->stage->prepareGraphLaunch(ctx, stream))
+                {
+                    LOG_ERROR("[ForwardExecutionEngine] Prefill graph "
+                              << (phase_name ? phase_name : "launch")
+                              << " metadata preparation failed for stage '"
+                              << node_name << "'");
+                    return false;
+                }
+            }
+            return true;
+        };
+
         auto ensurePrefillCaptureStream = [&]() -> std::pair<IWorkerGPUContext *, void *>
         {
             IWorkerGPUContext *gpu_ctx = gpuContextForPrefill();
@@ -1952,6 +2150,9 @@ namespace llaminar2
                 return false;
             }
             bindPrefillStreamToStages(stream);
+
+            if (!preparePrefillGraphLaunchMetadata(stream, "replay"))
+                return false;
 
             if (!launchPrefillGraph(gpu_ctx, stream, "replay", PrefillGraphPhase::Ready, "replay", "none"))
             {
@@ -1989,6 +2190,8 @@ namespace llaminar2
             // Apply the dedicated prefill stream to all stages and drain any
             // previous warmup work before beginning stream capture.
             bindPrefillStreamToStages(stream);
+            if (!preparePrefillGraphLaunchMetadata(stream, "capture"))
+                return false;
             gpu_ctx->synchronizeStream(stream);
             gpu_ctx->clearLastError();
 

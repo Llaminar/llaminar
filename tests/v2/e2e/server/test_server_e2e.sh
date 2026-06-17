@@ -13,6 +13,7 @@
 #   Suite 5: Qwen3.5 27B dense Q4_K_M on cpu, rocm:0 (too large for single 24GB CUDA GPU)
 #   Suite 6: Qwen3.5 27B dense Q4_K_M TP2 on rocm:0,rocm:1
 #   Suite 7: Qwen3.5 27B dense Q4_K_M PP2 on cuda:0+rocm:0 (equal 32/32 layer split)
+#   Suite 8+: Qwen3.6 dense/MoE baseline, prefix-cache, and MTP server cases
 #
 # Each backend test:
 #   1. Starts llaminar2 serve on a unique port
@@ -30,7 +31,7 @@
 #
 # Usage:
 #   ./test_server_e2e.sh [--binary <path>] [--model <path>] [--backends <list>]
-#   ./test_server_e2e.sh [--binary <path>] [--suite "model_path|backend1,backend2[|max_tokens]"] ...
+#   ./test_server_e2e.sh [--binary <path>] [--suite "model_path|backend1,backend2[|max_tokens[|extra_flags[|label[|suite_options]]]]]"] ...
 #   LLAMINAR_E2E_LONG_CONTEXT=1 ./test_server_e2e.sh [options]
 #
 # Optional long-context mode runs only when the model path, basename, or label
@@ -50,6 +51,12 @@
 #   LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS Minimum helper prompt tokens (default: 900)
 #   LLAMINAR_E2E_LONG_REQUEST_TIMEOUT Long helper request timeout (default: REQUEST_TIMEOUT)
 #   LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B Minimum parsed model size in billions (default: 4)
+#   LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS Seconds to poll for GPU VRAM release
+#                       after server shutdown before declaring a leak (default: 30)
+#   LLAMINAR_E2E_ENABLE_REMOTE_EXPERT_OVERLAY Enable experimental remote
+#                       NodeLocal CPU-cold ExpertOverlay suites. These are
+#                       intentionally off until production participant graphs
+#                       run matched MPI sparse dispatch/expert/return stages.
 # =============================================================================
 
 set -euo pipefail
@@ -70,13 +77,24 @@ HOST_RSS_GPU_MODEL_MULTIPLIER="${LLAMINAR_E2E_HOST_RSS_GPU_MODEL_MULTIPLIER:-2}"
 HOST_RSS_EXTRA_MB="${LLAMINAR_E2E_HOST_RSS_EXTRA_MB:-5120}"
 CPU_GPU_DELTA_LIMIT_MB="${LLAMINAR_E2E_CPU_GPU_DELTA_LIMIT_MB:-128}"
 GPU_ACTIVE_MIN_MB="${LLAMINAR_E2E_GPU_ACTIVE_MIN_MB:-256}"
-THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS:-}"
+GPU_RELEASE_TIMEOUT_SECONDS="${LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS:-30}"
+TRACE_TOKENS="${LLAMINAR_E2E_TRACE_TOKENS:-0}"
+REMOTE_EXPERT_OVERLAY_E2E="${LLAMINAR_E2E_ENABLE_REMOTE_EXPERT_OVERLAY:-0}"
+# Thinking-capable Qwen models may spend hundreds of tokens deliberating before
+# answering. The E2E suite is a bounded server regression gate, so exercise the
+# thinking-budget path by default instead of relying on unconstrained thinking
+# to finish within the HTTP timeout. Set LLAMINAR_E2E_THINKING_BUDGET_TOKENS=""
+# to request the production default of no explicit budget.
+THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
 
-# Model suites: "model_path|backend1,backend2,...[|max_tokens[|extra_flags]]"
-#   or shorthand: "model_path|backend1,backend2,...|extra_flags" (max_tokens omitted → defaults to 10)
+# Model suites: "model_path|backend1,backend2,...[|max_tokens[|extra_flags[|label[|suite_options]]]]"
+#   or shorthand: "model_path|backend1,backend2,...|extra_flags" (max_tokens omitted → defaults to 200)
 # Uses '|' as delimiter (not ':') because device names contain colons (cuda:0).
 # The optional 4th field (extra_flags) is passed verbatim to the server command.
-# If the 3rd field is non-numeric, it's treated as extra_flags (max_tokens defaults to 10).
+# The optional 5th field (label) is a short display/log suffix for feature cases.
+# The optional 6th field (suite_options) is harness metadata. Supported:
+#   no-long-context  Skip duplicate optional long-context helper for feature variants.
+# If the 3rd field is non-numeric, it's treated as extra_flags (max_tokens defaults to 200).
 # Each --suite flag appends to the list. If none given, defaults are used.
 declare -a SUITES=()
 OVERRIDE_MODEL=""
@@ -156,6 +174,54 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     if [ -f "$S7_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
         SUITES+=("${S7_MODEL}|pp|200|--define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-31 --pp-stage 1=rocm_pp:32-63")
     fi
+
+    # Suite 8: Qwen3.6 27B dense baseline and feature server cases.
+    # These are the current vLLM-style MTP target model family. Include
+    # `cpu` explicitly: in Llaminar device selection, -d cpu exercises all
+    # CPU sockets as a NodeLocal CPU domain rather than pinning one socket.
+    S8_MODEL="/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf"
+    S8_PREFIX_FLAGS="--prefix-cache --prefix-cache-storage ram --prefix-cache-ram-budget-mb 1024 --prefix-cache-terminal-state auto"
+    S8_MTP_FLAGS="--mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed --mtp-verify-mode greedy"
+    if [ -f "$S8_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
+        SUITES+=("${S8_MODEL}|cpu,cuda:0,rocm:0|200||qwen36-dense-baseline")
+        SUITES+=("${S8_MODEL}|cpu,cuda:0,rocm:0|200|${S8_PREFIX_FLAGS}|qwen36-dense-prefix-ram|no-long-context")
+        SUITES+=("${S8_MODEL}|cpu,cuda:0,rocm:0|200|${S8_MTP_FLAGS}|qwen36-dense-mtp-greedy-d2|no-long-context")
+    fi
+
+    # Suite 9: Qwen3.6 35B-A3B MoE baseline and feature server cases.
+    # Prefix cache uses the placement fingerprint policy so routed-expert
+    # placement becomes part of the restore contract.
+    S9_MODEL="/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
+    S9_PREFIX_FLAGS="${S8_PREFIX_FLAGS} --prefix-cache-moe-policy placement-fingerprint"
+    S9_MTP_FLAGS="${S8_MTP_FLAGS}"
+    S9_TP_CUDA2_FLAGS="--tp-devices cuda:0,cuda:1"
+    S9_TP_ROCM2_FLAGS="--tp-devices rocm:0,rocm:1"
+    S9_TP_ROCM4_FLAGS="--tp-devices rocm:0,rocm:1,rocm:2,rocm:3"
+    # Remote NodeLocal CPU-cold ExpertOverlay shapes are the production target,
+    # but they must not run in the default gate until non-root participant ranks
+    # execute matched MPI sparse dispatch/local-expert/return-reduce stages.
+    S9_OVERLAY_ROCM2_CPU2_FLAGS="--moe-expert-overlay tiered --moe-expert-overlay-continuation qwen36_moe_rocm_hot --moe-expert-overlay-base-domain qwen36_moe_rocm_hot --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot --moe-expert-overlay-residency static-by-id --moe-expert-overlay-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=replicated_experts;owner=0 --moe-expert-overlay-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=replicated_experts;ranks=0,1 --moe-expert-overlay-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-expert-overlay-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
+    S9_OVERLAY_CUDA2_CPU2_FLAGS="--moe-expert-overlay tiered --moe-expert-overlay-continuation qwen36_moe_cuda_hot --moe-expert-overlay-base-domain qwen36_moe_cuda_hot --moe-expert-overlay-shared-domain qwen36_moe_cuda_hot --moe-expert-overlay-residency static-by-id --moe-expert-overlay-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;compute=replicated_experts;owner=0 --moe-expert-overlay-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=replicated_experts;ranks=0,1 --moe-expert-overlay-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-expert-overlay-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
+    S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS="--moe-expert-overlay tiered --moe-expert-overlay-continuation qwen36_moe_cuda_hot --moe-expert-overlay-base-domain qwen36_moe_cuda_hot --moe-expert-overlay-shared-domain qwen36_moe_cuda_hot --moe-expert-overlay-residency static-by-id --moe-expert-overlay-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;compute=replicated_experts;owner=0 --moe-expert-overlay-domain qwen36_moe_rocm_warm=rocm:0,rocm:1;scope=local;backend=rccl;compute=replicated_experts;owner=0 --moe-expert-overlay-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=replicated_experts;ranks=0,1 --moe-expert-overlay-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=192;memory-mb=4096 --moe-expert-overlay-tier warm@qwen36_moe_rocm_warm;priority=1;max-experts-per-layer=64;memory-mb=4096 --moe-expert-overlay-tier cold@qwen36_moe_cpu_cold;priority=2;max-experts-per-layer=0;memory-mb=0;fallback=true"
+    if [ -f "$S9_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
+        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200||qwen36-moe-baseline")
+        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_PREFIX_FLAGS}|qwen36-moe-prefix-ram|no-long-context")
+        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_MTP_FLAGS}|qwen36-moe-mtp-greedy-d2|no-long-context")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-prefix-ram-cuda2tp|no-long-context")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-mtp-greedy-d2-cuda2tp|no-long-context")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-prefix-ram-rocm2tp|no-long-context")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context")
+        if [[ "$REMOTE_EXPERT_OVERLAY_E2E" == "1" ]]; then
+            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-rocm2-cpu2|no-long-context")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-rocm2-cpu2|no-long-context")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-cpu2|no-long-context")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-cpu2|no-long-context")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-rocm2-cpu2|no-long-context")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-rocm2-cpu2|no-long-context")
+        fi
+    fi
 fi
 
 STARTUP_TIMEOUT=300   # seconds to wait for server startup. Most models load in
@@ -207,7 +273,18 @@ sanitize_name() {
 
 is_thinking_model() {
     local label="$1"
-    [[ "${label,,}" == *"qwen3.5"* || "${label,,}" == *"qwen35"* ]]
+    [[ "${label,,}" == *"qwen3.5"* || "${label,,}" == *"qwen35"* ||
+       "${label,,}" == *"qwen3.6"* || "${label,,}" == *"qwen36"* ]]
+}
+
+is_prefix_cache_case() {
+    local extra_flags="$1"
+    [[ " ${extra_flags} " == *" --prefix-cache "* ]]
+}
+
+suite_disables_long_context() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",no-long-context,"* ]]
 }
 
 is_gpu_backend() {
@@ -377,16 +454,27 @@ shutdown_and_validate() {
         fail "[${tag}] Shutdown: unexpected exit code ${exit_code}"
     fi
 
-    # ─── Check 3: GPU VRAM fully released ────────────────────────────
-    # Give the driver time to reclaim memory. Multi-GPU (TP/PP) needs more
-    # time as each device independently tears down its allocations.
-    sleep 2
-    local gpu_after_mb
-    gpu_after_mb=$(get_total_gpu_memory_mb)
-    local gpu_leaked_mb=$((gpu_after_mb - gpu_before_mb))
-
     # Allow small variance (driver overhead, context caching) — 64 MiB tolerance
     local VRAM_LEAK_TOLERANCE_MB=64
+    local gpu_after_mb gpu_leaked_mb release_deadline
+
+    # ─── Check 3: GPU VRAM fully released ────────────────────────────
+    # Driver teardown can lag process exit, especially on ROCm after large
+    # models.  Poll for the same strict threshold instead of sampling once and
+    # reporting a false leak while the driver is still releasing allocations.
+    release_deadline=$((SECONDS + GPU_RELEASE_TIMEOUT_SECONDS))
+    while true; do
+        gpu_after_mb=$(get_total_gpu_memory_mb)
+        gpu_leaked_mb=$((gpu_after_mb - gpu_before_mb))
+        if [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ]; then
+            break
+        fi
+        if [ $SECONDS -ge $release_deadline ]; then
+            break
+        fi
+        sleep 1
+    done
+
     if [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ]; then
         pass "[${tag}] Shutdown: GPU VRAM released (before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB, delta=${gpu_leaked_mb} MiB)"
     else
@@ -936,6 +1024,7 @@ run_backend_tests() {
     local label="$4"
     local max_tokens="${5:-10}"
     local extra_flags="${6:-}"
+    local suite_options="${7:-}"
     local tag="${label}/${backend}"
     local thinking_model="false"
     if is_thinking_model "$label"; then
@@ -948,7 +1037,9 @@ run_backend_tests() {
     local model_size_b=""
     if [ "$LONG_CONTEXT_ENABLED" = "1" ]; then
         model_size_b=$(parse_model_size_b "$model" "$label")
-        if model_size_meets_threshold "$model_size_b" "$LONG_MIN_MODEL_SIZE_B"; then
+        if suite_disables_long_context "$suite_options"; then
+            echo -e "  ${YELLOW}SKIP${NC} [${tag}] Long-context: suite option no-long-context"
+        elif model_size_meets_threshold "$model_size_b" "$LONG_MIN_MODEL_SIZE_B"; then
             long_context_run="true"
             echo -e "  ${BLUE}INFO${NC} [${tag}] Long-context enabled: size ${model_size_b}B, tier ${LONG_CONTEXT_TIER}, context ${CONTEXT_LENGTH}"
         else
@@ -973,7 +1064,9 @@ run_backend_tests() {
         context_args=(-c "$CONTEXT_LENGTH")
     fi
 
-    LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" serve --port "$port" \
+    LLAMINAR_LOG_LEVEL="$LOG_LEVEL" \
+        LLAMINAR_TRACE_GENERATED_TOKENS="$TRACE_TOKENS" \
+        "$BINARY" serve --port "$port" \
         "${context_args[@]}" $device_flag $extra_flags -m "$model" >"$log_path" 2>&1 &
     local server_pid=$!
 
@@ -1013,10 +1106,24 @@ run_backend_tests() {
     # ─── Test 4: Second independent request (tests cache clear) ──────
     cache_clear_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"What is 3+5?"}]'
     run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Cache-clear" "8" "$cache_clear_messages"
+    local response_format_sample="$LAST_RESPONSE"
+
+    # ─── Prefix Cache Probe ───────────────────────────────────────────
+    # Feature suites that start the server with --prefix-cache get a pair of
+    # same-prefix requests. This keeps the check black-box and representative of
+    # served inference while still exercising lookup, restore/bypass, harvest,
+    # and ordinary response formatting through the HTTP path.
+    if is_prefix_cache_case "$extra_flags"; then
+        local prefix_a_messages prefix_b_messages
+        prefix_a_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 6+7?"}]'
+        prefix_b_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 9+5?"}]'
+        run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix A" "13" "$prefix_a_messages"
+        run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix B" "14" "$prefix_b_messages"
+    fi
 
     # ─── Test 5: Response format validation ───────────────────────────
     local has_usage
-    has_usage=$(printf '%s' "$LAST_RESPONSE" | validate_chat_response_format)
+    has_usage=$(printf '%s' "$response_format_sample" | validate_chat_response_format)
 
     if [ "$has_usage" = "ok" ]; then
         pass "[${tag}] Response format: valid usage + finish_reason"
@@ -1099,15 +1206,21 @@ else
 fi
 echo -e "  Suites: ${#SUITES[@]}"
 for suite in "${SUITES[@]}"; do
-    IFS='|' read -r local_model local_backends local_third local_extra <<< "$suite"
+    IFS='|' read -r local_model local_backends local_third local_extra local_label local_options <<< "$suite"
     # If third field isn't numeric, it's extra_flags (max_tokens was omitted)
     if [[ -n "$local_third" && ! "$local_third" =~ ^[0-9]+$ ]]; then
+        local_options="$local_label"
+        local_label="$local_extra"
         local_extra="$local_third"
     elif [[ -z "$local_extra" ]]; then
         local_extra=""
     fi
     local_suffix=""
-    if [ -n "$local_extra" ]; then local_suffix=" [${local_extra}]"; fi
+    if [ -n "${local_label:-}" ]; then
+        local_suffix=" [${local_label}]"
+    elif [ -n "$local_extra" ]; then
+        local_suffix=" [${local_extra}]"
+    fi
     echo -e "    $(basename "$local_model")  →  ${local_backends}${local_suffix}"
 done
 echo ""
@@ -1115,18 +1228,24 @@ echo ""
 PORT=$BASE_PORT
 
 for suite in "${SUITES[@]}"; do
-    # Parse suite: "model_path|backends[|max_tokens[|extra_flags]]"
+    # Parse suite: "model_path|backends[|max_tokens[|extra_flags[|label[|suite_options]]]]"
     # If the third field is not numeric, treat it as extra_flags (max_tokens defaults to 200).
-    IFS='|' read -r SUITE_MODEL SUITE_BACKENDS SUITE_MAX_TOKENS SUITE_EXTRA_FLAGS <<< "$suite"
+    IFS='|' read -r SUITE_MODEL SUITE_BACKENDS SUITE_MAX_TOKENS SUITE_EXTRA_FLAGS SUITE_LABEL_SUFFIX SUITE_OPTIONS <<< "$suite"
     if [[ -n "$SUITE_MAX_TOKENS" && ! "$SUITE_MAX_TOKENS" =~ ^[0-9]+$ ]]; then
         # Third field is not a number — it's extra_flags with max_tokens omitted
+        SUITE_OPTIONS="${SUITE_LABEL_SUFFIX:-}"
+        SUITE_LABEL_SUFFIX="${SUITE_EXTRA_FLAGS:-}"
         SUITE_EXTRA_FLAGS="$SUITE_MAX_TOKENS"
         SUITE_MAX_TOKENS="200"
     fi
     SUITE_MAX_TOKENS="${SUITE_MAX_TOKENS:-200}"  # Default: 200 tokens (enough for thinking models)
     SUITE_EXTRA_FLAGS="${SUITE_EXTRA_FLAGS:-}"   # Default: no extra flags
+    SUITE_LABEL_SUFFIX="${SUITE_LABEL_SUFFIX:-}" # Default: derive from flags or model basename
+    SUITE_OPTIONS="${SUITE_OPTIONS:-}"           # Default: no harness-only suite options
     SUITE_LABEL="$(basename "$SUITE_MODEL" .gguf)"
-    if [ -n "$SUITE_EXTRA_FLAGS" ]; then
+    if [ -n "$SUITE_LABEL_SUFFIX" ]; then
+        SUITE_LABEL="${SUITE_LABEL} [${SUITE_LABEL_SUFFIX}]"
+    elif [ -n "$SUITE_EXTRA_FLAGS" ]; then
         SUITE_LABEL="${SUITE_LABEL} [${SUITE_EXTRA_FLAGS}]"
     fi
 
@@ -1144,7 +1263,7 @@ for suite in "${SUITES[@]}"; do
     for BACKEND in "${BACKEND_LIST[@]}"; do
         BACKEND=$(echo "$BACKEND" | xargs)  # trim whitespace
         PORT=$((PORT + 1))
-        run_backend_tests "$SUITE_MODEL" "$BACKEND" "$PORT" "$SUITE_LABEL" "$SUITE_MAX_TOKENS" "$SUITE_EXTRA_FLAGS"
+        run_backend_tests "$SUITE_MODEL" "$BACKEND" "$PORT" "$SUITE_LABEL" "$SUITE_MAX_TOKENS" "$SUITE_EXTRA_FLAGS" "$SUITE_OPTIONS"
     done
 done
 

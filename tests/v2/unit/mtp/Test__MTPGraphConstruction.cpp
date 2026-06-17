@@ -2345,6 +2345,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
             {"device_tokens", "false"},
+            {"device_positions", "false"},
             {"kv_cache_only", "false"},
             {"moe_placement_epoch", "0"},
             {"seq_len", "1"}};
@@ -2442,6 +2443,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
             {"device_tokens", "false"},
+            {"device_positions", "false"},
             {"kv_cache_only", "false"},
             {"moe_placement_epoch", "0"},
             {"seq_len", "1"}};
@@ -2558,6 +2560,7 @@ TEST(Test__MTPGraphConstruction, DenseSidecarGraphCacheIgnoresMoEPlacementEpochC
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
             {"device_tokens", "false"},
+            {"device_positions", "false"},
             {"kv_cache_only", "false"},
             {"moe_placement_epoch", "0"},
             {"seq_len", "1"}};
@@ -2656,6 +2659,7 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
             {"device_tokens", "false"},
+            {"device_positions", "false"},
             {"kv_cache_only", "false"},
             {"moe_placement_epoch", "0"},
             {"seq_len", "1"}};
@@ -2664,6 +2668,7 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
             {"context", "mtp_decode_sidecar"},
             {"depth", "0"},
             {"device_tokens", "false"},
+            {"device_positions", "false"},
             {"kv_cache_only", "false"},
             {"moe_placement_epoch", "1"},
             {"seq_len", "1"}};
@@ -3090,6 +3095,7 @@ TEST(Test__MTPGraphConstruction, CPUShiftedPrefillBatchesRowsIntoSingleKVOnlySid
         {"context", "mtp_shifted_prefill"},
         {"depth", "0"},
         {"device_tokens", "false"},
+        {"device_positions", "false"},
         {"kv_cache_only", "true"},
         {"batch", "1"},
         {"seq_len", "4"}};
@@ -3448,13 +3454,12 @@ TEST(Test__MTPGraphConstruction, DynamicDepthFullAcceptCommitDiscardsSpeculative
     PerfStatsCollector::reset();
 }
 
-TEST(Test__MTPGraphConstruction, SpecStatePublicationRecordsAcceptedAndRejectedMutationReasons)
+TEST(Test__MTPGraphConstruction, CPUSpecStatePublicationIsRejectedBeforeMutation)
 {
     DeviceManager::instance().initialize(-1, false);
 
     auto run_case = [](int accepted_count,
-                       bool requires_correction,
-                       const std::string &expected_reason)
+                       bool requires_correction)
     {
         ScopedDebugEnv env({
             {"LLAMINAR_PERF_STATS_JSON", "1"},
@@ -3509,6 +3514,8 @@ TEST(Test__MTPGraphConstruction, SpecStatePublicationRecordsAcceptedAndRejectedM
             /*allow_speculative_discard=*/true,
             /*position_offset_override=*/static_cast<int>(prefix_tokens.size())));
 
+        const auto before_publish = orchestrator.prefixStateProbe();
+
         MTPSpecStepPlan plan;
         plan.request_index = 0;
         plan.request_id = 17;
@@ -3539,51 +3546,31 @@ TEST(Test__MTPGraphConstruction, SpecStatePublicationRecordsAcceptedAndRejectedM
         }
 
         std::string publication_error;
-        ASSERT_TRUE(orchestrator.publishAcceptedMTPSpecState(
+        EXPECT_FALSE(orchestrator.supportsMTPSpecStatePublication())
+            << "CPU direct all-position publication must remain disabled until "
+               "continuation equivalence is proven.";
+        EXPECT_FALSE(orchestrator.publishAcceptedMTPSpecState(
             plan,
-            &publication_error))
+            &publication_error));
+        EXPECT_NE(publication_error.find("not advertised"), std::string::npos)
             << publication_error;
 
         const auto after_publish = orchestrator.prefixStateProbe();
-        EXPECT_EQ(after_publish.current_position, plan.target_cached_tokens);
-        ASSERT_FALSE(after_publish.positions.empty());
-        ASSERT_FALSE(after_publish.sequence_lengths.empty());
-        EXPECT_EQ(after_publish.positions[0], plan.target_cached_tokens);
-        EXPECT_EQ(after_publish.sequence_lengths[0], plan.target_cached_tokens);
-        EXPECT_EQ(maxCachedTokens(after_publish.kv_caches), plan.target_cached_tokens);
-        EXPECT_EQ(maxCachedTokens(after_publish.mtp_kv_caches),
-                  std::max(0, plan.target_cached_tokens - 1));
-        EXPECT_EQ(after_publish.live_state_mutations, 1u);
-        EXPECT_EQ(after_publish.last_live_state_mutation_reason, expected_reason);
-        EXPECT_EQ(after_publish.last_live_state_mutation_operation,
-                  "mtp_spec_state_publication");
+        EXPECT_EQ(after_publish.current_position, before_publish.current_position);
+        EXPECT_EQ(after_publish.positions, before_publish.positions);
+        EXPECT_EQ(after_publish.sequence_lengths, before_publish.sequence_lengths);
+        EXPECT_EQ(after_publish.live_state_mutations,
+                  before_publish.live_state_mutations);
         EXPECT_EQ(after_publish.live_state_accepted_publications,
-                  requires_correction ? 0u : 1u);
+                  before_publish.live_state_accepted_publications);
         EXPECT_EQ(after_publish.live_state_rejected_corrections,
-                  requires_correction ? 1u : 0u);
-
-        const auto records = PerfStatsCollector::snapshot({"mtp"});
-        const auto mutation_tags = PerfStatsCollector::Tags{
-            {"operation", "mtp_spec_state_publication"},
-            {"mutation_reason", expected_reason},
-            {"kernel_dynamic_state", "reset"},
-            {"replay_state", "preserved"},
-            {"sidecar_replay_state", "preserved"}};
-        EXPECT_DOUBLE_EQ(
-            sumMTPRecordValuesContaining(
-                records,
-                PerfStatRecord::Kind::Counter,
-                "live_prefix_replay_state_after_mutation",
-                mutation_tags),
-            1.0);
+                  before_publish.live_state_rejected_corrections);
     };
 
     run_case(/*accepted_count=*/3,
-             /*requires_correction=*/false,
-             "accepted_publication");
+             /*requires_correction=*/false);
     run_case(/*accepted_count=*/1,
-             /*requires_correction=*/true,
-             "rejected_correction");
+             /*requires_correction=*/true);
 
     PerfStatsCollector::reset();
 }
@@ -3769,14 +3756,14 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
         {"operation", "restore_payload_checkpoint"},
         {"mutation_reason", "prefix_restore"},
         {"kernel_dynamic_state", "reset"},
-        {"replay_state", "preserved"},
-        {"sidecar_replay_state", "preserved"}};
+        {"replay_state", "reset"},
+        {"sidecar_replay_state", "reset"}};
     const auto truncate_tags = PerfStatsCollector::Tags{
         {"operation", "truncate_live_prefix"},
         {"mutation_reason", "prefix_truncate"},
         {"kernel_dynamic_state", "reset"},
-        {"replay_state", "preserved"},
-        {"sidecar_replay_state", "preserved"}};
+        {"replay_state", "reset"},
+        {"sidecar_replay_state", "reset"}};
     EXPECT_DOUBLE_EQ(
         sumMTPRecordValuesContaining(
             records,
@@ -3808,7 +3795,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "reset"},
         {"sidecar_replay_state", "reset"}};
-    EXPECT_EQ(findMTPRecordContaining(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
+    EXPECT_NE(findMTPRecordContaining(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
               nullptr);
     PerfStatsCollector::reset();
 }
@@ -3870,8 +3857,8 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
         {"operation", "restore_logical_checkpoint"},
         {"mutation_reason", "prefix_restore"},
         {"kernel_dynamic_state", "reset"},
-        {"replay_state", "preserved"},
-        {"sidecar_replay_state", "preserved"}};
+        {"replay_state", "reset"},
+        {"sidecar_replay_state", "reset"}};
     EXPECT_DOUBLE_EQ(
         sumMTPRecordValuesContaining(
             records,
@@ -3889,7 +3876,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
         {"kernel_dynamic_state", "reset"},
         {"replay_state", "reset"},
         {"sidecar_replay_state", "reset"}};
-    EXPECT_EQ(findMTPRecordContaining(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
+    EXPECT_NE(findMTPRecordContaining(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
               nullptr);
     PerfStatsCollector::reset();
 }
@@ -3942,13 +3929,26 @@ TEST(Test__MTPGraphConstruction, CPUReplayObservationsTrackLiveStateEpochAcrossR
 
     const auto observations_after_restore =
         orchestrator.forwardReplayCacheObservations();
-    ASSERT_EQ(observations_after_restore.size(), observations_after_decode.size());
-    for (const auto &observation : observations_after_restore)
+    EXPECT_TRUE(observations_after_restore.empty())
+        << "A prefix restore is an atomic timeline replacement; cached graph "
+           "observations from the discarded timeline must not survive it.";
+
+    /*
+     * The next decode should rebuild a normal CPU replay identity from the
+     * restored state.  CPU does not attach segmented GPU live-state epochs, so
+     * the freshly observed identity must still be epoch-neutral.
+     */
+    const int next_token = 2;
+    ASSERT_NE(orchestrator.forward(&next_token, 1, 1), nullptr);
+    const auto observations_after_redecode =
+        orchestrator.forwardReplayCacheObservations();
+    ASSERT_FALSE(observations_after_redecode.empty());
+    for (const auto &observation : observations_after_redecode)
     {
         EXPECT_TRUE(observation.valid);
         EXPECT_EQ(observation.segmented_capture_live_state_epoch, 0u);
         EXPECT_FALSE(observation.requires_live_state_epoch_recapture)
-            << "State-versioned replay must be a no-op for CPU graph identities.";
+            << "State-versioned replay must remain a no-op for CPU graph identities.";
     }
 }
 
@@ -4397,7 +4397,7 @@ TEST(Test__MTPGraphConstruction, GreedyBatchTransactionExecutorRunsOnCPUVerifier
     ASSERT_THAT(state.sequence_lengths, ::testing::ElementsAre(2, 3));
 }
 
-TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationUsesPaddedVerifierRowsOnCPU)
+TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationIsRejectedOnCPU)
 {
     DeviceManager::instance().initialize(-1, false);
 
@@ -4484,22 +4484,22 @@ TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationUsesPaddedVerifierRo
     batch.steps = {first, second};
 
     std::string publication_error;
-    ASSERT_TRUE(orchestrator.publishAcceptedMTPSpecStateBatch(
+    EXPECT_FALSE(orchestrator.supportsMTPSpecStatePublication())
+        << "CPU batched publication must not be reachable through the production "
+           "runner capability boundary.";
+    EXPECT_FALSE(orchestrator.publishAcceptedMTPSpecStateBatch(
         batch,
-        &publication_error))
+        &publication_error));
+    EXPECT_NE(publication_error.find("not advertised"), std::string::npos)
         << publication_error;
 
     const auto state = orchestrator.prefixStateProbe();
     ASSERT_THAT(state.positions, ::testing::ElementsAre(2, 3));
     ASSERT_THAT(state.sequence_lengths, ::testing::ElementsAre(2, 3));
-    EXPECT_EQ(state.live_state_mutations, 1u);
-    EXPECT_EQ(state.last_live_state_mutation_operation,
-              "mtp_spec_state_publication_batch");
-    EXPECT_EQ(state.last_live_state_mutation_reason,
-              "accepted_publication");
+    EXPECT_EQ(state.live_state_mutations, 0u);
 }
 
-TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationRejectsMissingTerminalHiddenRowsBeforeMutation)
+TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationRejectsOnCPUBeforeMutation)
 {
     DeviceManager::instance().initialize(-1, false);
 
@@ -4584,7 +4584,8 @@ TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationRejectsMissingTermin
     EXPECT_FALSE(orchestrator.publishAcceptedMTPSpecStateBatch(
         batch,
         &publication_error));
-    EXPECT_NE(publication_error.find("requires every request"), std::string::npos);
+    EXPECT_NE(publication_error.find("not advertised"), std::string::npos)
+        << publication_error;
 
     const auto after = orchestrator.prefixStateProbe();
     EXPECT_EQ(after.positions, before.positions);

@@ -60,45 +60,67 @@ namespace llaminar2
 {
     namespace
     {
-        bool synchronizeGpuBackendsBeforeRankMmapRelease()
+        std::vector<DeviceId> mmapReleaseSyncDevices(const RankOrchestrator::Config &config)
         {
-            bool ok = true;
-            auto sync_backend = [&ok](const char *name, IBackend *backend)
+            std::vector<DeviceId> devices;
+
+            auto add_device = [&devices](const GlobalDeviceAddress &address)
             {
-                if (!backend)
+                if (!address.isGPU())
                     return;
 
-                const int device_count = backend->deviceCount();
-                for (int device_idx = 0; device_idx < device_count; ++device_idx)
-                {
-                    if (debugEnv().vram_trace)
-                    {
-                        LOG_INFO("[VRAM_TRACE] rank_mmap_release.before_sync backend=" << name
-                                                                                       << " device=" << device_idx);
-                    }
-                    else
-                    {
-                        LOG_DEBUG("RankOrchestrator: synchronizing " << name << ":" << device_idx
-                                                                     << " before mmap DONTNEED");
-                    }
-
-                    if (!backend->synchronize(device_idx))
-                    {
-                        LOG_ERROR("RankOrchestrator: failed to synchronize " << name << ":"
-                                                                             << device_idx
-                                                                             << " before mmap DONTNEED");
-                        ok = false;
-                    }
-                    else if (debugEnv().vram_trace)
-                    {
-                        LOG_INFO("[VRAM_TRACE] rank_mmap_release.after_sync backend=" << name
-                                                                                      << " device=" << device_idx);
-                    }
-                }
+                const DeviceId local_device = address.toLocalDeviceId();
+                if (std::find(devices.begin(), devices.end(), local_device) == devices.end())
+                    devices.push_back(local_device);
             };
 
-            sync_backend("CUDA", getCUDABackend());
-            sync_backend("ROCm", getROCmBackend());
+            for (const auto &device : config.devices)
+                add_device(device);
+
+            for (const auto &stage : config.pp_stages)
+            {
+                for (const auto &device : stage.stage_devices)
+                    add_device(device);
+            }
+
+            return devices;
+        }
+
+        bool synchronizeGpuBackendsBeforeRankMmapRelease(const RankOrchestrator::Config &config)
+        {
+            bool ok = true;
+            for (const DeviceId &device : mmapReleaseSyncDevices(config))
+            {
+                IBackend *backend = getBackendFor(device);
+                if (!backend)
+                {
+                    LOG_ERROR("RankOrchestrator: no backend available for " << device
+                                                                            << " before mmap DONTNEED");
+                    ok = false;
+                    continue;
+                }
+
+                if (debugEnv().vram_trace)
+                {
+                    LOG_INFO("[VRAM_TRACE] rank_mmap_release.before_sync device=" << device);
+                }
+                else
+                {
+                    LOG_DEBUG("RankOrchestrator: synchronizing " << device
+                                                                 << " before mmap DONTNEED");
+                }
+
+                if (!backend->synchronize(device.gpu_ordinal()))
+                {
+                    LOG_ERROR("RankOrchestrator: failed to synchronize " << device
+                                                                         << " before mmap DONTNEED");
+                    ok = false;
+                }
+                else if (debugEnv().vram_trace)
+                {
+                    LOG_INFO("[VRAM_TRACE] rank_mmap_release.after_sync device=" << device);
+                }
+            }
             return ok;
         }
 
@@ -1836,6 +1858,16 @@ namespace llaminar2
             // Update position tracking
             current_position_ += seq_len;
             current_padded_seq_len_ = seq_len;
+            if (current_sequence_lengths_.empty())
+            {
+                current_sequence_lengths_.assign(
+                    static_cast<size_t>(std::max(1, config_.batch_size)),
+                    current_position_ - seq_len);
+            }
+            for (int &length : current_sequence_lengths_)
+            {
+                length += seq_len;
+            }
             stats_dirty_ = true;
 
             // After first prefill, release host-resident weight data.
@@ -1851,7 +1883,7 @@ namespace llaminar2
                     if (!mmap_dontneed_advised_)
                     {
                         mmap_dontneed_advised_ = true;
-                        if (synchronizeGpuBackendsBeforeRankMmapRelease())
+                        if (synchronizeGpuBackendsBeforeRankMmapRelease(config_))
                         {
                             if (debugEnv().vram_trace)
                                 LOG_INFO("[VRAM_TRACE] rank_mmap_release.before_advise phase=after_first_prefill");
@@ -2098,6 +2130,25 @@ namespace llaminar2
         if (mode_ != ParallelismMode::TP || device_runners_.size() < 2)
             return -1;
         return DeviceSampler::sample(device_runners_, params);
+    }
+
+    bool RankOrchestrator::requiresMPICoordinatedDecodeSampling(
+        const SamplingParams &params) const
+    {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->requiresMPICoordinatedDecodeSampling(params);
+        }
+
+        /*
+         * This method must mirror RankOrchestrator::sampleGreedyOnDevice() /
+         * sampleOnDevice(), not a child runner's latent capability.  The TP path
+         * samples through DeviceSampler over local child runners or falls back
+         * to rank-local gathered logits; it does not call
+         * child->sampleGreedyOnDevice(), so worker ranks must not enter child
+         * sampling collectives on its behalf.
+         */
+        return false;
     }
 
     const float *RankOrchestrator::logits() const
@@ -2601,6 +2652,29 @@ namespace llaminar2
         return false;
     }
 
+    bool RankOrchestrator::forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+        const DeviceResidentLogicalSequenceStateHandle &logical_state,
+        int request_index)
+    {
+        /*
+         * The resident mailbox names participant-local device memory.  A LocalPP
+         * or LocalTP domain needs a domain-wide mailbox map before every child
+         * can consume the same logical request without races, so only the
+         * single-child rank wrapper delegates this path for now.
+         */
+        if (finalPPSidecarRunner())
+        {
+            return false;
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+                logical_state,
+                request_index);
+        }
+        return false;
+    }
+
     bool RankOrchestrator::commitMTPShiftedRowsFromLastForward(
         const int32_t *tokens,
         int token_count,
@@ -2619,7 +2693,8 @@ namespace llaminar2
         int already_appended_tokens,
         int main_forward_token_count,
         bool allow_speculative_discard,
-        int position_offset_override)
+        int position_offset_override,
+        int already_appended_shifted_kv_tokens)
     {
         PerfStatsCollector::ScopedTimer total_timer(
             "mtp",
@@ -2660,7 +2735,8 @@ namespace llaminar2
                 already_appended_tokens,
                 main_forward_token_count,
                 allow_speculative_discard,
-                position_offset_override);
+                position_offset_override,
+                already_appended_shifted_kv_tokens);
         }
         if (device_runners_.empty())
             return false;
@@ -2674,7 +2750,8 @@ namespace llaminar2
                        already_appended_tokens,
                        main_forward_token_count,
                        allow_speculative_discard,
-                       position_offset_override);
+                       position_offset_override,
+                       already_appended_shifted_kv_tokens);
         }
 
         if (!tp_worker_pool_)
@@ -2706,7 +2783,7 @@ namespace llaminar2
             tp_worker_pool_->dispatch(
                 [this, &committed_tokens, token_count, already_appended_tokens,
                  main_forward_token_count, allow_speculative_discard,
-                 position_offset_override,
+                 position_offset_override, already_appended_shifted_kv_tokens,
                  kernel_phase, rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
                 {
                     KernelProfiler::setCurrentPhase(kernel_phase);
@@ -2736,7 +2813,8 @@ namespace llaminar2
                                         already_appended_tokens,
                                         main_forward_token_count,
                                         allow_speculative_discard,
-                                        position_offset_override);
+                                        position_offset_override,
+                                        already_appended_shifted_kv_tokens);
 
                     if (debugEnv().tp_collective_contract_trace)
                     {
@@ -2847,6 +2925,35 @@ namespace llaminar2
         }
         return device_runners_[0]->commitMTPShiftedRowFromDeviceTargetSample(
             target_sample_slot,
+            already_appended_tokens,
+            allow_speculative_discard,
+            position_offset_override);
+    }
+
+    bool RankOrchestrator::commitMTPShiftedRowFromDeviceResidentLogicalState(
+        const DeviceResidentLogicalSequenceStateHandle &logical_state,
+        int request_index,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->commitMTPShiftedRowFromDeviceResidentLogicalState(
+                logical_state,
+                request_index,
+                already_appended_tokens,
+                allow_speculative_discard,
+                position_offset_override);
+        }
+        if (device_runners_.size() != 1 || !device_runners_[0])
+        {
+            LOG_ERROR("[RankOrchestrator] Resident logical-state shifted MTP commit is not enabled for multi-participant TP domains yet");
+            return false;
+        }
+        return device_runners_[0]->commitMTPShiftedRowFromDeviceResidentLogicalState(
+            logical_state,
+            request_index,
             already_appended_tokens,
             allow_speculative_discard,
             position_offset_override);
@@ -3051,6 +3158,30 @@ namespace llaminar2
         return ok;
     }
 
+    bool RankOrchestrator::ensureMTPCheckpointTerminalHidden()
+    {
+        if (!pp_stage_runners_.empty())
+        {
+            /*
+             * This helper materializes the terminal hidden row consumed by the
+             * MTP sidecar. In LocalPP, only the pipeline tail owns the final
+             * hidden state, final norm, LM head, and MTP sidecar. Earlier stages
+             * own local KV/GDN replay state, but their activation tensors are
+             * transferred onward after forwardPP(); asking them to row-select a
+             * "terminal" hidden row can race stale producer-side device buffers.
+             */
+            IInferenceRunner *pp_sidecar = finalPPSidecarRunner();
+            return pp_sidecar && pp_sidecar->ensureMTPCheckpointTerminalHidden();
+        }
+
+        bool ok = true;
+        for (const auto &runner : device_runners_)
+        {
+            ok = runner && runner->ensureMTPCheckpointTerminalHidden() && ok;
+        }
+        return ok;
+    }
+
     const float *RankOrchestrator::mtpLogits() const
     {
         if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
@@ -3162,18 +3293,82 @@ namespace llaminar2
         {
             if (!runner || !runner->hasMTPLogitsLocal())
             {
+                LOG_DEBUG("RankOrchestrator::sampleGreedyFromMTPLogitsOnDevice: "
+                          "participant missing local MTP logits");
                 return -1;
             }
 
-            LogitsLocalInfo info = runner->getMTPLogitsLocalInfo();
+            LogitsLocalInfo info = runner->consumeMTPLogitsLocalInfoForSampling();
             if (!info)
             {
+                LOG_DEBUG("RankOrchestrator::sampleGreedyFromMTPLogitsOnDevice: "
+                          "participant returned empty local MTP logits info");
                 return -1;
             }
             local_infos.push_back(info);
         }
 
-        return DeviceSampler::sampleGreedyFromLocalInfos(local_infos, 0);
+        const int token = DeviceSampler::sampleGreedyFromLocalInfos(local_infos, 0);
+        if (token < 0)
+        {
+            std::ostringstream oss;
+            oss << "RankOrchestrator::sampleGreedyFromMTPLogitsOnDevice: "
+                   "sharded MTP sampling failed for "
+                << local_infos.size() << " participants";
+            for (size_t i = 0; i < local_infos.size(); ++i)
+            {
+                const auto &info = local_infos[i];
+                oss << " [idx=" << i
+                    << " tensor=" << (info.tensor ? "yes" : "no")
+                    << " gpu_ptr=" << info.gpu_ptr
+                    << " device="
+                    << (info.device.has_value() ? info.device->toString() : std::string("none"))
+                    << " stream=" << info.stream
+                    << " vocab_local=" << info.vocab_local
+                    << " argmax_capacity=" << info.argmax_partial_capacity
+                    << "]";
+            }
+            LOG_DEBUG(oss.str());
+        }
+        return token;
+    }
+
+    bool RankOrchestrator::sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+        int draft_sample_slot,
+        int32_t *out_token)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+                draft_sample_slot,
+                out_token);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+                draft_sample_slot,
+                out_token);
+        }
+        return false;
+    }
+
+    bool RankOrchestrator::sampleGreedyFromMainLogitsToDeviceTargetSlot(
+        int target_sample_slot,
+        int32_t *out_token)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                target_sample_slot,
+                out_token);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                target_sample_slot,
+                out_token);
+        }
+        return false;
     }
 
     int RankOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(int row)
@@ -3335,6 +3530,34 @@ namespace llaminar2
                 stop_tokens,
                 stop_token_count,
                 out);
+        }
+        return false;
+    }
+
+    bool RankOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
+        const int32_t *draft_tokens,
+        int draft_token_count,
+        const int32_t *stop_tokens,
+        int stop_token_count,
+        DeviceSpeculativeOutcomeHandle *out_handle)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
+                draft_tokens,
+                draft_token_count,
+                stop_tokens,
+                stop_token_count,
+                out_handle);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
+                draft_tokens,
+                draft_token_count,
+                stop_tokens,
+                stop_token_count,
+                out_handle);
         }
         return false;
     }
@@ -3574,15 +3797,52 @@ namespace llaminar2
         return false;
     }
 
+    bool RankOrchestrator::stageStochasticDraftTokensForDeviceVerification(
+        const int32_t *draft_tokens,
+        int draft_token_count,
+        int first_draft_slot)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            /*
+             * Device-side stochastic verification for LocalPP is final-stage
+             * owned: the final stage owns verifier logits/distributions and the
+             * draft-token slots consumed by the verifier summary kernel.
+             */
+            return pp_sidecar->stageStochasticDraftTokensForDeviceVerification(
+                draft_tokens,
+                draft_token_count,
+                first_draft_slot);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->stageStochasticDraftTokensForDeviceVerification(
+                draft_tokens,
+                draft_token_count,
+                first_draft_slot);
+        }
+        return false;
+    }
+
     const void *RankOrchestrator::prepareMTPVerifierInputTokensOnDevice(
         int32_t first_token,
         int first_draft_slot,
         int draft_token_count,
         int total_verifier_input_tokens)
     {
-        if (finalPPSidecarRunner())
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
-            return nullptr;
+            /*
+             * LocalPP verifier replay runs on the logits-owning final stage.
+             * The prepared verifier token row is consumed by that same final
+             * stage, so it follows final-stage ownership rather than the
+             * pipeline-head token input ownership used by normal prefill/decode.
+             */
+            return pp_sidecar->prepareMTPVerifierInputTokensOnDevice(
+                first_token,
+                first_draft_slot,
+                draft_token_count,
+                total_verifier_input_tokens);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
         {
@@ -3601,9 +3861,19 @@ namespace llaminar2
         int draft_token_count,
         int total_verifier_input_tokens)
     {
-        if (finalPPSidecarRunner())
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
-            return nullptr;
+            /*
+             * The first target sample slot and draft sample slots are produced
+             * by the final-stage stochastic verifier hooks, so compose the
+             * verifier token row on that same stage to avoid cross-stage device
+             * pointer aliasing.
+             */
+            return pp_sidecar->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+                first_target_sample_slot,
+                first_draft_slot,
+                draft_token_count,
+                total_verifier_input_tokens);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
         {
@@ -3865,6 +4135,25 @@ namespace llaminar2
         }
     }
 
+    bool RankOrchestrator::supportsLogicalMTPVerifierBaseCheckpoint() const
+    {
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty())
+        {
+            return false;
+        }
+
+        for (const auto &runner : participants)
+        {
+            if (!runner || !runner->supportsLogicalMTPVerifierBaseCheckpoint())
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool RankOrchestrator::supportsMTPSpecStatePublication() const
     {
         const auto &participants =
@@ -3882,6 +4171,70 @@ namespace llaminar2
             }
         }
         return true;
+    }
+
+    MTPVerifierRowCapability RankOrchestrator::mtpVerifierRowCapability() const
+    {
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        MTPVerifierRowCapability capability;
+        if (participants.empty())
+        {
+            return capability;
+        }
+
+        bool initialized = false;
+        for (const auto &runner : participants)
+        {
+            if (!runner)
+            {
+                return {};
+            }
+            const MTPVerifierRowCapability child =
+                runner->mtpVerifierRowCapability();
+            if (!initialized)
+            {
+                capability = child;
+                initialized = true;
+            }
+            else
+            {
+                capability.intersectWith(child);
+            }
+        }
+        return capability;
+    }
+
+    MTPVerifierEconomyCapability RankOrchestrator::mtpVerifierEconomyCapability() const
+    {
+        const auto &participants =
+            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        MTPVerifierEconomyCapability capability;
+        if (participants.empty())
+        {
+            return capability;
+        }
+
+        bool initialized = false;
+        for (const auto &runner : participants)
+        {
+            if (!runner)
+            {
+                return {};
+            }
+            const MTPVerifierEconomyCapability child =
+                runner->mtpVerifierEconomyCapability();
+            if (!initialized)
+            {
+                capability = child;
+                initialized = true;
+            }
+            else
+            {
+                capability.intersectWith(child);
+            }
+        }
+        return capability;
     }
 
     bool RankOrchestrator::publishAcceptedMTPSpecState(
@@ -4731,9 +5084,48 @@ namespace llaminar2
         {
             return pp_sidecar->supportsMTPSidecarPreservesMainState();
         }
-        return device_runners_.size() == 1 &&
-               device_runners_[0] &&
-               device_runners_[0]->supportsMTPSidecarPreservesMainState();
+        if (device_runners_.empty())
+            return false;
+
+        /*
+         * LocalTP runs the MTP sidecar on every participant in lockstep.  The
+         * rank-level capability is therefore a domain-wide AND: a single child
+         * that cannot preserve main state makes the whole TP sidecar unsafe for
+         * verifier-base reuse.
+         */
+        return std::all_of(
+            device_runners_.begin(),
+            device_runners_.end(),
+            [](const std::unique_ptr<IInferenceRunner> &runner)
+            {
+                return runner &&
+                       runner->supportsMTPSidecarPreservesMainState();
+            });
+    }
+
+    bool RankOrchestrator::supportsMTPShiftedRowReuseFromSidecar() const
+    {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->supportsMTPShiftedRowReuseFromSidecar();
+        }
+        if (device_runners_.empty())
+            return false;
+
+        /*
+         * Reusing the first shifted MTP KV row is only correct when every TP
+         * shard can keep its sidecar row as the accepted row-zero publication
+         * boundary.  Treat it as a rank-wide all-participant capability rather
+         * than a property of participant 0.
+         */
+        return std::all_of(
+            device_runners_.begin(),
+            device_runners_.end(),
+            [](const std::unique_ptr<IInferenceRunner> &runner)
+            {
+                return runner &&
+                       runner->supportsMTPShiftedRowReuseFromSidecar();
+            });
     }
 
     bool RankOrchestrator::applyPenaltiesOnDevice(
@@ -4750,7 +5142,24 @@ namespace llaminar2
                 penalties,
                 vocab_size);
         }
-        return penalties.empty();
+        if (penalties.empty())
+            return true;
+
+        /*
+         * Column-parallel logits are rank-wide state.  Each child runner
+         * applies the same sparse global-token penalty map and internally
+         * ignores tokens outside its vocab shard.  Returning false here for
+         * non-empty maps made temperature-zero LocalTP MTP fail as soon as
+         * model defaults enabled repetition penalties.
+         */
+        bool ok = true;
+        for (const auto &runner : device_runners_)
+        {
+            ok = runner &&
+                 runner->applyPenaltiesOnDevice(penalties, vocab_size) &&
+                 ok;
+        }
+        return ok;
     }
 
     bool RankOrchestrator::applyPenaltiesToMTPLogitsOnDevice(
@@ -4769,7 +5178,24 @@ namespace llaminar2
                 penalties,
                 vocab_size);
         }
-        return penalties.empty();
+        if (penalties.empty())
+            return true;
+
+        /*
+         * MTP sidecar logits are sharded exactly like the main LM head in
+         * LocalTP.  Fan out the global sparse penalties to every participant so
+         * the next rank-level sampler sees a coherent penalty-mutated row.
+         */
+        bool ok = true;
+        for (const auto &runner : device_runners_)
+        {
+            ok = runner &&
+                 runner->applyPenaltiesToMTPLogitsOnDevice(
+                     penalties,
+                     vocab_size) &&
+                 ok;
+        }
+        return ok;
     }
 
     bool RankOrchestrator::applyPenaltiesToAllPositionLogitsOnDeviceRow(
@@ -4791,7 +5217,20 @@ namespace llaminar2
                 penalties,
                 vocab_size);
         }
-        return penalties.empty();
+        if (penalties.empty())
+            return true;
+
+        bool ok = true;
+        for (const auto &runner : device_runners_)
+        {
+            ok = runner &&
+                 runner->applyPenaltiesToAllPositionLogitsOnDeviceRow(
+                     row,
+                     penalties,
+                     vocab_size) &&
+                 ok;
+        }
+        return ok;
     }
 
     void RankOrchestrator::setSkipLogitsGatherDecode(bool skip)
@@ -5378,7 +5817,25 @@ namespace llaminar2
 
         restore_runners(device_runners_);
         restore_runners(pp_stage_runners_);
-        return saw_runner && ok && participant_index == snapshot.participant_snapshots.size();
+        if (!(saw_runner && ok && participant_index == snapshot.participant_snapshots.size()))
+            return false;
+
+        /*
+         * A prefix restore is atomic at the rank boundary as well as at each
+         * child runner.  The children own the actual KV/GDN payloads, but rank
+         * orchestration still owns public position/sequence bookkeeping used by
+         * diagnostics, PP mode, and any code path that cannot delegate directly
+         * to a single child.  Keep that aggregate state in lockstep with the
+         * restored child snapshots so repeated restore/replay cycles cannot
+         * observe stale parent metadata.
+         */
+        current_position_ = snapshot.cached_tokens;
+        current_padded_seq_len_ = 0;
+        current_sequence_lengths_.assign(
+            static_cast<size_t>(std::max(1, config_.batch_size)),
+            snapshot.cached_tokens);
+        stats_dirty_ = true;
+        return true;
     }
 
     bool RankOrchestrator::truncateLivePrefixState(int cached_tokens, int seq_idx)

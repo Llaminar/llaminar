@@ -20,12 +20,15 @@
 #include "../../../memory/BufferId.h"
 #include "../../../loaders/WeightPlan.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
 {
 
     class ITensorGemm;
+    class FP32Tensor;
+    class TensorBase;
     class PreparedWeightStore;
 
     /**
@@ -86,6 +89,16 @@ namespace llaminar2
             std::optional<PreparedWeightRef> prepared_ref_a;
             std::optional<PreparedWeightRef> prepared_ref_b;
             PreparedWeightStore *prepared_store = nullptr;
+
+            /**
+             * @brief Execute tiny MTP verifier batches through repeated M=1 GEMVs.
+             *
+             * GDN projection feeds recurrent state.  In an all-position verifier
+             * graph, even small M=2..4 quantized-dispatch drift can poison later
+             * row snapshots, so publication-capable verifier graphs use the same
+             * one-row projection contract as serial decode.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
         };
 
         static_assert(StageParamsRequired<Params>);
@@ -119,7 +132,18 @@ namespace llaminar2
         ITensorGemm *resolveGemm(
             const ITensor *weight, ITensorGemm *&cached, const char *name);
 
+        bool executeDecodeEquivalentVerifierPrefill(
+            const TensorBase *input,
+            const std::vector<ITensorGemm::TensorProjectionDesc> &projections,
+            int m,
+            int k);
+
         Params params_;
+        std::shared_ptr<FP32Tensor> verifier_input_row_;
+        std::shared_ptr<FP32Tensor> verifier_qkv_row_;
+        std::shared_ptr<FP32Tensor> verifier_z_row_;
+        std::shared_ptr<FP32Tensor> verifier_a_row_;
+        std::shared_ptr<FP32Tensor> verifier_b_row_;
     };
 
 } // namespace llaminar2

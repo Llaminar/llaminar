@@ -82,6 +82,11 @@ namespace
             last_m_ = m;
             last_n_ = n;
             last_k_ = k;
+            saw_request_m7_n11_k13_ =
+                saw_request_m7_n11_k13_ || (m == 7 && n == 11 && k == 13);
+            saw_request_m600_n1_ =
+                saw_request_m600_n1_ || (m == 600 && n == 1);
+            saw_decode_m1_ = saw_decode_m1_ || (m == 1);
 
             WorkspaceRequirements reqs;
             reqs.buffers = buffers_;
@@ -117,6 +122,9 @@ namespace
         int lastM() const { return last_m_; }
         int lastN() const { return last_n_; }
         int lastK() const { return last_k_; }
+        bool sawRequestM7N11K13() const { return saw_request_m7_n11_k13_; }
+        bool sawRequestM600N1() const { return saw_request_m600_n1_; }
+        bool sawDecodeM1() const { return saw_decode_m1_; }
 
         void setBuffers(std::vector<WorkspaceDescriptor> buffers) { buffers_ = std::move(buffers); }
 
@@ -129,6 +137,9 @@ namespace
         mutable int last_m_ = -1;
         mutable int last_n_ = -1;
         mutable int last_k_ = -1;
+        mutable bool saw_request_m7_n11_k13_ = false;
+        mutable bool saw_request_m600_n1_ = false;
+        mutable bool saw_decode_m1_ = false;
     };
 
     class DeclaredShapeWorkspaceStage : public IComputeStage, public IWorkspaceConsumer
@@ -137,10 +148,12 @@ namespace
         DeclaredShapeWorkspaceStage(
             DeviceId device,
             std::vector<size_t> input_shape,
-            std::vector<size_t> output_shape)
+            std::vector<size_t> output_shape,
+            bool declare_decode_only_buffer = false)
             : IComputeStage(device),
               input_shape_(std::move(input_shape)),
-              output_shape_(std::move(output_shape))
+              output_shape_(std::move(output_shape)),
+              declare_decode_only_buffer_(declare_decode_only_buffer)
         {
         }
 
@@ -163,9 +176,15 @@ namespace
             last_m_ = m;
             last_n_ = n;
             last_k_ = k;
+            saw_declared_m_ = saw_declared_m_ || (m == static_cast<int>(input_shape_[0]));
+            saw_decode_m_ = saw_decode_m_ || (m == 1);
 
             WorkspaceRequirements reqs;
             reqs.buffers.push_back({"declared_shape_scratch", 4096, 256, true});
+            if (declare_decode_only_buffer_ && m == 1)
+            {
+                reqs.buffers.push_back({"decode_only_scratch", 2048, 256, true});
+            }
             return reqs;
         }
 
@@ -188,17 +207,22 @@ namespace
         int lastM() const { return last_m_; }
         int lastN() const { return last_n_; }
         int lastK() const { return last_k_; }
+        bool sawDeclaredM() const { return saw_declared_m_; }
+        bool sawDecodeM() const { return saw_decode_m_; }
         DeviceWorkspaceManager *boundWorkspace() const { return bound_workspace_; }
 
     private:
         std::vector<size_t> input_shape_;
         std::vector<size_t> output_shape_;
+        bool declare_decode_only_buffer_ = false;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
         int bind_calls_ = 0;
         mutable int requirements_calls_ = 0;
         mutable int last_m_ = -1;
         mutable int last_n_ = -1;
         mutable int last_k_ = -1;
+        mutable bool saw_declared_m_ = false;
+        mutable bool saw_decode_m_ = false;
     };
 
     WorkspaceConsumerRequest requestFor(MockWorkspaceConsumer &consumer, DeviceId device)
@@ -274,10 +298,9 @@ TEST(Test__WorkspaceAllocator, ReallocatesExistingWorkspaceWhenNamedBufferGrows)
     // 2 bindWorkspace calls: first nullptr (ABA protection before old workspace
     // destruction), then the actual new workspace pointer.
     EXPECT_EQ(larger_consumer.bindCalls(), 2);
-    EXPECT_GE(larger_consumer.requirementsCalls(), 1);
-    EXPECT_EQ(larger_consumer.lastM(), 7);
-    EXPECT_EQ(larger_consumer.lastN(), 11);
-    EXPECT_EQ(larger_consumer.lastK(), 13);
+    EXPECT_GE(larger_consumer.requirementsCalls(), 2);
+    EXPECT_TRUE(larger_consumer.sawRequestM7N11K13());
+    EXPECT_TRUE(larger_consumer.sawDecodeM1());
 }
 
 TEST(Test__WorkspaceAllocator, BindsAllExtraConsumersToMergedWorkspace)
@@ -323,10 +346,10 @@ TEST(Test__WorkspaceAllocator, BindsAllExtraConsumersToMergedWorkspace)
     EXPECT_TRUE(workspace->hasBuffer("kvcache_conv_scratch_v"));
     EXPECT_EQ(workspace->getBufferSize("kvcache_conv_scratch_k"), 4096u);
     EXPECT_EQ(workspace->getBufferSize("kvcache_conv_scratch_v"), 4096u);
-    EXPECT_EQ(main_kv_cache.lastM(), 600);
-    EXPECT_EQ(main_kv_cache.lastN(), 1);
-    EXPECT_EQ(mtp_kv_cache.lastM(), 600);
-    EXPECT_EQ(mtp_kv_cache.lastN(), 1);
+    EXPECT_TRUE(main_kv_cache.sawRequestM600N1());
+    EXPECT_TRUE(main_kv_cache.sawDecodeM1());
+    EXPECT_TRUE(mtp_kv_cache.sawRequestM600N1());
+    EXPECT_TRUE(mtp_kv_cache.sawDecodeM1());
 }
 
 TEST(Test__WorkspaceAllocator, GraphConsumerUsesDeclaredStageShapeForWorkspaceM)
@@ -356,13 +379,49 @@ TEST(Test__WorkspaceAllocator, GraphConsumerUsesDeclaredStageShapeForWorkspaceM)
         unitBudgetConfig()));
 
     EXPECT_NE(raw_stage->boundWorkspace(), nullptr);
-    EXPECT_GE(raw_stage->requirementsCalls(), 1);
+    EXPECT_GE(raw_stage->requirementsCalls(), 2);
     EXPECT_EQ(raw_stage->bindCalls(), 1);
-    EXPECT_EQ(raw_stage->lastM(), 2)
+    EXPECT_TRUE(raw_stage->sawDeclaredM())
         << "Workspace sizing must honor graph-declared M for MTP verifier replay";
+    EXPECT_TRUE(raw_stage->sawDecodeM())
+        << "GPU graph workspaces must also be sized for one-row decode replay";
     EXPECT_EQ(raw_stage->lastK(), 8);
     EXPECT_EQ(raw_stage->lastN(), 0)
         << "Prepared kernels keep their own output width when no explicit N is required";
+}
+
+TEST(Test__WorkspaceAllocator, GraphConsumerIncludesDecodeOnlyWorkspaceForPrefillSizedGraph)
+{
+    auto device = selectAvailableGpuWithMemory();
+    if (!device)
+    {
+        GTEST_SKIP() << "No CUDA/ROCm GPU with enough free memory for WorkspaceAllocator unit test";
+    }
+
+    WorkspaceAllocator allocator;
+    ComputeGraph graph;
+    auto hints = tinyHints();
+    hints.max_seq_len = 4096;
+
+    auto stage = std::make_unique<DeclaredShapeWorkspaceStage>(
+        *device,
+        std::vector<size_t>{128, 8},
+        std::vector<size_t>{128, 16},
+        true);
+    auto *raw_stage = stage.get();
+    graph.addNode("cuda_fused_decode_like", std::move(stage), *device);
+
+    ASSERT_TRUE(allocator.allocateForGraph(
+        graph,
+        hints,
+        {},
+        unitBudgetConfig()));
+
+    ASSERT_NE(raw_stage->boundWorkspace(), nullptr);
+    EXPECT_TRUE(raw_stage->sawDeclaredM());
+    EXPECT_TRUE(raw_stage->sawDecodeM());
+    EXPECT_TRUE(raw_stage->boundWorkspace()->hasBuffer("decode_only_scratch"))
+        << "A prefill-sized graph allocation must include buffers declared only for M=1 decode";
 }
 
 TEST(Test__WorkspaceAllocator, GraphConsumerSkipsCPUWorkspaceForDeclaredStage)

@@ -139,7 +139,7 @@ namespace llaminar2
             /**
              * @brief Append the shared expert to the routed verifier pipeline.
              *
-             * This CUDA-only verifier fast path represents the shared expert as
+             * This GPU verifier fast path represents the shared expert as
              * logical expert `num_experts` with one extra route per row.  The
              * grouped pipeline writes the final MoE FFN output directly, so the
              * graph must not add separate shared-expert FFN/gate/combine stages
@@ -247,6 +247,18 @@ namespace llaminar2
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
+        /**
+         * @brief Drop per-request fused decode warmup state.
+         *
+         * clear_cache() may reset backend pointer-table readiness while keeping
+         * this graph object alive, so the next request must warm routed MoE
+         * decode again before capture is allowed.
+         */
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            runtime_grouped_decode_warmed_ = false;
+        }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -290,9 +302,27 @@ namespace llaminar2
 
         // Test accessor
         void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
+        void setRuntimeGroupedDecodeWarmedForTesting(bool warmed) { runtime_grouped_decode_warmed_ = warmed; }
         bool usesCPUDecodeEquivalentVerifierPrefillForTesting() const
         {
             return params_.force_decode_equivalent_verifier_prefill;
+        }
+        /**
+         * @brief Test-only predicate for the fixed-topology M=1 verifier replay.
+         *
+         * LocalTP and overlay runners may own only a subset of experts.  Those
+         * lanes must not claim the full-ownership descriptor-table replay path;
+         * they use the mask-aware device grouped route instead.
+         */
+        bool usesFixedTopologyGroupedVerifierReplayForTesting() const
+        {
+            return params_.force_grouped_verifier_prefill_for_decode &&
+                   params_.seq_len == 1 &&
+                   canUseFixedTopologyGroupedPrefill();
+        }
+        TensorBase *combinedSharedGateInputForTesting() const
+        {
+            return effectiveCombinedSharedGateInput();
         }
 
     private:
@@ -311,6 +341,14 @@ namespace llaminar2
         mutable std::shared_ptr<FP32Tensor> scratch_gate_;
         mutable std::shared_ptr<FP32Tensor> scratch_up_;
         mutable std::shared_ptr<FP32Tensor> scratch_out_;
+        /**
+         * @brief Output scratch for verifier rows replayed through decode.
+         *
+         * executeSingleToken() uses scratch_out_ as an internal SwiGLU/down
+         * temporary.  The per-row verifier output must not alias that scratch,
+         * otherwise the helper can accumulate into its own intermediate buffer.
+         */
+        mutable std::shared_ptr<FP32Tensor> verifier_output_row_;
         mutable int scratch_capacity_ = 0;
 
         /// Batched gate+up scratch buffers for M=1 decode (one per top-k expert).
@@ -333,10 +371,33 @@ namespace llaminar2
         /// Cached MoE kernel (gather/scatter, SwiGLU fallback)
         mutable IMoEKernel *moe_kernel_ = nullptr;
 
+        /**
+         * @brief True after routed single-token fused decode has staged runtime pointer arrays.
+         *
+         * CUDA and ROCm fused MoE decode read device-side pointer tables for the
+         * gate/up and down scratch slots during graph replay.  Those tables are
+         * populated by an eager warmup run because graph capture must not contain
+         * the host-to-device metadata uploads.  Keep this flag tied to the current
+         * workspace, descriptor tables, and runtime layer so capture can only
+         * start after that exact route has succeeded.
+         */
+        mutable bool runtime_grouped_decode_warmed_ = false;
+
         /// Fast path for decode (seq_len=1): avoids token grouping, gather/scatter,
         /// and per-expert heap allocations. Uses routing results directly.
         bool executeSingleToken(IDeviceContext *ctx);
-        bool executeCPUDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
+
+        /**
+         * @brief Execute verifier-sized batches as a series of decode rows.
+         *
+         * MTP state publication restores live KV/GDN/conv state from a selected
+         * verifier row.  That only remains sound when the verifier row was
+         * produced by the same math as ordinary one-token decode.  This helper
+         * enforces that contract for CPU, CUDA, and ROCm by running M=1 expert
+         * projections per row, while still using backend tensor kernels for the
+         * heavy GPU work.
+         */
+        bool executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
 
         void ensureGemmEnginesCached();
         bool ensureGemmEnginesForExperts(const std::vector<int> &expert_ids);
@@ -350,6 +411,7 @@ namespace llaminar2
         bool canUseRuntimePrefillGrouping() const;
         bool canUseFixedTopologyGroupedPrefill() const;
         bool canUseCombinedSharedVerifierPrefill() const;
+        TensorBase *effectiveCombinedSharedGateInput() const;
         bool executeCombinedSharedVerifierPrefill(IMoEKernel *kernel) const;
         bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
@@ -379,6 +441,8 @@ namespace llaminar2
         mutable int combined_shared_desc_table_num_experts_ = 0;
         mutable int combined_shared_desc_table_d_model_ = 0;
         mutable int combined_shared_desc_table_intermediate_ = 0;
+        mutable std::shared_ptr<FP32Tensor> combined_shared_gate_inp_fp32_;
+        mutable TensorBase *combined_shared_gate_inp_source_ = nullptr;
 
         DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
         bool moe_runtime_table_initialized_ = false;
@@ -433,6 +497,18 @@ namespace llaminar2
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
+        /**
+         * @brief Drop per-request grouped decode warmup state.
+         *
+         * The backend owns graph-replayed pointer arrays for shared-expert
+         * decode. Session reset may clear those arrays without rebuilding the
+         * stage, so capture must require a fresh warmup.
+         */
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            grouped_decode_warmed_ = false;
+        }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -489,11 +565,22 @@ namespace llaminar2
         bool ensureSharedGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool ensureSharedGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool shouldUseGroupedVerifierPrefillRoute() const;
-        bool shouldUseCPUDecodeEquivalentVerifierPrefill() const;
+        bool shouldUseDecodeEquivalentVerifierPrefill() const;
         bool shouldUseGroupedDecodeRoute() const;
         bool tryGroupedVerifierPrefill(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool tryGroupedDecode(IMoEKernel *kernel, int d_model, int intermediate) const;
-        bool executeCPUDecodeEquivalentVerifierPrefill(IMoEKernel *kernel, int d_model, int intermediate);
+
+        /**
+         * @brief Execute shared expert verifier rows through the decode path.
+         *
+         * The shared expert has no routing state, but its quantized GEMM kernels
+         * can still choose different M=2..4 math than M=1 decode.  State
+         * publication needs the M=1 path so the next accepted token continues
+         * exactly like serial decode.
+         */
+        bool executeDecodeEquivalentVerifierPrefill(
+            IDeviceContext *ctx, IMoEKernel *kernel,
+            int d_model, int intermediate);
 
         mutable int shared_grouped_gateup_desc_table_id_ = -1;
         mutable int shared_grouped_gateup_desc_table_d_model_ = 0;
@@ -540,8 +627,9 @@ namespace llaminar2
 
             /// Optional routed MoE output to add after shared-expert gating.
             /// When both routed_residual and combined_output are set, the stage
-            /// treats shared_output as read-only and writes the fused result to
-            /// combined_output. When omitted, the legacy in-place gate path is used.
+            /// writes the gated shared contribution back to shared_output and
+            /// writes routed_residual + shared_output to combined_output in the
+            /// same kernel. When omitted, the legacy in-place gate path is used.
             TensorBase *routed_residual = nullptr;
             TensorBase *combined_output = nullptr;
             int seq_len = 0;

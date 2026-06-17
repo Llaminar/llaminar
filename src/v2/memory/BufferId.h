@@ -98,8 +98,10 @@ namespace llaminar2
         STOCHASTIC_TARGET_SAMPLE_TOKENS, ///< Device-resident sampled main/verifier target tokens [1, 4]
         STOCHASTIC_DRAFT_SAMPLE_TOKENS, ///< Device-resident sampled MTP draft tokens [1, 3]
         STOCHASTIC_DRAFT_SAMPLE_PROBS,  ///< Device-resident sampled MTP draft probabilities [1, 3]
-        STOCHASTIC_TOPK_PARTIAL_VALS, ///< Per-block stochastic top-k partial values [blocks, 32]
-        STOCHASTIC_TOPK_PARTIAL_IDXS, ///< Per-block stochastic top-k partial indices [blocks, 32]
+        STOCHASTIC_TOPK_PARTIAL_VALS, ///< Target/verifier per-block stochastic top-k partial values [blocks, 32]
+        STOCHASTIC_TOPK_PARTIAL_IDXS, ///< Target/verifier per-block stochastic top-k partial indices [blocks, 32]
+        STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS, ///< MTP-draft per-block stochastic top-k partial values [blocks, 32]
+        STOCHASTIC_DRAFT_TOPK_PARTIAL_IDXS, ///< MTP-draft per-block stochastic top-k partial indices [blocks, 32]
         STOCHASTIC_VERIFY_TOKENS,    ///< Scalar stochastic verifier output tokens [1, 4]
         STOCHASTIC_VERIFY_ACCEPTED,  ///< Scalar stochastic verifier accept flags [1, 4]
         STOCHASTIC_VERIFY_ACCEPT_PROBS, ///< Scalar stochastic verifier accept probabilities [1, 4]
@@ -245,6 +247,10 @@ namespace llaminar2
             return "STOCHASTIC_TOPK_PARTIAL_VALS";
         case BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS:
             return "STOCHASTIC_TOPK_PARTIAL_IDXS";
+        case BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS:
+            return "STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS";
+        case BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_IDXS:
+            return "STOCHASTIC_DRAFT_TOPK_PARTIAL_IDXS";
         case BufferId::STOCHASTIC_VERIFY_TOKENS:
             return "STOCHASTIC_VERIFY_TOKENS";
         case BufferId::STOCHASTIC_VERIFY_ACCEPTED:

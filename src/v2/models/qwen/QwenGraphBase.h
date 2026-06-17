@@ -122,7 +122,8 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device,
-            const std::vector<int> *sequence_lengths = nullptr) override = 0;
+            const std::vector<int> *sequence_lengths = nullptr,
+            const void *position_ids_device = nullptr) override = 0;
 
         // =====================================================================
         // Configuration
@@ -279,6 +280,7 @@ namespace llaminar2
             TensorBase *input_hidden,
             IKVCache *kv_cache,
             const int *position_ids,
+            const void *position_ids_device,
             DeviceId device);
 
         ComputeGraph buildLayerGraph(
@@ -286,6 +288,7 @@ namespace llaminar2
             TensorBase *input_hidden,
             IKVCache *kv_cache,
             const int *position_ids,
+            const void *position_ids_device,
             DeviceId device);
 
         ComputeGraph buildLMHeadGraph(
@@ -444,6 +447,7 @@ namespace llaminar2
             int local_n_kv_heads,
             int total_tokens,
             const int *position_ids,
+            const void *position_ids_device,
             DeviceId device);
 
         /**
@@ -491,6 +495,7 @@ namespace llaminar2
             int local_n_kv_heads,
             IKVCache *kv_cache,
             const int *position_ids,
+            const void *position_ids_device,
             DeviceId device,
             bool has_qkv_proj,
             const std::string &rope_dependency,
@@ -522,7 +527,8 @@ namespace llaminar2
             TensorBase *normalized_out,
             const std::string &prev_node,
             int seq_len,
-            DeviceId device);
+            DeviceId device,
+            BufferId input_buffer_id = BufferId::HIDDEN_STATE);
 
         const TPDomain *getDomainForLayer(int layer_idx, bool is_attention) const;
     };

@@ -78,7 +78,7 @@ namespace llaminar2
     {
         const float *input_data = input->data();
         const float *gate_data = gate_inp->data();
-        const float *shared_data = shared_output->data();
+        float *shared_data = shared_output->mutable_data();
         const float *residual_data = routed_residual->data();
         float *combined_data = combined_output->mutable_data();
 
@@ -92,8 +92,11 @@ namespace llaminar2
             const float gate = 1.0f / (1.0f + std::exp(-dot));
             const size_t row_offset = static_cast<size_t>(t) * d_model;
             for (int j = 0; j < d_model; ++j)
-                combined_data[row_offset + j] = residual_data[row_offset + j] +
-                                                gate * shared_data[row_offset + j];
+            {
+                const float gated_shared = gate * shared_data[row_offset + j];
+                shared_data[row_offset + j] = gated_shared;
+                combined_data[row_offset + j] = residual_data[row_offset + j] + gated_shared;
+            }
         }
     }
 

@@ -1605,7 +1605,7 @@ __global__ void rocm_moe_shared_expert_gate_decode_fused_kernel(
 __global__ void rocm_moe_shared_expert_gate_add_kernel(
     const float *__restrict__ input,            // [seq_len, d_model]
     const float *__restrict__ gate_inp,         // [d_model]
-    const float *__restrict__ shared_output,    // [seq_len, d_model]
+    float *__restrict__ shared_output,          // [seq_len, d_model]
     const float *__restrict__ routed_residual,  // [seq_len, d_model]
     float *__restrict__ combined_output,        // [seq_len, d_model]
     int seq_len, int d_model)
@@ -1642,8 +1642,11 @@ __global__ void rocm_moe_shared_expert_gate_add_kernel(
 
     const float gate = warp_sums[0];
     for (int i = threadIdx.x; i < d_model; i += blockDim.x)
-        combined_output[row_offset + i] =
-            routed_residual[row_offset + i] + gate * shared_output[row_offset + i];
+    {
+        const float gated_shared = gate * shared_output[row_offset + i];
+        shared_output[row_offset + i] = gated_shared;
+        combined_output[row_offset + i] = routed_residual[row_offset + i] + gated_shared;
+    }
 }
 
 // =========================================================================
@@ -2430,7 +2433,7 @@ bool hipMoE_shared_expert_gate_decode_fused(
 
 bool hipMoE_shared_expert_gate_add(
     const float *input, const float *gate_inp,
-    const float *shared_output, const float *routed_residual,
+    float *shared_output, const float *routed_residual,
     float *combined_output, int seq_len, int d_model,
     int device_idx, void *stream)
 {

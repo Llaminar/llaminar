@@ -151,6 +151,7 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1);
+        bool ensureMTPCheckpointTerminalHiddenAll();
         bool setComputeAllPositionLogitsAll(bool enabled);
         uint64_t moePlacementEpochAll() const;
         PrefixStateSnapshot captureLivePrefixStateAll(int seq_idx = 0) const;
@@ -291,6 +292,7 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
+        bool ensureMTPCheckpointTerminalHidden() override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;

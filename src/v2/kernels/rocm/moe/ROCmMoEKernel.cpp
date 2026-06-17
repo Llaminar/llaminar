@@ -189,6 +189,34 @@ namespace
         tensor->transitionTo(llaminar2::TensorCoherenceState::SYNCED);
     }
 
+    llaminar2::PerfStatsCollector::Tags groupedDecodeTags(
+        const char *source,
+        int active_slots,
+        int d_model,
+        int intermediate,
+        const char *route)
+    {
+        return {
+            {"source", source},
+            {"active_slots", std::to_string(active_slots)},
+            {"d_model", std::to_string(d_model)},
+            {"intermediate", std::to_string(intermediate)},
+            {"route", route}};
+    }
+
+    void recordGroupedDecodeCounter(
+        const char *name,
+        const char *source,
+        int active_slots,
+        int d_model,
+        int intermediate,
+        const char *route)
+    {
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel", name, 1.0, {}, {},
+            groupedDecodeTags(source, active_slots, d_model, intermediate, route));
+    }
+
     bool ensureTensorOnDevice(llaminar2::ITensor *tensor,
                               llaminar2::DeviceId device,
                               void *stream,
@@ -371,7 +399,7 @@ extern "C"
 
     bool hipMoE_shared_expert_gate_add(
         const float *input, const float *gate_inp,
-        const float *shared_output, const float *routed_residual,
+        float *shared_output, const float *routed_residual,
         float *combined_output, int seq_len, int d_model,
         int device_idx, void *stream);
 
@@ -2445,8 +2473,45 @@ namespace llaminar2
         return true;
     }
 
+    bool ROCmMoEKernel::runtimePointerWorkspaceSlot(
+        int descriptor_table_id,
+        RuntimePointerArrayScope scope,
+        std::size_t *workspace_slot,
+        const char *context) const
+    {
+        if (!workspace_slot || descriptor_table_id < 0)
+            return false;
+
+        const std::size_t table_slot = static_cast<std::size_t>(descriptor_table_id);
+        if (table_slot >= kRuntimePointerArrayTableSlots)
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " pointer workspace table slot exceeded: table_id="
+                                         << descriptor_table_id << " table_slots="
+                                         << kRuntimePointerArrayTableSlots);
+            return false;
+        }
+
+        const std::size_t scope_slot = static_cast<std::size_t>(scope);
+        const std::size_t slot =
+            scope_slot * kRuntimePointerArrayTableSlots + table_slot;
+        if (slot >= kRuntimePointerArrayWorkspaceEntries)
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " pointer workspace slot exceeded: scope="
+                                         << scope_slot << " table_id="
+                                         << descriptor_table_id << " capacity="
+                                         << kRuntimePointerArrayWorkspaceEntries);
+            return false;
+        }
+
+        *workspace_slot = slot;
+        return true;
+    }
+
     bool ROCmMoEKernel::stageRuntimeGateUpPointerArrays(
         int descriptor_table_id,
+        RuntimePointerArrayScope scope,
         int top_k,
         const std::array<float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
         const std::array<float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &up_ptrs,
@@ -2459,12 +2524,11 @@ namespace llaminar2
             return false;
         }
 
-        const size_t workspace_slot = static_cast<size_t>(descriptor_table_id);
-        if (workspace_slot >= kRuntimePointerArrayWorkspaceEntries)
-        {
-            LOG_ERROR("[ROCmMoEKernel::stageRuntimeGateUpPointerArrays] pointer workspace slot capacity exceeded");
+        std::size_t workspace_slot = 0;
+        if (!runtimePointerWorkspaceSlot(
+                descriptor_table_id, scope, &workspace_slot,
+                "grouped gate/up"))
             return false;
-        }
         if (!setMoEDevice(device_ordinal_, "stageRuntimeGateUpPointerArrays"))
             return false;
 
@@ -2519,6 +2583,7 @@ namespace llaminar2
 
     bool ROCmMoEKernel::stageRuntimeDownPointerArrays(
         int descriptor_table_id,
+        RuntimePointerArrayScope scope,
         int top_k,
         const std::array<const float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
         const std::array<const float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &up_ptrs,
@@ -2531,12 +2596,11 @@ namespace llaminar2
             return false;
         }
 
-        const size_t workspace_slot = static_cast<size_t>(descriptor_table_id);
-        if (workspace_slot >= kRuntimePointerArrayWorkspaceEntries)
-        {
-            LOG_ERROR("[ROCmMoEKernel::stageRuntimeDownPointerArrays] pointer workspace slot capacity exceeded");
+        std::size_t workspace_slot = 0;
+        if (!runtimePointerWorkspaceSlot(
+                descriptor_table_id, scope, &workspace_slot,
+                "grouped down"))
             return false;
-        }
         if (!setMoEDevice(device_ordinal_, "stageRuntimeDownPointerArrays"))
             return false;
 
@@ -2764,32 +2828,10 @@ namespace llaminar2
             return false;
         }
 
-#if LLAMINAR_ASSERTIONS_ACTIVE
-        DeviceMoELayerRuntime runtime_snapshot{};
-        hipError_t runtime_copy_err = hipMemcpy(&runtime_snapshot, runtime_layer,
-                                                sizeof(DeviceMoELayerRuntime),
-                                                hipMemcpyDeviceToHost);
-        if (runtime_copy_err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] runtime validation D2H failed: "
-                      << hipGetErrorString(runtime_copy_err));
-            return false;
-        }
-        if (runtime_snapshot.active_bank > 1u ||
-            runtime_snapshot.active_epoch == 0u ||
-            runtime_snapshot.expert_count != static_cast<uint32_t>(num_experts) ||
-            runtime_snapshot.top_k != static_cast<uint32_t>(top_k) ||
-            runtime_snapshot.banks[runtime_snapshot.active_bank].epoch != runtime_snapshot.active_epoch ||
-            runtime_snapshot.banks[runtime_snapshot.active_bank].expert_count != static_cast<uint32_t>(num_experts))
-        {
-            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] invalid runtime layer state"
-                      << " active_bank=" << runtime_snapshot.active_bank
-                      << " active_epoch=" << runtime_snapshot.active_epoch
-                      << " expert_count=" << runtime_snapshot.expert_count
-                      << " top_k=" << runtime_snapshot.top_k);
-            return false;
-        }
-#endif
+        // The runtime table is a graph-build invariant validated by the MoE
+        // stages before decode capture.  Do not copy it back here: this path is
+        // part of vLLM-style speculative decode replay and must stay entirely
+        // device-resident once the graph is hot.
 
         const float *h = static_cast<const float *>(hidden->gpu_data_ptr());
         const void *g = gate_weights->gpu_data_ptr();
@@ -3137,7 +3179,7 @@ namespace llaminar2
 
         const float *in = static_cast<const float *>(input->gpu_data_ptr());
         const float *gi = static_cast<const float *>(gate_inp->gpu_data_ptr());
-        const float *so = static_cast<const float *>(shared_output->gpu_data_ptr());
+        float *so = static_cast<float *>(shared_output->gpu_data_ptr());
         const float *rr = static_cast<const float *>(routed_residual->gpu_data_ptr());
         float *co = static_cast<float *>(combined_output->gpu_data_ptr());
         if (!in || !gi || !so || !rr || !co)
@@ -3153,6 +3195,7 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::sharedExpertGateAddFromTensors] fused gate-add kernel launch failed");
             return;
         }
+        markDeviceWritten(shared_output, device, stream);
         markDeviceWritten(combined_output, device, stream);
     }
 
@@ -3458,7 +3501,8 @@ namespace llaminar2
         float **d_gate_output_ptrs = nullptr;
         float **d_up_output_ptrs = nullptr;
         if (!stageRuntimeGateUpPointerArrays(
-                descriptor_table_id, num_active, gate_output_ptrs, up_output_ptrs,
+                descriptor_table_id, RuntimePointerArrayScope::TableDecode,
+                num_active, gate_output_ptrs, up_output_ptrs,
                 &d_gate_output_ptrs, &d_up_output_ptrs))
         {
             return false;
@@ -3675,7 +3719,8 @@ namespace llaminar2
         float **d_gate_output_ptrs = nullptr;
         float **d_up_output_ptrs = nullptr;
         if (!stageRuntimeGateUpPointerArrays(
-                descriptor_table_id, top_k, gate_output_ptrs, up_output_ptrs,
+                descriptor_table_id, RuntimePointerArrayScope::RuntimeTwoStep,
+                top_k, gate_output_ptrs, up_output_ptrs,
                 &d_gate_output_ptrs, &d_up_output_ptrs))
         {
             return false;
@@ -3743,6 +3788,230 @@ namespace llaminar2
             }
         }
         return ok;
+    }
+
+    bool ROCmMoEKernel::groupedExpertDecodeFromRuntime(
+        DeviceMoELayerRuntime *runtime_layer,
+        const TensorBase *input,
+        int gateup_descriptor_table_id,
+        int down_descriptor_table_id,
+        int top_k,
+        ITensor *output,
+        int d_model,
+        int intermediate)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_FFN, static_cast<hipStream_t>(getStream()));
+
+        if (!runtime_layer || !input || gateup_descriptor_table_id < 0 ||
+            down_descriptor_table_id < 0 || top_k <= 0 || !output ||
+            d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (top_k > static_cast<int>(kDeviceMoEMaxTopK) ||
+            top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
+            (d_model % 32) != 0 || (intermediate % 32) != 0)
+        {
+            return false;
+        }
+        if (gateup_descriptor_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_descriptor_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_descriptor_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_descriptor_table_id];
+        if (!gateup_table.valid || !gateup_table.device_gate_descs || !gateup_table.device_up_descs ||
+            !down_table.valid || !down_table.device_descs ||
+            gateup_table.d_model != d_model || gateup_table.intermediate != intermediate ||
+            down_table.d_model != d_model || down_table.intermediate != intermediate)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] descriptor table mismatch");
+            return false;
+        }
+
+        const hipStream_t stream = static_cast<hipStream_t>(getStream());
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!setMoEDevice(device_ordinal_, "groupedExpertDecodeFromRuntime"))
+            return false;
+
+        /*
+         * This fused wrapper is intentionally workspace-native. The stage no
+         * longer has to materialize one TensorBase per top-k slot, and captured
+         * graphs replay stable pointer-table slots instead of host-owned scratch
+         * tensors. If a graph would need to upload/allocate here, fail loudly.
+         */
+        if (!ensureGroupedGateUpCapacity(top_k, d_model) ||
+            !ensureGroupedDecodeCapacity(top_k, intermediate) ||
+            !ensureGroupedPrefillScratchCapacity(top_k, d_model, intermediate))
+        {
+            return false;
+        }
+
+        const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
+        if (!d_hidden && rejectDecodeStagingDuringCapture("fused grouped decode input tensor"))
+            return false;
+        if (!d_hidden)
+        {
+            if (!const_cast<TensorBase *>(input)->ensureOnDevice(device, stream))
+                return false;
+            d_hidden = static_cast<const float *>(input->gpu_data_ptr());
+        }
+
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        if (!d_output && rejectDecodeStagingDuringCapture("fused grouped decode output tensor"))
+            return false;
+        if (!d_output)
+        {
+            auto *output_base = dynamic_cast<TensorBase *>(output);
+            if (!output_base || !output_base->ensureOnDevice(device, stream))
+                return false;
+            d_output = static_cast<float *>(output->gpu_data_ptr());
+        }
+
+        const int *d_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
+        const float *d_weights = runtimeTopKWeightsDevice(runtime_layer);
+        if (!d_hidden || !d_output || !d_expert_ids || !d_weights ||
+            !d_prefill_gate_ || !d_prefill_up_)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] missing runtime/output device pointer");
+            return false;
+        }
+
+        const int max_dim = std::max(d_model, intermediate);
+        std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
+        std::array<float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK> const_gate_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK> const_up_ptrs = {};
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            gate_ptrs[slot] = d_prefill_gate_ + static_cast<size_t>(slot) * max_dim;
+            up_ptrs[slot] = d_prefill_up_ + static_cast<size_t>(slot) * intermediate;
+            const_gate_ptrs[slot] = gate_ptrs[slot];
+            const_up_ptrs[slot] = up_ptrs[slot];
+        }
+
+        float **d_gate_ptrs = nullptr;
+        float **d_up_ptrs = nullptr;
+        if (!stageRuntimeGateUpPointerArrays(
+                gateup_descriptor_table_id, RuntimePointerArrayScope::RuntimeFused,
+                top_k, gate_ptrs, up_ptrs,
+                &d_gate_ptrs, &d_up_ptrs))
+        {
+            return false;
+        }
+
+        const int gateup_k_partitions = debugEnv().rocm.moe_gateup_kparts;
+        const bool use_gateup_kpart =
+            debugEnv().rocm.moe_gateup_kpart_decode &&
+            groupedDecodeSupportsCodebook(gateup_table.codebook_id) &&
+            ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate);
+
+        bool gateup_ok = false;
+        if (use_gateup_kpart)
+        {
+            gateup_ok = rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+                d_hidden,
+                gateup_table.device_gate_descs,
+                gateup_table.device_up_descs,
+                d_expert_ids,
+                d_gate_ptrs,
+                d_up_ptrs,
+                d_grouped_hidden_int8_,
+                d_grouped_hidden_scales_,
+                d_grouped_gateup_gate_partials_,
+                d_grouped_gateup_up_partials_,
+                top_k,
+                intermediate,
+                d_model,
+                gateup_table.codebook_id,
+                gateup_k_partitions,
+                device_ordinal_,
+                stream);
+            if (!gateup_ok)
+            {
+                LOG_DEBUG("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                          "K-partition gate/up path failed; falling back to serial path");
+            }
+        }
+
+        if (!gateup_ok)
+        {
+            gateup_ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
+                d_hidden,
+                gateup_table.device_gate_descs,
+                gateup_table.device_up_descs,
+                d_expert_ids,
+                d_gate_ptrs,
+                d_up_ptrs,
+                d_grouped_hidden_int8_,
+                d_grouped_hidden_scales_,
+                top_k,
+                intermediate,
+                d_model,
+                gateup_table.codebook_id,
+                device_ordinal_,
+                stream);
+        }
+        if (!gateup_ok)
+            return false;
+
+        const float **d_down_gate_ptrs = nullptr;
+        const float **d_down_up_ptrs = nullptr;
+        if (!stageRuntimeDownPointerArrays(
+                down_descriptor_table_id, RuntimePointerArrayScope::RuntimeFused,
+                top_k, const_gate_ptrs, const_up_ptrs,
+                &d_down_gate_ptrs, &d_down_up_ptrs))
+        {
+            return false;
+        }
+
+        const bool use_parallel_down =
+            debugEnv().rocm.moe_parallel_down_decode &&
+            top_k > 1 &&
+            groupedDecodeSupportsCodebook(down_table.codebook_id);
+
+        const bool down_ok = use_parallel_down
+                                 ? rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
+                                       d_down_gate_ptrs,
+                                       d_down_up_ptrs,
+                                       down_table.device_descs,
+                                       d_expert_ids,
+                                       d_weights,
+                                       d_grouped_swiglu_int8_,
+                                       d_grouped_swiglu_scales_,
+                                       d_output,
+                                       top_k,
+                                       d_model,
+                                       intermediate,
+                                       down_table.codebook_id,
+                                       device_ordinal_,
+                                       stream)
+                                 : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+                                       d_down_gate_ptrs,
+                                       d_down_up_ptrs,
+                                       down_table.device_descs,
+                                       d_expert_ids,
+                                       d_weights,
+                                       d_grouped_swiglu_int8_,
+                                       d_grouped_swiglu_scales_,
+                                       d_output,
+                                       top_k,
+                                       d_model,
+                                       intermediate,
+                                       down_table.codebook_id,
+                                       device_ordinal_,
+                                       stream);
+        if (!down_ok)
+            return false;
+
+        markDeviceWritten(output, device, stream);
+        recordGroupedDecodeCounter(
+            "rocm_moe_grouped_decode_fused_calls", "runtime", top_k,
+            d_model, intermediate,
+            use_parallel_down ? "fused_parallel_down" : "fused_serial_down");
+        return true;
     }
 
     bool ROCmMoEKernel::groupedExpertDownDecodeFromTable(
@@ -3824,7 +4093,8 @@ namespace llaminar2
         const float **d_gate_ptrs = nullptr;
         const float **d_up_ptrs = nullptr;
         if (!stageRuntimeDownPointerArrays(
-                descriptor_table_id, num_active, gate_ptrs, up_ptrs,
+                descriptor_table_id, RuntimePointerArrayScope::TableDecode,
+                num_active, gate_ptrs, up_ptrs,
                 &d_gate_ptrs, &d_up_ptrs))
             return false;
 
@@ -4020,7 +4290,8 @@ namespace llaminar2
         const float **d_gate_ptrs = nullptr;
         const float **d_up_ptrs = nullptr;
         if (!stageRuntimeDownPointerArrays(
-                descriptor_table_id, top_k, gate_ptrs, up_ptrs,
+                descriptor_table_id, RuntimePointerArrayScope::RuntimeTwoStep,
+                top_k, gate_ptrs, up_ptrs,
                 &d_gate_ptrs, &d_up_ptrs))
         {
             return false;
@@ -4930,8 +5201,16 @@ namespace llaminar2
         const bool need_realloc = (total_slots > prefill_slots_cap_ ||
                                    d_model > prefill_d_model_cap_ ||
                                    intermediate > prefill_intermediate_cap_);
-        if (!need_realloc)
+        if (!need_realloc &&
+            d_prefill_A_int8_ &&
+            d_prefill_A_scales_ &&
+            d_prefill_swiglu_int8_ &&
+            d_prefill_swiglu_scales_ &&
+            d_prefill_gate_ &&
+            d_prefill_up_)
+        {
             return true;
+        }
 
         const int max_dim = (d_model > intermediate) ? d_model : intermediate;
         const int max_blocks = max_dim / 32;

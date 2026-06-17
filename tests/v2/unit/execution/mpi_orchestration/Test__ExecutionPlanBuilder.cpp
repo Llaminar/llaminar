@@ -43,7 +43,7 @@ public:
         rank_inv.rank = rank;
         rank_inv.hostname = hostname;
         rank_inv.node_id = rank; // Simple: one rank per node
-        rank_inv.local_rank = 0;
+        rank_inv.local_rank = rank;
         rank_inv.numa_nodes = 2;
 
         for (const auto &[type, ordinal] : gpus)
@@ -1169,6 +1169,26 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_WithMultipleGPUs_NoTPConfig_Selects
     EXPECT_FALSE(plan.primary_device.isCPU());
     EXPECT_EQ(plan.primary_device.device_type, DeviceType::CUDA);
     EXPECT_EQ(plan.primary_device.device_ordinal, 0);
+}
+
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainMissingDeviceThrows)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::ROCm, 0}, {DeviceType::ROCm, 1}})
+                       .build();
+
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "rocm_hot=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"));
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "cpu_cold=cpu:0,cpu:1;scope=local;backend=upi;owner=0"));
+
+    EXPECT_THROW(
+        (void)builder->buildAllPlans(config, model, cluster),
+        std::invalid_argument)
+        << "Explicit domains must fail at planning time when a participant "
+           "is absent from the cluster inventory; otherwise execution can "
+           "build null collective participants and crash later.";
 }
 
 TEST_F(Test__ExecutionPlanBuilder, BuildPlan_EmptyInventory_FallsBackToCPU)

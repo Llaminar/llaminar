@@ -662,6 +662,18 @@ namespace llaminar2
         virtual bool hasVerifierStateCapture() const { return false; }
 
         /**
+         * @brief True when missing verifier state capture makes publication unsafe.
+         *
+         * Some stages own mutable recurrent state that must be restored from
+         * an accepted verifier row for MTP state publication to be
+         * decode-equivalent.  Returning true here turns a missing capture slot
+         * into a hard publication error when the caller requires captured
+         * stage state, instead of silently skipping the stage and allowing a
+         * later continuation token to drift.
+         */
+        virtual bool requiresVerifierStateCaptureForPublication() const { return false; }
+
+        /**
          * @brief Restore mutable model state captured after a verifier row.
          *
          * The row is zero-based within the most recent all-position verifier
@@ -671,6 +683,56 @@ namespace llaminar2
         virtual bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr)
         {
             (void)row;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Restore mutable model state captured after a verifier row chosen on device.
+         *
+         * Device-resident stochastic MTP publication receives accepted-count
+         * metadata in GPU memory.  Stages that implement this method must read
+         * @p device_row_index on @p stream and restore the corresponding
+         * captured row without synchronizing that index or mutable stage state
+         * to the host. This is the device-owned hot path used by resident MTP
+         * publication; host mirror refresh must be a separate explicit action.
+         */
+        virtual bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            const int *device_row_index,
+            void *stream)
+        {
+            (void)device_row_index;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Restore one captured verifier row for each request in a batch.
+         *
+         * Batched device-resident MTP publication receives a device array of
+         * accepted verifier rows. Implementations that override this method
+         * must read `device_row_indices[request * row_index_stride]` on
+         * @p stream and restore that request's mutable model state into a
+         * request-owned live-state slot. A negative row index means that
+         * request accepted no verifier row and its live state must be left at
+         * the pre-verifier value. This is not equivalent to looping
+         * restoreVerifierStateCaptureRowFromDeviceIndex(): scalar restore would
+         * overwrite one layer-owned state buffer and leak state between
+         * requests.
+         *
+         * The default is a hard failure so backends cannot quietly opt into
+         * request batching before their capture layout and live-state ownership
+         * are request-aware.
+         */
+        virtual bool restoreVerifierStateCaptureRowsFromDeviceIndices(
+            const int *device_row_indices,
+            int request_count,
+            int row_index_stride,
+            void *stream)
+        {
+            (void)device_row_indices;
+            (void)request_count;
+            (void)row_index_stride;
             (void)stream;
             return false;
         }
@@ -765,6 +827,53 @@ namespace llaminar2
         {
             (void)pos_offset;
             (void)seq_len;
+        }
+
+        /**
+         * @brief Refresh explicit host position rows before cached graph replay.
+         *
+         * The forward graph cache reuses stage objects while token and position
+         * inputs change every decode step.  Most stages ignore explicit
+         * position rows; RoPE consumes them to preserve request-batched or
+         * otherwise non-contiguous absolute positions without rebuilding the
+         * graph.
+         */
+        virtual void updateDynamicPositionIds(const int *position_ids, int seq_len)
+        {
+            (void)position_ids;
+            (void)seq_len;
+        }
+
+        /**
+         * @brief Refresh device-resident position rows before cached graph replay.
+         *
+         * GPU MTP publication can keep logical continuation positions in device
+         * workspace memory.  Stages that understand this contract must bind the
+         * pointer on their explicit graph stream and must not copy it through
+         * host memory.  The default implementation is a no-op for stages that
+         * do not consume RoPE-style positions.
+         */
+        virtual void updateDynamicDevicePositionIds(const void *position_ids_device, int seq_len)
+        {
+            (void)position_ids_device;
+            (void)seq_len;
+        }
+
+        /**
+         * @brief Return whether replay can use device-resident position rows without a host scalar.
+         *
+         * Phase 10 MTP publication keeps accepted logical positions in a
+         * runner-owned device mailbox.  A stage that returns true here promises
+         * that, after updateDynamicDevicePositionIds() is called, any later
+         * updateDynamicParams() call either ignores its scalar position
+         * argument or derives equivalent metadata from device-resident state on
+         * the explicit stage stream.  Stages that still need a host position
+         * must keep the default false result so resident replay hard-fails
+         * instead of silently reading stale host shadows.
+         */
+        virtual bool supportsDeviceResidentDynamicPositionReplay() const
+        {
+            return false;
         }
 
         /**

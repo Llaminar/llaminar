@@ -10,6 +10,7 @@ spelling.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -44,7 +45,22 @@ def main() -> int:
             "--summary",
             str(summary),
         ]
-        subprocess.run(command, check=True)
+        env = os.environ.copy()
+        # This validator trains on a six-row smoke fixture.  Letting NumPy or
+        # sklearn fan out to every CPU core makes the full CTest unit sweep
+        # oversubscribe badly, which can turn a sub-second logical check into a
+        # timeout.  The production sweep/training scripts remain unconstrained;
+        # only this tiny regression child process is pinned to one worker.
+        for name in (
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+            "BLIS_NUM_THREADS",
+        ):
+            env[name] = "1"
+        subprocess.run(command, check=True, env=env)
 
         text = output.read_text()
         helpers = re.findall(r"inline __host__ void selectTuning_CB(\d+)\(", text)

@@ -51,6 +51,61 @@ namespace
     };
 
     /**
+     * @brief Minimal KV cache stub for capture-signature unit tests.
+     *
+     * AttentionComputeStage::graphCaptureVariantSignature() only needs cache
+     * precision, layer count, and the host cached-token count.  A lightweight
+     * fake keeps this regression in the unit suite without requiring CUDA/ROCm
+     * devices or allocating real KV storage.
+     */
+    class FakeCaptureKVCache final : public IKVCache
+    {
+    public:
+        int cached_tokens = 0;
+        ActivationPrecision k_precision_value = ActivationPrecision::FP16;
+        ActivationPrecision v_precision_value = ActivationPrecision::FP16;
+
+        ActivationPrecision k_precision() const override { return k_precision_value; }
+        ActivationPrecision v_precision() const override { return v_precision_value; }
+        int get_cached_tokens(int, int = 0) const override { return cached_tokens; }
+        int max_seq_len() const override { return 4096; }
+        int n_layers() const override { return 1; }
+
+        bool get_kv(int, int, ITensor **out_k, ITensor **out_v,
+                    int *out_kv_len = nullptr) override
+        {
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
+            if (out_kv_len)
+                *out_kv_len = cached_tokens;
+            return true;
+        }
+
+        bool get_kv(int, int, const ITensor **out_k, const ITensor **out_v,
+                    int *out_kv_len = nullptr) const override
+        {
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
+            if (out_kv_len)
+                *out_kv_len = cached_tokens;
+            return true;
+        }
+
+        bool append(int, int, const ITensor *, const ITensor *, int) override
+        {
+            return false;
+        }
+
+        void clear() override { cached_tokens = 0; }
+        void clear_sequence(int, int) override { cached_tokens = 0; }
+        void clear_layer(int) override { cached_tokens = 0; }
+    };
+
+    /**
      * @brief Test that AttentionComputeStage can be constructed with valid params
      */
     TEST_F(Test__AttentionComputeStage, Construction)
@@ -129,6 +184,162 @@ namespace
 
         // Unknown backends should not be supported
         EXPECT_FALSE(stage->supportsBackend(static_cast<ComputeBackendType>(999)));
+    }
+
+    /**
+     * @brief Multirow GPU verifier capture signatures bucket KV launch regimes.
+     *
+     * Qwen3.6 MTP verifier attention reads row-local KV length from dynamic
+     * device params before every launch.  Exact token positions are therefore
+     * not capture variants.  CUDA and ROCm should recapture only when the
+     * launch regime bucket can change, avoiding warmup-only verifier graphs on
+     * adjacent decode steps.
+     */
+    TEST_F(Test__AttentionComputeStage, MultirowGpuCaptureSignatureBucketsCachedTokens)
+    {
+        FakeCaptureKVCache kv_cache;
+        kv_cache.cached_tokens = 597;
+
+        auto make_params = [&](DeviceId device)
+        {
+            AttentionComputeStage::Params params;
+            params.device_id = device;
+            params.kv_cache = &kv_cache;
+            params.layer_idx = 0;
+            params.batch_size = 1;
+            params.seq_len = 2;
+            params.kv_len = kv_cache.cached_tokens;
+            params.n_heads = 16;
+            params.n_kv_heads = 2;
+            params.head_dim = 256;
+            params.causal = true;
+            params.auto_detect_mode = true;
+            params.apply_rope_to_k = true;
+            params.rope_theta = 10000000.0f;
+            params.partial_rotary_factor = 0.25f;
+            return params;
+        };
+
+        for (DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            AttentionComputeStage stage_before(make_params(device));
+            const uint64_t before = stage_before.graphCaptureVariantSignature();
+            EXPECT_NE(before, 0u) << device.toString();
+
+            kv_cache.cached_tokens = 598;
+            AttentionComputeStage stage_after(make_params(device));
+            const uint64_t after = stage_after.graphCaptureVariantSignature();
+            EXPECT_NE(after, 0u) << device.toString();
+            EXPECT_EQ(before, after)
+                << "captured multirow verifier attention should not recapture "
+                   "for adjacent token positions in the same launch bucket on "
+                << device.toString();
+
+            kv_cache.cached_tokens = 597;
+        }
+    }
+
+    /**
+     * @brief Multirow verifier attention still recaptures at launch bucket boundaries.
+     *
+     * The capture key intentionally avoids per-token churn, but it must retain
+     * real topology changes.  These cached-token choices straddle the first
+     * CUDA split bucket and ROCm requested-split-cap bucket respectively.
+     */
+    TEST_F(Test__AttentionComputeStage, MultirowGpuCaptureSignatureChangesAtLaunchBucketBoundary)
+    {
+        FakeCaptureKVCache kv_cache;
+
+        auto make_params = [&](DeviceId device)
+        {
+            AttentionComputeStage::Params params;
+            params.device_id = device;
+            params.kv_cache = &kv_cache;
+            params.layer_idx = 0;
+            params.batch_size = 1;
+            params.seq_len = 2;
+            params.kv_len = kv_cache.cached_tokens;
+            params.n_heads = 16;
+            params.n_kv_heads = 2;
+            params.head_dim = 256;
+            params.causal = true;
+            params.auto_detect_mode = true;
+            params.apply_rope_to_k = true;
+            params.rope_theta = 10000000.0f;
+            params.partial_rotary_factor = 0.25f;
+            return params;
+        };
+
+        kv_cache.cached_tokens = 29;
+        AttentionComputeStage cuda_before(make_params(DeviceId::cuda(0)));
+        const uint64_t cuda_sig_before = cuda_before.graphCaptureVariantSignature();
+        ASSERT_NE(cuda_sig_before, 0u);
+        kv_cache.cached_tokens = 30;
+        AttentionComputeStage cuda_after(make_params(DeviceId::cuda(0)));
+        EXPECT_NE(cuda_sig_before, cuda_after.graphCaptureVariantSignature())
+            << "CUDA small-M verifier attention must recapture when row split bucket changes.";
+
+        kv_cache.cached_tokens = 62;
+        AttentionComputeStage rocm_before(make_params(DeviceId::rocm(0)));
+        const uint64_t rocm_sig_before = rocm_before.graphCaptureVariantSignature();
+        ASSERT_NE(rocm_sig_before, 0u);
+        kv_cache.cached_tokens = 63;
+        AttentionComputeStage rocm_after(make_params(DeviceId::rocm(0)));
+        EXPECT_NE(rocm_sig_before, rocm_after.graphCaptureVariantSignature())
+            << "ROCm small-M verifier attention must recapture when requested split cap changes.";
+    }
+
+    /**
+     * @brief One-row decode does not recapture on every token position.
+     *
+     * The multirow verifier needs exact KV-length keys because its RoPE-on-read
+     * conversion records a variable-size operation.  Normal one-row decode is
+     * deliberately more stable: CUDA keeps no attention capture variant, while
+     * ROCm keys only by split-K launch bucket.  This catches accidental
+     * per-token recapture in the hot decode path.
+     */
+    TEST_F(Test__AttentionComputeStage, SingleRowGpuCaptureSignatureAvoidsExactTokenCount)
+    {
+        FakeCaptureKVCache kv_cache;
+        kv_cache.cached_tokens = 597;
+
+        auto make_params = [&](DeviceId device)
+        {
+            AttentionComputeStage::Params params;
+            params.device_id = device;
+            params.kv_cache = &kv_cache;
+            params.layer_idx = 0;
+            params.batch_size = 1;
+            params.seq_len = 1;
+            params.kv_len = kv_cache.cached_tokens;
+            params.n_heads = 16;
+            params.n_kv_heads = 2;
+            params.head_dim = 256;
+            params.causal = true;
+            params.auto_detect_mode = true;
+            params.apply_rope_to_k = true;
+            params.rope_theta = 10000000.0f;
+            params.partial_rotary_factor = 0.25f;
+            return params;
+        };
+
+        AttentionComputeStage cuda_before(make_params(DeviceId::cuda(0)));
+        EXPECT_EQ(cuda_before.graphCaptureVariantSignature(), 0u);
+
+        AttentionComputeStage rocm_before(make_params(DeviceId::rocm(0)));
+        const uint64_t rocm_sig_before = rocm_before.graphCaptureVariantSignature();
+        EXPECT_NE(rocm_sig_before, 0u);
+
+        kv_cache.cached_tokens = 598;
+
+        AttentionComputeStage cuda_after(make_params(DeviceId::cuda(0)));
+        EXPECT_EQ(cuda_after.graphCaptureVariantSignature(), 0u);
+
+        AttentionComputeStage rocm_after(make_params(DeviceId::rocm(0)));
+        const uint64_t rocm_sig_after = rocm_after.graphCaptureVariantSignature();
+        EXPECT_EQ(rocm_sig_before, rocm_sig_after)
+            << "ROCm one-row decode should remain bucketed by launch topology "
+               "rather than recapturing for every exact token count";
     }
 
     /**

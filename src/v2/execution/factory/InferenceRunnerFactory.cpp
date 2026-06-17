@@ -3619,10 +3619,20 @@ namespace llaminar2
                         return nullptr;
                     }
 
+                    // LocalTP dense weights are tensor-sharded through the
+                    // weight plan, but ordinary MoE routed experts still need
+                    // resident per-device GEMM engines before the graph is
+                    // materialized. ExpertOverlay has its own filtered
+                    // placement-plan preparation path below, so keep that path
+                    // separate and prepare full local expert jobs only for
+                    // non-overlay MoE LocalTP.
+                    const bool include_local_tp_expert_jobs =
+                        graph_config.moe.num_experts > 0 &&
+                        !graph_config.moe.expert_overlay_runtime_plan;
                     if (!concrete_weight_mgr->prepareWeightsForDevice(
                             frozen_weights,
                             device,
-                            /*include_expert_jobs=*/false))
+                            include_local_tp_expert_jobs))
                     {
                         LOG_ERROR("[InferenceRunner] LocalTP binding-driven weight preparation failed for device "
                                   << device.to_string());

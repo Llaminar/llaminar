@@ -60,6 +60,33 @@ namespace llaminar2
         }
     } // namespace
 
+    int computeMTPShiftedKVTargetCachedTokens(
+        const MTPSpecStepPlan &plan,
+        int mtp_depth)
+    {
+        if (mtp_depth < 0)
+            return 0;
+
+        const int shift = mtp_depth + 1;
+        if (plan.reuse_initial_mtp_shifted_kv_row)
+        {
+            return std::max(0, plan.target_cached_tokens - shift);
+        }
+
+        /*
+         * Without a reusable sidecar row, the verifier-base restore has also
+         * discarded the row that a just-run sidecar would have appended.  The
+         * live shifted cache therefore starts one row behind the ordinary
+         * depth shift, and only verifier rows after the shift boundary may
+         * extend it.
+         */
+        const int base_shifted =
+            std::max(0, plan.base_cached_tokens - shift - 1);
+        const int verifier_shifted_delta =
+            std::max(0, plan.accepted_count - shift);
+        return base_shifted + verifier_shifted_delta;
+    }
+
     MTPSpecKVPublicationResult publishAcceptedMTPSpecKVState(
         const MTPSpecStepPlan &plan,
         IKVCache &main_cache,
@@ -108,7 +135,9 @@ namespace llaminar2
             }
 
             const int shifted_tokens =
-                std::max(0, plan.target_cached_tokens - static_cast<int>(depth) - 1);
+                computeMTPShiftedKVTargetCachedTokens(
+                    plan,
+                    static_cast<int>(depth));
             if (shifted_tokens > cache->max_seq_len())
             {
                 std::ostringstream msg;
@@ -119,9 +148,18 @@ namespace llaminar2
             }
             if (!cache->truncateSequence(seq_idx, shifted_tokens, stream))
             {
+                const int current_tokens =
+                    cache->get_cached_tokens(cache->first_layer_index(), seq_idx);
                 std::ostringstream msg;
                 msg << "MTP spec KV publication failed truncating MTP KV depth "
-                    << depth << " to " << shifted_tokens << " tokens";
+                    << depth << " to " << shifted_tokens
+                    << " tokens (current=" << current_tokens
+                    << " base=" << plan.base_cached_tokens
+                    << " accepted=" << plan.accepted_count
+                    << " target=" << plan.target_cached_tokens
+                    << " reuse_initial_shifted_row="
+                    << (plan.reuse_initial_mtp_shifted_kv_row ? "true" : "false")
+                    << ")";
                 return kvPublicationFailure(plan, seq_idx, msg.str());
             }
             result.mtp_truncated_tokens.push_back(shifted_tokens);

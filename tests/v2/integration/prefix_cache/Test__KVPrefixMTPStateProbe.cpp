@@ -336,12 +336,84 @@ namespace
         const std::string &context,
         const std::string &capture_phase)
     {
-        return findPerfCounterValue(
-            records,
-            "forward_graph",
-            "decode_segmented_phase",
-            "decode",
-            {{"context", context}, {"phase", capture_phase}});
+        double total = 0.0;
+        for (const auto &record : records)
+        {
+            if (record.kind != PerfStatRecord::Kind::Counter ||
+                record.domain != "forward_graph" ||
+                record.name != "decode_segmented_phase" ||
+                record.phase != "decode")
+            {
+                continue;
+            }
+
+            const auto context_it = record.tags.find("context");
+            const auto phase_it = record.tags.find("phase");
+            if (context_it == record.tags.end() ||
+                phase_it == record.tags.end() ||
+                phase_it->second != capture_phase)
+            {
+                continue;
+            }
+
+            const std::string &actual_context = context_it->second;
+            const bool exact_match = actual_context == context;
+            const bool family_match =
+                actual_context.rfind(context + "_", 0) == 0;
+            if (exact_match || family_match)
+                total += record.value;
+        }
+        return total;
+    }
+
+    /**
+     * @brief Sum a named MTP counter from an already-captured perf snapshot.
+     */
+    double mtpCounterValue(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &name)
+    {
+        double total = 0.0;
+        for (const auto &record : records)
+        {
+            if (record.kind == PerfStatRecord::Kind::Counter &&
+                record.domain == "mtp" &&
+                record.name == name &&
+                record.phase == "decode")
+            {
+                total += record.value;
+            }
+        }
+        return total;
+    }
+
+    enum class MTPVerifierGraphPath
+    {
+        None,
+        AllPositionStatePublication,
+        DecodeEquivalent,
+    };
+
+    /**
+     * @brief Identify which verifier contract executed for the current MTP run.
+     *
+     * Phase 9.7 keeps direct all-position state publication fail-closed until a
+     * backend/model lane proves every verifier row against serial decode.  The
+     * supported migration lane is the shared decode-equivalent verifier, for
+     * both greedy and stochastic sampling. That lane must still use graph-
+     * captured main decode and catch-up contexts. This helper lets probes assert
+     * the active contract instead of baking in the older all-position-only
+     * expectation.
+     */
+    MTPVerifierGraphPath mtpVerifierGraphPath(
+        const std::vector<PerfStatRecord> &records)
+    {
+        if (mtpCounterValue(records, "all_position_state_publication_verifier_runs") >= 1.0)
+            return MTPVerifierGraphPath::AllPositionStatePublication;
+        if (mtpCounterValue(records, "decode_equivalent_stochastic_verifier_runs") >= 1.0 ||
+            mtpCounterValue(records, "decode_equivalent_sequential_verifier_runs") >= 1.0)
+            return MTPVerifierGraphPath::DecodeEquivalent;
+        return MTPVerifierGraphPath::None;
     }
 
     /**
@@ -367,6 +439,73 @@ namespace
             EXPECT_GE(segmentedDecodePhaseCount(records, context, "replay"), 1.0)
                 << context << " must replay a previously captured graph";
         }
+    }
+
+    /**
+     * @brief Assert graph replay for the active MTP verifier path.
+     *
+     * Direct all-position publication replays the `main_verifier` graph.  The
+     * Phase 9.7-supported decode-equivalent lane replays ordinary `main_decode`
+     * plus `mtp_decode_catchup` graphs while preserving the same verifier math
+     * and accepted-state contract.
+     */
+    void expectMTPVerifierGraphLifecycle(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &backend_name,
+        bool require_warmup_capture,
+        bool require_replay)
+    {
+        const MTPVerifierGraphPath path = mtpVerifierGraphPath(records);
+        ASSERT_NE(path, MTPVerifierGraphPath::None)
+            << backend_name << " MTP must execute a supported verifier path";
+
+        if (path == MTPVerifierGraphPath::AllPositionStatePublication)
+        {
+            expectSegmentedGraphLifecycle(
+                records,
+                backend_name,
+                "main_verifier",
+                require_warmup_capture,
+                require_replay);
+            return;
+        }
+
+        expectSegmentedGraphLifecycle(
+            records,
+            backend_name,
+            "main_decode",
+            require_warmup_capture,
+            require_replay);
+        expectSegmentedGraphLifecycle(
+            records,
+            backend_name,
+            "mtp_decode_catchup",
+            require_warmup_capture,
+            require_replay);
+    }
+
+    /**
+     * @brief Assert that accepted MTP state was published through a fast path.
+     *
+     * Greedy and older host-planned paths may materialize accepted shifted rows
+     * by replaying the `mtp_decode_catchup` graph. The vLLM-style stochastic
+     * path can skip that graph entirely by publishing KV/GDN/hidden state from
+     * compact device-resident verifier metadata. Both are valid fast paths; a
+     * test failure here means the run fell back to neither.
+     */
+    void expectMTPAcceptedStateFastPublication(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &backend_name)
+    {
+        const bool catchup_replayed =
+            segmentedDecodePhaseCount(records, "mtp_decode_catchup", "replay") >= 1.0;
+        const bool resident_published =
+            mtpCounterValue(records, "device_resident_state_publications") >= 1.0 &&
+            mtpCounterValue(records, "device_resident_kv_sequence_state_publications") >= 1.0 &&
+            mtpCounterValue(records, "spec_state_publications") >= 1.0;
+        EXPECT_TRUE(catchup_replayed || resident_published)
+            << backend_name << " MTP accepted-state publication must either replay "
+            << "the catch-up graph or use direct device-resident publication";
     }
 
     std::string lowercase(std::string value)
@@ -611,10 +750,9 @@ namespace
         EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
         EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
 
-        expectSegmentedGraphLifecycle(
+        expectMTPVerifierGraphLifecycle(
             records,
             backend_name,
-            "main_verifier",
             /*require_warmup_capture=*/true,
             /*require_replay=*/true);
         expectSegmentedGraphLifecycle(
@@ -623,12 +761,9 @@ namespace
             "mtp_decode_sidecar",
             /*require_warmup_capture=*/true,
             /*require_replay=*/true);
-        expectSegmentedGraphLifecycle(
+        expectMTPAcceptedStateFastPublication(
             records,
-            backend_name,
-            "mtp_decode_catchup",
-            /*require_warmup_capture=*/true,
-            /*require_replay=*/true);
+            backend_name);
         PerfStatsCollector::reset();
     }
 
@@ -752,7 +887,7 @@ namespace
         auto first_tokens = run_benchmark_style_cycle(0);
         ASSERT_EQ(first_tokens.size(), decode_token_count);
 
-        const auto graph_lifecycle_records = PerfStatsCollector::snapshot({"forward_graph"});
+        const auto graph_lifecycle_records = PerfStatsCollector::snapshot({"mtp", "forward_graph"});
         /*
          * vLLM-style d1 stochastic decode does not need an ordinary
          * `main_decode` forward after prefill: the target verifier consumes the
@@ -760,10 +895,9 @@ namespace
          * MTP sidecar contexts.  Phase 6 therefore guards the graph-shaped
          * verifier and sidecar lanes directly.
          */
-        expectSegmentedGraphLifecycle(
+        expectMTPVerifierGraphLifecycle(
             graph_lifecycle_records,
             backend_name,
-            "main_verifier",
             /*require_warmup_capture=*/true,
             /*require_replay=*/true);
         expectSegmentedGraphLifecycle(
@@ -772,12 +906,9 @@ namespace
             "mtp_decode_sidecar",
             /*require_warmup_capture=*/true,
             /*require_replay=*/true);
-        expectSegmentedGraphLifecycle(
+        expectMTPAcceptedStateFastPublication(
             graph_lifecycle_records,
-            backend_name,
-            "mtp_decode_catchup",
-            /*require_warmup_capture=*/true,
-            /*require_replay=*/true);
+            backend_name);
 
         PerfStatsCollector::reset();
         std::vector<int32_t> result_tokens;
@@ -814,10 +945,9 @@ namespace
         runner->setSkipLogitsGatherPrefill(false);
         runner->shutdown();
 
-        expectSegmentedGraphLifecycle(
+        expectMTPVerifierGraphLifecycle(
             records,
             backend_name,
-            "main_verifier",
             /*require_warmup_capture=*/false,
             /*require_replay=*/true);
         expectSegmentedGraphLifecycle(
@@ -826,27 +956,13 @@ namespace
             "mtp_decode_sidecar",
             /*require_warmup_capture=*/false,
             /*require_replay=*/true);
-        expectSegmentedGraphLifecycle(
+        expectMTPAcceptedStateFastPublication(
             records,
-            backend_name,
-            "mtp_decode_catchup",
-            /*require_warmup_capture=*/false,
-            /*require_replay=*/true);
+            backend_name);
 
         auto counter = [&](const std::string &name)
         {
-            double total = 0.0;
-            for (const auto &record : records)
-            {
-                if (record.kind == PerfStatRecord::Kind::Counter &&
-                    record.domain == "mtp" &&
-                    record.name == name &&
-                    record.phase == "decode")
-                {
-                    total += record.value;
-                }
-            }
-            return total;
+            return mtpCounterValue(records, name);
         };
 
         EXPECT_TRUE(snapshot.mtp_config_enabled);
@@ -874,18 +990,29 @@ namespace
         EXPECT_GE(snapshot.mtp_request.stochastic_acceptance_rate, 0.0);
         EXPECT_LE(snapshot.mtp_request.stochastic_acceptance_rate, 1.0);
         EXPECT_GE(counter("first_token_stochastic_device_samples"), 1.0);
-        /*
-         * The accepted vLLM-style contract publishes verifier rows from the
-         * all-position target forward.  The older decode-equivalent stochastic
-         * replay path was a migration fallback; keeping this assertion pointed
-         * at the new path prevents us from accidentally reviving it.
-         */
-        EXPECT_GE(counter("all_position_state_publication_verifier_runs"), 1.0)
-            << backend_name << " stochastic MTP must publish accepted verifier rows "
-            << "through all-position state publication";
-        EXPECT_EQ(counter("decode_equivalent_stochastic_verifier_runs"), 0.0)
-            << backend_name << " stochastic MTP must not use the retired "
-            << "decode-equivalent verifier fallback";
+        const MTPVerifierGraphPath verifier_path =
+            mtpVerifierGraphPath(records);
+        ASSERT_NE(verifier_path, MTPVerifierGraphPath::None)
+            << backend_name << " stochastic MTP must execute a supported verifier path";
+        if (verifier_path == MTPVerifierGraphPath::AllPositionStatePublication)
+        {
+            EXPECT_GE(counter("all_position_state_publication_verifier_runs"), 1.0)
+                << backend_name << " stochastic MTP must publish accepted verifier rows "
+                << "through all-position state publication when that capability is advertised";
+            EXPECT_EQ(counter("decode_equivalent_stochastic_verifier_runs"), 0.0)
+                << backend_name << " all-position stochastic MTP must not also "
+                << "run the decode-equivalent verifier";
+        }
+        else
+        {
+            EXPECT_GE(counter("decode_equivalent_stochastic_verifier_runs"), 1.0)
+                << backend_name << " Phase 9.7 stochastic MTP should use the "
+                << "shared decode-equivalent verifier while direct all-position "
+                << "publication remains fail-closed";
+            EXPECT_EQ(counter("all_position_state_publication_verifier_runs"), 0.0)
+                << backend_name << " decode-equivalent stochastic MTP must not "
+                << "claim direct all-position state publication";
+        }
         if (backend_name == "ROCm" || backend_name == "CUDA")
         {
             EXPECT_GE(counter("stochastic_draft_greedy_proposals"), 1.0)
@@ -894,7 +1021,8 @@ namespace
             EXPECT_GE(counter("stochastic_topk_smallk_scratch_distribution_builds"), 1.0)
                 << backend_name << " stochastic MTP target sampling must use the "
                 << "arena-declared small-k top-k scratch path";
-            if (!use_presence_penalty)
+            if (verifier_path == MTPVerifierGraphPath::AllPositionStatePublication &&
+                !use_presence_penalty)
             {
                 EXPECT_GE(counter("first_token_stochastic_deferred_host_reads"), 1.0)
                     << backend_name << " penalty-free stochastic first tokens should stay device-resident until summary";
@@ -919,10 +1047,22 @@ namespace
                 EXPECT_EQ(counter("mtp_token_stochastic_device_samples"), 0.0)
                     << backend_name << " deferred draft samples should not force a host-visible token sample";
             }
-            else
+            else if (verifier_path == MTPVerifierGraphPath::AllPositionStatePublication)
             {
                 EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0)
                     << backend_name << " penalty paths still need a host-visible sampled token for sampler history";
+            }
+            else
+            {
+                EXPECT_GE(counter("stochastic_verify_batch_rows"), 1.0)
+                    << backend_name << " decode-equivalent stochastic verification "
+                    << "must still use the shared device-side batch verifier";
+                EXPECT_GE(counter("stochastic_request_batch_draft_token_stages"), 1.0)
+                    << backend_name << " decode-equivalent stochastic verification "
+                    << "must stage draft tokens through device-owned request buffers";
+                EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0)
+                    << backend_name << " decode-equivalent stochastic verification "
+                    << "keeps host-visible token shadows for sampler history";
             }
         }
         EXPECT_GE(counter("stochastic_accept_tests"), 1.0);
@@ -936,6 +1076,116 @@ namespace
             << backend_name << " stochastic MTP must not build verifier distributions from host full logits";
         EXPECT_EQ(counter("phase138_stochastic_spec_decode_runs"), 0.0)
             << backend_name << " stochastic MTP must not use the retired accepted-count-only fallback";
+    }
+
+    /**
+     * @brief Prove the first stochastic token is stable across request resets.
+     *
+     * This isolates the ready-prefill-logits path used for token zero.  A
+     * failure here means the first sampled distribution changed before later
+     * MTP verifier/publication work can affect the request.
+     */
+    void runQwen36MTPGpuGraphsStochasticFirstTokenRepeatability(
+        GlobalDeviceAddress device,
+        const std::string &backend_name)
+    {
+        ScopedDebugEnv deterministic_env({
+            {"LLAMINAR_DETERMINISTIC", "1"},
+        });
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+            {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_stochastic_first_token_stats.json"},
+            {"LLAMINAR_PERF_STATS_FILTER", "mtp,forward_graph"},
+        });
+        PerfStatsCollector::reset();
+
+        const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+        if (!env_model)
+            env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+        const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+        }
+
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = 896;
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.device_for_this_rank = device;
+        config.kv_cache_precision = "auto";
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 1;
+        config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+
+        auto factory = createOrchestrationRunnerFactory();
+        auto runner = factory->createFromOrchestrationConfig(config);
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+        auto tokenizer = runner->tokenizer();
+        ASSERT_NE(tokenizer, nullptr);
+        const std::vector<int32_t> prompt =
+            buildDeterministicPromptTokens(*tokenizer, /*prompt_token_count=*/768);
+        ASSERT_FALSE(prompt.empty());
+
+        SamplingParams stochastic;
+        stochastic.temperature = 0.6f;
+        stochastic.top_k = 20;
+        stochastic.top_p = 0.95f;
+        stochastic.presence_penalty = 0.25f;
+        stochastic.seed = 123;
+
+        runner->setSamplingParams(stochastic);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        auto run_cycle = [&](int cycle) -> std::vector<int32_t>
+        {
+            runner->clearCache();
+            if (!runner->prefill(prompt))
+            {
+                ADD_FAILURE() << backend_name << " cycle " << cycle
+                              << " prefill failed: " << runner->lastError();
+                return {};
+            }
+            runner->setDecodeStepTokenBudget(1);
+            auto step = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
+            if (!step.error.empty())
+            {
+                ADD_FAILURE() << backend_name << " cycle " << cycle
+                              << " decode failed: " << step.error;
+                return {};
+            }
+            return step.tokens;
+        };
+
+        const std::vector<int32_t> warmup = run_cycle(-1);
+        ASSERT_EQ(warmup.size(), 1u);
+        const std::vector<int32_t> expected = run_cycle(0);
+        ASSERT_EQ(expected.size(), 1u);
+
+        for (int cycle = 1; cycle <= 4; ++cycle)
+        {
+            const std::vector<int32_t> actual = run_cycle(cycle);
+            ASSERT_EQ(actual.size(), 1u);
+            EXPECT_EQ(actual, expected)
+                << backend_name
+                << " first stochastic token changed after clearCache/prefill at cycle "
+                << cycle << "; warmup=" << formatTokenWindow(warmup, 0)
+                << " expected=" << formatTokenWindow(expected, 0)
+                << " actual=" << formatTokenWindow(actual, 0);
+        }
+
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+        runner->shutdown();
+        PerfStatsCollector::reset();
     }
 
     int mpiWorldSize()
@@ -2205,6 +2455,23 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticClearCacheRepe
         /*prompt_token_count=*/768);
 }
 
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticFirstTokenRepeatability)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No ROCm device available for Qwen3.6 stochastic MTP first-token repeatability";
+    }
+    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(rocm_ordinal, 0);
+    ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
+        << "Selected ROCm device ordinal is outside the available device range";
+    runQwen36MTPGpuGraphsStochasticFirstTokenRepeatability(
+        GlobalDeviceAddress::rocm(rocm_ordinal),
+        "ROCm");
+}
+
 TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticRealModelSmoke)
 {
     auto &dm = DeviceManager::instance();
@@ -2242,6 +2509,23 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticClearCacheRepe
         /*deterministic_repeatability=*/true,
         /*use_presence_penalty=*/true,
         /*prompt_token_count=*/768);
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticFirstTokenRepeatability)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No CUDA device available for Qwen3.6 stochastic MTP first-token repeatability";
+    }
+    const int cuda_ordinal = qwen36CudaSingleDeviceOrdinal();
+    ASSERT_GE(cuda_ordinal, 0);
+    ASSERT_LT(cuda_ordinal, dm.cuda_device_count())
+        << "Selected CUDA device ordinal is outside the available device range";
+    runQwen36MTPGpuGraphsStochasticFirstTokenRepeatability(
+        GlobalDeviceAddress::cuda(cuda_ordinal),
+        "CUDA");
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmoke)
@@ -2301,9 +2585,10 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
     SamplingParams greedy;
     greedy.temperature = 0.0f;
     // Reproduce the verifier graph-cache lifetime pattern from the ROCm MTP
-    // benchmark: full-depth verifier, smaller tail verifier, request reset, then
-    // full-depth verifier cache reuse. The all-position logits buffers must stay
-    // alive per verifier row count across the reset.
+    // benchmark: full-depth draft, smaller tail draft, request reset, then
+    // full-depth cache reuse. Phase 9.7 currently keeps direct all-position
+    // verifier publication fail-closed, so the reusable graph cache is the
+    // decode-equivalent main decode lane rather than `main_verifier`.
     auto warm_result = runner->generate(prompt, 6, greedy);
     ASSERT_TRUE(warm_result.error.empty()) << warm_result.error;
     runner->clearCache();
@@ -2321,20 +2606,26 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags miss_tags = {
-        {"all_position_logits", "true"},
-        {"context", "main_verifier"},
+        {"all_position_logit_rows", "0"},
+        {"all_position_logits", "false"},
+        {"context", "main_decode"},
         {"decode_has_history", "true"},
         {"moe_placement_epoch", "0"},
         {"result", "miss"},
-        {"seq_len", "4"},
+        {"seq_len", "1"},
+        {"uses_device_position_ids", "false"},
+        {"uses_device_token_ids", "false"},
     };
     const PerfStatsCollector::Tags hit_tags = {
-        {"all_position_logits", "true"},
-        {"context", "main_verifier"},
+        {"all_position_logit_rows", "0"},
+        {"all_position_logits", "false"},
+        {"context", "main_decode"},
         {"decode_has_history", "true"},
         {"moe_placement_epoch", "0"},
         {"result", "hit"},
-        {"seq_len", "4"},
+        {"seq_len", "1"},
+        {"uses_device_position_ids", "false"},
+        {"uses_device_token_ids", "false"},
     };
     EXPECT_GE(findPerfCounterValue(records, "forward_graph", "forward_cache_lookup", "decode", miss_tags), 1.0);
     EXPECT_GE(findPerfCounterValue(records, "forward_graph", "forward_cache_lookup", "decode", hit_tags), 1.0);
@@ -2554,8 +2845,15 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
 
     EXPECT_GE(forward_lookup_count("miss"), 1.0);
     EXPECT_GE(forward_lookup_count("hit"), 1.0);
-    EXPECT_GE(lifecycle_count("warmup", "warmup", "none"), 1.0);
-    EXPECT_GE(lifecycle_count("capture", "ready", "armed_warmup"), 1.0);
+    /*
+     * `clearCache()` now resets request-owned KV/GDN/short-conv state and
+     * invalidates any prefill executable that could have captured pointers into
+     * that state.  The padded bucket cache should still hit the host-side
+     * forward graph, but each post-reset prefill must re-arm capture from Cold
+     * instead of replaying or capturing an executable across request state.
+     */
+    EXPECT_GE(lifecycle_count("warmup", "warmup", "none"), 2.0);
+    EXPECT_EQ(lifecycle_count("capture", "ready", "armed_warmup"), 0.0);
     PerfStatsCollector::reset();
 }
 

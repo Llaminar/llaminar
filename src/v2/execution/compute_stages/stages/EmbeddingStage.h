@@ -72,6 +72,10 @@ namespace llaminar2
         bool validatePreparedWeights(std::string *error) const override;
         bool isGraphCapturable() const override { return true; }
         bool hasDynamicParams() const override { return true; }
+        bool supportsDeviceResidentDynamicPositionReplay() const override
+        {
+            return true;
+        }
         /// In vocab-parallel TP, each device only embeds tokens in its shard;
         /// tokens outside the shard produce all-zero output (summed via AllReduce).
         /// This applies to both MPI-based TP (world_size > 1) and LOCAL TP

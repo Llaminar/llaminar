@@ -4152,61 +4152,140 @@ namespace llaminar2
             int tier_index = -1;
             int participant_world_rank = -1;
             int participant_index = -1;
+            std::shared_ptr<TensorBase> parent_owner; // keeps the 3D parent alive while view jobs are staged
             std::shared_ptr<TensorBase> view; // 2D expert view (keeps parent alive)
         };
         std::vector<MoEExpertJob> moe_jobs;
 
         // Track 3D parent tensors by name so release readiness is tensor-specific.
-        std::vector<std::pair<std::string, std::shared_ptr<TensorBase>>> moe_parent_tensors;
+        struct MoEParentTensorRecord
+        {
+            std::string name;
+            std::shared_ptr<TensorBase> parent;
+            std::vector<int> expected_experts;
+        };
+        std::vector<MoEParentTensorRecord> moe_parent_tensors;
 
         if (include_expert_jobs)
         {
-            std::lock_guard<std::mutex> lock(cache_mutex_);
-
             // Group 3D expert tensors by layer: layer_idx -> {gate, up, down}
+            struct MoERoleTensor
+            {
+                std::shared_ptr<TensorBase> owner;
+                TensorBase *tensor = nullptr;
+                std::string name;
+                size_t tensor_expert_start = 0;
+                size_t global_expert_start = 0;
+                size_t expert_count = 0;
+            };
             struct MoELayerTensors
             {
-                std::shared_ptr<TensorBase> gate;
-                std::shared_ptr<TensorBase> up;
-                std::shared_ptr<TensorBase> down;
-                std::string gate_name;
-                std::string up_name;
-                std::string down_name;
+                MoERoleTensor gate;
+                MoERoleTensor up;
+                MoERoleTensor down;
             };
             std::unordered_map<int, MoELayerTensors> moe_layers;
 
-            for (const auto &[name, tensor] : cache_)
+            auto add_moe_parent = [&](const std::string &name,
+                                      std::shared_ptr<TensorBase> owner,
+                                      TensorBase *tensor,
+                                      const WeightSliceSpec &slice)
             {
                 if (!tensor || name.find("_exps.weight") == std::string::npos)
-                    continue;
+                    return;
                 if (layer_filter && !layer_filter(name))
-                    continue;
+                    return;
 
                 int layer_idx = parseMoELayerIndex(name);
                 if (layer_idx < 0)
-                    continue;
+                    return;
+
+                const auto &shape = tensor->shape();
+                if (shape.size() != 3 || shape[2] == 0)
+                    return;
+
+                MoERoleTensor source;
+                source.owner = std::move(owner);
+                source.tensor = tensor;
+                source.name = name;
+
+                /**
+                 * Expert-parallel LocalTP freezes a tensor that already contains
+                 * only this participant's expert range. The registry, router, and
+                 * graph still use global expert ids, so keep two coordinates:
+                 *
+                 * - tensor_expert_start: local index inside this tensor for view offsets
+                 * - global_expert_start: model expert id registered in ExpertGemmRegistry
+                 */
+                source.expert_count = shape[2];
+                if (slice.expert_count != 0)
+                {
+                    source.global_expert_start = slice.expert_start;
+                    source.expert_count = std::min(slice.expert_count, shape[2]);
+                    if (!slice.inner_is_presliced)
+                    {
+                        source.tensor_expert_start = slice.expert_start;
+                        if (source.tensor_expert_start >= shape[2])
+                            source.expert_count = 0;
+                        else
+                            source.expert_count = std::min(source.expert_count,
+                                                           shape[2] - source.tensor_expert_start);
+                    }
+                }
 
                 if (name.find("ffn_gate_exps.weight") != std::string::npos)
                 {
-                    moe_layers[layer_idx].gate = tensor;
-                    moe_layers[layer_idx].gate_name = name;
+                    moe_layers[layer_idx].gate = std::move(source);
                 }
                 else if (name.find("ffn_up_exps.weight") != std::string::npos)
                 {
-                    moe_layers[layer_idx].up = tensor;
-                    moe_layers[layer_idx].up_name = name;
+                    moe_layers[layer_idx].up = std::move(source);
                 }
                 else if (name.find("ffn_down_exps.weight") != std::string::npos)
                 {
-                    moe_layers[layer_idx].down = tensor;
-                    moe_layers[layer_idx].down_name = name;
+                    moe_layers[layer_idx].down = std::move(source);
+                }
+            };
+
+            bool collected_from_frozen = false;
+            if (frozen_weights)
+            {
+                for (const auto &binding : frozen_weights->bindings())
+                {
+                    if (!binding.tensor)
+                        continue;
+                    const bool resident_on_target =
+                        binding.prepared.has_value()
+                            ? binding.prepared->device == target_device
+                            : (binding.residency.resident_device.has_value()
+                                   ? *binding.residency.resident_device == target_device
+                                   : binding.residency.home_device == target_device);
+                    if (!resident_on_target)
+                        continue;
+
+                    add_moe_parent(binding.identity.canonical_name,
+                                   binding.tensor_owner,
+                                   binding.tensor,
+                                   binding.slice);
+                    if (binding.identity.canonical_name.find("_exps.weight") != std::string::npos)
+                        collected_from_frozen = true;
+                }
+            }
+
+            if (!collected_from_frozen)
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                for (const auto &[name, tensor] : cache_)
+                {
+                    WeightSliceSpec full_slice;
+                    add_moe_parent(name, tensor, tensor.get(), full_slice);
                 }
             }
 
             // Create 2D expert views for each complete layer
             for (auto &[layer_idx, tensors] : moe_layers)
             {
-                if (!tensors.gate || !tensors.up || !tensors.down)
+                if (!tensors.gate.tensor || !tensors.up.tensor || !tensors.down.tensor)
                 {
                     LOG_WARN("[WeightManager] GPU pipeline: incomplete MoE expert tensors for layer "
                              << layer_idx << " — skipping");
@@ -4214,7 +4293,7 @@ namespace llaminar2
                 }
 
                 // GGUF 3D: shape[0]=cols (K, fastest), shape[1]=rows_per_expert, shape[2]=num_experts
-                const auto &gate_shape = tensors.gate->shape();
+                const auto &gate_shape = tensors.gate.tensor->shape();
                 if (gate_shape.size() != 3)
                 {
                     LOG_WARN("[WeightManager] GPU pipeline: MoE gate tensor for layer "
@@ -4222,53 +4301,72 @@ namespace llaminar2
                     continue;
                 }
 
-                const int num_experts = static_cast<int>(gate_shape[2]);
+                const size_t local_expert_count = std::min({tensors.gate.expert_count,
+                                                            tensors.up.expert_count,
+                                                            tensors.down.expert_count});
+                if (local_expert_count == 0 ||
+                    tensors.gate.global_expert_start != tensors.up.global_expert_start ||
+                    tensors.gate.global_expert_start != tensors.down.global_expert_start)
+                {
+                    LOG_WARN("[WeightManager] GPU pipeline: inconsistent MoE expert slices for layer "
+                             << layer_idx << " — skipping");
+                    continue;
+                }
 
-                moe_parent_tensors.emplace_back(tensors.gate_name, tensors.gate);
-                moe_parent_tensors.emplace_back(tensors.up_name, tensors.up);
-                moe_parent_tensors.emplace_back(tensors.down_name, tensors.down);
+                std::vector<int> expected_experts;
+                expected_experts.reserve(local_expert_count);
+                for (size_t local_idx = 0; local_idx < local_expert_count; ++local_idx)
+                {
+                    expected_experts.push_back(static_cast<int>(tensors.gate.global_expert_start + local_idx));
+                }
+
+                moe_parent_tensors.push_back({tensors.gate.name, tensors.gate.owner, expected_experts});
+                moe_parent_tensors.push_back({tensors.up.name, tensors.up.owner, expected_experts});
+                moe_parent_tensors.push_back({tensors.down.name, tensors.down.owner, expected_experts});
 
                 struct RoleTensor
                 {
                     ExpertGemmRegistry::WeightRole role;
                     const char *tag;
-                    TensorBase *tensor_3d;
+                    const MoERoleTensor *source;
                 };
                 RoleTensor roles[] = {
-                    {ExpertGemmRegistry::WeightRole::GATE, "gate", tensors.gate.get()},
-                    {ExpertGemmRegistry::WeightRole::UP, "up", tensors.up.get()},
-                    {ExpertGemmRegistry::WeightRole::DOWN, "down", tensors.down.get()},
+                    {ExpertGemmRegistry::WeightRole::GATE, "gate", &tensors.gate},
+                    {ExpertGemmRegistry::WeightRole::UP, "up", &tensors.up},
+                    {ExpertGemmRegistry::WeightRole::DOWN, "down", &tensors.down},
                 };
 
                 for (const auto &rt : roles)
                 {
                     // Each role tensor may have different dimensions
                     // (e.g., down is [intermediate, d_model, num_experts] while gate/up are [d_model, intermediate, num_experts])
-                    const auto &role_shape = rt.tensor_3d->shape();
+                    const auto &role_shape = rt.source->tensor->shape();
                     const size_t role_cols = role_shape[0];
                     const size_t role_rows_per_expert = role_shape[1];
                     const size_t role_elements_per_expert = role_rows_per_expert * role_cols;
 
-                    for (int e = 0; e < num_experts; ++e)
+                    for (size_t local_idx = 0; local_idx < local_expert_count; ++local_idx)
                     {
+                        const int global_expert = static_cast<int>(rt.source->global_expert_start + local_idx);
                         const auto *overlay_request = overlay_preparation_plan
-                                                          ? overlay_preparation_plan->requestFor(target_device, layer_idx, e, rt.role)
+                                                          ? overlay_preparation_plan->requestFor(target_device, layer_idx, global_expert, rt.role)
                                                           : nullptr;
                         if (overlay_preparation_plan && !overlay_request)
                         {
                             continue;
                         }
 
-                        const size_t element_offset = static_cast<size_t>(e) * role_elements_per_expert;
+                        const size_t tensor_expert_idx = rt.source->tensor_expert_start + local_idx;
+                        const size_t element_offset = tensor_expert_idx * role_elements_per_expert;
                         std::vector<size_t> view_shape = {role_rows_per_expert, role_cols};
-                        auto view = rt.tensor_3d->create_view(view_shape, element_offset);
+                        auto view = rt.source->tensor->create_view(view_shape, element_offset);
                         if (!view)
                         {
                             throw std::runtime_error(
-                                "[WeightManager] GPU pipeline: failed to create expert view for layer " + std::to_string(layer_idx) + " " + rt.tag + " expert " + std::to_string(e) + " (shape=[" + std::to_string(role_rows_per_expert) + "," + std::to_string(role_cols) + "], offset=" + std::to_string(element_offset) + ")");
+                                "[WeightManager] GPU pipeline: failed to create expert view for layer " + std::to_string(layer_idx) + " " + rt.tag + " expert " + std::to_string(global_expert) + " (shape=[" + std::to_string(role_rows_per_expert) + "," + std::to_string(role_cols) + "], offset=" + std::to_string(element_offset) + ")");
                         }
 
-                        std::string slot_name = "moe_L" + std::to_string(layer_idx) + "_" + rt.tag + "_e" + std::to_string(e);
+                        std::string slot_name = "moe_L" + std::to_string(layer_idx) + "_" + rt.tag + "_e" + std::to_string(global_expert);
                         std::string domain_name;
                         std::string tier_name;
                         int tier_index = -1;
@@ -4283,18 +4381,21 @@ namespace llaminar2
                             participant_index = overlay_request->participant_index;
                             slot_name = "moe_" + registrySlotComponent(domain_name) + "_tier" +
                                         std::to_string(tier_index) + "_L" + std::to_string(layer_idx) +
-                                        "_" + rt.tag + "_e" + std::to_string(e);
+                                        "_" + rt.tag + "_e" + std::to_string(global_expert);
                         }
 
-                        moe_jobs.push_back({layer_idx, e, rt.role, std::move(slot_name),
+                        moe_jobs.push_back({layer_idx, global_expert, rt.role, std::move(slot_name),
                                             std::move(domain_name), std::move(tier_name), tier_index,
                                             participant_world_rank, participant_index,
+                                            rt.source->owner,
                                             std::move(view)});
                     }
                 }
 
-                LOG_DEBUG("[WeightManager] GPU pipeline: collected " << num_experts
-                                                                     << " experts × 3 roles for MoE layer " << layer_idx);
+                LOG_DEBUG("[WeightManager] GPU pipeline: collected " << local_expert_count
+                                                                     << " local experts × 3 roles for MoE layer " << layer_idx
+                                                                     << " starting at global expert "
+                                                                     << tensors.gate.global_expert_start);
             }
         }
 
@@ -5072,24 +5173,24 @@ namespace llaminar2
         // Mark 3D MoE parent tensors ready only after their exact layer/role has
         // all expert engines registered for this device. Host release happens in
         // releaseAllHostWeightData(), after all expected device tickets are ready.
-        for (const auto &[name, parent] : moe_parent_tensors)
+        for (const auto &parent_record : moe_parent_tensors)
         {
-            if (!parent)
+            if (!parent_record.parent || parent_record.expected_experts.empty())
                 continue;
 
             int layer_idx = -1;
             ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
-            const int num_experts = moeExpertCountFromParentTensor(*parent);
-            if (!parseMoEExpertParentName(name, layer_idx, role) || num_experts <= 0)
+            if (!parseMoEExpertParentName(parent_record.name, layer_idx, role))
             {
-                markPrepState(name, target_device, WeightPrepState::FAILED, true,
+                markPrepState(parent_record.name, target_device, WeightPrepState::FAILED, true,
                               "GPU pipeline: invalid MoE parent tensor metadata");
                 continue;
             }
 
-            if (expert_gemm_registry_.hasCompleteRole(target_device, layer_idx, num_experts, role))
+            if (expert_gemm_registry_.hasCompleteRoleForExperts(
+                    target_device, layer_idx, parent_record.expected_experts, role))
             {
-                markPrepState(name, target_device, WeightPrepState::READY, true,
+                markPrepState(parent_record.name, target_device, WeightPrepState::READY, true,
                               std::string("GPU pipeline: MoE ") + moeWeightRoleName(role) +
                                   " expert parent ready");
             }
@@ -5116,13 +5217,13 @@ namespace llaminar2
 
                 if (overlay_ready)
                 {
-                    markPrepState(name, target_device, WeightPrepState::READY, true,
+                    markPrepState(parent_record.name, target_device, WeightPrepState::READY, true,
                                   std::string("GPU pipeline: MoE overlay ") + moeWeightRoleName(role) +
                                       " expert subset ready");
                 }
                 else
                 {
-                    markPrepState(name, target_device, WeightPrepState::FAILED, true,
+                    markPrepState(parent_record.name, target_device, WeightPrepState::FAILED, true,
                                   std::string("GPU pipeline: incomplete MoE overlay ") + moeWeightRoleName(role) +
                                       " expert registry entries" +
                                       (missing_domain.empty() ? std::string() : " for domain " + missing_domain));
@@ -5130,7 +5231,7 @@ namespace llaminar2
             }
             else
             {
-                markPrepState(name, target_device, WeightPrepState::FAILED, true,
+                markPrepState(parent_record.name, target_device, WeightPrepState::FAILED, true,
                               std::string("GPU pipeline: incomplete MoE ") + moeWeightRoleName(role) +
                                   " expert registry entries");
             }

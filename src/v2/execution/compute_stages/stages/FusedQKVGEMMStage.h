@@ -11,6 +11,7 @@
 #include "../../../memory/BufferId.h"
 #include "../../../loaders/WeightPlan.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
@@ -18,6 +19,7 @@ namespace llaminar2
 
     // Forward declarations for cached kernel pointers
     class ITensorGemm;
+    class FP32Tensor;
     class PreparedWeightStore;
 
     /**
@@ -65,6 +67,19 @@ namespace llaminar2
             std::optional<BufferId> output_q_buffer_id;
             std::optional<BufferId> output_k_buffer_id;
             std::optional<BufferId> output_v_buffer_id;
+
+            /**
+             * @brief Execute tiny verifier batches as serial one-row decode projections.
+             *
+             * MTP publication compares the state produced by an all-position verifier
+             * pass against the state that would have been produced by accepting the
+             * same rows through normal decode. Quantized GEMM kernels can choose
+             * different small-M routes for m=2..4 than they do for m=1, which is fine
+             * for logits tolerance but not for byte-stable KV publication. When this
+             * flag is set the stage preserves the single graph node contract while
+             * invoking the existing one-row decode path for each verifier row.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution
@@ -132,6 +147,22 @@ namespace llaminar2
         bool cache_resolved_individual_ = false;
 
         bool resolveIndividualKernels(const char *caller);
+        bool executeDecodeEquivalentVerifierPrefill(
+            TensorBase *input_base,
+            TensorBase *output_q_base,
+            TensorBase *output_k_base,
+            TensorBase *output_v_base,
+            ITensorGemm *gemm_q,
+            ITensorGemm *gemm_k,
+            ITensorGemm *gemm_v);
+
+        // Reused tiny row tensors for device-side verifier publication.  They are
+        // deliberately owned by the stage so repeated decode steps do not allocate
+        // a fresh scratch tensor for every verifier row.
+        std::shared_ptr<FP32Tensor> verifier_input_row_;
+        std::shared_ptr<FP32Tensor> verifier_output_q_row_;
+        std::shared_ptr<FP32Tensor> verifier_output_k_row_;
+        std::shared_ptr<FP32Tensor> verifier_output_v_row_;
     };
 
 } // namespace llaminar2

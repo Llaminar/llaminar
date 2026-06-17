@@ -82,7 +82,9 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     float *__restrict__ output,
     float *__restrict__ state,
     int n_heads, int d_k, int d_v,
-    bool use_qk_l2norm)
+    bool use_qk_l2norm,
+    const int *__restrict__ effective_seq_len_ptr,
+    int effective_row_idx)
 {
     const int h = blockIdx.x;
     if (h >= n_heads) return;
@@ -114,6 +116,13 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     const int warp_id = tid / 64;
     const int lane_id = tid % 64;
     const int num_warps = block_size / 64; // 4
+
+    if (effective_seq_len_ptr && effective_row_idx >= *effective_seq_len_ptr)
+    {
+        if (vi < d_v && split_id == 0)
+            o_head[vi] = 0.0f;
+        return;
+    }
 
     // Load Q and K into shared memory (all 256 threads cooperate)
     for (int i = tid; i < d_k; i += block_size) {
@@ -225,6 +234,30 @@ __global__ void rocm_gdn_recurrent_step_kernel(
             o_head[vi] = out_vi;
         }
     }
+}
+
+__global__ void rocm_gdn_copy_state_snapshot_if_active_kernel(
+    const float *__restrict__ state,
+    float *__restrict__ state_snapshots,
+    const int *__restrict__ effective_seq_len_ptr,
+    int row_idx,
+    int state_floats,
+    int snapshot_stride_floats)
+{
+    if (!state || !state_snapshots || !effective_seq_len_ptr ||
+        row_idx >= *effective_seq_len_ptr)
+    {
+        return;
+    }
+
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    float *snapshot =
+        state_snapshots +
+        static_cast<size_t>(row_idx) *
+            static_cast<size_t>(snapshot_stride_floats);
+    for (int i = tid; i < state_floats; i += stride)
+        snapshot[i] = state[i];
 }
 
 // =========================================================================
@@ -655,6 +688,71 @@ __global__ void rocm_short_conv1d_decode_kernel(
     conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
 }
 
+/**
+ * @brief Decode-equivalent short-conv verifier row with a post-row snapshot.
+ *
+ * All-position MTP state publication restores these snapshots as live
+ * short-conv history.  They must match serial one-token decode exactly, so the
+ * MTP-sized verifier path uses this row loop instead of inferring state from
+ * the parallel prefill kernel.  The optional device effective length keeps
+ * padded graph rows inactive without a host-side branch.
+ */
+__global__ void rocm_short_conv1d_decode_snapshot_row_kernel(
+    const float *__restrict__ input,
+    const float *__restrict__ weight,
+    const float *__restrict__ bias,
+    float *__restrict__ output,
+    float *__restrict__ conv_state,
+    const int *__restrict__ effective_seq_len_ptr,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int row,
+    int channels, int kernel_size,
+    bool apply_silu)
+{
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= channels) return;
+
+    bool active = true;
+    if (effective_seq_len_ptr)
+    {
+        const int raw_effective = *effective_seq_len_ptr;
+        const int effective = raw_effective < 0 ? 0 : raw_effective;
+        active = row < effective;
+    }
+    if (!active)
+    {
+        output[ch] = 0.0f;
+        return;
+    }
+
+    const int ks_minus1 = kernel_size - 1;
+    float sum = 0.0f;
+    for (int k = 0; k < ks_minus1; k++)
+        sum += conv_state[ch * ks_minus1 + k] * weight[ch * kernel_size + k];
+    sum += input[ch] * weight[ch * kernel_size + ks_minus1];
+
+    if (bias) sum += bias[ch];
+    if (apply_silu)
+        sum = sum / (1.0f + expf(-sum));
+    output[ch] = sum;
+
+    for (int k = 0; k < ks_minus1 - 1; k++)
+        conv_state[ch * ks_minus1 + k] = conv_state[ch * ks_minus1 + k + 1];
+    conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
+
+    if (state_snapshots && row < max_snapshot_rows)
+    {
+        float *snapshot =
+            state_snapshots +
+            (size_t)row * snapshot_stride_floats +
+            (size_t)ch * ks_minus1;
+        for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+            snapshot[state_idx] = conv_state[ch * ks_minus1 + state_idx];
+    }
+}
+
 __global__ void rocm_short_conv1d_prefill_kernel(
     const float *__restrict__ input,
     const float *__restrict__ weight,
@@ -713,6 +811,61 @@ __global__ void rocm_short_conv1d_prefill_kernel(
                              : (conv_state ? conv_state[ch * ks_minus1 + ks_minus1 + src_t] : 0.0f);
         }
     }
+}
+
+bool rocmGDN_short_conv1d_via_single_row_chunks(
+    const float *input, const float *weight, const float *bias,
+    float *output, float *conv_state,
+    const int *device_effective_seq_len,
+    int seq_len, int channels, int kernel_size,
+    bool apply_silu,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    void *stream)
+{
+    if (!input || !weight || !output || !conv_state ||
+        seq_len <= 0 || channels <= 0 || kernel_size <= 1 ||
+        !state_snapshots || snapshot_stride_floats < channels * (kernel_size - 1) ||
+        max_snapshot_rows <= 0)
+    {
+        return false;
+    }
+
+    /*
+     * Match the CUDA/GDN publication contract: MTP verifier chunks are tiny,
+     * so process them as serial decode rows and snapshot the real post-row
+     * history.  Long prefill remains on the parallel prefill implementation.
+     */
+    int threads = 256;
+    int blocks = (channels + threads - 1) / threads;
+    const size_t row_stride = static_cast<size_t>(channels);
+    for (int row = 0; row < seq_len; ++row)
+    {
+        hipLaunchKernelGGL(rocm_short_conv1d_decode_snapshot_row_kernel,
+            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+            input + static_cast<size_t>(row) * row_stride,
+            weight,
+            bias,
+            output + static_cast<size_t>(row) * row_stride,
+            conv_state,
+            device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            row,
+            channels,
+            kernel_size,
+            apply_silu);
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_short_conv1d_decode_snapshot_row] %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+    }
+    return true;
 }
 
 __global__ void rocm_short_conv1d_state_update_kernel(
@@ -914,6 +1067,37 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
     }
 }
 
+/**
+ * Copy one captured verifier state row selected by a device scalar.
+ *
+ * The accepted-row selector is produced by GPU stochastic verifier metadata.
+ * Reading it here keeps GDN/short-conv state publication on the verifier stream
+ * and avoids a host synchronization just to discover the row index.
+ */
+__global__ void rocm_gdn_copy_capture_row_from_device_index_kernel(
+    float *__restrict__ dst,
+    const float *__restrict__ capture,
+    const int *__restrict__ row_index,
+    int rows,
+    int state_size)
+{
+    if (!dst || !capture || !row_index || rows <= 0 || state_size <= 0)
+        return;
+    const int row = *row_index;
+    if (row < 0 || row >= rows)
+        return;
+
+    const float *src =
+        capture + static_cast<size_t>(row) * static_cast<size_t>(state_size);
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < state_size;
+         i += stride)
+    {
+        dst[i] = src[i];
+    }
+}
+
 } // anonymous namespace (deinterleave kernel)
 
 // =========================================================================
@@ -971,6 +1155,50 @@ void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size
 void rocmGDN_stream_synchronize(void *stream)
 {
     hipStreamSynchronize((hipStream_t)stream);
+}
+
+bool rocmGDN_gpu_copy_capture_row_from_device_index(
+    float *dst,
+    const float *capture,
+    const int *device_row_index,
+    int rows,
+    int state_size,
+    int device_idx,
+    void *stream)
+{
+    if (!dst || !capture || !device_row_index ||
+        rows <= 0 || state_size <= 0 || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    int blocks = (state_size + threads - 1) / threads;
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > 1024)
+        blocks = 1024;
+    hipLaunchKernelGGL(
+        rocm_gdn_copy_capture_row_from_device_index_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        (hipStream_t)stream,
+        dst,
+        capture,
+        device_row_index,
+        rows,
+        state_size);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGDN_gpu_copy_capture_row_from_device_index] %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
 }
 
 } // extern "C" (memory helpers)
@@ -1072,7 +1300,9 @@ bool rocmGDN_recurrent_step(
         dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
         q, k, v, alpha, beta_raw, A_log, dt_bias,
         output, state,
-        n_heads, d_k, d_v, use_qk_l2norm);
+        n_heads, d_k, d_v, use_qk_l2norm,
+        nullptr,
+        -1);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
@@ -1091,7 +1321,50 @@ bool rocmGDN_recurrent_step(
     return true;
 }
 
-bool rocmGDN_chunk_forward(
+bool rocmGDN_recurrent_step_effective_row(
+    const float *q, const float *k, const float *v,
+    const float *alpha, const float *beta_raw,
+    const float *A_log, const float *dt_bias,
+    float *output, float *state,
+    int n_heads, int d_k, int d_v,
+    bool use_qk_l2norm,
+    const int *device_effective_seq_len,
+    int row_idx,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    int col_threads = 256;
+    const int cols_per_block = col_threads / 4;
+    const int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
+    const int smem_size = (2 * d_k + 4 + 2 * col_threads) * sizeof(float);
+
+    hipLaunchKernelGGL(rocm_gdn_recurrent_step_kernel,
+        dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
+        q, k, v, alpha, beta_raw, A_log, dt_bias,
+        output, state,
+        n_heads, d_k, d_v, use_qk_l2norm,
+        device_effective_seq_len,
+        row_idx);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "[rocmGDN_recurrent_step_effective_row] %s\n", hipGetErrorString(err));
+        return false;
+    }
+    if (llaminar2::debugEnv().rocm.gdn_sync)
+    {
+        err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_recurrent_step_effective_row_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool rocmGDN_chunk_forward_kernel_route(
     const float *Q, const float *K, const float *V,
     const float *alpha, const float *beta_raw,
     const float *A_log, const float *dt_bias,
@@ -1101,6 +1374,7 @@ bool rocmGDN_chunk_forward(
     float *state_snapshots,
     int snapshot_stride_floats,
     int max_snapshot_rows,
+    const int *device_effective_seq_len,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -1136,7 +1410,7 @@ bool rocmGDN_chunk_forward(
         dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
         output, state,
-        nullptr,
+        device_effective_seq_len,
         state_snapshots,
         snapshot_stride_floats,
         max_snapshot_rows,
@@ -1159,6 +1433,218 @@ bool rocmGDN_chunk_forward(
     return true;
 }
 
+/**
+ * Runs short GDN verifier chunks as a sequence of true one-row recurrences.
+ *
+ * The multi-row ROCm prefill kernel keeps the recurrence state in registers
+ * and only commits the final state to global memory. That is great for normal
+ * prefill, but all-position MTP publication needs every verifier row to be a
+ * byte-for-byte publishable checkpoint for later decode continuation. For the
+ * tiny verifier shapes used by MTP (`draft + 1`, currently <= 4), use the same
+ * one-row route as decode and copy the live state into the requested snapshot
+ * row after each row. This mirrors the CUDA path and keeps the state-publication
+ * contract backend-independent.
+ */
+bool rocmGDN_chunk_forward_via_single_row_chunks(
+    const float *Q, const float *K, const float *V,
+    const float *alpha, const float *beta_raw,
+    const float *A_log, const float *dt_bias,
+    float *output, float *state,
+    int seq_len, int n_heads, int d_k, int d_v,
+    bool use_qk_l2norm,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int device_idx, void *stream)
+{
+    if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
+        !output || !state ||
+        seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+        (state_snapshots && max_snapshot_rows <= 0))
+    {
+        return false;
+    }
+
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    const int state_floats = n_heads * d_k * d_v;
+    if (state_snapshots && snapshot_stride_floats < state_floats)
+        return false;
+
+    /*
+     * Publishable MTP verifier rows must be decode-equivalent.
+     *
+     * This helper is only used for tiny verifier chunks (`draft + 1`, <= 4).
+     * Route each row through the same recurrent_step path used by serial
+     * decode, then snapshot the resulting live state. That keeps CUDA, ROCm,
+     * and future CPU/GPU implementations aligned on the vLLM-style publication
+     * contract: a restored verifier row is indistinguishable from replaying the
+     * accepted verifier inputs one token at a time.
+     */
+    for (int row = 0; row < seq_len; ++row)
+    {
+        if (!rocmGDN_recurrent_step(
+                Q + static_cast<size_t>(row) * qk_stride,
+                K + static_cast<size_t>(row) * qk_stride,
+                V + static_cast<size_t>(row) * v_stride,
+                alpha + static_cast<size_t>(row) * n_heads,
+                beta_raw + static_cast<size_t>(row) * n_heads,
+                A_log,
+                dt_bias,
+                output + static_cast<size_t>(row) * v_stride,
+                state,
+                n_heads, d_k, d_v, use_qk_l2norm,
+                device_idx, stream))
+        {
+            return false;
+        }
+
+        if (state_snapshots && row < max_snapshot_rows)
+        {
+            float *snapshot =
+                state_snapshots +
+                static_cast<size_t>(row) *
+                    static_cast<size_t>(snapshot_stride_floats);
+            hipError_t err = hipMemcpyAsync(
+                snapshot,
+                state,
+                static_cast<size_t>(state_floats) * sizeof(float),
+                hipMemcpyDeviceToDevice,
+                static_cast<hipStream_t>(stream));
+            if (err != hipSuccess)
+            {
+                fprintf(stderr, "[rocmGDN_chunk_forward_snapshot] %s\n",
+                        hipGetErrorString(err));
+                return false;
+            }
+            err = hipGetLastError();
+            if (err != hipSuccess)
+            {
+                fprintf(stderr, "[rocmGDN_chunk_forward_snapshot_launch] %s\n",
+                        hipGetErrorString(err));
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool rocmGDN_chunk_forward(
+    const float *Q, const float *K, const float *V,
+    const float *alpha, const float *beta_raw,
+    const float *A_log, const float *dt_bias,
+    float *output, float *state,
+    int seq_len, int n_heads, int d_k, int d_v,
+    bool use_qk_l2norm,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (seq_len > 0 && seq_len <= 4)
+    {
+        return rocmGDN_chunk_forward_via_single_row_chunks(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, state,
+            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            device_idx, stream);
+    }
+
+    return rocmGDN_chunk_forward_kernel_route(
+        Q, K, V, alpha, beta_raw, A_log, dt_bias,
+        output, state,
+        seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+        state_snapshots,
+        snapshot_stride_floats,
+        max_snapshot_rows,
+        nullptr,
+        device_idx, stream);
+}
+
+bool rocmGDN_chunk_forward_effective_via_single_row_chunks(
+    const float *Q, const float *K, const float *V,
+    const float *alpha, const float *beta_raw,
+    const float *A_log, const float *dt_bias,
+    float *output, float *state,
+    int seq_len, int n_heads, int d_k, int d_v,
+    bool use_qk_l2norm,
+    const int *device_effective_seq_len,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int device_idx, void *stream)
+{
+    if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
+        !output || !state || !device_effective_seq_len ||
+        seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+        (state_snapshots && max_snapshot_rows <= 0))
+    {
+        return false;
+    }
+
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    const int state_floats = n_heads * d_k * d_v;
+    if (state_snapshots && snapshot_stride_floats < state_floats)
+        return false;
+
+    /*
+     * Grouped verifier graphs keep the real row count in a device scalar so
+     * replay can remain fully captured.  Rows beyond that count must not
+     * advance the recurrent state or publish snapshots, otherwise a later
+     * accepted-state restore can diverge from serial decode.
+     */
+    for (int row = 0; row < seq_len; ++row)
+    {
+        if (!rocmGDN_recurrent_step_effective_row(
+                Q + static_cast<size_t>(row) * qk_stride,
+                K + static_cast<size_t>(row) * qk_stride,
+                V + static_cast<size_t>(row) * v_stride,
+                alpha + static_cast<size_t>(row) * n_heads,
+                beta_raw + static_cast<size_t>(row) * n_heads,
+                A_log,
+                dt_bias,
+                output + static_cast<size_t>(row) * v_stride,
+                state,
+                n_heads, d_k, d_v, use_qk_l2norm,
+                device_effective_seq_len,
+                row,
+                device_idx, stream))
+        {
+            return false;
+        }
+
+        if (state_snapshots && row < max_snapshot_rows)
+        {
+            const int threads = 256;
+            const int blocks = (state_floats + threads - 1) / threads;
+            hipLaunchKernelGGL(rocm_gdn_copy_state_snapshot_if_active_kernel,
+                dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+                state,
+                state_snapshots,
+                device_effective_seq_len,
+                row,
+                state_floats,
+                snapshot_stride_floats);
+            const hipError_t err = hipGetLastError();
+            if (err != hipSuccess)
+            {
+                fprintf(stderr, "[rocmGDN_chunk_forward_effective_snapshot] %s\n",
+                        hipGetErrorString(err));
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 bool rocmGDN_chunk_forward_effective(
     const float *Q, const float *K, const float *V,
     const float *alpha, const float *beta_raw,
@@ -1174,6 +1660,19 @@ bool rocmGDN_chunk_forward_effective(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+    if (seq_len > 0 && seq_len <= 4)
+    {
+        return rocmGDN_chunk_forward_effective_via_single_row_chunks(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, state,
+            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+            device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            device_idx, stream);
+    }
+
     if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
     {
         print_pointer_attrs("Q", Q);
@@ -1188,34 +1687,21 @@ bool rocmGDN_chunk_forward_effective(
         print_pointer_attrs("effective_seq_len", device_effective_seq_len);
     }
 
-    int col_threads = 256;
-    int cols_per_block = col_threads / 4;
-    if (d_v <= 64)
-    {
-        col_threads = 128;
-        cols_per_block = col_threads / 4;
-    }
-    int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
-    int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
-
-    hipLaunchKernelGGL(rocm_gdn_chunk_forward_kernel,
-        dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
+    const bool ok = rocmGDN_chunk_forward_kernel_route(
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
         output, state,
-        device_effective_seq_len,
+        seq_len, n_heads, d_k, d_v, use_qk_l2norm,
         state_snapshots,
         snapshot_stride_floats,
         max_snapshot_rows,
-        seq_len, n_heads, d_k, d_v, use_qk_l2norm);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        fprintf(stderr, "[rocmGDN_chunk_forward_effective] %s\n", hipGetErrorString(err));
+        device_effective_seq_len,
+        device_idx, stream);
+    if (!ok)
         return false;
-    }
+
     if (llaminar2::debugEnv().rocm.gdn_sync)
     {
-        err = hipStreamSynchronize((hipStream_t)stream);
+        hipError_t err = hipStreamSynchronize((hipStream_t)stream);
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmGDN_chunk_forward_effective_sync] %s\n", hipGetErrorString(err));
@@ -1236,6 +1722,15 @@ bool rocmGDN_short_conv1d(
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (state_snapshots && seq_len > 0 && seq_len <= 4)
+    {
+        return rocmGDN_short_conv1d_via_single_row_chunks(
+            input, weight, bias, output, conv_state, nullptr,
+            seq_len, channels, kernel_size, apply_silu,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+            stream);
+    }
 
     if (seq_len == 1) {
         int threads = 256;
@@ -1283,6 +1778,15 @@ bool rocmGDN_short_conv1d_effective(
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (state_snapshots && seq_len > 0 && seq_len <= 4)
+    {
+        return rocmGDN_short_conv1d_via_single_row_chunks(
+            input, weight, bias, output, conv_state, device_effective_seq_len,
+            seq_len, channels, kernel_size, apply_silu,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+            stream);
+    }
 
     if (seq_len == 1) {
         int threads = 256;

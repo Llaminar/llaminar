@@ -248,13 +248,25 @@ namespace
                                           << cudaGetErrorString(err));
             return false;
         }
-        const bool type_ok = attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged;
+        // Snapshot-enabled activation tensors may be zero-copy mapped host memory.
+        // They are valid CUDA kernel inputs only when the pointer is the
+        // device-visible alias returned by cudaHostGetDevicePointer(), not an
+        // arbitrary host pointer.
+        const bool mapped_device_alias =
+            attr.type == cudaMemoryTypeHost &&
+            attr.device == expected_device &&
+            attr.devicePointer == ptr;
+        const bool type_ok = attr.type == cudaMemoryTypeDevice ||
+                             attr.type == cudaMemoryTypeManaged ||
+                             mapped_device_alias;
         if (type_ok && attr.device == expected_device)
             return true;
         LOG_ERROR("[CUDAMoEKernel] " << context << " requires " << name
                                       << " pointer on CUDA device " << expected_device
                                       << ", got attr.device=" << attr.device
                                       << " attr.type=" << static_cast<int>(attr.type)
+                                      << " device_ptr=" << attr.devicePointer
+                                      << " host_ptr=" << attr.hostPointer
                                       << " ptr=" << ptr);
         return false;
     }
@@ -343,6 +355,20 @@ namespace
         cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
         const cudaError_t err = cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &status);
         return err == cudaSuccess && status != cudaStreamCaptureStatusNone;
+    }
+
+    /**
+     * Return true whenever CUDA work is being recorded for replay.
+     *
+     * Llaminar has an internal graph-capture guard, but several low-level tests
+     * and capture utilities use CUDA stream capture directly. Runtime MoE
+     * pointer tables must treat both modes identically: all host-staged pointer
+     * arrays have to be uploaded before capture begins so replay never depends
+     * on stack-owned host arrays or implicit H2D copies.
+     */
+    bool isCudaMoEDecodeCaptureActive(void *stream)
+    {
+        return llaminar2::isGraphCaptureActive() || isCudaStreamCapturing(stream);
     }
 
     int *runtimeTopKExpertIdsDevice(llaminar2::DeviceMoELayerRuntime *runtime_layer)
@@ -511,7 +537,7 @@ extern "C"
         int seq_len, int d_model, int device_idx, void *stream);
 
     bool cudaMoE_shared_expert_gate_add(
-        const float *input, const float *gate_inp, const float *shared_output,
+        const float *input, const float *gate_inp, float *shared_output,
         const float *routed_residual, float *combined_output,
         int seq_len, int d_model, int device_idx, void *stream);
 
@@ -848,8 +874,8 @@ namespace llaminar2
         grouped_decode_metadata_cap_ = 0;
         grouped_decode_cached_expert_ids_.clear();
         grouped_decode_cached_weights_.clear();
-        runtime_gateup_pointer_cache_.clear();
-        runtime_down_pointer_cache_.clear();
+        gateup_pointer_slot_ready_.fill(false);
+        down_pointer_slot_ready_.fill(false);
         scratch_workspace_bound_ = false;
     }
 
@@ -862,6 +888,14 @@ namespace llaminar2
         prepared_num_experts_ = 0;
         group_active_expert_slots_ = 0;
         group_has_appended_single_expert_ = false;
+        /*
+         * Runtime pointer slots are staged during graph warmup.  A dynamic
+         * reset means the next captured graph must restage its deterministic
+         * scoped table slots instead of inheriting bindings from a discarded
+         * graph.
+         */
+        gateup_pointer_slot_ready_.fill(false);
+        down_pointer_slot_ready_.fill(false);
     }
 
     void CUDAMoEKernel::releaseDeviceBuffers() noexcept
@@ -943,8 +977,8 @@ namespace llaminar2
         grouped_down_kpart_slots_cap_ = 0;
         grouped_down_desc_tables_.clear();
         grouped_gateup_desc_tables_.clear();
-        runtime_gateup_pointer_cache_.clear();
-        runtime_down_pointer_cache_.clear();
+        gateup_pointer_slot_ready_.fill(false);
+        down_pointer_slot_ready_.fill(false);
 
         if (router_cublas_handle_)
         {
@@ -1156,8 +1190,16 @@ namespace llaminar2
         const bool need_realloc = total_slots > prefill_slots_cap_ ||
                                   d_model > prefill_d_model_cap_ ||
                                   intermediate > prefill_intermediate_cap_;
-        if (!need_realloc)
+        if (!need_realloc &&
+            d_prefill_A_int8_ &&
+            d_prefill_A_scales_ &&
+            d_prefill_swiglu_int8_ &&
+            d_prefill_swiglu_scales_ &&
+            d_prefill_gate_ &&
+            d_prefill_up_)
+        {
             return true;
+        }
 
         const int max_dim = std::max(d_model, intermediate);
         const int max_blocks = (max_dim + 31) / 32;
@@ -1438,8 +1480,45 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDAMoEKernel::runtimePointerWorkspaceSlot(
+        int table_id,
+        RuntimePointerArrayScope scope,
+        std::size_t *workspace_slot,
+        const char *context) const
+    {
+        if (!workspace_slot || table_id < 0)
+            return false;
+
+        const std::size_t table_slot = static_cast<std::size_t>(table_id);
+        if (table_slot >= kRuntimePointerArrayTableSlots)
+        {
+            LOG_ERROR("[CUDAMoEKernel] " << context
+                                         << " pointer workspace table slot exceeded: table_id="
+                                         << table_id << " table_slots="
+                                         << kRuntimePointerArrayTableSlots);
+            return false;
+        }
+
+        const std::size_t scope_slot = static_cast<std::size_t>(scope);
+        const std::size_t slot =
+            scope_slot * kRuntimePointerArrayTableSlots + table_slot;
+        if (slot >= kRuntimePointerArrayWorkspaceEntries)
+        {
+            LOG_ERROR("[CUDAMoEKernel] " << context
+                                         << " pointer workspace slot exceeded: scope="
+                                         << scope_slot << " table_id=" << table_id
+                                         << " capacity="
+                                         << kRuntimePointerArrayWorkspaceEntries);
+            return false;
+        }
+
+        *workspace_slot = slot;
+        return true;
+    }
+
     bool CUDAMoEKernel::ensureRuntimeGateUpPointerArrays(
         int table_id,
+        RuntimePointerArrayScope scope,
         int top_k,
         const std::array<float *, CUDAMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
         const std::array<float *, CUDAMoEKernel::kRuntimePointerArrayMaxTopK> &up_ptrs,
@@ -1450,39 +1529,11 @@ namespace llaminar2
             top_k > static_cast<int>(kRuntimePointerArrayMaxTopK))
             return false;
 
-        for (auto &entry : runtime_gateup_pointer_cache_)
-        {
-            if (entry.table_id != table_id || entry.top_k != top_k)
-                continue;
-
-            bool matches = true;
-            for (int slot = 0; slot < top_k; ++slot)
-            {
-                if (entry.gate_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]) ||
-                    entry.up_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(up_ptrs[slot]))
-                {
-                    matches = false;
-                    break;
-                }
-            }
-            if (matches && entry.d_gate_ptrs && entry.d_up_ptrs)
-            {
-                *d_gate_ptrs = entry.d_gate_ptrs;
-                *d_up_ptrs = entry.d_up_ptrs;
-                return true;
-            }
-        }
-
-        if (isGraphCaptureActive())
-        {
-            LOG_ERROR("[CUDAMoEKernel] grouped gate/up pointer cache miss during graph capture");
+        std::size_t workspace_slot = 0;
+        if (!runtimePointerWorkspaceSlot(
+                table_id, scope, &workspace_slot,
+                "grouped gate/up"))
             return false;
-        }
-        if (runtime_gateup_pointer_cache_.size() >= kRuntimePointerArrayWorkspaceEntries)
-        {
-            LOG_ERROR("[CUDAMoEKernel] grouped gate/up pointer workspace slot capacity exceeded");
-            return false;
-        }
         if (!setMoEDevice(device_ordinal_, "ensureRuntimeGateUpPointerArrays"))
             return false;
 
@@ -1504,48 +1555,51 @@ namespace llaminar2
             return false;
         }
 
-        RuntimeGateUpPointerCacheEntry entry;
-        entry.table_id = table_id;
-        entry.top_k = top_k;
-        entry.workspace_slot =
-            static_cast<int>(runtime_gateup_pointer_cache_.size());
-        entry.d_gate_ptrs =
+        float **slot_gate_ptrs =
             static_cast<float **>(gate_ptr_workspace) +
-            static_cast<size_t>(entry.workspace_slot) * kRuntimePointerArrayMaxTopK;
-        entry.d_up_ptrs =
+            workspace_slot * kRuntimePointerArrayMaxTopK;
+        float **slot_up_ptrs =
             static_cast<float **>(up_ptr_workspace) +
-            static_cast<size_t>(entry.workspace_slot) * kRuntimePointerArrayMaxTopK;
-        for (int slot = 0; slot < top_k; ++slot)
-        {
-            entry.gate_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]);
-            entry.up_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(up_ptrs[slot]);
-        }
+            workspace_slot * kRuntimePointerArrayMaxTopK;
 
         cudaStream_t stream = static_cast<cudaStream_t>(
             requireStream("CUDAMoEKernel::ensureRuntimeGateUpPointerArrays"));
-        cudaError_t err = cudaMemcpyAsync(entry.d_gate_ptrs, gate_ptrs.data(),
+        if (isCudaMoEDecodeCaptureActive(stream))
+        {
+            if (!gateup_pointer_slot_ready_[workspace_slot])
+            {
+                LOG_ERROR("[CUDAMoEKernel] grouped gate/up pointer workspace slot "
+                          << workspace_slot << " was not staged before graph capture");
+                return false;
+            }
+            *d_gate_ptrs = slot_gate_ptrs;
+            *d_up_ptrs = slot_up_ptrs;
+            return true;
+        }
+
+        cudaError_t err = cudaMemcpyAsync(slot_gate_ptrs, gate_ptrs.data(),
                                           static_cast<size_t>(top_k) * sizeof(float *),
                                           cudaMemcpyHostToDevice, stream);
         if (err == cudaSuccess)
-            err = cudaMemcpyAsync(entry.d_up_ptrs, up_ptrs.data(),
+            err = cudaMemcpyAsync(slot_up_ptrs, up_ptrs.data(),
                                   static_cast<size_t>(top_k) * sizeof(float *),
                                   cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDAMoEKernel] grouped gate/up pointer cache upload failed: "
+            LOG_ERROR("[CUDAMoEKernel] grouped gate/up pointer staging failed: "
                       << cudaGetErrorString(err));
             return false;
         }
 
-        runtime_gateup_pointer_cache_.push_back(entry);
-        auto &cached = runtime_gateup_pointer_cache_.back();
-        *d_gate_ptrs = cached.d_gate_ptrs;
-        *d_up_ptrs = cached.d_up_ptrs;
+        gateup_pointer_slot_ready_[workspace_slot] = true;
+        *d_gate_ptrs = slot_gate_ptrs;
+        *d_up_ptrs = slot_up_ptrs;
         return true;
     }
 
     bool CUDAMoEKernel::ensureRuntimeDownPointerArrays(
         int table_id,
+        RuntimePointerArrayScope scope,
         int top_k,
         const std::array<const float *, CUDAMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
         const std::array<const float *, CUDAMoEKernel::kRuntimePointerArrayMaxTopK> &up_ptrs,
@@ -1556,39 +1610,11 @@ namespace llaminar2
             top_k > static_cast<int>(kRuntimePointerArrayMaxTopK))
             return false;
 
-        for (auto &entry : runtime_down_pointer_cache_)
-        {
-            if (entry.table_id != table_id || entry.top_k != top_k)
-                continue;
-
-            bool matches = true;
-            for (int slot = 0; slot < top_k; ++slot)
-            {
-                if (entry.gate_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]) ||
-                    entry.up_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(up_ptrs[slot]))
-                {
-                    matches = false;
-                    break;
-                }
-            }
-            if (matches && entry.d_gate_ptrs && entry.d_up_ptrs)
-            {
-                *d_gate_ptrs = entry.d_gate_ptrs;
-                *d_up_ptrs = entry.d_up_ptrs;
-                return true;
-            }
-        }
-
-        if (isGraphCaptureActive())
-        {
-            LOG_ERROR("[CUDAMoEKernel] grouped down pointer cache miss during graph capture");
+        std::size_t workspace_slot = 0;
+        if (!runtimePointerWorkspaceSlot(
+                table_id, scope, &workspace_slot,
+                "grouped down"))
             return false;
-        }
-        if (runtime_down_pointer_cache_.size() >= kRuntimePointerArrayWorkspaceEntries)
-        {
-            LOG_ERROR("[CUDAMoEKernel] grouped down pointer workspace slot capacity exceeded");
-            return false;
-        }
         if (!setMoEDevice(device_ordinal_, "ensureRuntimeDownPointerArrays"))
             return false;
 
@@ -1610,43 +1636,45 @@ namespace llaminar2
             return false;
         }
 
-        RuntimeDownPointerCacheEntry entry;
-        entry.table_id = table_id;
-        entry.top_k = top_k;
-        entry.workspace_slot =
-            static_cast<int>(runtime_down_pointer_cache_.size());
-        entry.d_gate_ptrs =
+        const float **slot_gate_ptrs =
             static_cast<const float **>(gate_ptr_workspace) +
-            static_cast<size_t>(entry.workspace_slot) * kRuntimePointerArrayMaxTopK;
-        entry.d_up_ptrs =
+            workspace_slot * kRuntimePointerArrayMaxTopK;
+        const float **slot_up_ptrs =
             static_cast<const float **>(up_ptr_workspace) +
-            static_cast<size_t>(entry.workspace_slot) * kRuntimePointerArrayMaxTopK;
-        for (int slot = 0; slot < top_k; ++slot)
-        {
-            entry.gate_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]);
-            entry.up_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(up_ptrs[slot]);
-        }
+            workspace_slot * kRuntimePointerArrayMaxTopK;
 
         cudaStream_t stream = static_cast<cudaStream_t>(
             requireStream("CUDAMoEKernel::ensureRuntimeDownPointerArrays"));
-        cudaError_t err = cudaMemcpyAsync(entry.d_gate_ptrs, gate_ptrs.data(),
+        if (isCudaMoEDecodeCaptureActive(stream))
+        {
+            if (!down_pointer_slot_ready_[workspace_slot])
+            {
+                LOG_ERROR("[CUDAMoEKernel] grouped down pointer workspace slot "
+                          << workspace_slot << " was not staged before graph capture");
+                return false;
+            }
+            *d_gate_ptrs = slot_gate_ptrs;
+            *d_up_ptrs = slot_up_ptrs;
+            return true;
+        }
+
+        cudaError_t err = cudaMemcpyAsync(slot_gate_ptrs, gate_ptrs.data(),
                                           static_cast<size_t>(top_k) * sizeof(const float *),
                                           cudaMemcpyHostToDevice, stream);
         if (err == cudaSuccess)
-            err = cudaMemcpyAsync(entry.d_up_ptrs, up_ptrs.data(),
+            err = cudaMemcpyAsync(slot_up_ptrs, up_ptrs.data(),
                                   static_cast<size_t>(top_k) * sizeof(const float *),
                                   cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDAMoEKernel] grouped down pointer cache upload failed: "
+            LOG_ERROR("[CUDAMoEKernel] grouped down pointer staging failed: "
                       << cudaGetErrorString(err));
             return false;
         }
 
-        runtime_down_pointer_cache_.push_back(entry);
-        auto &cached = runtime_down_pointer_cache_.back();
-        *d_gate_ptrs = cached.d_gate_ptrs;
-        *d_up_ptrs = cached.d_up_ptrs;
+        down_pointer_slot_ready_[workspace_slot] = true;
+        *d_gate_ptrs = slot_gate_ptrs;
+        *d_up_ptrs = slot_up_ptrs;
         return true;
     }
 
@@ -2161,7 +2189,7 @@ namespace llaminar2
 
         const auto *in = static_cast<const float *>(input->gpu_data_ptr());
         const auto *gi = static_cast<const float *>(gate_inp->gpu_data_ptr());
-        const auto *so = static_cast<const float *>(shared_output->gpu_data_ptr());
+        auto *so = static_cast<float *>(shared_output->gpu_data_ptr());
         const auto *rr = static_cast<const float *>(routed_residual->gpu_data_ptr());
         auto *co = static_cast<float *>(combined_output->gpu_data_ptr());
         if (!in || !gi || !so || !rr || !co)
@@ -2176,6 +2204,7 @@ namespace llaminar2
             LOG_ERROR("[CUDAMoEKernel::sharedExpertGateAddFromTensors] fused gate-add kernel launch failed");
             return;
         }
+        markDeviceWritten(shared_output, device, stream);
         markDeviceWritten(combined_output, device, stream);
     }
 
@@ -2334,6 +2363,35 @@ namespace llaminar2
             }
         }
 
+        /*
+         * Descriptor tables are weight-shaped, not request-shaped.  Graph
+         * recapture can ask for the same table repeatedly; returning the
+         * existing id keeps CUDA aligned with ROCm's deterministic slot model
+         * and prevents pointer-array workspace slots from growing with replay
+         * attempts.
+         */
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        for (size_t index = 0; index < grouped_down_desc_tables_.size(); ++index)
+        {
+            const auto &existing = grouped_down_desc_tables_[index];
+            if (!existing.valid ||
+                !existing.device_descs ||
+                existing.num_experts != num_experts ||
+                existing.d_model != d_model ||
+                existing.intermediate != intermediate ||
+                existing.codebook_id != codebook_id ||
+                existing.codebook_mask != codebook_mask ||
+                existing.host_descs.size() != static_cast<size_t>(num_experts))
+            {
+                continue;
+            }
+            if (std::memcmp(existing.host_descs.data(), down_descs, desc_bytes) == 0)
+            {
+                return static_cast<int>(index);
+            }
+        }
+
         GroupedDownDescriptorTable table;
         table.host_descs.assign(down_descs, down_descs + num_experts);
         table.num_experts = num_experts;
@@ -2344,10 +2402,10 @@ namespace llaminar2
 
         DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
         cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&device_descs),
-                                     static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc));
+                                     desc_bytes);
         if (err == cudaSuccess)
             err = cudaMemcpyAsync(device_descs, table.host_descs.data(),
-                                  static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                  desc_bytes,
                                   cudaMemcpyHostToDevice, static_cast<cudaStream_t>(getStream()));
         if (err != cudaSuccess)
         {
@@ -2418,6 +2476,37 @@ namespace llaminar2
             }
         }
 
+        /*
+         * Gate/up descriptor tables are persistent prepared-weight metadata.
+         * Reusing identical tables gives CUDA the same deterministic descriptor
+         * id behavior as ROCm and keeps graph-owned pointer slots stable across
+         * replay-state resets.
+         */
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        for (size_t index = 0; index < grouped_gateup_desc_tables_.size(); ++index)
+        {
+            const auto &existing = grouped_gateup_desc_tables_[index];
+            if (!existing.valid ||
+                !existing.device_gate_descs ||
+                !existing.device_up_descs ||
+                existing.num_experts != num_experts ||
+                existing.d_model != d_model ||
+                existing.intermediate != intermediate ||
+                existing.codebook_id != codebook_id ||
+                existing.codebook_mask != codebook_mask ||
+                existing.host_gate_descs.size() != static_cast<size_t>(num_experts) ||
+                existing.host_up_descs.size() != static_cast<size_t>(num_experts))
+            {
+                continue;
+            }
+            if (std::memcmp(existing.host_gate_descs.data(), gate_descs, desc_bytes) == 0 &&
+                std::memcmp(existing.host_up_descs.data(), up_descs, desc_bytes) == 0)
+            {
+                return static_cast<int>(index);
+            }
+        }
+
         GroupedGateUpDescriptorTable table;
         table.host_gate_descs.assign(gate_descs, gate_descs + num_experts);
         table.host_up_descs.assign(up_descs, up_descs + num_experts);
@@ -2430,17 +2519,17 @@ namespace llaminar2
         DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
         DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
         cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&device_gate_descs),
-                                     static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc));
+                                     desc_bytes);
         if (err == cudaSuccess)
             err = cudaMalloc(reinterpret_cast<void **>(&device_up_descs),
-                             static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc));
+                             desc_bytes);
         if (err == cudaSuccess)
             err = cudaMemcpyAsync(device_gate_descs, table.host_gate_descs.data(),
-                                  static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                  desc_bytes,
                                   cudaMemcpyHostToDevice, static_cast<cudaStream_t>(getStream()));
         if (err == cudaSuccess)
             err = cudaMemcpyAsync(device_up_descs, table.host_up_descs.data(),
-                                  static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                  desc_bytes,
                                   cudaMemcpyHostToDevice, static_cast<cudaStream_t>(getStream()));
         if (err != cudaSuccess)
         {
@@ -2676,8 +2765,11 @@ namespace llaminar2
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
+        const int active_expert_slots = group_active_expert_slots_;
+        const int *d_active_expert_ids =
+            (active_expert_slots > 0) ? d_group_active_expert_ids_ : nullptr;
         const bool use_gateup_kpart =
-            group_active_expert_slots_ > 0 &&
+            active_expert_slots > 0 &&
             max_tokens_per_expert <= 4 &&
             debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
             ensureGroupedGateUpKPartScratchCapacity(
@@ -2745,7 +2837,7 @@ namespace llaminar2
             d_group_offsets_,
             d_group_token_indices_,
             shared_expert_group ? nullptr : d_group_original_to_grouped_,
-            d_group_active_expert_ids_,
+            d_active_expert_ids,
             d_single_expert_ids,
             d_group_weights_,
             d_prefill_A_int8_,
@@ -2764,7 +2856,7 @@ namespace llaminar2
             max_tokens_per_expert,
             total_slots,
             top_k,
-            group_active_expert_slots_,
+            active_expert_slots,
             gateup_table.codebook_id,
             down_table.codebook_id,
             gateup_table.codebook_mask,
@@ -2781,7 +2873,6 @@ namespace llaminar2
         }
 
         markDeviceWritten(output, device, stream);
-        const int active_expert_slots = group_active_expert_slots_;
         const int requested_tile_m = debugEnv().gemm.cuda_moe_prefill_tile_m;
         // Shared expert verifier rows have a single active expert slot. The
         // measured CUDA path is faster when it keeps the M tile at 2 even for
@@ -2840,6 +2931,7 @@ namespace llaminar2
             return false;
 
         void *stream = requireStream("CUDAMoEKernel::groupedExpertGateUpDecodeFromTable");
+        const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
         const DeviceId device = deviceId();
         if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromTable"))
             return false;
@@ -2855,7 +2947,7 @@ namespace llaminar2
             return false;
 
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
-        if (!d_hidden && isGraphCaptureActive())
+        if (!d_hidden && capture_active)
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] input upload required during graph capture");
             return false;
@@ -2888,7 +2980,7 @@ namespace llaminar2
             if (!gate_outputs[slot] || !up_outputs[slot])
                 return false;
             if ((!gate_outputs[slot]->gpu_data_ptr() || !up_outputs[slot]->gpu_data_ptr()) &&
-                isGraphCaptureActive())
+                capture_active)
             {
                 LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] output allocation required during graph capture");
                 return false;
@@ -2916,7 +3008,8 @@ namespace llaminar2
 
         float **d_gate_ptrs = nullptr;
         float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeGateUpPointerArrays(table_id, num_active, gate_ptrs, up_ptrs,
+        if (!ensureRuntimeGateUpPointerArrays(table_id, RuntimePointerArrayScope::TableDecode,
+                                              num_active, gate_ptrs, up_ptrs,
                                               &d_gate_ptrs, &d_up_ptrs))
             return false;
 
@@ -3006,6 +3099,7 @@ namespace llaminar2
             return false;
 
         void *stream = requireStream("CUDAMoEKernel::groupedExpertDownDecodeFromTable");
+        const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
         const DeviceId device = deviceId();
         if (!ensureGroupedDownDecodeCapacity(num_active, intermediate) ||
             !setMoEDevice(device_ordinal_, "groupedExpertDownDecodeFromTable"))
@@ -3023,7 +3117,7 @@ namespace llaminar2
                 return false;
         }
 
-        if (!output->gpu_data_ptr() && isGraphCaptureActive())
+        if (!output->gpu_data_ptr() && capture_active)
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] output allocation required during graph capture");
             return false;
@@ -3033,7 +3127,8 @@ namespace llaminar2
 
         const float **d_gate_ptrs = nullptr;
         const float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeDownPointerArrays(table_id, num_active, gate_ptrs, up_ptrs,
+        if (!ensureRuntimeDownPointerArrays(table_id, RuntimePointerArrayScope::TableDecode,
+                                            num_active, gate_ptrs, up_ptrs,
                                             &d_gate_ptrs, &d_up_ptrs))
             return false;
 
@@ -3119,6 +3214,7 @@ namespace llaminar2
         }
 
         void *stream = requireStream("CUDAMoEKernel::groupedExpertDecodeFromRuntime");
+        const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
         const DeviceId device = deviceId();
         if (!setMoEDevice(device_ordinal_, "groupedExpertDecodeFromRuntime"))
             return false;
@@ -3138,7 +3234,7 @@ namespace llaminar2
             return false;
 
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
-        if (!d_hidden && isGraphCaptureActive())
+        if (!d_hidden && capture_active)
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] input upload required during graph capture");
             return false;
@@ -3153,7 +3249,7 @@ namespace llaminar2
         if (!d_hidden || !d_prefill_gate_ || !d_prefill_up_)
             return false;
 
-        if (!output->gpu_data_ptr() && isGraphCaptureActive())
+        if (!output->gpu_data_ptr() && capture_active)
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] output allocation required during graph capture");
             return false;
@@ -3176,12 +3272,14 @@ namespace llaminar2
 
         float **d_gate_ptrs = nullptr;
         float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeGateUpPointerArrays(gateup_table_id, top_k, gate_ptrs, up_ptrs,
+        if (!ensureRuntimeGateUpPointerArrays(gateup_table_id, RuntimePointerArrayScope::RuntimeFused,
+                                              top_k, gate_ptrs, up_ptrs,
                                               &d_gate_ptrs, &d_up_ptrs))
             return false;
         const float **d_down_gate_ptrs = nullptr;
         const float **d_down_up_ptrs = nullptr;
-        if (!ensureRuntimeDownPointerArrays(down_table_id, top_k, const_gate_ptrs, const_up_ptrs,
+        if (!ensureRuntimeDownPointerArrays(down_table_id, RuntimePointerArrayScope::RuntimeFused,
+                                            top_k, const_gate_ptrs, const_up_ptrs,
                                             &d_down_gate_ptrs, &d_down_up_ptrs))
             return false;
 
@@ -3273,7 +3371,7 @@ namespace llaminar2
         recordGroupedDecodeCounter(
             "cuda_moe_grouped_decode_fused_calls", "runtime", top_k,
             d_model, intermediate, "fused_block_down");
-        if (!isGraphCaptureActive() && !isCudaStreamCapturing(stream))
+        if (!capture_active)
         {
             recordFusedDecodeTimer("cuda_moe_fused_decode_hidden_quantize", top_k, d_model, intermediate);
             recordFusedDecodeTimer("cuda_moe_fused_decode_gateup_kpart", top_k, d_model, intermediate);
@@ -3313,6 +3411,7 @@ namespace llaminar2
         }
 
         void *stream = requireStream("CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime");
+        const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
         const DeviceId device = deviceId();
         if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model))
             return false;
@@ -3330,7 +3429,7 @@ namespace llaminar2
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         if (!d_hidden)
         {
-            if (isGraphCaptureActive())
+            if (capture_active)
             {
                 LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime] input upload required during graph capture");
                 return false;
@@ -3351,7 +3450,7 @@ namespace llaminar2
                 return false;
             }
             if ((!gate_outputs[slot]->gpu_data_ptr() || !up_outputs[slot]->gpu_data_ptr()) &&
-                isGraphCaptureActive())
+                capture_active)
             {
                 LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime] output allocation required during graph capture");
                 return false;
@@ -3372,7 +3471,8 @@ namespace llaminar2
 
         float **d_gate_ptrs = nullptr;
         float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeGateUpPointerArrays(table_id, top_k, gate_ptrs, up_ptrs,
+        if (!ensureRuntimeGateUpPointerArrays(table_id, RuntimePointerArrayScope::RuntimeTwoStep,
+                                              top_k, gate_ptrs, up_ptrs,
                                               &d_gate_ptrs, &d_up_ptrs))
             return false;
 
@@ -3462,6 +3562,7 @@ namespace llaminar2
         }
 
         void *stream = requireStream("CUDAMoEKernel::groupedExpertDownDecodeFromRuntime");
+        const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
         const DeviceId device = deviceId();
         if (!ensureGroupedDownDecodeCapacity(top_k, intermediate))
             return false;
@@ -3488,7 +3589,7 @@ namespace llaminar2
             }
         }
 
-        if (!output->gpu_data_ptr() && isGraphCaptureActive())
+        if (!output->gpu_data_ptr() && capture_active)
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRuntime] output allocation required during graph capture");
             return false;
@@ -3498,7 +3599,8 @@ namespace llaminar2
 
         const float **d_gate_ptrs = nullptr;
         const float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeDownPointerArrays(table_id, top_k, gate_ptrs, up_ptrs,
+        if (!ensureRuntimeDownPointerArrays(table_id, RuntimePointerArrayScope::RuntimeTwoStep,
+                                            top_k, gate_ptrs, up_ptrs,
                                             &d_gate_ptrs, &d_up_ptrs))
             return false;
 

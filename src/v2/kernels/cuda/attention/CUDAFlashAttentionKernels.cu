@@ -133,6 +133,33 @@ namespace
     }
 
     /**
+     * @brief Derive graph-captured attention params from live KV cache count.
+     *
+     * The stage records this kernel immediately before attention. That keeps
+     * `AttentionDeviceParams` tied to the cache's device-owned sequence state
+     * after KV append, which is the ordering needed for vLLM-style resident MTP
+     * publication without a host scalar handoff.
+     */
+    __global__ void cuda_derive_attention_params_from_cached_tokens_kernel(
+        llaminar2::attention::AttentionDeviceParams *__restrict__ out,
+        const int *__restrict__ post_append_cached_tokens,
+        int seq_len,
+        int query_rows)
+    {
+        const int row = static_cast<int>(threadIdx.x);
+        if (!out || !post_append_cached_tokens || row >= query_rows)
+            return;
+
+        const int kv_len = max(1, *post_append_cached_tokens);
+        const int logical_seq_len = max(1, seq_len);
+        const int base_position = max(0, kv_len - logical_seq_len);
+        const int row_kv_len = max(1, kv_len - (query_rows - 1 - row));
+        out[row].kv_len = row_kv_len;
+        out[row].position_offset = base_position + row;
+        out[row].mask_stride = kv_len;
+    }
+
+    /**
      * @brief Compute shared memory size for a given FA2 configuration
      */
     inline size_t computeFA2SmemSize(int tile_q, int tile_kv, int head_dim,
@@ -2396,6 +2423,38 @@ extern "C"
         }
 
         return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    }
+
+    /**
+     * @brief Derive AttentionDeviceParams from device-owned KV cache count.
+     */
+    int cudaFlashAttn_prepare_device_params_from_count(
+        void *device_params,
+        const int *post_append_cached_tokens,
+        int seq_len,
+        int query_rows,
+        void *stream)
+    {
+        if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
+            query_rows <= 0 || !stream)
+        {
+            return -1;
+        }
+
+        cuda_derive_attention_params_from_cached_tokens_kernel<<<1, query_rows, 0,
+                                                                 static_cast<cudaStream_t>(stream)>>>(
+            static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
+            post_append_cached_tokens,
+            seq_len,
+            query_rows);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            printf("[cudaFlashAttn_prepare_device_params_from_count] Kernel launch failed: %s\n",
+                   cudaGetErrorString(err));
+            return -1;
+        }
+        return 0;
     }
 
     /**

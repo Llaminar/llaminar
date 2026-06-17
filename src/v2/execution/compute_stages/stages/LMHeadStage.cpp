@@ -4,11 +4,15 @@
  */
 
 #include "LMHeadStage.h"
+#include "VerifierDecodeEquivalentGemmRows.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/GemmContext.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../loaders/PreparedWeightStore.h"
+
+#include <algorithm>
 
 namespace llaminar2
 {
@@ -143,19 +147,33 @@ namespace llaminar2
         // Bias is passed directly to GEMM kernel for fused application.
         // CPU NativeVNNI uses its batched M=2..4 path here for verifier rows;
         // parity tests compare these rows against serial one-token decode.
-        bool success = lm_gemm->multiply_tensor(
-            hidden_states,
-            logits,
-            lm_m,
-            params_.vocab_size,
-            params_.d_model,
-            true, // transpose_B (lm_head is [vocab_size, d_model])
-            1.0f, 0.0f,
-            params_.bias_tensor, // Bias fused into GEMM
-            params_.mpi_ctx,
-            params_.device_id.toKernelDeviceIndex(),
-            bound_workspace_,
-            lm_activation_offset);
+        bool success = false;
+        if (params_.force_decode_equivalent_verifier_prefill &&
+            params_.compute_all_positions &&
+            lm_m > 1)
+        {
+            success = executeDecodeEquivalentVerifierPrefill(
+                hidden_states,
+                logits,
+                lm_gemm,
+                lm_m);
+        }
+        else
+        {
+            success = lm_gemm->multiply_tensor(
+                hidden_states,
+                logits,
+                lm_m,
+                params_.vocab_size,
+                params_.d_model,
+                true, // transpose_B (lm_head is [vocab_size, d_model])
+                1.0f, 0.0f,
+                params_.bias_tensor, // Bias fused into GEMM
+                params_.mpi_ctx,
+                params_.device_id.toKernelDeviceIndex(),
+                bound_workspace_,
+                lm_activation_offset);
+        }
 
         if (!success)
         {
@@ -171,6 +189,140 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool LMHeadStage::executeDecodeEquivalentVerifierPrefill(
+        const TensorBase *hidden_states,
+        TensorBase *logits,
+        ITensorGemm *lm_gemm,
+        int lm_m)
+    {
+        if (!hidden_states || !logits || !lm_gemm)
+            return false;
+        if (lm_m > 4)
+        {
+            LOG_ERROR("[LMHeadStage] Decode-equivalent verifier prefill is only supported "
+                      << "for tiny MTP verifier batches, got m=" << lm_m);
+            return false;
+        }
+
+        const bool is_gpu = params_.device_id.is_gpu();
+        void *stream = gpuStream();
+        if (is_gpu && !stream)
+        {
+            LOG_ERROR("[LMHeadStage] Decode-equivalent GPU verifier prefill requires an explicit stream");
+            return false;
+        }
+
+        if (!verifier_gemm_rows::ensureScratchFP32(
+                verifier_hidden_row_, 1, static_cast<size_t>(params_.d_model),
+                params_.device_id, stream, "LMHeadStage", "hidden_row") ||
+            !verifier_gemm_rows::ensureScratchFP32(
+                verifier_logits_row_, 1, static_cast<size_t>(params_.vocab_size),
+                params_.device_id, stream, "LMHeadStage", "logits_row"))
+        {
+            return false;
+        }
+
+        const float *hidden_data = is_gpu ? nullptr : hidden_states->data();
+        float *logits_data = is_gpu ? nullptr : logits->mutable_data();
+        if (!is_gpu && (!hidden_data || !logits_data))
+        {
+            LOG_ERROR("[LMHeadStage] Decode-equivalent verifier prefill requires host-visible FP32 tensors");
+            return false;
+        }
+        if (is_gpu)
+        {
+            if (!hidden_states->gpu_data_ptr())
+            {
+                LOG_ERROR("[LMHeadStage] Decode-equivalent verifier hidden input is not device-resident on "
+                          << params_.device_id.to_string());
+                return false;
+            }
+            if (!logits->allocateOnDevice(params_.device_id, stream))
+            {
+                LOG_ERROR("[LMHeadStage] Failed to prepare verifier logits tensor on "
+                          << params_.device_id.to_string());
+                return false;
+            }
+        }
+
+        bool success = true;
+        for (int row = 0; row < lm_m; ++row)
+        {
+            if (is_gpu)
+            {
+                success = verifier_gemm_rows::copyFP32DeviceRow(
+                    verifier_hidden_row_.get(), 0, params_.d_model,
+                    hidden_states, row, params_.d_model,
+                    params_.d_model, params_.device_id, stream,
+                    "LMHeadStage", "verifier_hidden_row");
+                if (!success)
+                    break;
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    verifier_hidden_row_.get(), params_.device_id, stream);
+            }
+            else
+            {
+                std::copy(hidden_data + static_cast<size_t>(row) * params_.d_model,
+                          hidden_data + static_cast<size_t>(row + 1) * params_.d_model,
+                          verifier_hidden_row_->mutable_data());
+            }
+
+            const bool row_ok = lm_gemm->multiply_tensor(
+                verifier_hidden_row_.get(),
+                verifier_logits_row_.get(),
+                1,
+                params_.vocab_size,
+                params_.d_model,
+                true,
+                1.0f,
+                0.0f,
+                params_.bias_tensor,
+                params_.mpi_ctx,
+                params_.device_id.toKernelDeviceIndex(),
+                bound_workspace_);
+            if (!row_ok)
+            {
+                LOG_ERROR("[LMHeadStage] Decode-equivalent verifier LM-head row "
+                          << row << " failed");
+                success = false;
+                break;
+            }
+
+            if (is_gpu)
+            {
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    verifier_logits_row_.get(), params_.device_id, stream);
+                success = verifier_gemm_rows::copyFP32DeviceRow(
+                    logits, row, params_.vocab_size,
+                    verifier_logits_row_.get(), 0, params_.vocab_size,
+                    params_.vocab_size, params_.device_id, stream,
+                    "LMHeadStage", "verifier_logits_row");
+                if (!success)
+                    break;
+            }
+            else
+            {
+                std::copy(verifier_logits_row_->data(),
+                          verifier_logits_row_->data() + params_.vocab_size,
+                          logits_data + static_cast<size_t>(row) * params_.vocab_size);
+            }
+        }
+
+        if (success)
+        {
+            if (is_gpu)
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    logits, params_.device_id, stream);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "lm_head_decode_equivalent_verifier_prefill_rows",
+                static_cast<double>(lm_m),
+                {},
+                params_.device_id.to_string());
+        }
+        return success;
     }
 
     size_t LMHeadStage::estimatedFlops() const

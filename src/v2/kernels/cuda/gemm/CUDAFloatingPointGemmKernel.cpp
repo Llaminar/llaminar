@@ -431,6 +431,94 @@ namespace llaminar2
                 return false;
             }
 
+            bool can_use_homogeneous_batched_path = true;
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                const auto &proj = projections[i];
+                auto *fp_kernel = dynamic_cast<CUDAFloatingPointGemmKernel *>(proj.kernel);
+                if (!fp_kernel || !proj.output)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Projection "
+                              << i << " is not a CUDA FP32 GEMM/output pair");
+                    return false;
+                }
+                if (proj.n <= 0 ||
+                    fp_kernel->N_ != static_cast<size_t>(proj.n) ||
+                    fp_kernel->K_ != K_ ||
+                    fp_kernel->precision_ != Precision::FP32 ||
+                    fp_kernel->cuda_device_id_ != cuda_device_id_)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Projection "
+                              << i << " is not compatible with the FP32 projection group"
+                              << " n=" << proj.n
+                              << " kernel_n=" << fp_kernel->N_
+                              << " k=" << fp_kernel->K_
+                              << " expected_k=" << K_);
+                    return false;
+                }
+                if (proj.output->native_type() != TensorType::FP32)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Projection "
+                              << i << " output must be FP32");
+                    return false;
+                }
+                fp_kernel->setGPUStream(gpu_stream_);
+
+                // The cublas batched-same-A path requires identical N and no
+                // per-projection bias. QKV projection groups often have
+                // n_q != n_k == n_v, so those groups use the same explicit-stream
+                // single-projection GEMM path below instead of failing.
+                if (proj.n != n || proj.bias)
+                    can_use_homogeneous_batched_path = false;
+            }
+
+            if (!can_use_homogeneous_batched_path)
+            {
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &proj = projections[i];
+                    auto *fp_kernel = static_cast<CUDAFloatingPointGemmKernel *>(proj.kernel);
+                    auto *output = static_cast<TensorBase *>(proj.output);
+                    if (!fp_kernel->multiply_tensor(
+                            input,
+                            output,
+                            m,
+                            proj.n,
+                            k,
+                            /*transpose_B=*/true,
+                            /*alpha=*/1.0f,
+                            /*beta=*/0.0f,
+                            proj.bias,
+                            nullptr,
+                            -1,
+                            bound_workspace_,
+                            /*activation_row_offset=*/0))
+                    {
+                        LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Heterogeneous FP32 projection "
+                                  << i << " failed");
+                        return false;
+                    }
+                }
+
+                if (PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cuda_fp32_batched_fused_projection_calls",
+                        1.0,
+                        "gemm",
+                        "cuda:" + std::to_string(cuda_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"m", std::to_string(m)},
+                            {"k", std::to_string(k)},
+                            {"n", "mixed"},
+                            {"projections", std::to_string(projections.size())},
+                            {"mapped_redirect", "per_projection"},
+                            {"route", "cublas_sequential_heterogeneous"}});
+                }
+                return true;
+            }
+
             std::vector<const float *> d_B_matrices;
             std::vector<float *> d_C_matrices;
             std::vector<float *> d_mapped_outputs;
@@ -447,38 +535,6 @@ namespace llaminar2
             {
                 const auto &proj = projections[i];
                 auto *fp_kernel = dynamic_cast<CUDAFloatingPointGemmKernel *>(proj.kernel);
-                if (!fp_kernel || !proj.output)
-                {
-                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Projection "
-                              << i << " is not a CUDA FP32 GEMM/output pair");
-                    return false;
-                }
-                if (proj.bias)
-                {
-                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Bias is not supported in batched FP32 projection groups");
-                    return false;
-                }
-                if (proj.n != n ||
-                    fp_kernel->N_ != static_cast<size_t>(n) ||
-                    fp_kernel->K_ != K_ ||
-                    fp_kernel->precision_ != Precision::FP32 ||
-                    fp_kernel->cuda_device_id_ != cuda_device_id_)
-                {
-                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Projection "
-                              << i << " is not compatible with the batched FP32 group"
-                              << " n=" << proj.n << " expected_n=" << n
-                              << " k=" << fp_kernel->K_ << " expected_k=" << K_);
-                    return false;
-                }
-                if (proj.output->native_type() != TensorType::FP32)
-                {
-                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Projection "
-                              << i << " output must be FP32");
-                    return false;
-                }
-
-                fp_kernel->setGPUStream(gpu_stream_);
-
                 auto *d_C = static_cast<float *>(proj.output->gpu_data_ptr());
                 if (!fp_kernel->d_weights_ || !d_C)
                 {

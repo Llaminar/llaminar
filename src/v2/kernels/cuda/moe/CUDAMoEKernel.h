@@ -260,7 +260,26 @@ namespace llaminar2
 
     private:
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
-        static constexpr std::size_t kRuntimePointerArrayWorkspaceEntries = 1024;
+        static constexpr std::size_t kRuntimePointerArrayTableSlots = 1024;
+        static constexpr std::size_t kRuntimePointerArrayWorkspaceScopes = 3;
+        static constexpr std::size_t kRuntimePointerArrayWorkspaceEntries =
+            kRuntimePointerArrayTableSlots * kRuntimePointerArrayWorkspaceScopes;
+
+        /**
+         * @brief Stable graph-capture slot bands for grouped decode pointer arrays.
+         *
+         * Descriptor table ids identify the weight table, but not the scratch
+         * destination shape.  Table-driven decode, two-step runtime decode, and
+         * fused runtime decode can legally reuse the same descriptor table while
+         * writing to different scratch/output tensors.  CUDA graphs capture the
+         * pointer-array device address, so each semantic path gets a stable band.
+         */
+        enum class RuntimePointerArrayScope : std::size_t
+        {
+            TableDecode = 0,
+            RuntimeTwoStep = 1,
+            RuntimeFused = 2,
+        };
 
         struct DeviceRouteBuffers
         {
@@ -304,6 +323,7 @@ namespace llaminar2
             float *d_grouped_weights);
         bool ensureRuntimeGateUpPointerArrays(
             int table_id,
+            RuntimePointerArrayScope scope,
             int top_k,
             const std::array<float *, kRuntimePointerArrayMaxTopK> &gate_ptrs,
             const std::array<float *, kRuntimePointerArrayMaxTopK> &up_ptrs,
@@ -311,11 +331,17 @@ namespace llaminar2
             float ***d_up_ptrs);
         bool ensureRuntimeDownPointerArrays(
             int table_id,
+            RuntimePointerArrayScope scope,
             int top_k,
             const std::array<const float *, kRuntimePointerArrayMaxTopK> &gate_ptrs,
             const std::array<const float *, kRuntimePointerArrayMaxTopK> &up_ptrs,
             const float ***d_gate_ptrs,
             const float ***d_up_ptrs);
+        bool runtimePointerWorkspaceSlot(
+            int table_id,
+            RuntimePointerArrayScope scope,
+            std::size_t *workspace_slot,
+            const char *context) const;
         bool bindWorkspaceBuffer(void **ptr, const char *name, size_t bytes, const char *context);
         void clearWorkspaceScratchBindings() noexcept;
         void releaseDeviceBuffers() noexcept;
@@ -344,28 +370,6 @@ namespace llaminar2
             uint8_t codebook_id = 0;
             uint32_t codebook_mask = 0;
             bool valid = false;
-        };
-
-        struct RuntimeGateUpPointerCacheEntry
-        {
-            int table_id = -1;
-            int top_k = 0;
-            int workspace_slot = -1;
-            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> gate_ptr_values = {};
-            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> up_ptr_values = {};
-            float **d_gate_ptrs = nullptr;
-            float **d_up_ptrs = nullptr;
-        };
-
-        struct RuntimeDownPointerCacheEntry
-        {
-            int table_id = -1;
-            int top_k = 0;
-            int workspace_slot = -1;
-            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> gate_ptr_values = {};
-            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> up_ptr_values = {};
-            const float **d_gate_ptrs = nullptr;
-            const float **d_up_ptrs = nullptr;
         };
 
         int device_ordinal_ = 0;
@@ -399,8 +403,20 @@ namespace llaminar2
 
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
         std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;
-        std::vector<RuntimeGateUpPointerCacheEntry> runtime_gateup_pointer_cache_;
-        std::vector<RuntimeDownPointerCacheEntry> runtime_down_pointer_cache_;
+        /**
+         * @brief Warmup readiness for graph-owned grouped-decode pointer slots.
+         *
+         * CUDA graph replay captures the device address of the pointer-array
+         * slot, not the host pointer values used to stage it.  CUDA therefore
+         * follows the ROCm-style deterministic workspace contract, but includes
+         * the decode path scope in the slot key because CUDA fused decode and
+         * two-step decode can share descriptor tables while targeting different
+         * scratch buffers. Warmup stages the scoped slot, and capture refuses to
+         * proceed unless that slot is already ready. No per-pointer cache is
+         * kept on the kernel object.
+         */
+        std::array<bool, kRuntimePointerArrayWorkspaceEntries> gateup_pointer_slot_ready_{};
+        std::array<bool, kRuntimePointerArrayWorkspaceEntries> down_pointer_slot_ready_{};
 
         int8_t *d_prefill_A_int8_ = nullptr;
         float *d_prefill_A_scales_ = nullptr;

@@ -1,8 +1,10 @@
 #pragma once
 
+#include "backends/DeviceId.h"
 #include "execution/prefix_cache/PrefixStorageBackend.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -72,6 +74,20 @@ namespace llaminar2
         std::vector<PrefixBlockHandle> blocks;
         std::vector<PrefixBlockHandle> mtp_blocks;
         std::vector<PrefixStateSnapshot> participant_snapshots;
+        /**
+         * @brief Optional GPU event proving asynchronous snapshot payloads are ready.
+         *
+         * Logical MTP checkpoints can export recurrent/hybrid state into
+         * device-resident payload buffers without synchronizing the host.  The
+         * event lets later restores wait on the producing stream before they
+         * import from that payload.  The producing runner also keeps a pending
+         * copy of the same event so the next live-state mutation cannot
+         * overwrite the source state while the snapshot copy is still queued.
+         */
+        std::shared_ptr<void> ready_event;
+        void *ready_producer_stream = nullptr;
+        DeviceId ready_device = DeviceId::invalid();
+        bool ready_event_valid = false;
 
         bool decodeEquivalent() const
         {
@@ -89,6 +105,10 @@ namespace llaminar2
             blocks.swap(other.blocks);
             mtp_blocks.swap(other.mtp_blocks);
             participant_snapshots.swap(other.participant_snapshots);
+            ready_event.swap(other.ready_event);
+            swap(ready_producer_stream, other.ready_producer_stream);
+            swap(ready_device, other.ready_device);
+            swap(ready_event_valid, other.ready_event_valid);
         }
     };
 

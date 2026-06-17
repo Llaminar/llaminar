@@ -30,6 +30,7 @@
 #include "../../execution/compute_stages/stages/FusedResidualNormStage.h"
 #include "../../execution/compute_stages/stages/QKNormStage.h"
 #include "../../execution/mtp/MTPSpecDecodeMetadata.h"
+#include "../../kernels/IHybridKVCache.h"
 #include "../../config/PipelineConfig.h"
 #include "../../memory/BufferId.h" // Phase 2: contract BufferIds
 #include <algorithm>
@@ -78,6 +79,34 @@ namespace llaminar2
         BufferId gatheredLogitsBufferId(bool all_positions)
         {
             return all_positions ? BufferId::ALL_POSITION_LOGITS : BufferId::LOGITS;
+        }
+
+        /**
+         * @brief Resolve the layer id passed to a KV-cache stage.
+         *
+         * Plain PP-local ring caches are sized only for the current stage, so
+         * they still need compact local ids. Hybrid caches own the FA/GDN layer
+         * map internally and need the absolute model layer id; otherwise a
+         * second PP-stage offset subtraction can alias different FA layers onto
+         * the same compressed cache slot.
+         *
+         * MTP sidecar caches opt into already-local ids with
+         * layer_idx_is_cache_local and intentionally bypass both mappings.
+         */
+        int kvCacheLayerForGraphStage(const IKVCache *kv_cache,
+                                      int layer_idx,
+                                      int pp_layer_offset,
+                                      bool layer_idx_is_cache_local)
+        {
+            if (layer_idx_is_cache_local)
+            {
+                return layer_idx;
+            }
+            if (dynamic_cast<const IHybridKVCache *>(kv_cache))
+            {
+                return layer_idx;
+            }
+            return layer_idx - pp_layer_offset;
         }
 
         /**
@@ -312,18 +341,19 @@ namespace llaminar2
         const WeightBinding *binding,
         DeviceId device) const
     {
-        // Model GEMM stages must be wired from frozen WeightBinding ids. The
-        // store lookup is intentionally binding-first so cloned or sliced tensor
-        // pointers cannot accidentally select a prepared handle for a different
-        // graph binding, device, PP stage, or TP shard.
+        // Model GEMM stages must be wired from store-owned frozen WeightBinding
+        // ids.  A binding may still carry an old PreparedWeightRef from an
+        // earlier loader/materialization pass, but graph stages resolve refs
+        // through PreparedWeightStore at execution time. Returning a ref that
+        // the store cannot resolve creates a graph that validates cleanly at
+        // construction and then fails on the first replay. Treat the store as
+        // the sole source of truth for graph-executable prepared weights.
         if (binding && prepared_weight_store_)
         {
             auto ref = prepared_weight_store_->preparedRefForBinding(binding->binding_id, device);
             if (ref.has_value())
                 return ref;
         }
-        if (binding && binding->prepared.has_value() && binding->prepared->device == device)
-            return binding->prepared;
         return std::nullopt;
     }
 
@@ -573,6 +603,7 @@ namespace llaminar2
         qwen_input.token_ids = input.token_ids;
         qwen_input.token_ids_device = input.token_ids_device;
         qwen_input.position_ids = input.position_ids;
+        qwen_input.position_ids_device = input.position_ids_device;
         qwen_input.batch_size = input.batch_size;
         qwen_input.seq_len = input.seq_len;
         qwen_input.real_seq_len = input.real_seq_len;
@@ -621,7 +652,7 @@ namespace llaminar2
         ComputeGraph attn_graph = buildAttentionGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
             ctx.batch_size, ctx.kv_cache, ctx.position_ids, ctx.device,
-            ctx.sequence_lengths);
+            ctx.sequence_lengths, ctx.position_ids_device);
 
         // Build FFN graph
         ComputeGraph ffn_graph = buildFFNGraph(
@@ -752,7 +783,7 @@ namespace llaminar2
             ComputeGraph attn_graph = buildAttentionGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, input.kv_cache, position_ids, device,
-                input.sequence_lengths);
+                input.sequence_lengths, input.position_ids_device);
 
             // Get the terminal node of attention sub-graph
             std::string attn_last = attn_graph.terminalNode();
@@ -791,9 +822,13 @@ namespace llaminar2
         TensorBase *final_norm_input = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                            ? buffers_.layer_buffers.residual
                                            : buffers_.current_hidden;
+        const BufferId final_norm_input_id =
+            (final_norm_input == buffers_.layer_buffers.residual)
+                ? BufferId::RESIDUAL
+                : BufferId::HIDDEN_STATE;
 
         addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                            prev_node, total_tokens, device);
+                            prev_node, total_tokens, device, final_norm_input_id);
         prev_node = "final_norm";
 
         std::string lm_head_dependency = prev_node;
@@ -1099,7 +1134,7 @@ namespace llaminar2
             ComputeGraph attn_graph = buildAttentionGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, input.kv_cache, position_ids, device,
-                input.sequence_lengths);
+                input.sequence_lengths, input.position_ids_device);
 
             // Get the terminal node of attention sub-graph
             std::string attn_last = attn_graph.terminalNode();
@@ -1148,9 +1183,13 @@ namespace llaminar2
             TensorBase *final_norm_input = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                                ? buffers_.layer_buffers.residual
                                                : buffers_.current_hidden;
+            const BufferId final_norm_input_id =
+                (final_norm_input == buffers_.layer_buffers.residual)
+                    ? BufferId::RESIDUAL
+                    : BufferId::HIDDEN_STATE;
 
             addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                                prev_node, total_tokens, device);
+                                prev_node, total_tokens, device, final_norm_input_id);
             prev_node = "final_norm";
 
             std::string lm_head_dependency = prev_node;
@@ -1408,7 +1447,7 @@ namespace llaminar2
                 ComputeGraph attn_graph = buildAttentionGraph(
                     layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                     input.batch_size, layer_kv_cache, position_ids, stage_device,
-                    input.sequence_lengths);
+                    input.sequence_lengths, input.position_ids_device);
 
                 // Get the terminal node of attention sub-graph
                 std::string attn_last = attn_graph.terminalNode();
@@ -1512,9 +1551,13 @@ namespace llaminar2
                 TensorBase *final_norm_input = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                                    ? buffers_.layer_buffers.residual
                                                    : buffers_.current_hidden;
+                const BufferId final_norm_input_id =
+                    (final_norm_input == buffers_.layer_buffers.residual)
+                        ? BufferId::RESIDUAL
+                        : BufferId::HIDDEN_STATE;
 
                 addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                                    prev_node, total_tokens, stage_device);
+                                    prev_node, total_tokens, stage_device, final_norm_input_id);
                 prev_node = "final_norm";
 
                 std::string lm_head_dependency = prev_node;
@@ -1697,8 +1740,10 @@ namespace llaminar2
         TensorBase *input_hidden,
         IKVCache *kv_cache,
         const int *position_ids,
+        const void *position_ids_device,
         DeviceId device)
     {
+        (void)position_ids_device;
         LOG_DEBUG("[QwenGraphBase] Building transformer layers graph: "
                   << config_.n_layers << " layers");
 
@@ -1729,8 +1774,10 @@ namespace llaminar2
         TensorBase *input_hidden,
         IKVCache *kv_cache,
         const int *position_ids,
+        const void *position_ids_device,
         DeviceId device)
     {
+        (void)position_ids_device;
         LOG_DEBUG("[QwenGraphBase] Building layer " << layer_idx << " graph");
 
         ComputeGraph graph;
@@ -1870,6 +1917,13 @@ namespace llaminar2
             lm_head_compute_all_positions);
         lm_params.compute_all_positions = lm_head_compute_all_positions;
         lm_params.use_prefill_replay_row_offset = lm_head_use_prefill_row_offset;
+        lm_params.force_decode_equivalent_verifier_prefill =
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled &&
+            lm_head_compute_all_positions &&
+            lm_head_seq_len > 1 &&
+            lm_head_seq_len <= 4;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
@@ -1924,6 +1978,12 @@ namespace llaminar2
 
         // Compute total tokens for GEMM m parameter
         int total_tokens = batch_size * seq_len;
+        const bool force_decode_equivalent_ffn_verifier_prefill =
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            total_tokens > 1 &&
+            total_tokens <= 4 &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled;
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
         const WeightBinding *gate_proj_binding =
             layer.gate_proj_binding ? layer.gate_proj_binding : layer_bindings.gate_proj;
@@ -1983,6 +2043,8 @@ namespace llaminar2
             gate_up_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
             gate_up_params.output_gate_buffer_id = buffers.idFor(BufferId::GATE_PROJ);
             gate_up_params.output_up_buffer_id = buffers.idFor(BufferId::UP_PROJ);
+            gate_up_params.force_decode_equivalent_verifier_prefill =
+                force_decode_equivalent_ffn_verifier_prefill;
 
             graph.addNode(prefix + "gate_up_proj",
                           ComputeStageFactory::createFusedGateUpGEMM(gate_up_params),
@@ -2019,6 +2081,8 @@ namespace llaminar2
                 .a_buffer_id = buffers.idFor(BufferId::UP_PROJ),
                 .gate_buffer_id = buffers.idFor(BufferId::GATE_PROJ),
                 .c_buffer_id = buffers.idFor(BufferId::ATTN_PROJ),
+                .force_decode_equivalent_verifier_prefill =
+                    force_decode_equivalent_ffn_verifier_prefill,
                 .prepared_ref = preparedRefForGraphWeight(down_proj_binding, device),
                 .prepared_store = prepared_weight_store_};
 
@@ -2379,7 +2443,8 @@ namespace llaminar2
         TensorBase *normalized_out,
         const std::string &prev_node,
         int n_tokens,
-        DeviceId device)
+        DeviceId device,
+        BufferId input_buffer_id)
     {
         RMSNormStage::Params norm_params;
         norm_params.input = hidden;
@@ -2388,7 +2453,14 @@ namespace llaminar2
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = n_tokens;
         norm_params.device_id = device;
-        norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+        /*
+         * The buffer contract must describe the arena slot that backs the
+         * tensor pointer above. Hybrid Qwen3.6 routes its live residual stream
+         * through RESIDUAL for final norm; advertising HIDDEN_STATE here lets
+         * the executor cohere the wrong buffer and can leave GPU final-norm
+         * inputs stale after decode/prefix state handoff.
+         */
+        norm_params.input_buffer_id = input_buffer_id;
         norm_params.output_buffer_id = BufferId::NORMALIZED;
 
         graph.addNode("final_norm",
@@ -2617,10 +2689,17 @@ namespace llaminar2
         int local_n_kv_heads,
         int total_tokens,
         const int *position_ids,
+        const void *position_ids_device,
         DeviceId device)
     {
         const std::string node_name = prefix + "rope";
         int pos_offset = position_ids ? position_ids[0] : 0;
+        const bool force_decode_equivalent_rope_verifier_prefill =
+            device.is_cpu() &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled &&
+            total_tokens > 1 &&
+            total_tokens <= 4;
 
         graph.addNode(node_name,
                       ComputeStageFactory::createRoPE({
@@ -2635,7 +2714,10 @@ namespace llaminar2
                           .seq_len = total_tokens,
                           .partial_rotary_factor = config_.partial_rotary_factor,
                           .position_ids = position_ids,
+                          .position_ids_device = position_ids_device,
                           .skip_k = config_.rope_on_read,
+                          .force_decode_equivalent_verifier_prefill =
+                              force_decode_equivalent_rope_verifier_prefill,
                           .q_buffer_id = buffers.idFor(BufferId::Q_PROJ),
                           .k_buffer_id = buffers.idFor(BufferId::K_PROJ),
                       }),
@@ -2657,9 +2739,8 @@ namespace llaminar2
         bool layer_idx_is_cache_local)
     {
         int total_tokens = batch_size * seq_len;
-        int kv_local_layer = layer_idx_is_cache_local
-                                 ? layer_idx
-                                 : layer_idx - config_.pp_layer_offset;
+        const int kv_stage_layer = kvCacheLayerForGraphStage(
+            kv_cache, layer_idx, config_.pp_layer_offset, layer_idx_is_cache_local);
 
         if (kv_cache)
         {
@@ -2669,7 +2750,7 @@ namespace llaminar2
                               .K = buffers.K,
                               .V = buffers.V,
                               .kv_cache = kv_cache,
-                              .layer_idx = kv_local_layer,
+                              .layer_idx = kv_stage_layer,
                               .seq_idx = 0,
                               .num_tokens = total_tokens,
                               .batch_size = batch_size,
@@ -2705,15 +2786,16 @@ namespace llaminar2
         int local_n_kv_heads,
         IKVCache *kv_cache,
         const int *position_ids,
+        const void *position_ids_device,
         DeviceId device,
         bool has_qkv_proj,
         const std::string &rope_dependency,
         bool layer_idx_is_cache_local)
     {
+        (void)position_ids_device;
         int total_tokens = batch_size * seq_len;
-        int kv_local_layer = layer_idx_is_cache_local
-                                 ? layer_idx
-                                 : layer_idx - config_.pp_layer_offset;
+        const int kv_stage_layer = kvCacheLayerForGraphStage(
+            kv_cache, layer_idx, config_.pp_layer_offset, layer_idx_is_cache_local);
 
         const std::string kv_append_dependency =
             addKVCacheAppend(
@@ -2736,11 +2818,11 @@ namespace llaminar2
 
         if (kv_cache)
         {
-            int cached_tokens = kv_cache->get_cached_tokens(kv_local_layer, 0);
+            int cached_tokens = kv_cache->get_cached_tokens(kv_stage_layer, 0);
             if (cached_tokens > 0 && batch_size == 1)
             {
-                K_for_attn = kv_cache->get_k(kv_local_layer, 0);
-                V_for_attn = kv_cache->get_v(kv_local_layer, 0);
+                K_for_attn = kv_cache->get_k(kv_stage_layer, 0);
+                V_for_attn = kv_cache->get_v(kv_stage_layer, 0);
                 kv_len = cached_tokens;
                 LOG_TRACE("[QwenGraphBase] Layer " << layer_idx << " using cached K/V (decode mode)");
             }
@@ -2768,7 +2850,7 @@ namespace llaminar2
             graph.addNode(prefix + "kv_gather",
                           ComputeStageFactory::createKVCacheGather({
                               .kv_cache = kv_cache,
-                              .layer_idx = kv_local_layer,
+                              .layer_idx = kv_stage_layer,
                               .batch_size = batch_size,
                               .out_K = buffers.gathered_K,
                               .out_V = buffers.gathered_V,
@@ -2808,7 +2890,7 @@ namespace llaminar2
             attn_params.workspace_context = buffers.workspace_context;
             attn_params.workspace_mask = buffers.workspace_mask;
             attn_params.kv_cache = kv_cache;
-            attn_params.layer_idx = kv_local_layer;
+            attn_params.layer_idx = kv_stage_layer;
             attn_params.read_kv_from_cache = device.is_gpu() &&
                                              (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
                                              (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
@@ -2863,6 +2945,12 @@ namespace llaminar2
 
         int wo_n = static_cast<int>(wo_weight->shape()[0]);
         int wo_k = static_cast<int>(wo_weight->shape()[1]);
+        const bool force_decode_equivalent_wo_verifier_prefill =
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            total_tokens > 1 &&
+            total_tokens <= 4 &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled;
 
         std::string wo_node = prefix + wo_node_suffix;
         graph.addNode(wo_node,
@@ -2880,6 +2968,7 @@ namespace llaminar2
                           .gemm_context = GemmContext::ATTN,
                           .a_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT),
                           .c_buffer_id = buffers.idFor(BufferId::ATTN_PROJ),
+                          .force_decode_equivalent_verifier_prefill = force_decode_equivalent_wo_verifier_prefill,
                           .prepared_ref = preparedRefForGraphWeight(wo_binding, device),
                           .prepared_store = prepared_weight_store_,
                       }),

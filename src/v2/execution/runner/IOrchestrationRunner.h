@@ -188,6 +188,26 @@ namespace llaminar2
         virtual GenerationResult decodeStep() = 0;
 
         /**
+         * @brief Commit a caller-selected token at the next decode position.
+         *
+         * This is used for protocol-level forced continuations such as
+         * thinking-budget stop prompts. Implementations must advance any live
+         * KV/GDN state needed to reach the token's position, discard the
+         * naturally sampled token for that position, and make @p token the
+         * authoritative last token for the following decode step.
+         *
+         * Unlike appending text at the HTTP layer, this keeps model state,
+         * sampler history, and later decode output coherent.
+         */
+        virtual GenerationResult forceDecodeToken(int32_t token)
+        {
+            (void)token;
+            GenerationResult result;
+            result.error = "forceDecodeToken unsupported";
+            return result;
+        }
+
+        /**
          * @brief Whether decodeStepBatch() is implemented for this runner.
          *
          * Request batching is an explicit capability because it requires

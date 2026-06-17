@@ -105,6 +105,8 @@ namespace llaminar2
             return "InvalidatedByPlacement";
         case PrefillGraphRejectReason::SessionReset:
             return "SessionReset";
+        case PrefillGraphRejectReason::RequestStateReset:
+            return "RequestStateReset";
         }
         return "Unknown";
     }

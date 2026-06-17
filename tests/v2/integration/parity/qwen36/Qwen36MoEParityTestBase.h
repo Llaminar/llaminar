@@ -5,6 +5,9 @@
 #include "backends/HardwareInventory.h"
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/moe/MoEExpertParallelPlan.h"
+#include "execution/mtp/MTPDecodeCatchup.h"
+#include "execution/mtp/MTPStateTransaction.h"
+#include "execution/mtp/MTPSpecStateContract.h"
 #include "kernels/KernelFactory.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
@@ -18,9 +21,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <set>
+#include <sstream>
+#include <vector>
 
 #ifdef HAVE_CUDA
 extern "C"
@@ -823,6 +829,56 @@ namespace llaminar2::test::parity::qwen36
                ::testing::Test::HasFatalFailure();
     }
 
+    inline bool moECaseExpectsAllPositionSpecPublication(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cpu()
+                                    : test_case.devices.front().toLocalDeviceId();
+        /*
+         * Qwen3.6 MoE is hybrid/GDN. Phase 9.6 gives MTP sidecars persistent
+         * router/expert metadata, but the all-position verifier rows are still
+         * a separate live-state publication contract. Keep every MoE backend on
+         * decode-equivalent replay until the all-position verifier rows are
+         * serial-equivalent and continuation-equivalent on that backend.
+         */
+        (void)device;
+        return false;
+    }
+
+    inline bool hasMTPPerfCounter(
+        const std::vector<PerfStatRecord> &records,
+        const char *name)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.kind == PerfStatRecord::Kind::Counter &&
+                       record.domain == "mtp" &&
+                       record.name == name;
+            });
+    }
+
+    inline bool hasMTPPerfRecordTag(
+        const std::vector<PerfStatRecord> &records,
+        const char *name,
+        const char *tag_key,
+        const char *tag_value)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                if (record.domain != "mtp" || record.name != name)
+                    return false;
+                const auto it = record.tags.find(tag_key);
+                return it != record.tags.end() && it->second == tag_value;
+            });
+    }
+
     inline void runMoEPrefixRestoreParity(
         const MoEPrefixRestoreParityCase &test_case,
         PrefixRestoreParityMode mode)
@@ -1165,36 +1221,44 @@ namespace llaminar2::test::parity::qwen36
                         1e-12);
         }
 
-        auto has_mtp_counter =
-            [&](const char *name) -> bool
-        {
-            return std::any_of(
-                phase138_records.begin(),
-                phase138_records.end(),
-                [&](const PerfStatRecord &record)
-                {
-                    return record.kind == PerfStatRecord::Kind::Counter &&
-                           record.domain == "mtp" &&
-                           record.name == name;
-                });
-        };
         const bool used_decode_equivalent_stochastic_verifier =
-            has_mtp_counter("decode_equivalent_stochastic_verifier_runs");
+            hasMTPPerfCounter(
+                phase138_records,
+                "decode_equivalent_stochastic_verifier_runs");
         const bool used_all_position_publication =
-            has_mtp_counter("all_position_state_publication_verifier_runs") &&
-            has_mtp_counter("spec_state_publications");
-        EXPECT_TRUE(used_all_position_publication)
-            << "Qwen3.6 MoE stochastic MTP must exercise vLLM-style "
-               "all-position state publication on CPU, CUDA, and ROCm\n"
-            << PerfStatsCollector::summaryString({"mtp"});
-        EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
-            << "Qwen3.6 MoE stochastic MTP must not fall back to the "
-               "decode-equivalent stochastic verifier once publication is "
-               "available\n"
-            << PerfStatsCollector::summaryString({"mtp"});
+            hasMTPPerfCounter(
+                phase138_records,
+                "all_position_state_publication_verifier_runs") &&
+            hasMTPPerfCounter(phase138_records, "spec_state_publications");
+        if (moECaseExpectsAllPositionSpecPublication(test_case))
+        {
+            EXPECT_TRUE(used_all_position_publication)
+                << "GPU Qwen3.6 MoE stochastic MTP must exercise vLLM-style "
+                   "all-position state publication\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
+                << "GPU Qwen3.6 MoE stochastic MTP must not fall back to the "
+                   "decode-equivalent stochastic verifier once publication is "
+                   "available\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+        }
+        else
+        {
+            EXPECT_TRUE(used_decode_equivalent_stochastic_verifier)
+                << "CPU Qwen3.6 MoE stochastic MTP must use the shared "
+                   "decode-equivalent verifier while direct all-position "
+                   "publication is not advertised\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_all_position_publication)
+                << "CPU Qwen3.6 MoE stochastic MTP must not publish from an "
+                   "unproven multi-row all-position verifier\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+        }
 
         const bool used_retired_phase138_stochastic_candidate =
-            has_mtp_counter("phase138_stochastic_spec_decode_runs");
+            hasMTPPerfCounter(
+                phase138_records,
+                "phase138_stochastic_spec_decode_runs");
         EXPECT_FALSE(used_retired_phase138_stochastic_candidate)
             << "Stateful Qwen3.6 MoE stochastic MTP must not use the retired "
                "accepted-count publication candidate\n"
@@ -1388,6 +1452,129 @@ namespace llaminar2::test::parity::qwen36
                 << ":" << logits[indices[static_cast<size_t>(i)]];
         }
         return oss.str();
+    }
+
+    struct VerifierLogitMetrics
+    {
+        double cosine = 1.0;
+        double rel_l2 = 0.0;
+        double max_abs_diff = 0.0;
+        size_t max_abs_index = 0;
+        double symmetric_kl = 0.0;
+    };
+
+    inline VerifierLogitMetrics computeVerifierLogitMetrics(
+        const float *actual_logits,
+        const float *serial_logits,
+        int vocab_size)
+    {
+        VerifierLogitMetrics metrics;
+        if (!actual_logits || !serial_logits || vocab_size <= 0)
+        {
+            metrics.cosine = 0.0;
+            metrics.rel_l2 = std::numeric_limits<double>::infinity();
+            metrics.max_abs_diff = std::numeric_limits<double>::infinity();
+            metrics.symmetric_kl = std::numeric_limits<double>::infinity();
+            return metrics;
+        }
+
+        double dot = 0.0;
+        double actual_norm = 0.0;
+        double serial_norm = 0.0;
+        double diff_norm = 0.0;
+        float actual_max = actual_logits[0];
+        float serial_max = serial_logits[0];
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            actual_max = std::max(actual_max, actual_logits[i]);
+            serial_max = std::max(serial_max, serial_logits[i]);
+            const double actual = static_cast<double>(actual_logits[i]);
+            const double serial = static_cast<double>(serial_logits[i]);
+            const double diff = actual - serial;
+            dot += actual * serial;
+            actual_norm += actual * actual;
+            serial_norm += serial * serial;
+            diff_norm += diff * diff;
+            const double abs_diff = std::abs(diff);
+            if (abs_diff > metrics.max_abs_diff)
+            {
+                metrics.max_abs_diff = abs_diff;
+                metrics.max_abs_index = static_cast<size_t>(i);
+            }
+        }
+
+        const double denom = std::sqrt(actual_norm * serial_norm);
+        metrics.cosine = denom > 0.0 ? dot / denom : 1.0;
+        metrics.rel_l2 = serial_norm > 0.0 ? std::sqrt(diff_norm / serial_norm)
+                                           : std::sqrt(diff_norm);
+
+        std::vector<double> actual_probs(static_cast<size_t>(vocab_size), 0.0);
+        std::vector<double> serial_probs(static_cast<size_t>(vocab_size), 0.0);
+        double actual_sum = 0.0;
+        double serial_sum = 0.0;
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            const double actual =
+                std::exp(static_cast<double>(actual_logits[i] - actual_max));
+            const double serial =
+                std::exp(static_cast<double>(serial_logits[i] - serial_max));
+            actual_probs[static_cast<size_t>(i)] = actual;
+            serial_probs[static_cast<size_t>(i)] = serial;
+            actual_sum += actual;
+            serial_sum += serial;
+        }
+
+        /*
+         * KL is evaluated on the full softmax distribution.  Use a tiny floor
+         * only to keep the diagnostic finite when a backend underflows a tail
+         * probability differently; the floor is far below meaningful mass.
+         */
+        constexpr double probability_floor = 1.0e-300;
+        double actual_to_serial = 0.0;
+        double serial_to_actual = 0.0;
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            const double p = std::max(
+                actual_probs[static_cast<size_t>(i)] / actual_sum,
+                probability_floor);
+            const double q = std::max(
+                serial_probs[static_cast<size_t>(i)] / serial_sum,
+                probability_floor);
+            actual_to_serial += p * std::log(p / q);
+            serial_to_actual += q * std::log(q / p);
+        }
+        metrics.symmetric_kl = 0.5 * (actual_to_serial + serial_to_actual);
+        return metrics;
+    }
+
+    inline ::testing::AssertionResult verifierLogitsNumericallyEquivalent(
+        const float *actual_logits,
+        const float *serial_logits,
+        int vocab_size,
+        const std::string &label,
+        double min_cosine = 0.99995,
+        double max_rel_l2 = 0.005,
+        double max_symmetric_kl = 1.0e-4)
+    {
+        const VerifierLogitMetrics metrics =
+            computeVerifierLogitMetrics(actual_logits, serial_logits, vocab_size);
+        if (metrics.cosine >= min_cosine &&
+            metrics.rel_l2 <= max_rel_l2 &&
+            metrics.symmetric_kl <= max_symmetric_kl)
+        {
+            return ::testing::AssertionSuccess();
+        }
+
+        return ::testing::AssertionFailure()
+               << label
+               << " logit distribution drift: cosine=" << metrics.cosine
+               << " rel_l2=" << metrics.rel_l2
+               << " symmetric_kl=" << metrics.symmetric_kl
+               << " max_abs_diff=" << metrics.max_abs_diff
+               << " max_abs_index=" << metrics.max_abs_index
+               << " thresholds(cosine>=" << min_cosine
+               << ", rel_l2<=" << max_rel_l2
+               << ", symmetric_kl<=" << max_symmetric_kl << ")";
     }
 
     inline std::string csvEscapeMoEDiagnostic(const std::string &value)
@@ -2145,7 +2332,13 @@ namespace llaminar2::test::parity::qwen36
     }
 
     inline void runMoEMainVerifierAllPositionRowsMatchSerialDecode(
-        const MoEPrefixRestoreParityCase &test_case)
+        const MoEPrefixRestoreParityCase &test_case,
+        bool use_row_indexed_logits = false,
+        bool use_skip_gather = false,
+        bool verify_compact_device_outcome = false,
+        bool use_deferred_verifier_sync = false,
+        bool verify_published_state_continuation = false,
+        int verifier_row_count = 2)
     {
         ScopedMoEParityDeterministicMode deterministic_mode(
             shouldUseMoEParityDeterministicMode(test_case));
@@ -2157,8 +2350,14 @@ namespace llaminar2::test::parity::qwen36
         {
             return;
         }
-        ASSERT_GE(expected_tokens.size(), 4u)
-            << "all-position verifier row regression needs four reference tokens";
+        ASSERT_GE(verifier_row_count, 1)
+            << "verifier row proof must exercise at least one row";
+        ASSERT_LE(verifier_row_count, 4)
+            << "Phase 9.7 production proof currently targets M=1..4";
+        ASSERT_GE(expected_tokens.size(), 2u)
+            << "all-position verifier row regression needs two setup tokens; "
+               "later verifier tokens are extended from a serial Llaminar "
+               "oracle so the proof is not limited by PyTorch fixture length";
 
         const DeviceId device = test_case.devices.empty()
                                     ? DeviceId::cpu()
@@ -2200,8 +2399,8 @@ namespace llaminar2::test::parity::qwen36
         };
 
         runner->setSuppressTimeline(true);
-        runner->setSkipLogitsGatherDecode(false);
-        runner->setSkipLogitsGatherPrefill(false);
+        runner->setSkipLogitsGatherDecode(use_skip_gather);
+        runner->setSkipLogitsGatherPrefill(use_skip_gather);
         runner->enableSnapshotCapture();
 
         ASSERT_TRUE(runner->forward(
@@ -2210,55 +2409,182 @@ namespace llaminar2::test::parity::qwen36
             << "prefill forward failed";
         EXPECT_EQ(sample_current("prefill"), expected_tokens[0]);
 
+        int32_t token_after_setup = -1;
         for (int i = 0; i < 2; ++i)
         {
             const int32_t token = expected_tokens[static_cast<size_t>(i)];
             ASSERT_TRUE(runner->forward(&token, 1))
                 << "serial setup forward failed at token index " << i;
-            EXPECT_EQ(sample_current("serial setup"), expected_tokens[static_cast<size_t>(i + 1)])
-                << "unexpected setup token at index " << i;
+            /*
+             * This regression proves that the all-position verifier rows are
+             * decode-equivalent to serial Llaminar rows for a fixed token
+             * sequence. Some benchmark-prompt MoE fixtures contain PyTorch vs
+             * quantized-Llaminar near ties during setup, so do not make this
+             * helper fail on the reference token here; dedicated PyTorch parity
+             * tests own that contract. Sampling still flushes device-side logits
+             * and catches sampleGreedyOnDevice failures.
+             */
+            token_after_setup = sample_current("serial setup");
         }
+        ASSERT_GE(token_after_setup, 0)
+            << "serial setup must produce the first verifier input token";
 
-        const int production_sidecar_position = runner->get_position();
-        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
-            expected_tokens[0],
-            /*already_appended_tokens=*/0,
-            /*allow_speculative_discard=*/true,
-            production_sidecar_position - 2))
-            << "failed to advance shifted MTP cache for first setup token";
-        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
-            expected_tokens[1],
-            /*already_appended_tokens=*/0,
-            /*allow_speculative_discard=*/true,
-            production_sidecar_position - 1))
-            << "failed to advance shifted MTP cache for second setup token";
+        if (verify_published_state_continuation)
+        {
+            /*
+             * Publication tests intentionally include shifted-MTP cache state:
+             * they mirror the production accepted-prefix boundary and then
+             * prove continuation equivalence.  Pure verifier-row proofs do not
+             * need sidecar maintenance, and keeping that state out of the base
+             * snapshot makes the M=1..4 numeric checks isolate target-model
+             * logits/KV/GDN equivalence rather than shifted-cache coherence.
+             */
+            const int production_sidecar_position = runner->get_position();
+            ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+                expected_tokens[0],
+                /*already_appended_tokens=*/0,
+                /*allow_speculative_discard=*/true,
+                production_sidecar_position - 2))
+                << "failed to advance shifted MTP cache for first setup token";
+            ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+                expected_tokens[1],
+                /*already_appended_tokens=*/0,
+                /*allow_speculative_discard=*/true,
+                production_sidecar_position - 1))
+                << "failed to advance shifted MTP cache for second setup token";
+        }
 
         const PrefixStateSnapshot verifier_base = runner->captureLivePrefixState();
         ASSERT_TRUE(verifier_base.valid);
+        std::optional<PrefixRuntimeStateSnapshot> verifier_base_probe;
+        std::optional<PrefixRuntimeStateSnapshot> after_pre_verifier_shifted_commit_probe;
+        if (verify_published_state_continuation)
+        {
+            verifier_base_probe = runner->prefixStateProbe();
+        }
 
-        const std::array<int32_t, 2> verifier_tokens = {
-            expected_tokens[2],
-            expected_tokens[3],
-        };
+        std::vector<int32_t> verifier_tokens;
+        verifier_tokens.reserve(static_cast<size_t>(verifier_row_count));
+        int32_t next_verifier_token = token_after_setup;
+        for (int i = 0; i < verifier_row_count; ++i)
+        {
+            verifier_tokens.push_back(next_verifier_token);
+            ASSERT_TRUE(runner->forward(&next_verifier_token, 1))
+                << "serial verifier-token extension failed at row " << i;
+            next_verifier_token =
+                sample_current("serial verifier-token extension");
+            ASSERT_GE(next_verifier_token, 0)
+                << "serial verifier-token extension must produce row "
+                << (i + 1);
+        }
+        ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base))
+            << "verifier row proof must restore the captured base after "
+               "serially extending verifier input tokens";
 
         runner->clearSnapshots();
         const int base_sidecar_position = runner->get_position();
-        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
-            verifier_tokens[0],
-            /*already_appended_tokens=*/0,
-            /*allow_speculative_discard=*/true,
-            base_sidecar_position))
-            << "shifted MTP row commit from terminal hidden must not perturb "
-               "main all-position verifier state";
+        if (verify_published_state_continuation)
+        {
+            ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+                verifier_tokens[0],
+                /*already_appended_tokens=*/0,
+                /*allow_speculative_discard=*/true,
+                base_sidecar_position))
+                << "shifted MTP row commit from terminal hidden must not perturb "
+                   "main all-position verifier state";
+        }
+        if (verify_published_state_continuation)
+        {
+            after_pre_verifier_shifted_commit_probe = runner->prefixStateProbe();
+        }
+        if (!runner->supportsMTPSidecarPreservesMainState())
+        {
+            /*
+             * This helper validates target-verifier row math.  MoE sidecars do
+             * not yet advertise the stronger vLLM-style guarantee that shifted
+             * sidecar maintenance leaves every live main-model surface untouched.
+             * Production restores the verifier base before target verification
+             * on those runners, so the diagnostic must exercise the same
+             * contract instead of accidentally testing an unsupported shortcut.
+             */
+            ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base))
+                << "MoE all-position verifier diagnostics must restore the "
+                   "verifier base after shifted-cache maintenance unless the "
+                   "runner explicitly preserves main state";
+        }
+        if (use_row_indexed_logits)
+        {
+            MTPSpecDecodeMetadataShape shape;
+            shape.max_requests = 1;
+            shape.max_draft_tokens =
+                static_cast<int>(verifier_tokens.size());
+            MTPSpecDecodeVerifierDraftRequest verifier_request;
+            verifier_request.request_id = 0;
+            verifier_request.draft_tokens.assign(
+                verifier_tokens.begin(),
+                verifier_tokens.end());
+            const MTPSpecDecodeVerifierInputPlan row_plan =
+                buildMTPSpecDecodeVerifierInputPlan(
+                    shape,
+                    {verifier_request});
+            ASSERT_TRUE(row_plan.ok) << row_plan.error;
+            ASSERT_TRUE(runner->setMTPSpecVerifierInputPlan(row_plan));
+            ASSERT_TRUE(runner->setComputeRowIndexedAllPositionLogits(
+                true,
+                row_plan.compact_logit_row_count));
+        }
+        if (use_deferred_verifier_sync)
+        {
+            runner->setMTPAllPositionVerifierSyncDeferralEnabled(true);
+        }
         ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
-        ASSERT_TRUE(runner->forward(verifier_tokens.data(), 2))
+        ASSERT_TRUE(runner->forward(
+            verifier_tokens.data(),
+            static_cast<int>(verifier_tokens.size())))
             << "all-position verifier forward failed";
-        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
-        std::array<int32_t, 2> all_position_rows = {-1, -1};
+        std::vector<int32_t> all_position_rows(verifier_tokens.size(), -1);
         ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
             0,
             static_cast<int>(all_position_rows.size()),
             all_position_rows.data()));
+        std::optional<DeviceSpeculativeVerifyBatchOutcome> compact_outcome;
+        if (verify_compact_device_outcome)
+        {
+            ASSERT_EQ(verifier_tokens.size(), 2u)
+                << "compact outcome regression is currently written for the "
+                   "two-row draft+bonus publication case";
+            ASSERT_TRUE(runner->supportsGreedyAllPositionBatchOutcomeOnDevice())
+                << "compact greedy all-position outcome is required for this regression";
+            DeviceSpeculativeVerifyBatchOutcome outcome;
+            ASSERT_TRUE(runner->verifyGreedyAllPositionBatchOutcomeOnDevice(
+                verifier_tokens.data(),
+                static_cast<int>(verifier_tokens.size()),
+                /*stop_tokens=*/nullptr,
+                /*stop_token_count=*/0,
+                &outcome));
+            ASSERT_TRUE(outcome.ok);
+            compact_outcome = outcome;
+        }
+        if (use_deferred_verifier_sync)
+        {
+            runner->setMTPAllPositionVerifierSyncDeferralEnabled(false);
+        }
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        if (use_row_indexed_logits)
+        {
+            ASSERT_TRUE(runner->setComputeRowIndexedAllPositionLogits(false, 0));
+            runner->clearMTPSpecVerifierInputPlan();
+        }
+        if (compact_outcome.has_value())
+        {
+            ASSERT_TRUE(compact_outcome->sampled_terminal)
+                << "two accepted verifier rows should expose the bonus ready token";
+            EXPECT_EQ(compact_outcome->accepted_speculative_prefix, 1);
+            EXPECT_EQ(compact_outcome->target_verifier_state_commit_count, 2);
+            EXPECT_EQ(compact_outcome->ready_token, all_position_rows[1])
+                << "compact device outcome must sample the same terminal row as "
+                   "direct row argmax";
+        }
         const float *all_position_logits = runner->getAllPositionLogits();
         ASSERT_NE(all_position_logits, nullptr);
         const int vocab = runner->vocab_size();
@@ -2268,23 +2594,400 @@ namespace llaminar2::test::parity::qwen36
                                       static_cast<size_t>(vocab));
         const auto all_position_snapshots = captureMoERunnerSnapshots(*runner);
 
-        ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base));
-        const int32_t first_verifier = verifier_tokens[0];
-        runner->clearSnapshots();
-        ASSERT_TRUE(runner->forward(&first_verifier, 1))
-            << "serial row0 verifier forward failed";
-        const int32_t serial_row0 = sample_current("serial verifier row0");
-        const auto serial_row0_snapshots = captureMoERunnerSnapshots(*runner);
+        if (verify_published_state_continuation)
+        {
+            ASSERT_EQ(verifier_tokens.size(), 2u)
+                << "published-state continuation regression is intentionally "
+                   "kept on the historical two-row case until Phase 9.7 proves "
+                   "each larger row count independently";
+            ScopedEnvironmentValues kv_payload_probe_env({
+                {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+            });
+            /*
+             * The all-position verifier can produce correct logits while still
+             * leaving the live KV/GDN state in a non-decode-equivalent shape.
+             * Exercise the public vLLM-style publication boundary directly:
+             * publish the accepted verifier rows, continue from the bonus row,
+             * and compare that continuation against serially decoding those
+             * same accepted rows from the captured verifier base.
+             */
+            MTPSpecStepPlan step;
+            step.request_index = 0;
+            step.request_id = 0;
+            step.draft_count = static_cast<int>(verifier_tokens.size());
+            step.target_rows = step.draft_count + 1;
+            step.valid_sampled_count = step.target_rows;
+            step.committed_output_count = step.draft_count;
+            step.accepted_count = step.draft_count;
+            step.rejected_count = 0;
+            step.base_cached_tokens = verifier_base.cached_tokens;
+            step.target_cached_tokens =
+                verifier_base.cached_tokens + step.accepted_count;
+            step.accepted_state_slot_index = step.accepted_count - 1;
+            step.bonus_ready_token_row = step.draft_count;
+            step.bonus_ready_token_index = step.draft_count;
+            step.bonus_ready_state_slot_index = step.draft_count;
+            step.next_condition_token = verifier_tokens[0];
+            step.all_drafts_accepted = true;
+            step.publish_mtp_shifted_kv = true;
+
+            MTPSpecStepPlanBatch batch;
+            batch.ok = true;
+            batch.shape.max_requests = 1;
+            batch.shape.max_draft_tokens = step.draft_count;
+            batch.request_count = 1;
+            batch.steps = {step};
+
+            /*
+             * Mirror OrchestrationRunner's accepted-prefix publication path.
+             * Dense sidecars may keep the first shifted row from the sidecar
+             * graph. MoE sidecars intentionally do not advertise that stronger
+             * main-state preservation contract, so production first rebuilds
+             * the initial shifted row from the verifier-base terminal hidden
+             * and only then commits later accepted rows from verifier hidden
+             * rows.
+             */
+            const bool first_shifted_row_available_from_sidecar =
+                runner->supportsMTPSidecarPreservesMainState();
+            if (!first_shifted_row_available_from_sidecar)
+            {
+                ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+                    verifier_tokens.front(),
+                    /*already_appended_tokens=*/0,
+                    /*allow_speculative_discard=*/true,
+                    static_cast<int>(verifier_base.cached_tokens)))
+                    << "publication regression must rebuild the initial "
+                       "shifted-cache row from verifier-base terminal hidden "
+                       "before publishing accepted state";
+            }
+
+            const int shifted_commit_position_offset =
+                first_shifted_row_available_from_sidecar
+                    ? base_sidecar_position
+                    : static_cast<int>(verifier_base.cached_tokens);
+            ASSERT_TRUE(runner->commitMTPShiftedRowsFromPartialForward(
+                verifier_tokens.data(),
+                step.accepted_count,
+                /*already_appended_tokens=*/1,
+                /*main_forward_token_count=*/static_cast<int>(verifier_tokens.size()),
+                /*allow_speculative_discard=*/true,
+                shifted_commit_position_offset,
+                /*already_appended_shifted_kv_tokens=*/1))
+                << "publication regression must mirror the production shifted-cache "
+                   "accepted-prefix catch-up before publishing accepted state";
+
+            std::string publication_error;
+            ASSERT_TRUE(runner->publishAcceptedMTPSpecStateBatch(
+                batch,
+                &publication_error))
+                << publication_error;
+            const PrefixRuntimeStateSnapshot published_state_probe =
+                runner->prefixStateProbe();
+
+            auto summarize_runtime_state =
+                [](const PrefixRuntimeStateSnapshot &probe) -> std::string
+            {
+                auto summarize_cache =
+                    [](const std::vector<PrefixKVCacheProbe> &caches)
+                    -> std::string
+                {
+                    std::string out;
+                    for (const auto &cache : caches)
+                    {
+                        if (!out.empty())
+                            out += ";";
+                        out += cache.owner + ":";
+                        const size_t limit =
+                            std::min<size_t>(cache.layers.size(), 8);
+                        for (size_t i = 0; i < limit; ++i)
+                        {
+                            if (i > 0)
+                                out += ",";
+                            const auto &layer = cache.layers[i];
+                            out += "L" +
+                                   std::to_string(layer.global_layer) +
+                                   "/S" + std::to_string(layer.seq_idx) +
+                                   "=" + std::to_string(layer.cached_tokens) +
+                                   "@" + std::to_string(layer.ring_head);
+                        }
+                        if (cache.layers.size() > limit)
+                            out += ",...";
+                    }
+                    return out.empty() ? std::string("none") : out;
+                };
+
+                auto join_ints = [](const std::vector<int> &values)
+                {
+                    std::string out;
+                    for (size_t i = 0; i < values.size(); ++i)
+                    {
+                        if (i > 0)
+                            out += ",";
+                        out += std::to_string(values[i]);
+                    }
+                    return out.empty() ? std::string("none") : out;
+                };
+
+                std::string gdn;
+                const size_t gdn_limit =
+                    std::min<size_t>(probe.gdn_layers.size(), 8);
+                for (size_t i = 0; i < gdn_limit; ++i)
+                {
+                    if (i > 0)
+                        gdn += ",";
+                    const auto &layer = probe.gdn_layers[i];
+                    gdn += "L" + std::to_string(layer.global_layer) +
+                           "/r=" + std::to_string(layer.recurrence_hash) +
+                           "/c=" + std::to_string(layer.conv_hash);
+                }
+                if (probe.gdn_layers.size() > gdn_limit)
+                    gdn += ",...";
+                if (gdn.empty())
+                    gdn = "none";
+
+                return "pos=" + std::to_string(probe.current_position) +
+                       " positions=[" + join_ints(probe.positions) + "]" +
+                       " seq=[" + join_ints(probe.sequence_lengths) + "]" +
+                       " kv={" + summarize_cache(probe.kv_caches) + "}" +
+                       " mtp={" + summarize_cache(probe.mtp_kv_caches) + "}" +
+                       " hidden=" + (probe.has_hidden ? "1" : "0") +
+                       " logits=" + (probe.has_logits ? "1" : "0") +
+                       " gdn={" + gdn + "}";
+            };
+
+            auto first_gdn_state_mismatch =
+                [](const PrefixRuntimeStateSnapshot &lhs,
+                   const PrefixRuntimeStateSnapshot &rhs) -> std::string
+            {
+                if (lhs.gdn_layers.size() != rhs.gdn_layers.size())
+                {
+                    return "layer-count " +
+                           std::to_string(lhs.gdn_layers.size()) + " vs " +
+                           std::to_string(rhs.gdn_layers.size());
+                }
+                for (size_t i = 0; i < lhs.gdn_layers.size(); ++i)
+                {
+                    const auto &a = lhs.gdn_layers[i];
+                    const auto &b = rhs.gdn_layers[i];
+                    if (a.global_layer != b.global_layer ||
+                        a.recurrence_hash != b.recurrence_hash ||
+                        a.conv_hash != b.conv_hash ||
+                        a.recurrence_all_zero != b.recurrence_all_zero ||
+                        a.conv_all_zero != b.conv_all_zero)
+                    {
+                        return "layer=" + std::to_string(a.global_layer) +
+                               " rec=" +
+                               std::to_string(a.recurrence_hash) + "/" +
+                               std::to_string(b.recurrence_hash) +
+                               " conv=" + std::to_string(a.conv_hash) +
+                               "/" + std::to_string(b.conv_hash);
+                    }
+                }
+                return "none";
+            };
+
+            auto generate_continuation =
+                [&](const std::string &label,
+                    int32_t input_token,
+                    int count,
+                    std::vector<int32_t> *out) -> bool
+            {
+                out->clear();
+                int32_t next_input = input_token;
+                for (int i = 0; i < count; ++i)
+                {
+                    if (!runner->forward(&next_input, 1))
+                    {
+                        ADD_FAILURE() << label
+                                      << " continuation forward failed at step "
+                                      << i;
+                        return false;
+                    }
+                    const std::string sample_label =
+                        label + " continuation step " + std::to_string(i);
+                    const int32_t sampled =
+                        sample_current(sample_label.c_str());
+                    out->push_back(sampled);
+                    next_input = sampled;
+                }
+                return true;
+            };
+
+            std::vector<int32_t> published_continuation;
+            constexpr int publication_continuation_tokens = 8;
+            ASSERT_TRUE(generate_continuation(
+                "published all-position state",
+                all_position_rows[1],
+                publication_continuation_tokens,
+                &published_continuation));
+
+            ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base));
+            runner->clearSnapshots();
+            ASSERT_TRUE(runner->forward(&verifier_tokens[0], 1))
+                << "serial publication reference row0 forward failed";
+            EXPECT_EQ(sample_current("serial publication reference row0"),
+                      all_position_rows[0]);
+            const PrefixRuntimeStateSnapshot serial_row0_state_probe =
+                runner->prefixStateProbe();
+            ASSERT_TRUE(runner->forward(&verifier_tokens[1], 1))
+                << "serial publication reference row1 forward failed";
+            const int32_t serial_ready =
+                sample_current("serial publication reference row1");
+            ASSERT_EQ(serial_ready, all_position_rows[1])
+                << "publication regression requires the same ready token on both paths";
+            const PrefixRuntimeStateSnapshot serial_state_probe =
+                runner->prefixStateProbe();
+            MTPRuntimeSnapshotComparisonOptions publication_compare_options;
+            publication_compare_options.compare_main_kv_payload_hashes = false;
+            publication_compare_options.compare_shifted_mtp_kv = false;
+            publication_compare_options.compare_gdn_hashes = false;
+            /*
+             * The CPU all-position verifier uses grouped projection rows before
+             * the GDN stage, while the serial oracle uses one-row GEMV.  The
+             * exact GDN/KV bytes are covered by lower-level parity tests; this
+             * publication regression checks logical metadata and then proves the
+             * accepted state by replaying a continuation from both paths.
+             */
+            const MTPStateValidationResult publication_state_match =
+                compareMTPRuntimeStateSnapshots(
+                    serial_state_probe,
+                    published_state_probe,
+                    publication_compare_options);
+            MTPRuntimeSnapshotComparisonOptions strict_publication_compare_options;
+            strict_publication_compare_options.compare_main_kv_payload_hashes = true;
+            strict_publication_compare_options.compare_shifted_mtp_kv = true;
+            strict_publication_compare_options.compare_gdn_hashes = true;
+            const MTPStateValidationResult strict_publication_state_match =
+                compareMTPRuntimeStateSnapshots(
+                    serial_state_probe,
+                    published_state_probe,
+                    strict_publication_compare_options);
+            MTPRuntimeSnapshotComparisonOptions main_only_publication_compare_options;
+            main_only_publication_compare_options.compare_main_kv_payload_hashes = true;
+            main_only_publication_compare_options.compare_shifted_mtp_kv = false;
+            main_only_publication_compare_options.compare_gdn_hashes = true;
+            const MTPStateValidationResult main_only_publication_state_match =
+                compareMTPRuntimeStateSnapshots(
+                    serial_state_probe,
+                    published_state_probe,
+                    main_only_publication_compare_options);
+            EXPECT_TRUE(publication_state_match)
+                << "MTP all-position publication must publish the same runtime "
+                   "metadata as serial accepted-row decode before continuation"
+                << "\nreason=" << publication_state_match.reason
+                << "\nstrict_reason=" << strict_publication_state_match.reason
+                << "\nmain_only_strict_reason="
+                << main_only_publication_state_match.reason
+                << "\nfirst_gdn_mismatch="
+                << first_gdn_state_mismatch(
+                       serial_state_probe,
+                       published_state_probe)
+                << "\nfirst_gdn_mismatch_vs_serial_row0="
+                << first_gdn_state_mismatch(
+                       serial_row0_state_probe,
+                       published_state_probe)
+                << "\nfirst_gdn_mismatch_base_vs_after_pre_verifier_shifted_commit="
+                << (verifier_base_probe.has_value() &&
+                            after_pre_verifier_shifted_commit_probe.has_value()
+                        ? first_gdn_state_mismatch(
+                              *verifier_base_probe,
+                              *after_pre_verifier_shifted_commit_probe)
+                        : std::string("not-captured"))
+                << "\npublished_state={"
+                << summarize_runtime_state(published_state_probe) << "}"
+                << "\nverifier_base_state={"
+                << (verifier_base_probe.has_value()
+                        ? summarize_runtime_state(*verifier_base_probe)
+                        : std::string("not-captured"))
+                << "}"
+                << "\nafter_pre_verifier_shifted_commit_state={"
+                << (after_pre_verifier_shifted_commit_probe.has_value()
+                        ? summarize_runtime_state(
+                              *after_pre_verifier_shifted_commit_probe)
+                        : std::string("not-captured"))
+                << "}"
+                << "\nserial_row0_state={"
+                << summarize_runtime_state(serial_row0_state_probe) << "}"
+                << "\nserial_state={"
+                << summarize_runtime_state(serial_state_probe) << "}"
+                << "\nmtp_perfstats="
+                << PerfStatsCollector::summaryString({"mtp"});
+
+            std::vector<int32_t> serial_continuation;
+            ASSERT_TRUE(generate_continuation(
+                "serial accepted state",
+                serial_ready,
+                publication_continuation_tokens,
+                &serial_continuation));
+
+            EXPECT_EQ(published_continuation, serial_continuation)
+                << "MTP all-position state publication must be continuation-equivalent"
+                << "\ncondition_prefix_tokens="
+                << joinTokensMoEDiagnostic({expected_tokens[0], expected_tokens[1]})
+                << "\nverifier_tokens="
+                << joinTokensMoEDiagnostic({verifier_tokens[0], verifier_tokens[1]})
+                << "\nall_position_rows="
+                << joinTokensMoEDiagnostic(
+                       {all_position_rows[0], all_position_rows[1]})
+                << "\npublished_continuation="
+                << joinTokensMoEDiagnostic(published_continuation)
+                << "\nserial_continuation="
+                << joinTokensMoEDiagnostic(serial_continuation)
+                << "\nstrict_state_match="
+                << (strict_publication_state_match
+                        ? std::string("ok")
+                        : strict_publication_state_match.reason)
+                << "\nmain_only_strict_state_match="
+                << (main_only_publication_state_match
+                        ? std::string("ok")
+                        : main_only_publication_state_match.reason)
+                << "\nmtp_perfstats="
+                << PerfStatsCollector::summaryString({"mtp"});
+
+            ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base));
+        }
 
         ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base));
-        runner->clearSnapshots();
-        ASSERT_TRUE(runner->forward(&first_verifier, 1))
-            << "serial row1 first verifier forward failed";
-        const int32_t second_verifier = verifier_tokens[1];
-        ASSERT_TRUE(runner->forward(&second_verifier, 1))
-            << "serial row1 second verifier forward failed";
-        const int32_t serial_row1 = sample_current("serial verifier row1");
-        const auto serial_row1_snapshots = captureMoERunnerSnapshots(*runner);
+        std::vector<int32_t> serial_rows(verifier_tokens.size(), -1);
+        std::vector<std::map<std::string, std::vector<float>>>
+            serial_snapshots_by_row;
+        serial_snapshots_by_row.reserve(verifier_tokens.size());
+        std::vector<std::string> serial_top5_by_row;
+        serial_top5_by_row.reserve(verifier_tokens.size());
+        std::vector<std::vector<float>> serial_logits_by_row;
+        serial_logits_by_row.reserve(verifier_tokens.size());
+
+        /*
+         * Phase 9.7 treats every verifier row as an independent publication
+         * candidate.  Replaying from the same verifier base for row k ensures
+         * the row is compared with exactly k+1 serial decode forwards, not with
+         * state accidentally inherited from a previous diagnostic row.
+         */
+        for (size_t row = 0; row < verifier_tokens.size(); ++row)
+        {
+            ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base));
+            runner->clearSnapshots();
+            for (size_t token_idx = 0; token_idx <= row; ++token_idx)
+            {
+                const int32_t token = verifier_tokens[token_idx];
+                ASSERT_TRUE(runner->forward(&token, 1))
+                    << "serial row " << row
+                    << " verifier forward failed at token index "
+                    << token_idx;
+            }
+            const std::string sample_label =
+                "serial verifier row " + std::to_string(row);
+            serial_rows[row] = sample_current(sample_label.c_str());
+            const float *serial_logits = runner->logits();
+            ASSERT_NE(serial_logits, nullptr)
+                << "serial verifier row " << row
+                << " must expose logits for numeric equivalence metrics";
+            serial_logits_by_row.emplace_back(
+                serial_logits,
+                serial_logits + static_cast<size_t>(vocab));
+            serial_top5_by_row.push_back(topKSummary(runner->logits(), vocab, 5));
+            serial_snapshots_by_row.push_back(captureMoERunnerSnapshots(*runner));
+        }
 
         const auto result_dir = moeDiagnosticResultsDir();
         const auto csv_path = result_dir / "main_verifier_all_position_vs_serial.csv";
@@ -2292,20 +2995,16 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_TRUE(csv.is_open()) << "failed to open " << csv_path;
         writeMoESnapshotCsvHeader(csv);
         std::vector<MoESnapshotCompareRow> rows;
-        appendMoEAllPositionVerifierRows(
-            all_position_snapshots,
-            serial_row0_snapshots,
-            0,
-            1,
-            csv,
-            &rows);
-        appendMoEAllPositionVerifierRows(
-            all_position_snapshots,
-            serial_row1_snapshots,
-            1,
-            2,
-            csv,
-            &rows);
+        for (size_t row = 0; row < verifier_tokens.size(); ++row)
+        {
+            appendMoEAllPositionVerifierRows(
+                all_position_snapshots,
+                serial_snapshots_by_row[row],
+                static_cast<int>(row),
+                static_cast<int>(row + 1),
+                csv,
+                &rows);
+        }
 
         auto first_bad_row = [&](const std::string &comparison)
             -> const MoESnapshotCompareRow *
@@ -2317,46 +3016,336 @@ namespace llaminar2::test::parity::qwen36
                 /*include_sidecar_keys=*/true);
         };
 
-        const std::string row0_top5 = topKSummary(
-            all_position_logits_copy.data(),
-            vocab,
-            5);
-        const std::string row1_top5 = topKSummary(
-            all_position_logits_copy.data() + static_cast<size_t>(vocab),
-            vocab,
-            5);
-        const std::string serial_row1_top5 =
-            topKSummary(runner->logits(), vocab, 5);
+        for (size_t row = 0; row < verifier_tokens.size(); ++row)
+        {
+            const std::string comparison =
+                "all_position_row" + std::to_string(row) +
+                "_vs_serial_prefix" + std::to_string(row + 1);
+            const float *row_logits =
+                all_position_logits_copy.data() +
+                row * static_cast<size_t>(vocab);
+            const std::string all_position_top5 =
+                topKSummary(row_logits, vocab, 5);
+            EXPECT_TRUE(verifierLogitsNumericallyEquivalent(
+                row_logits,
+                serial_logits_by_row[row].data(),
+                vocab,
+                "all-position row " + std::to_string(row) +
+                    " vs serial prefix " + std::to_string(row + 1)))
+                << "\ncondition_prefix_tokens="
+                << joinTokensMoEDiagnostic({expected_tokens[0], expected_tokens[1]})
+                << "\nverifier_tokens="
+                << joinTokensMoEDiagnostic(verifier_tokens)
+                << "\nrow all-position top5=[" << all_position_top5 << "]"
+                << "\nrow serial top5=[" << serial_top5_by_row[row] << "]"
+                << "\ndiagnostic CSV: " << csv_path;
+            EXPECT_EQ(all_position_rows[row], serial_rows[row])
+                << "all-position row " << row
+                << " must match " << (row + 1)
+                << " serial verifier decode step(s)"
+                << "\ncondition_prefix_tokens="
+                << joinTokensMoEDiagnostic({expected_tokens[0], expected_tokens[1]})
+                << "\nverifier_tokens="
+                << joinTokensMoEDiagnostic(verifier_tokens)
+                << "\nall_position_rows="
+                << joinTokensMoEDiagnostic(all_position_rows)
+                << "\nserial_rows="
+                << joinTokensMoEDiagnostic(serial_rows)
+                << "\nrow all-position top5=[" << all_position_top5 << "]"
+                << "\nrow serial top5=[" << serial_top5_by_row[row] << "]"
+                << "\nfirst divergence="
+                << (first_bad_row(comparison)
+                        ? describeMoEDiagnosticRow(*first_bad_row(comparison))
+                        : std::string("none"))
+                << "\ndiagnostic CSV: " << csv_path;
+        }
 
-        EXPECT_EQ(all_position_rows[0], serial_row0)
-            << "all-position row0 must match one serial verifier decode"
-            << "\nall_position_rows=" << all_position_rows[0] << ","
-            << all_position_rows[1]
-            << "\nserial_row0=" << serial_row0
-            << "\nrow0 top5=[" << row0_top5 << "]"
-            << "\ndiagnostic CSV: " << csv_path;
-        EXPECT_EQ(all_position_rows[1], serial_row1)
-            << "all-position bonus row must match two serial verifier decodes"
-            << "\ncondition_prefix_tokens="
-            << joinTokensMoEDiagnostic({expected_tokens[0], expected_tokens[1]})
+        runner->disableSnapshotCapture();
+    }
+
+    inline void runMoEMainVerifierDecodeEquivalentRowsMatchSerialDecode(
+        const MoEPrefixRestoreParityCase &test_case,
+        int verifier_row_count)
+    {
+        ScopedMoEParityDeterministicMode deterministic_mode(
+            shouldUseMoEParityDeterministicMode(test_case));
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
+        ASSERT_GE(verifier_row_count, 1)
+            << "decode-equivalent verifier-row proof must exercise at least one row";
+        ASSERT_LE(verifier_row_count, 4)
+            << "Phase 9.7 production proof currently targets M=1..4";
+        ASSERT_GE(expected_tokens.size(), 2u)
+            << "decode-equivalent verifier row proof needs two setup tokens";
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cpu()
+                                    : test_case.devices.front().toLocalDeviceId();
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = verifier_row_count;
+        config.moe_expert_parallel_plan = test_case.moe_expert_parallel_plan;
+
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+        auto runner = createInferenceRunner(model_ctx, nullptr, device, config);
+        ASSERT_NE(runner, nullptr);
+        ASSERT_GT(runner->vocab_size(), 0);
+
+        auto sample_current = [&](const char *label) -> int32_t
+        {
+            int32_t sampled = runner->sampleGreedyOnDevice();
+            if (sampled >= 0)
+            {
+                return sampled;
+            }
+            const float *logits = runner->logits();
+            ADD_FAILURE() << "sampleGreedyOnDevice failed after " << label
+                          << "; falling back to host-visible logits";
+            return argmaxToken(logits, runner->vocab_size());
+        };
+
+        runner->setSuppressTimeline(true);
+        runner->enableSnapshotCapture();
+
+        ASSERT_TRUE(runner->forward(
+            prompt_tokens.data(),
+            static_cast<int>(prompt_tokens.size())))
+            << "prefill forward failed";
+        EXPECT_EQ(sample_current("prefill"), expected_tokens[0]);
+
+        int32_t token_after_setup = -1;
+        for (int i = 0; i < 2; ++i)
+        {
+            const int32_t token = expected_tokens[static_cast<size_t>(i)];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "serial setup forward failed at token index " << i;
+            token_after_setup = sample_current("serial setup");
+        }
+        ASSERT_GE(token_after_setup, 0)
+            << "serial setup must produce the first verifier input token";
+
+        /*
+         * The shared production catch-up helper owns both main decode state and
+         * shifted-MTP cache maintenance.  The two setup tokens above were
+         * ordinary serial forwards in this isolated proof, so prime the shifted
+         * cache to the same base position production would have reached before
+         * starting a speculative transaction.
+         */
+        const int setup_sidecar_position = runner->get_position();
+        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+            expected_tokens[0],
+            /*already_appended_tokens=*/0,
+            /*allow_speculative_discard=*/true,
+            setup_sidecar_position - 2))
+            << "failed to prime shifted MTP cache for first setup token";
+        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+            expected_tokens[1],
+            /*already_appended_tokens=*/0,
+            /*allow_speculative_discard=*/true,
+            setup_sidecar_position - 1))
+            << "failed to prime shifted MTP cache for second setup token";
+
+        const PrefixStateSnapshot verifier_base = runner->captureLivePrefixState();
+        ASSERT_TRUE(verifier_base.valid);
+
+        std::vector<int32_t> verifier_tokens;
+        verifier_tokens.reserve(static_cast<size_t>(verifier_row_count));
+        int32_t next_verifier_token = token_after_setup;
+        for (int i = 0; i < verifier_row_count; ++i)
+        {
+            verifier_tokens.push_back(next_verifier_token);
+            ASSERT_TRUE(runner->forward(&next_verifier_token, 1))
+                << "serial verifier-token extension failed at row " << i;
+            next_verifier_token =
+                sample_current("serial verifier-token extension");
+            ASSERT_GE(next_verifier_token, 0)
+                << "serial verifier-token extension must produce row "
+                << (i + 1);
+        }
+        const int32_t expected_ready_token = next_verifier_token;
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base))
+            << "decode-equivalent row proof must restore the verifier base "
+               "before running the shared production catch-up helper";
+
+        const int vocab = runner->vocab_size();
+        const int base_sidecar_position = runner->get_position();
+        std::vector<std::vector<float>> catchup_logits_by_row;
+        std::vector<int32_t> catchup_samples_by_row;
+        catchup_logits_by_row.reserve(static_cast<size_t>(verifier_row_count));
+        catchup_samples_by_row.reserve(static_cast<size_t>(verifier_row_count));
+
+        MTPDecodeCatchupGreedyRequest request;
+        request.draft_tokens = verifier_tokens;
+        request.base_sidecar_position = base_sidecar_position;
+        request.allow_speculative_discard = true;
+        request.verifier_path = "phase97_decode_equivalent_row_proof";
+        request.implementation_name = "shared_stepwise";
+        request.verifier_base_checkpoint = &verifier_base;
+
+        /*
+         * This callback is the production shared verifier's row boundary. It
+         * samples where OrchestrationRunner samples, then snapshots the full
+         * logit distribution so Phase 9.7 proves cosine, relative L2, and
+         * symmetric KL rather than only top-token equality.
+         */
+        auto sample_after_forward = [&]() -> int32_t
+        {
+            const int32_t sampled =
+                sample_current("decode-equivalent catch-up row");
+            const float *logits = runner->logits();
+            if (!logits)
+            {
+                ADD_FAILURE()
+                    << "decode-equivalent catch-up row did not expose logits";
+                return sampled;
+            }
+            catchup_samples_by_row.push_back(sampled);
+            catchup_logits_by_row.emplace_back(
+                logits,
+                logits + static_cast<size_t>(vocab));
+            return sampled;
+        };
+
+        MTPDecodeCatchupGreedyResult catchup =
+            runSharedStepwiseMTPDecodeCatchupGreedy(
+                *runner,
+                request,
+                sample_after_forward);
+        ASSERT_TRUE(catchup.ok) << catchup.error;
+        EXPECT_EQ(catchup.accepted_tokens, verifier_tokens)
+            << "The proof fixture builds verifier draft tokens from the serial "
+               "oracle, so the shared stepwise verifier should accept every "
+               "row before producing the ready token.";
+        EXPECT_TRUE(catchup.all_speculative_accepted);
+        EXPECT_EQ(catchup.ready_token, expected_ready_token);
+        ASSERT_EQ(catchup_logits_by_row.size(),
+                  static_cast<size_t>(verifier_row_count));
+        ASSERT_EQ(catchup_samples_by_row.size(),
+                  static_cast<size_t>(verifier_row_count));
+
+        auto generate_continuation =
+            [&](const std::string &label,
+                int32_t input_token,
+                int count,
+                std::vector<int32_t> *out) -> bool
+        {
+            out->clear();
+            int32_t next_input = input_token;
+            for (int i = 0; i < count; ++i)
+            {
+                if (!runner->forward(&next_input, 1))
+                {
+                    ADD_FAILURE() << label
+                                  << " continuation forward failed at step "
+                                  << i;
+                    return false;
+                }
+                const std::string sample_label =
+                    label + " continuation step " + std::to_string(i);
+                const int32_t sampled =
+                    sample_current(sample_label.c_str());
+                out->push_back(sampled);
+                next_input = sampled;
+            }
+            return true;
+        };
+
+        std::vector<int32_t> catchup_continuation;
+        constexpr int continuation_tokens = 4;
+        ASSERT_TRUE(generate_continuation(
+            "decode-equivalent catch-up state",
+            catchup.ready_token,
+            continuation_tokens,
+            &catchup_continuation));
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base));
+        for (int32_t token : verifier_tokens)
+        {
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "serial continuation reference failed while replaying "
+                   "verifier token "
+                << token;
+        }
+        const int32_t serial_ready_token =
+            sample_current("serial continuation reference");
+        EXPECT_EQ(serial_ready_token, catchup.ready_token);
+        std::vector<int32_t> serial_continuation;
+        ASSERT_TRUE(generate_continuation(
+            "serial verifier state",
+            serial_ready_token,
+            continuation_tokens,
+            &serial_continuation));
+        EXPECT_EQ(catchup_continuation, serial_continuation)
+            << "decode-equivalent catch-up state must continue exactly like "
+               "serial decode"
             << "\nverifier_tokens="
-            << joinTokensMoEDiagnostic({verifier_tokens[0], verifier_tokens[1]})
-            << "\nall_position_rows=" << all_position_rows[0] << ","
-            << all_position_rows[1]
-            << "\nserial_row1=" << serial_row1
-            << "\nrow1 all-position top5=[" << row1_top5 << "]"
-            << "\nrow1 serial top5=[" << serial_row1_top5 << "]"
-            << "\nfirst row0 divergence="
-            << (first_bad_row("all_position_row0_vs_serial_prefix1")
-                    ? describeMoEDiagnosticRow(
-                          *first_bad_row("all_position_row0_vs_serial_prefix1"))
-                    : std::string("none"))
-            << "\nfirst row1 divergence="
-            << (first_bad_row("all_position_row1_vs_serial_prefix2")
-                    ? describeMoEDiagnosticRow(
-                          *first_bad_row("all_position_row1_vs_serial_prefix2"))
-                    : std::string("none"))
-            << "\ndiagnostic CSV: " << csv_path;
+            << joinTokensMoEDiagnostic(verifier_tokens)
+            << "\ncatchup_continuation="
+            << joinTokensMoEDiagnostic(catchup_continuation)
+            << "\nserial_continuation="
+            << joinTokensMoEDiagnostic(serial_continuation);
+
+        for (size_t row = 0; row < verifier_tokens.size(); ++row)
+        {
+            ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base));
+            for (size_t token_idx = 0; token_idx <= row; ++token_idx)
+            {
+                const int32_t token = verifier_tokens[token_idx];
+                ASSERT_TRUE(runner->forward(&token, 1))
+                    << "serial row " << row
+                    << " verifier forward failed at token index "
+                    << token_idx;
+            }
+            const std::string sample_label =
+                "serial verifier row " + std::to_string(row);
+            const int32_t serial_sample =
+                sample_current(sample_label.c_str());
+            const float *serial_logits = runner->logits();
+            ASSERT_NE(serial_logits, nullptr)
+                << "serial verifier row " << row
+                << " must expose logits for numeric equivalence metrics";
+
+            EXPECT_TRUE(verifierLogitsNumericallyEquivalent(
+                catchup_logits_by_row[row].data(),
+                serial_logits,
+                vocab,
+                "decode-equivalent catch-up row " + std::to_string(row) +
+                    " vs serial prefix " + std::to_string(row + 1)))
+                << "\ncondition_prefix_tokens="
+                << joinTokensMoEDiagnostic({expected_tokens[0], expected_tokens[1]})
+                << "\nverifier_tokens="
+                << joinTokensMoEDiagnostic(verifier_tokens)
+                << "\nrow catch-up top5=["
+                << topKSummary(catchup_logits_by_row[row].data(), vocab, 5)
+                << "]\nrow serial top5=["
+                << topKSummary(serial_logits, vocab, 5)
+                << "]";
+            EXPECT_EQ(catchup_samples_by_row[row], serial_sample)
+                << "decode-equivalent row " << row
+                << " must sample the same token as serial replay"
+                << "\nverifier_tokens="
+                << joinTokensMoEDiagnostic(verifier_tokens);
+        }
 
         runner->disableSnapshotCapture();
     }
@@ -2696,9 +3685,11 @@ namespace llaminar2::test::parity::qwen36
         int decode_token_budget,
         int mtp_draft_tokens = 1,
         MTPDepthPolicyConfig mtp_depth_policy = {},
-        bool allow_reference_prefix_only = false)
+        bool allow_reference_prefix_only = false,
+        bool use_deterministic_mode = true)
     {
         ScopedMoEParityDeterministicMode deterministic_mode(
+            use_deterministic_mode &&
             shouldUseMoEParityDeterministicMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
@@ -2945,10 +3936,122 @@ namespace llaminar2::test::parity::qwen36
               << "\nmtp tokens: " << joinTokensMoEDiagnostic(mtp_tokens);
     }
 
-    inline void expectCudaMoEMTPVerifierFusedPrefillPath()
+    inline void runMoEMTPPersistentSidecarMetadataParity(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        ASSERT_FALSE(test_case.devices.empty());
+        ASSERT_TRUE(test_case.devices.front().toLocalDeviceId().is_gpu())
+            << "Phase 9.6 persistent sidecar metadata is a GPU graph-capture "
+               "contract; CPU keeps host-owned replay for now.";
+
+        ScopedEnvironmentValues perf_stats_enabled({
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+        PerfStatsCollector::reset();
+
+        runMoEMTPBenchmarkStyleSkipGatherParity(
+            test_case,
+            /*decode_token_budget=*/8,
+            /*mtp_draft_tokens=*/1,
+            {},
+            /*allow_reference_prefix_only=*/true);
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        EXPECT_TRUE(
+            hasMTPPerfCounter(
+                records,
+                "moe_mtp_sidecar_runtime_table_creations") ||
+            hasMTPPerfCounter(
+                records,
+                "moe_mtp_sidecar_runtime_table_reuses"))
+            << "GPU MoE MTP sidecars must use persistent depth-scoped "
+               "runtime tables for router/expert metadata.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_TRUE(hasMTPPerfRecordTag(
+            records,
+            "moe_mtp_sidecar_runtime_table_creations",
+            "histogram_sync",
+            "disabled") ||
+            hasMTPPerfRecordTag(
+                records,
+                "moe_mtp_sidecar_runtime_table_reuses",
+                "histogram_sync",
+                "disabled"))
+            << "MTP sidecar runtime tables must not register request-level "
+               "decode histogram sync callbacks.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_TRUE(hasMTPPerfCounter(
+            records,
+            "decode_equivalent_sequential_verifier_runs"))
+            << "MoE MTP must stay on decode-equivalent verification until "
+               "all-position verifier rows are proven serial-equivalent.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(hasMTPPerfRecordTag(
+            records,
+            "sidecar_replay_reset",
+            "reset_scope",
+            "after_spec_publication"))
+            << "MoE MTP should not observe an accepted-state publication "
+               "sidecar recapture while direct MoE publication is disabled.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(hasMTPPerfCounter(
+            records,
+            "all_position_state_publication_verifier_runs"))
+            << "MoE direct all-position publication must remain disabled until "
+               "its verifier rows are serial-equivalent.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+
+        PerfStatsCollector::reset();
+    }
+
+    inline void runMoEMainVerifierUsesDecodeEquivalentReplayWhenPublicationUnsupported(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        ASSERT_FALSE(moECaseExpectsAllPositionSpecPublication(test_case))
+            << "This regression is for CPU hybrid/GDN MoE, where direct "
+               "all-position publication is intentionally not advertised.";
+
+        ScopedEnvironmentValues perf_stats_enabled({
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+            {"LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK", "1"},
+            {"LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_DEPTH", "4"},
+        });
+        PerfStatsCollector::reset();
+
+        runMoEMTPBenchmarkStyleSkipGatherParity(
+            test_case,
+            /*decode_token_budget=*/8,
+            /*mtp_draft_tokens=*/1,
+            {},
+            /*allow_reference_prefix_only=*/true);
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        EXPECT_TRUE(hasMTPPerfCounter(
+            records,
+            "decode_equivalent_sequential_verifier_runs"))
+            << "CPU MoE MTP must choose the shared decode-equivalent verifier "
+               "rather than publishing from a multi-row all-position graph.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(hasMTPPerfCounter(
+            records,
+            "all_position_state_publication_verifier_runs"))
+            << "CPU MoE MTP unexpectedly used direct all-position publication "
+               "after that capability was withdrawn.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(hasMTPPerfCounter(records, "spec_state_publications"))
+            << "CPU MoE MTP must not call spec-state publication until CPU "
+               "all-position verifier rows are decode-equivalent.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+
+        PerfStatsCollector::reset();
+    }
+
+    inline void expectCudaMoEMTPVerifierFusedPrefillPath(int expected_seq_len = 2)
     {
         const auto records = PerfStatsCollector::snapshot(
-            {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
+            {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls",
+             "kernel.cuda_moe_combined_shared_prefill_group_calls",
+             "kernel.cuda_moe_combined_shared_prefill_pipeline_calls"});
         auto tag_equals = [](const PerfStatRecord &record,
                              const char *key,
                              const char *value) -> bool
@@ -2956,6 +4059,15 @@ namespace llaminar2::test::parity::qwen36
             const auto it = record.tags.find(key);
             return it != record.tags.end() && it->second == value;
         };
+        const int expected_top_k = 9;
+        const int expected_experts = 257;
+        const int expected_total_slots = expected_seq_len * expected_top_k;
+        const int expected_active_slots = std::min(expected_total_slots, expected_experts);
+        const int expected_tile_m = expected_seq_len <= 2 ? 2 : 4;
+        const std::string seq_len_tag = std::to_string(expected_seq_len);
+        const std::string total_slots_tag = std::to_string(expected_total_slots);
+        const std::string active_slots_tag = std::to_string(expected_active_slots);
+        const std::string tile_m_tag = std::to_string(expected_tile_m);
 
         const auto match = std::find_if(
             records.begin(),
@@ -2964,9 +4076,13 @@ namespace llaminar2::test::parity::qwen36
             {
                 return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
                        tag_equals(record, "swiglu_path", "fused") &&
-                       tag_equals(record, "tile_m", "2") &&
+                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
+                       tag_equals(record, "total_slots", total_slots_tag.c_str()) &&
+                       tag_equals(record, "top_k", "9") &&
+                       tag_equals(record, "num_experts", "257") &&
+                       tag_equals(record, "tile_m", tile_m_tag.c_str()) &&
                        tag_equals(record, "tile_n", "64") &&
-                       tag_equals(record, "active_expert_slots", "16") &&
+                       tag_equals(record, "active_expert_slots", active_slots_tag.c_str()) &&
                        tag_equals(record, "gateup_route", "kpart_swiglu") &&
                        tag_equals(record, "down_route", "kpart_prefill") &&
                        tag_equals(record, "down_accumulation", "token_direct");
@@ -2974,12 +4090,48 @@ namespace llaminar2::test::parity::qwen36
 
         ASSERT_NE(match, records.end())
             << "CUDA Qwen3.6 MoE MTP verifier path did not exercise the fused "
-            << "split-K grouped prefill SwiGLU/down kernels with the verifier-sized tile. "
-            << "This is a production-path regression: keep the fused path "
-            << "correct instead of routing around it.\n"
+            << "combined routed+shared grouped prefill SwiGLU/down kernels with "
+            << "the verifier-sized tile. This is a production-path regression: "
+            << "keep the fused path correct instead of routing around it.\n"
             << PerfStatsCollector::summaryString(
-                   {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
+                   {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls",
+                    "kernel.cuda_moe_combined_shared_prefill_group_calls",
+                    "kernel.cuda_moe_combined_shared_prefill_pipeline_calls"});
         EXPECT_GT(match->count, 0u);
+
+        const auto combined_group = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "cuda_moe_combined_shared_prefill_group_calls" &&
+                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
+                       tag_equals(record, "routed_top_k", "8") &&
+                       tag_equals(record, "combined_top_k", "9") &&
+                       tag_equals(record, "combined_experts", "257") &&
+                       tag_equals(record, "active_expert_slots", active_slots_tag.c_str());
+            });
+        ASSERT_NE(combined_group, records.end())
+            << "CUDA combined routed+shared verifier grouping did not run.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_moe_combined_shared_prefill_group_calls"});
+
+        const auto combined_pipeline = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "cuda_moe_combined_shared_prefill_pipeline_calls" &&
+                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
+                       tag_equals(record, "routed_top_k", "8") &&
+                       tag_equals(record, "combined_top_k", "9") &&
+                       tag_equals(record, "combined_experts", "257") &&
+                       tag_equals(record, "mode", "single_table");
+            });
+        ASSERT_NE(combined_pipeline, records.end())
+            << "CUDA combined routed+shared verifier pipeline did not run.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_moe_combined_shared_prefill_pipeline_calls"});
     }
 
     inline void runMoEMTPDynamicDepthRequestStateResetBenchmarkStyle(
@@ -3119,11 +4271,12 @@ namespace llaminar2::test::parity::qwen36
         runner->shutdown();
     }
 
-    inline void expectCudaMoEMTPVerifierSharedExpertFusedPrefillPath()
+    inline void expectCudaMoEMTPVerifierSharedExpertFusedPrefillPath(int expected_seq_len = 2)
     {
         const auto records = PerfStatsCollector::snapshot(
             {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls",
-             "kernel.cuda_moe_shared_expert_prefill_group_calls"});
+             "kernel.cuda_moe_combined_shared_prefill_group_calls",
+             "kernel.cuda_moe_combined_shared_prefill_pipeline_calls"});
         auto tag_equals = [](const PerfStatRecord &record,
                              const char *key,
                              const char *value) -> bool
@@ -3131,6 +4284,15 @@ namespace llaminar2::test::parity::qwen36
             const auto it = record.tags.find(key);
             return it != record.tags.end() && it->second == value;
         };
+        const int expected_top_k = 9;
+        const int expected_experts = 257;
+        const int expected_total_slots = expected_seq_len * expected_top_k;
+        const int expected_active_slots = std::min(expected_total_slots, expected_experts);
+        const int expected_tile_m = expected_seq_len <= 2 ? 2 : 4;
+        const std::string seq_len_tag = std::to_string(expected_seq_len);
+        const std::string total_slots_tag = std::to_string(expected_total_slots);
+        const std::string active_slots_tag = std::to_string(expected_active_slots);
+        const std::string tile_m_tag = std::to_string(expected_tile_m);
 
         const auto shared_prefill = std::find_if(
             records.begin(),
@@ -3139,11 +4301,13 @@ namespace llaminar2::test::parity::qwen36
             {
                 return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
                        tag_equals(record, "swiglu_path", "fused") &&
-                       tag_equals(record, "tile_m", "2") &&
+                       tag_equals(record, "tile_m", tile_m_tag.c_str()) &&
                        tag_equals(record, "tile_n", "64") &&
-                       tag_equals(record, "total_slots", "2") &&
-                       tag_equals(record, "active_expert_slots", "1") &&
-                       tag_equals(record, "num_experts", "1") &&
+                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
+                       tag_equals(record, "total_slots", total_slots_tag.c_str()) &&
+                       tag_equals(record, "active_expert_slots", active_slots_tag.c_str()) &&
+                       tag_equals(record, "num_experts", "257") &&
+                       tag_equals(record, "top_k", "9") &&
                        tag_equals(record, "gateup_route", "kpart_swiglu") &&
                        tag_equals(record, "down_route", "kpart_prefill") &&
                        tag_equals(record, "down_accumulation", "token_direct");
@@ -3151,11 +4315,13 @@ namespace llaminar2::test::parity::qwen36
 
         ASSERT_NE(shared_prefill, records.end())
             << "CUDA Qwen3.6 MoE MTP verifier shared expert did not exercise "
-            << "the grouped split-K prefill route. Keep the fused shared-expert "
-            << "path correct instead of silently falling back to dense GEMMs.\n"
+            << "the combined routed+shared grouped route. Keep the fused "
+            << "shared-expert path correct inside the single-table verifier "
+            << "instead of silently falling back to dense GEMMs.\n"
             << PerfStatsCollector::summaryString(
                    {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls",
-                    "kernel.cuda_moe_shared_expert_prefill_group_calls"});
+                    "kernel.cuda_moe_combined_shared_prefill_group_calls",
+                    "kernel.cuda_moe_combined_shared_prefill_pipeline_calls"});
         EXPECT_GT(shared_prefill->count, 0u);
 
         const auto shared_group = std::find_if(
@@ -3163,16 +4329,18 @@ namespace llaminar2::test::parity::qwen36
             records.end(),
             [&](const PerfStatRecord &record)
             {
-                return record.name == "cuda_moe_shared_expert_prefill_group_calls" &&
-                       tag_equals(record, "seq_len", "2") &&
-                       tag_equals(record, "active_expert_slots", "1") &&
-                       tag_equals(record, "top_k", "1");
+                return record.name == "cuda_moe_combined_shared_prefill_group_calls" &&
+                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
+                       tag_equals(record, "routed_top_k", "8") &&
+                       tag_equals(record, "combined_top_k", "9") &&
+                       tag_equals(record, "combined_experts", "257") &&
+                       tag_equals(record, "active_expert_slots", active_slots_tag.c_str());
             });
 
         ASSERT_NE(shared_group, records.end())
-            << "CUDA shared expert grouped verifier setup did not run.\n"
+            << "CUDA combined shared-expert grouped verifier setup did not run.\n"
             << PerfStatsCollector::summaryString(
-                   {"kernel.cuda_moe_shared_expert_prefill_group_calls"});
+                   {"kernel.cuda_moe_combined_shared_prefill_group_calls"});
         EXPECT_GT(shared_group->count, 0u);
     }
 

@@ -730,6 +730,54 @@ namespace llaminar2
         EXPECT_EQ(v->getWorkspace(), &workspace);
     }
 
+    TEST_F(Test__FusedQKVGEMMStage, DecodeEquivalentVerifierPrefillUsesOneRowCalls)
+    {
+        const ModelContextId model_id{9915};
+        PreparedWeightStore store(model_id);
+        auto q = std::make_shared<RecordingWorkspaceGemm>("q");
+        auto k = std::make_shared<RecordingWorkspaceGemm>("k");
+        auto v = std::make_shared<RecordingWorkspaceGemm>("v");
+
+        auto q_ref = registerRecordingGemm(store, q, "blk.0.attn_q.weight", model_id);
+        auto k_ref = registerRecordingGemm(store, k, "blk.0.attn_k.weight", model_id);
+        auto v_ref = registerRecordingGemm(store, v, "blk.0.attn_v.weight", model_id);
+
+        FusedQKVGEMMStage::Params params{
+            .input = input_.get(),
+            .m = m_,
+            .k = k_,
+            .wq = wq_.get(),
+            .output_q = output_q_.get(),
+            .n_q = n_q_,
+            .wk = wk_.get(),
+            .output_k = output_k_.get(),
+            .n_k = n_k_,
+            .wv = wv_.get(),
+            .output_v = output_v_.get(),
+            .n_v = n_v_,
+            .force_decode_equivalent_verifier_prefill = true,
+            .prepared_ref_q = q_ref,
+            .prepared_ref_k = k_ref,
+            .prepared_ref_v = v_ref,
+            .prepared_store = &store};
+
+        FusedQKVGEMMStage stage(params);
+        DeviceWorkspaceManager workspace(DeviceId::cpu(), 1024);
+        stage.bindWorkspace(&workspace);
+
+        ASSERT_TRUE(stage.execute(ctx_.get()));
+
+        // The CPU verifier publication path must reuse the exact one-row
+        // decode projection route for every verifier row.  Multi-row CPU
+        // GEMV/GEMM routes can be numerically close but still produce distinct
+        // KV bytes, which breaks all-position state publication.
+        EXPECT_EQ(q->fused_call_count, m_);
+        EXPECT_EQ(q->observed_fused_m, std::vector<int>(static_cast<size_t>(m_), 1));
+        EXPECT_EQ(q->observed_fused_k, std::vector<int>(static_cast<size_t>(m_), k_));
+        EXPECT_EQ(q->observed_fused_projection_count, std::vector<int>(static_cast<size_t>(m_), 3));
+        EXPECT_EQ(q->last_fused_workspace, &workspace);
+    }
+
     TEST_F(Test__FusedQKVGEMMStage, SupportsBackend)
     {
         FusedQKVGEMMStage::Params params{

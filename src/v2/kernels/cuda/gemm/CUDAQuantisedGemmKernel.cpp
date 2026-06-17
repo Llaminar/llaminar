@@ -265,11 +265,12 @@ namespace llaminar2
         // Concurrent prefill stream pool (per-device stream/event handles only)
         // =====================================================================
 
-        // Current graph builders form at most three quantized projection groups
+        // Current graph builders can form up to four quantized projection groups
         // that benefit from concurrent prefill dispatch: fused QKV (3), gate/up
-        // (2), and GDN qkv/z (2). Slot 0 reuses the normal ACC_INT32 workspace;
-        // the remaining slots live in CUDA_CONCURRENT_PREFILL_ACC_INT32.
-        constexpr int kCudaConcurrentPrefillWorkspaceSlots = 3;
+        // (2), and GDN q/k/v/z (4). Slot 0 reuses the normal ACC_INT32
+        // workspace; the remaining slots live in
+        // CUDA_CONCURRENT_PREFILL_ACC_INT32.
+        constexpr int kCudaConcurrentPrefillWorkspaceSlots = 4;
         constexpr int kCudaConcurrentPrefillExtraAccumulatorSlots =
             kCudaConcurrentPrefillWorkspaceSlots - 1;
         // Decode projection fan-out can exceed the stream count, especially
@@ -876,28 +877,22 @@ namespace llaminar2
             if (!impl_)
                 return;
 
-            if (impl_->gemv_ctx)
-            {
-                cudaGemvContext_destroy(impl_->gemv_ctx);
-                impl_->gemv_ctx = nullptr;
-            }
-            if (impl_->prefill_ctx)
-            {
-                cudaPrefillContext_destroy(impl_->prefill_ctx);
-                impl_->prefill_ctx = nullptr;
-            }
-            if (impl_->cublas_ctx)
-            {
-                cudaCuBLASContext_destroy(impl_->cublas_ctx);
-                impl_->cublas_ctx = nullptr;
-            }
-
+            /*
+             * Request/session reset must not destroy GEMM contexts. CUDA graph
+             * executables capture kernel parameters by value, including pointers
+             * to context-owned handles or workspace bindings used by the native
+             * GEMV/prefill/cuBLAS paths. Those contexts are request-independent
+             * resources and are released by Impl destruction or full KernelFactory
+             * cache teardown. Keeping them alive lets preserved prefill graphs
+             * replay correctly after clearCache(); workspace rebinding still
+             * invalidates executable graph captures at the ForwardGraphCache layer.
+             */
             gpu_stream_ = nullptr;
         }
 
         bool CUDAQuantisedGemmKernel::hasDynamicStateActive() const
         {
-            return impl_ && (impl_->gemv_ctx || impl_->prefill_ctx || impl_->cublas_ctx || gpu_stream_ != nullptr);
+            return gpu_stream_ != nullptr;
         }
 
         bool CUDAQuantisedGemmKernel::exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)

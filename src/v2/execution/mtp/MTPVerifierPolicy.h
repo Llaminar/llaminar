@@ -45,24 +45,31 @@ namespace llaminar2
             return decision;
         }
 
+        /*
+         * Greedy decode with penalties is still deterministic: the accepted
+         * token is the argmax after applying the request-local sparse penalty
+         * map.  It cannot use the all-position publication shortcut until that
+         * shortcut applies the correct row-local penalty history, but the
+         * shared sequential verifier already samples each target and draft row
+         * after applying the same penalties as normal decode.
+         */
         const bool use_decode_equivalent_sequential =
-            supported_sampling_mode &&
-            !input.uses_sampling_penalties;
+            supported_sampling_mode;
         if (use_decode_equivalent_sequential)
         {
             decision.path = MTPVerifierExecutionPath::DecodeEquivalentSequential;
             decision.accepted_all_position_state_requires_replay = true;
-            decision.reason = input.stochastic_verify
-                                  ? "stochastic_uses_shared_decode_equivalent_verifier"
-                                  : "greedy_uses_shared_decode_equivalent_verifier";
+            decision.reason = input.uses_sampling_penalties
+                                  ? "greedy_penalties_use_shared_decode_equivalent_verifier"
+                                  : (input.stochastic_verify
+                                         ? "stochastic_uses_shared_decode_equivalent_verifier"
+                                         : "greedy_uses_shared_decode_equivalent_verifier");
             return decision;
         }
 
         decision.path = MTPVerifierExecutionPath::Unsupported;
         decision.accepted_all_position_state_requires_replay = true;
-        decision.reason = input.uses_sampling_penalties
-                              ? "greedy_penalty_mtp_requires_new_transaction_path"
-                              : "sampling_mode_not_supported_by_shared_verifier";
+        decision.reason = "sampling_mode_not_supported_by_shared_verifier";
         return decision;
     }
 

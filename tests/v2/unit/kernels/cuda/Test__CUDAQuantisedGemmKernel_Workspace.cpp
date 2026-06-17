@@ -31,8 +31,8 @@ using llaminar2::test::TestTensorFactory;
 
 namespace
 {
-    constexpr int kConcurrentPrefillWorkspaceSlots = 3;
-    constexpr int kConcurrentPrefillExtraAccumulatorSlots = 2;
+    constexpr int kConcurrentPrefillWorkspaceSlots = 4;
+    constexpr int kConcurrentPrefillExtraAccumulatorSlots = 3;
 
     int paddedPrefillM(int m)
     {
@@ -349,7 +349,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       ConcurrentPrefillAccumulatorWorkspace_HasTwoExtraPaddedSlots)
+       ConcurrentPrefillAccumulatorWorkspace_HasThreeExtraPaddedSlots)
 {
     auto weights = TestTensorFactory::createQ8_0Random({64, 128}, /*seed=*/11);
     CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);

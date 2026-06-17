@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "kernels/cpu/rotation/ActivationRotation.h"
 #include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
@@ -929,6 +930,84 @@ namespace
                     << " batched small-M verifier max error differs from serial decode rows";
             }
         }
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_FusedProjectionWithActivationRotationMatchesSerialDecodeRows)
+    {
+        const int K = 128;
+        const int M = 2;
+        const int N0 = 384;
+        const int N1 = 256;
+
+        ActivationRotation rotation(K, 128);
+        auto weights0 = createWeightsForFormat("Q4_0", N0, K);
+        auto weights1 = createWeightsForFormat("Q4_0", N1, K);
+        ASSERT_NE(weights0, nullptr);
+        ASSERT_NE(weights1, nullptr);
+        weights0->setActivationRotation(&rotation);
+        weights1->setActivationRotation(&rotation);
+
+        CPUNativeVNNIGemmKernel kernel0(weights0.get());
+        CPUNativeVNNIGemmKernel kernel1(weights1.get());
+        ASSERT_TRUE(kernel0.isValid());
+        ASSERT_TRUE(kernel1.isValid());
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f, 3101);
+        ASSERT_NE(input, nullptr);
+
+        FP32Tensor grouped0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+        FP32Tensor grouped1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+        std::vector<ITensorGemm::TensorProjectionDesc> grouped_projections = {
+            {&kernel0, &grouped0, N0, nullptr, "proj0"},
+            {&kernel1, &grouped1, N1, nullptr, "proj1"}};
+
+        ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), grouped_projections, M, K))
+            << "Grouped verifier projection should support rotated CPU NativeVNNI weights";
+
+        std::vector<float> serial0(static_cast<size_t>(M) * static_cast<size_t>(N0), 0.0f);
+        std::vector<float> serial1(static_cast<size_t>(M) * static_cast<size_t>(N1), 0.0f);
+        for (int row = 0; row < M; ++row)
+        {
+            FP32Tensor row_input({1, static_cast<size_t>(K)});
+            std::memcpy(
+                row_input.mutable_data(),
+                input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                static_cast<size_t>(K) * sizeof(float));
+
+            FP32Tensor row0({1, static_cast<size_t>(N0)});
+            FP32Tensor row1({1, static_cast<size_t>(N1)});
+            std::vector<ITensorGemm::TensorProjectionDesc> row_projections = {
+                {&kernel0, &row0, N0, nullptr, "proj0"},
+                {&kernel1, &row1, N1, nullptr, "proj1"}};
+
+            ASSERT_TRUE(kernel0.multiply_fused_tensor(&row_input, row_projections, 1, K))
+                << "Serial decode projection failed for row " << row;
+            std::memcpy(
+                serial0.data() + static_cast<size_t>(row) * static_cast<size_t>(N0),
+                row0.data(),
+                static_cast<size_t>(N0) * sizeof(float));
+            std::memcpy(
+                serial1.data() + static_cast<size_t>(row) * static_cast<size_t>(N1),
+                row1.data(),
+                static_cast<size_t>(N1) * sizeof(float));
+        }
+
+        const size_t count0 = static_cast<size_t>(M) * static_cast<size_t>(N0);
+        const size_t count1 = static_cast<size_t>(M) * static_cast<size_t>(N1);
+        const float cos0 = cosineSimilarity(grouped0.data(), serial0.data(), count0);
+        const float cos1 = cosineSimilarity(grouped1.data(), serial1.data(), count1);
+        const float err0 = maxAbsError(grouped0.data(), serial0.data(), count0);
+        const float err1 = maxAbsError(grouped1.data(), serial1.data(), count1);
+
+        EXPECT_GE(cos0, 0.999999f)
+            << "Grouped rotated projection 0 must equal serial decode rows";
+        EXPECT_GE(cos1, 0.999999f)
+            << "Grouped rotated projection 1 must equal serial decode rows";
+        EXPECT_LE(err0, 1e-5f)
+            << "Grouped rotated projection 0 max error";
+        EXPECT_LE(err1, 1e-5f)
+            << "Grouped rotated projection 1 max error";
     }
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_Qwen36ShapesMatchSerialDecodeRows)

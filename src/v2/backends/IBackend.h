@@ -242,6 +242,21 @@ namespace llaminar2
         virtual void *createEvent(int device_id) = 0;
 
         /**
+         * @brief Create an event suitable for elapsed-time measurement.
+         *
+         * Normal synchronization events may disable timing to avoid pipeline
+         * overhead in the hot path.  Profiling code that needs device elapsed
+         * time must request timing-capable events explicitly through this API.
+         *
+         * @param device_id GPU device ID (0-based)
+         * @return Opaque event handle (nullptr on failure)
+         */
+        virtual void *createTimingEvent(int device_id)
+        {
+            return createEvent(device_id);
+        }
+
+        /**
          * @brief Destroy an event created by createEvent()
          *
          * @param event Opaque event handle (may be nullptr)
@@ -292,6 +307,32 @@ namespace llaminar2
          * waits for a specific point in the stream, not all device operations.
          */
         virtual bool waitForEvent(void *event, int device_id) = 0;
+
+        /**
+         * @brief Measure elapsed milliseconds between two recorded timing events.
+         *
+         * The caller must ensure both events came from @ref createTimingEvent
+         * and have completed before relying on the value.  Implementations
+         * return false when elapsed timing is unsupported.
+         *
+         * @param start_event Event recorded before the measured work
+         * @param stop_event Event recorded after the measured work
+         * @param device_id GPU device ID (0-based)
+         * @param out_ms Destination for elapsed milliseconds
+         * @return true on success, false on unsupported/error
+         */
+        virtual bool eventElapsedTimeMs(
+            void *start_event,
+            void *stop_event,
+            int device_id,
+            float *out_ms)
+        {
+            (void)start_event;
+            (void)stop_event;
+            (void)device_id;
+            (void)out_ms;
+            return false;
+        }
 
         /**
          * @brief Set active device for subsequent operations
@@ -649,6 +690,7 @@ namespace llaminar2
          *
          * @param out_values_device Device buffer [rows] for max values.
          * @param out_indices_device Device buffer [rows] for row-local token ids.
+         * @param output_stride Element stride between adjacent output rows.
          */
         virtual bool enqueueArgmaxF32BatchedRowsDevice(
             const void *data_device,
@@ -660,7 +702,8 @@ namespace llaminar2
             void *out_indices_device,
             void *partial_vals = nullptr,
             void *partial_idxs = nullptr,
-            int partial_capacity = 0)
+            int partial_capacity = 0,
+            int output_stride = 1)
         {
             (void)data_device;
             (void)rows;
@@ -672,6 +715,7 @@ namespace llaminar2
             (void)partial_vals;
             (void)partial_idxs;
             (void)partial_capacity;
+            (void)output_stride;
             return false;
         }
 
@@ -1289,9 +1333,20 @@ namespace llaminar2
          * verifier can skip the sampled-token lookup in the compact draft
          * table. Residual sampling still uses the full draft table.
          *
-         * Thresholds remain scalar host values for now because they are
-         * deterministic RNG outputs owned by the runner; moving them to device
-         * memory is a later plumbing step.
+         * Passing both draft distribution pointers as null is a separate,
+         * intentional vLLM-style greedy-draft mode: the draft proposal is
+         * treated as one-hot at `draft_tokens_device[row]`, so the verifier can
+         * use the compact target distribution without materializing any draft
+         * probability table. Passing only one null draft pointer is invalid.
+         *
+         * Thresholds normally arrive as scalar host values.  For deterministic
+         * seeded vLLM-style one-hot verification, callers may pass both
+         * threshold arrays as null and provide `inverse_sample_seed` plus
+         * `inverse_sample_first_logical_position`; the backend must derive
+         * accept/residual thresholds inside the explicit stream launch using
+         * `sampling_math::mtp_spec_threshold_from_seed()`.  Passing only one
+         * null threshold array, omitting the seed, or requesting seeded
+         * thresholds with a materialized draft distribution is invalid.
          *
          * Implementations must only enqueue work on `stream`; they must not
          * allocate, synchronize, or use a default/null GPU stream.
@@ -1313,7 +1368,10 @@ namespace llaminar2
             void *out_accepted_device,
             void *out_accept_probability_device = nullptr,
             void *out_accept_threshold_device = nullptr,
-            const void *draft_token_probabilities_device = nullptr)
+            const void *draft_token_probabilities_device = nullptr,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            int inverse_sample_vocab_size = 0)
         {
             (void)target_token_ids_device;
             (void)target_probs_device;
@@ -1332,6 +1390,9 @@ namespace llaminar2
             (void)out_accept_probability_device;
             (void)out_accept_threshold_device;
             (void)draft_token_probabilities_device;
+            (void)inverse_sample_seed;
+            (void)inverse_sample_first_logical_position;
+            (void)inverse_sample_vocab_size;
             return false;
         }
 
@@ -1648,7 +1709,9 @@ namespace llaminar2
          * @param draft_tokens_device INT32 verifier input row
          *        `[first_token, draft_1, ...]`.
          * @param compare_row_count Number of speculative rows to compare.
-         * @param first_token Host copy of `draft_tokens_device[0]`.
+         * @param first_token Legacy host shadow of `draft_tokens_device[0]`.
+         *        GPU reducers must read entry zero from @p draft_tokens_device
+         *        so deferred first-token paths do not need a pre-verifier D2H.
          */
         virtual bool enqueueSummarizeGreedySpeculativeVerifyBatch(
             const void *verify_tokens_device,
@@ -1672,6 +1735,106 @@ namespace llaminar2
             (void)stream;
             (void)out_tokens_device;
             (void)out_meta_device;
+            return false;
+        }
+
+        /**
+         * @brief Derive device-resident speculative state publication metadata.
+         *
+         * The compact verifier reducers write one metadata row per request. This
+         * graph-capturable helper converts that compact row into the row index
+         * and cache-token count consumed by MTP state publication:
+         *
+         * - restore row: flattened verifier state row to publish
+         * - target cached tokens: base cached tokens plus committed verifier rows
+         * - accepted state count: verifier rows committed for the request
+         * - all-drafts-accepted and stopped flags: transaction predicates that
+         *   let downstream graph-captured consumers decide whether the resident
+         *   next-condition token is a continuation candidate without first
+         *   materializing the compact outcome on the CPU
+         * - ok: 1 when the compact metadata was valid for publication
+         *
+         * `base_cached_tokens_device` is an INT32 array with one entry per
+         * request. All output pointers are INT32 arrays with one entry per
+         * request. Backends must launch on the explicit non-null `stream`, never
+         * allocate inside this call, and use the shared SamplingMath helper so
+         * CUDA, ROCm, and CPU-side tests keep the same off-by-one semantics.
+         */
+        virtual bool enqueueDeriveSpeculativePublicationMetadata(
+            const void *meta_device,
+            int meta_stride,
+            const void *base_cached_tokens_device,
+            int request_count,
+            int padded_state_rows_per_request,
+            int max_state_commit_rows,
+            int device_id,
+            void *stream,
+            void *out_restore_rows_device,
+            void *out_target_cached_tokens_device,
+            void *out_accepted_state_counts_device,
+            void *out_ok_device,
+            void *out_next_condition_tokens_device = nullptr,
+            const void *output_tokens_device = nullptr,
+            int output_token_stride = 0,
+            void *out_all_drafts_accepted_flags_device = nullptr,
+            void *out_stopped_flags_device = nullptr)
+        {
+            (void)meta_device;
+            (void)meta_stride;
+            (void)base_cached_tokens_device;
+            (void)request_count;
+            (void)padded_state_rows_per_request;
+            (void)max_state_commit_rows;
+            (void)device_id;
+            (void)stream;
+            (void)out_restore_rows_device;
+            (void)out_target_cached_tokens_device;
+            (void)out_accepted_state_counts_device;
+            (void)out_ok_device;
+            (void)out_next_condition_tokens_device;
+            (void)output_tokens_device;
+            (void)output_token_stride;
+            (void)out_all_drafts_accepted_flags_device;
+            (void)out_stopped_flags_device;
+            return false;
+        }
+
+        /**
+         * @brief Derive shifted MTP KV cache publication counts on device.
+         *
+         * Direct all-position MTP publication updates both the main target KV
+         * cache and each shifted sidecar KV cache.  This helper derives the
+         * sidecar depth's target cached-token count and wrapped-head advance
+         * count from the same compact verifier metadata as
+         * enqueueDeriveSpeculativePublicationMetadata(), using
+         * `max(0, target_cached_tokens - mtp_depth - 1)`.
+         */
+        virtual bool enqueueDeriveShiftedSpeculativePublicationMetadata(
+            const void *meta_device,
+            int meta_stride,
+            const void *base_cached_tokens_device,
+            int request_count,
+            int padded_state_rows_per_request,
+            int max_state_commit_rows,
+            int mtp_depth,
+            int device_id,
+            void *stream,
+            void *out_target_cached_tokens_device,
+            void *out_accepted_state_counts_device,
+            void *out_ok_device)
+        {
+            (void)meta_device;
+            (void)meta_stride;
+            (void)base_cached_tokens_device;
+            (void)request_count;
+            (void)padded_state_rows_per_request;
+            (void)max_state_commit_rows;
+            (void)mtp_depth;
+            (void)device_id;
+            (void)stream;
+            (void)out_target_cached_tokens_device;
+            (void)out_accepted_state_counts_device;
+            (void)out_ok_device;
             return false;
         }
 

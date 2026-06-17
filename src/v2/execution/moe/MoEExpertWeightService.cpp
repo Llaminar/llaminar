@@ -260,9 +260,13 @@ namespace llaminar2
         }
 
         // EP range: only extract views for local experts
-        // Dynamic rebalancing: when expert_mask is set, expert data is replicated.
-        // Extract views for ALL experts so GEMM engines can be prepared for all.
-        // The mask only controls which experts are executed, not which views exist.
+        // Dynamic rebalancing may set an expert mask while using replicated
+        // parent tensors. In that case, extracting all views is safe because
+        // every global expert id is physically present. LocalTP static expert
+        // ownership can also be expressed as a mask, but its parent tensor is
+        // presliced to the local expert range. Presliced tensors are the source
+        // of truth for physical bounds, so they must never attempt to view
+        // global expert ids outside [local_start, local_end).
         const bool extract_all = !ctx.expert_mask.empty();
         const int local_start = ctx.local_expert_start;
         const int local_count = (ctx.local_expert_count < 0)
@@ -306,8 +310,11 @@ namespace llaminar2
 
             for (int e = 0; e < n_experts; ++e)
             {
-                // Skip non-local experts under EP (unless extracting all for dynamic rebalancing)
-                if (!extract_all && (e < local_start || e >= local_end))
+                // Skip non-local experts under EP. A full replicated tensor can
+                // still extract every global expert when dynamic rebalance asks
+                // for it, but a presliced LocalTP tensor contains only local
+                // expert storage and must clamp to the physical local range.
+                if ((is_presliced || !extract_all) && (e < local_start || e >= local_end))
                     continue;
 
                 // For pre-sliced tensors: local expert `e` is at tensor index `e - local_start`

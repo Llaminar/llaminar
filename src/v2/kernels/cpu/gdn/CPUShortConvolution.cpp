@@ -150,7 +150,6 @@ namespace llaminar2
         if (state_len <= 0 || snapshot_stride_floats < state_floats || max_snapshot_rows <= 0)
             return false;
 
-        std::vector<float> initial_state(conv_state, conv_state + state_floats);
         std::vector<float> raw_input_copy;
         const float *raw_input = input;
         if (input == output)
@@ -159,32 +158,42 @@ namespace llaminar2
             raw_input = raw_input_copy.data();
         }
 
-        if (!executePrefillPreservingInPlaceTail(
-                input, weight, bias, output, conv_state,
-                seq_len, channels, kernel_size, apply_silu))
-            return false;
-
-        auto do_work = [&]()
+        /*
+         * Publishable MTP verifier rows must be decode-equivalent.  The normal
+         * CPU prefill path computes the same row outputs, but publication cares
+         * about the hidden history buffer after each row.  Walk the tiny MTP
+         * verifier chunk through the same one-token decode helper used in live
+         * generation, then snapshot that post-row history.  This mirrors the
+         * CUDA/ROCm verifier-state contract and keeps future continuation tests
+         * sensitive to real state drift.
+         */
+        for (int t = 0; t < seq_len; ++t)
         {
-#pragma omp for schedule(static)
-            for (int c = 0; c < channels; ++c)
+            const float *row_input =
+                raw_input + static_cast<size_t>(t) * static_cast<size_t>(channels);
+            float *row_output =
+                output + static_cast<size_t>(t) * static_cast<size_t>(channels);
+            if (!executeDecode(
+                    row_input,
+                    weight,
+                    bias,
+                    row_output,
+                    conv_state,
+                    channels,
+                    kernel_size,
+                    apply_silu))
             {
-                const int rows_to_capture = std::min(seq_len, max_snapshot_rows);
-                for (int t = 0; t < rows_to_capture; ++t)
-                {
-                    float *row = state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats;
-                    float *state = row + static_cast<size_t>(c) * state_len;
-                    for (int s = 0; s < state_len; ++s)
-                    {
-                        const int src_t = t - state_len + 1 + s;
-                        state[s] = (src_t >= 0)
-                                       ? raw_input[static_cast<size_t>(src_t) * channels + c]
-                                       : initial_state[static_cast<size_t>(c) * state_len + state_len + src_t];
-                    }
-                }
+                return false;
             }
-        };
-        OMP_WORKSHARE_REGION(do_work);
+
+            if (t < max_snapshot_rows)
+            {
+                std::memcpy(
+                    state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats,
+                    conv_state,
+                    static_cast<size_t>(state_floats) * sizeof(float));
+            }
+        }
         return true;
     }
 

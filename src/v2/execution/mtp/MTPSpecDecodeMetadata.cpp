@@ -122,6 +122,11 @@ namespace llaminar2
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::NEXT_CONDITION_TOKENS, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::ALL_DRAFTS_ACCEPTED_FLAGS, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::STOPPED_FLAGS, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::BASE_CACHED_TOKENS, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::TARGET_CACHED_TOKENS, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::SHIFTED_TARGET_CACHED_TOKENS, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::SHIFTED_ACCEPTED_STATE_COUNTS, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::PUBLICATION_OK_FLAGS, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS, requests + 1));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::STATE_INDICES, target_slots));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_COUNTS, requests));
@@ -1289,6 +1294,11 @@ namespace llaminar2
                next_condition_tokens &&
                all_drafts_accepted_flags &&
                stopped_flags &&
+               base_cached_tokens &&
+               target_cached_tokens &&
+               shifted_target_cached_tokens &&
+               shifted_accepted_state_counts &&
+               publication_ok_flags &&
                query_start_locs &&
                state_indices &&
                accepted_state_counts &&
@@ -1456,6 +1466,21 @@ namespace llaminar2
             !bind_int32(
                 MTPSpecDecodeWorkspaceBuffers::STOPPED_FLAGS,
                 &device_pointers_.stopped_flags) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::BASE_CACHED_TOKENS,
+                &device_pointers_.base_cached_tokens) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::TARGET_CACHED_TOKENS,
+                &device_pointers_.target_cached_tokens) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::SHIFTED_TARGET_CACHED_TOKENS,
+                &device_pointers_.shifted_target_cached_tokens) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::SHIFTED_ACCEPTED_STATE_COUNTS,
+                &device_pointers_.shifted_accepted_state_counts) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::PUBLICATION_OK_FLAGS,
+                &device_pointers_.publication_ok_flags) ||
             !bind_int32(
                 MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS,
                 &device_pointers_.query_start_locs) ||

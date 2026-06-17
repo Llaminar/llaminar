@@ -4,13 +4,17 @@
  */
 
 #include "FusedGateUpGEMMStage.h"
+#include "VerifierDecodeEquivalentGemmRows.h"
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/GemmContext.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../loaders/PreparedWeightStore.h"
+
+#include <algorithm>
 
 namespace llaminar2
 {
@@ -169,6 +173,16 @@ namespace llaminar2
         }
         fused_kernel->setGPUStream(gpuStream());
 
+        if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
+        {
+            return executeDecodeEquivalentVerifierPrefill(
+                ctx,
+                input_base,
+                output_gate_base,
+                output_up_base,
+                fused_kernel);
+        }
+
         // Check if we have bias - use appropriate execute method
         if (params_.bias_gate || params_.bias_up)
         {
@@ -200,6 +214,168 @@ namespace llaminar2
 
         LOG_DEBUG("[FusedGateUpGEMMStage] Complete");
         return true;
+    }
+
+    bool FusedGateUpGEMMStage::executeDecodeEquivalentVerifierPrefill(
+        IDeviceContext *ctx,
+        const TensorBase *input,
+        TensorBase *output_gate,
+        TensorBase *output_up,
+        ITensorFusedGateUpGemm *kernel)
+    {
+        if (!input || !output_gate || !output_up || !kernel)
+            return false;
+        if (params_.m > 4)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Decode-equivalent verifier prefill is only supported "
+                      << "for tiny MTP verifier batches, got m=" << params_.m);
+            return false;
+        }
+
+        const bool is_gpu = params_.device_id.is_gpu();
+        void *stream = gpuStream();
+        if (is_gpu && !stream)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Decode-equivalent GPU verifier prefill requires an explicit stream");
+            return false;
+        }
+
+        if (!verifier_gemm_rows::ensureScratchFP32(
+                verifier_input_row_, 1, static_cast<size_t>(params_.k),
+                params_.device_id, stream, "FusedGateUpGEMMStage", "input_row") ||
+            !verifier_gemm_rows::ensureScratchFP32(
+                verifier_gate_row_, 1, static_cast<size_t>(params_.n_gate),
+                params_.device_id, stream, "FusedGateUpGEMMStage", "gate_row") ||
+            !verifier_gemm_rows::ensureScratchFP32(
+                verifier_up_row_, 1, static_cast<size_t>(params_.n_up),
+                params_.device_id, stream, "FusedGateUpGEMMStage", "up_row"))
+        {
+            return false;
+        }
+
+        const float *input_data = is_gpu ? nullptr : input->data();
+        if (!is_gpu && !input_data)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Decode-equivalent verifier prefill requires host-visible FP32 input");
+            return false;
+        }
+        if (is_gpu && !input->gpu_data_ptr())
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Decode-equivalent verifier input is not device-resident on "
+                      << params_.device_id.to_string());
+            return false;
+        }
+
+        bool success = true;
+        for (int row = 0; row < params_.m; ++row)
+        {
+            if (is_gpu)
+            {
+                success = verifier_gemm_rows::copyFP32DeviceRow(
+                    verifier_input_row_.get(), 0, params_.k,
+                    input, row, params_.k,
+                    params_.k, params_.device_id, stream,
+                    "FusedGateUpGEMMStage", "verifier_input_row");
+                if (!success)
+                    break;
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    verifier_input_row_.get(), params_.device_id, stream);
+            }
+            else
+            {
+                std::copy(input_data + static_cast<size_t>(row) * params_.k,
+                          input_data + static_cast<size_t>(row + 1) * params_.k,
+                          verifier_input_row_->mutable_data());
+            }
+
+            const bool row_ok =
+                (params_.bias_gate || params_.bias_up)
+                    ? kernel->execute_with_bias(
+                          verifier_input_row_.get(),
+                          verifier_gate_row_.get(),
+                          verifier_up_row_.get(),
+                          params_.bias_gate,
+                          params_.bias_up,
+                          1,
+                          params_.k,
+                          params_.n_gate,
+                          params_.n_up,
+                          ctx,
+                          params_.device_id.toKernelDeviceIndex())
+                    : kernel->execute(
+                          verifier_input_row_.get(),
+                          verifier_gate_row_.get(),
+                          verifier_up_row_.get(),
+                          1,
+                          params_.k,
+                          params_.n_gate,
+                          params_.n_up,
+                          ctx,
+                          params_.device_id.toKernelDeviceIndex());
+            if (!row_ok)
+            {
+                LOG_ERROR("[FusedGateUpGEMMStage] Decode-equivalent verifier row "
+                          << row << " failed");
+                success = false;
+                break;
+            }
+
+            if (is_gpu)
+            {
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    verifier_gate_row_.get(), params_.device_id, stream);
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    verifier_up_row_.get(), params_.device_id, stream);
+                success =
+                    verifier_gemm_rows::copyFP32DeviceRow(
+                        output_gate, row, params_.n_gate,
+                        verifier_gate_row_.get(), 0, params_.n_gate,
+                        params_.n_gate, params_.device_id, stream,
+                        "FusedGateUpGEMMStage", "verifier_gate_output_row") &&
+                    verifier_gemm_rows::copyFP32DeviceRow(
+                        output_up, row, params_.n_up,
+                        verifier_up_row_.get(), 0, params_.n_up,
+                        params_.n_up, params_.device_id, stream,
+                        "FusedGateUpGEMMStage", "verifier_up_output_row");
+                if (!success)
+                    break;
+            }
+            else
+            {
+                float *gate_data = output_gate->mutable_data();
+                float *up_data = output_up->mutable_data();
+                if (!gate_data || !up_data)
+                {
+                    LOG_ERROR("[FusedGateUpGEMMStage] Decode-equivalent outputs are not host-visible");
+                    success = false;
+                    break;
+                }
+                std::copy(verifier_gate_row_->data(),
+                          verifier_gate_row_->data() + params_.n_gate,
+                          gate_data + static_cast<size_t>(row) * params_.n_gate);
+                std::copy(verifier_up_row_->data(),
+                          verifier_up_row_->data() + params_.n_up,
+                          up_data + static_cast<size_t>(row) * params_.n_up);
+            }
+        }
+
+        if (success)
+        {
+            if (is_gpu)
+            {
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    output_gate, params_.device_id, stream);
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    output_up, params_.device_id, stream);
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "gate_up_decode_equivalent_verifier_prefill_rows",
+                static_cast<double>(params_.m),
+                {},
+                params_.device_id.to_string());
+        }
+        return success;
     }
 
     size_t FusedGateUpGEMMStage::estimatedFlops() const

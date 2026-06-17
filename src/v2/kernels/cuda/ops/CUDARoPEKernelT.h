@@ -103,6 +103,7 @@ namespace llaminar2
                     inv_freq_initialized_ = false;
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
+                    dynamic_position_ids_device_ptr_ = nullptr;
                 }
                 workspace_ = workspace;
             }
@@ -116,6 +117,7 @@ namespace llaminar2
                 {
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
+                    dynamic_position_ids_device_ptr_ = nullptr;
                 }
                 gpu_stream_ = stream;
             }
@@ -124,6 +126,8 @@ namespace llaminar2
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
+            /// Bind explicit position IDs that already live on the device.
+            void setDynamicDevicePositionIds(const void *position_ids_device, int seq_len) override;
 
             void resetDynamicState() override
             {
@@ -134,6 +138,7 @@ namespace llaminar2
                 dynamic_pos_offset_ = 0;
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
+                dynamic_position_ids_device_ptr_ = nullptr;
                 if (h_device_params_)
                     h_device_params_->pos_offset = 0;
             }
@@ -258,6 +263,7 @@ namespace llaminar2
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;
             int dynamic_position_ids_seq_len_ = 0;
+            const int *dynamic_position_ids_device_ptr_ = nullptr;
         };
 
         // =========================================================================
@@ -309,6 +315,7 @@ namespace llaminar2
                 {
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
+                    dynamic_position_ids_device_ptr_ = nullptr;
                 }
                 gpu_stream_ = stream;
             }
@@ -317,6 +324,8 @@ namespace llaminar2
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
+            /// Bind explicit position IDs that already live on the device.
+            void setDynamicDevicePositionIds(const void *position_ids_device, int seq_len) override;
 
             void resetDynamicState() override
             {
@@ -327,6 +336,7 @@ namespace llaminar2
                 dynamic_pos_offset_ = 0;
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
+                dynamic_position_ids_device_ptr_ = nullptr;
                 if (h_device_params_)
                     h_device_params_->pos_offset = 0;
             }
@@ -368,6 +378,7 @@ namespace llaminar2
                     inv_freq_initialized_ = false;
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
+                    dynamic_position_ids_device_ptr_ = nullptr;
                 }
                 workspace_ = workspace;
             }
@@ -489,6 +500,7 @@ namespace llaminar2
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;
             int dynamic_position_ids_seq_len_ = 0;
+            const int *dynamic_position_ids_device_ptr_ = nullptr;
         };
 
         // =========================================================================
@@ -540,6 +552,7 @@ namespace llaminar2
                 {
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
+                    dynamic_position_ids_device_ptr_ = nullptr;
                 }
                 gpu_stream_ = stream;
             }
@@ -548,6 +561,8 @@ namespace llaminar2
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
+            /// Bind explicit position IDs that already live on the device.
+            void setDynamicDevicePositionIds(const void *position_ids_device, int seq_len) override;
 
             void resetDynamicState() override
             {
@@ -558,6 +573,7 @@ namespace llaminar2
                 dynamic_pos_offset_ = 0;
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
+                dynamic_position_ids_device_ptr_ = nullptr;
                 if (h_device_params_)
                     h_device_params_->pos_offset = 0;
             }
@@ -603,6 +619,7 @@ namespace llaminar2
                     inv_freq_initialized_ = false;
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
+                    dynamic_position_ids_device_ptr_ = nullptr;
                 }
                 workspace_ = workspace;
             }
@@ -724,6 +741,7 @@ namespace llaminar2
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;
             int dynamic_position_ids_seq_len_ = 0;
+            const int *dynamic_position_ids_device_ptr_ = nullptr;
         };
 
     } // namespace cuda

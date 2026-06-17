@@ -1318,6 +1318,7 @@ TEST_F(Test__ForwardExecutionEngine, ReplayCacheObservationsTrackOrdinaryAndVeri
             << "CPU entries have graph-cache identity but no GPU replay state.";
         EXPECT_EQ(observation.segmented_capture_live_state_epoch, 0u);
         EXPECT_FALSE(observation.requires_live_state_epoch_recapture);
+        EXPECT_FALSE(observation.all_position_verifier_recapture_pending);
         if (observation.signature.all_position_logits)
             verifier_obs = &observation;
         else
@@ -1337,14 +1338,23 @@ TEST_F(Test__ForwardExecutionEngine, ReplayCacheObservationsTrackOrdinaryAndVeri
     EXPECT_EQ(summary.preserved_for_stream_rebind, 2u);
     EXPECT_EQ(summary.all_position_verifier_preserved, 1u);
     EXPECT_EQ(summary.other_preserved, 1u)
-        << "Single-token condition decode and all-position verifier captures are both version-safe at MTP publication.";
+        << "Single-token condition decode and all-position verifier replay are both version-safe; "
+           "ordinary multi-token decode remains conservative.";
 
     const auto observations_after_reset =
         engine.replayCacheObservations(/*live_state_epoch=*/123);
     ASSERT_EQ(observations_after_reset.size(), 2u);
     for (const auto &observation : observations_after_reset)
     {
-        EXPECT_EQ(observation.segmented_capture_live_state_epoch, 123u);
+        if (observation.signature.all_position_logits)
+        {
+            EXPECT_EQ(observation.segmented_capture_live_state_epoch, 123u)
+                << "Multi-row verifier replay is preserved and stamped safe at the correction boundary.";
+        }
+        else
+        {
+            EXPECT_EQ(observation.segmented_capture_live_state_epoch, 123u);
+        }
         EXPECT_FALSE(observation.requires_live_state_epoch_recapture);
     }
 
@@ -1365,6 +1375,56 @@ TEST_F(Test__ForwardExecutionEngine, ReplayCacheObservationsTrackOrdinaryAndVeri
     EXPECT_EQ(host.build_forward_graph_calls, 2)
         << "Correction-boundary replay resets must preserve reusable ComputeGraphs; "
            "only captured replay executables/stream bindings are versioned.";
+}
+
+TEST_F(Test__ForwardExecutionEngine, ResetAllPositionVerifierReplayStateLeavesOrdinaryDecodeWarm)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    int ordinary_token = 42;
+    int ordinary_pos = 7;
+    auto ordinary = makeTestInput(
+        1,
+        1,
+        DeviceId::cpu(),
+        &ordinary_token,
+        &ordinary_pos);
+
+    int verifier_tokens[] = {43, 44};
+    int verifier_positions[] = {8, 9};
+    auto verifier = makeTestInput(
+        2,
+        1,
+        DeviceId::cpu(),
+        verifier_tokens,
+        verifier_positions);
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(ordinary, output, host));
+    host.mock_compute_all_position_logits = true;
+    ASSERT_TRUE(engine.execute(verifier, output, host));
+
+    const ForwardExecutionEngine::ReplayStateResetSummary summary =
+        engine.resetAllPositionVerifierReplayState();
+    EXPECT_EQ(summary.reset_replay_state, 1u);
+    EXPECT_EQ(summary.preserved_for_stream_rebind, 1u);
+    EXPECT_EQ(summary.ordinary_decode_reset, 0u)
+        << "Shifted MTP KV mutation must not discard ordinary decode replay.";
+    EXPECT_TRUE(summary.all_position_verifier_recapture_requested)
+        << "A shifted MTP KV mutation also has to protect a verifier cache "
+           "that may be created or recaptured after the mutation.";
+
+    const auto observations =
+        engine.replayCacheObservations(/*live_state_epoch=*/0);
+    ASSERT_EQ(observations.size(), 2u);
+    for (const auto &observation : observations)
+    {
+        EXPECT_TRUE(observation.all_position_verifier_recapture_pending)
+            << "The pending recapture request is engine-wide until a fresh "
+               "all-position verifier capture reaches replay-ready state.";
+    }
 }
 
 // =========================================================================
@@ -1574,6 +1634,7 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
         {"moe_placement_epoch", "0"},
         {"result", "miss"},
         {"uses_device_token_ids", "false"},
+        {"uses_device_position_ids", "false"},
         {"seq_len", "2"}};
     const PerfStatsCollector::Tags hit_tags = {
         {"all_position_logits", "true"},
@@ -1583,6 +1644,7 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
         {"moe_placement_epoch", "0"},
         {"result", "hit"},
         {"uses_device_token_ids", "false"},
+        {"uses_device_position_ids", "false"},
         {"seq_len", "2"}};
 
     EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "forward_cache_lookup", miss_tags), 1.0);

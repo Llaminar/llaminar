@@ -3,10 +3,12 @@
 #include "kernels/HybridKVCacheConfig.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/IKVCache.h"
+#include "tensors/TensorKernels.h"
+#include "utils/DebugEnv.h"
 
 #include <algorithm>
-#include <cstring>
 #include <utility>
+#include <vector>
 
 namespace llaminar2
 {
@@ -25,6 +27,11 @@ namespace llaminar2
         uint64_t hashFloatVector(const std::vector<float> &values)
         {
             return hashFloatBufferForPrefixProbe(values.data(), values.size());
+        }
+
+        bool envEnabled(const char *name)
+        {
+            return !DebugEnv::isFalseyEnv(name);
         }
     } // namespace
 
@@ -58,7 +65,8 @@ namespace llaminar2
         const IKVCache &cache,
         std::string owner,
         DeviceId device,
-        int sequence_count)
+        int sequence_count,
+        void *stream)
     {
         PrefixKVCacheProbe probe;
         probe.owner = std::move(owner);
@@ -86,6 +94,41 @@ namespace llaminar2
                 layer_probe.seq_idx = seq;
                 layer_probe.cached_tokens = cache.get_cached_tokens(layer, seq);
                 layer_probe.ring_head = cache.ring_head(layer, seq);
+                if (layer_probe.cached_tokens > 0 &&
+                    envEnabled("LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS"))
+                {
+                    const auto layout = cache.logicalBlockLayout(
+                        layer_probe.global_layer,
+                        layer_probe.cached_tokens);
+                    if (layout.k_bytes > 0 && layout.v_bytes > 0)
+                    {
+                        std::vector<uint8_t> k_bytes(layout.k_bytes);
+                        std::vector<uint8_t> v_bytes(layout.v_bytes);
+                        IKVCache::KVCacheLogicalBlockDescriptor desc;
+                        desc.layer = layer_probe.global_layer;
+                        desc.seq_idx = seq;
+                        desc.logical_token_start = 0;
+                        desc.token_count = layer_probe.cached_tokens;
+                        desc.stream = stream;
+                        if (cache.exportLogicalBlock(
+                                desc,
+                                k_bytes.data(),
+                                v_bytes.data()))
+                        {
+                            layer_probe.payload_hash_available = true;
+                            layer_probe.k_payload_bytes = layout.k_bytes;
+                            layer_probe.v_payload_bytes = layout.v_bytes;
+                            layer_probe.k_payload_hash =
+                                hashByteBufferForPrefixProbe(
+                                    k_bytes.data(),
+                                    k_bytes.size());
+                            layer_probe.v_payload_hash =
+                                hashByteBufferForPrefixProbe(
+                                    v_bytes.data(),
+                                    v_bytes.size());
+                        }
+                    }
+                }
                 probe.layers.push_back(layer_probe);
             }
         }
@@ -94,13 +137,40 @@ namespace llaminar2
     }
 
     std::vector<PrefixGDNLayerProbe> inspectHybridGDNForPrefixProbe(
-        const IKVCache &cache)
+        const IKVCache &cache,
+        void *stream)
     {
         const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&cache);
         if (!hybrid)
         {
             return {};
         }
+
+        std::vector<uint8_t> device_state_bytes;
+        const bool capture_device_state =
+            envEnabled("LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE");
+        if (capture_device_state)
+        {
+            const HybridPrefixStateMetadata metadata =
+                hybrid->hybridPrefixStateMetadata();
+            if (metadata.device_bytes > 0)
+            {
+                device_state_bytes.resize(metadata.device_bytes);
+                HybridPrefixStateDescriptor desc;
+                desc.stream = stream;
+                desc.synchronize = true;
+                desc.include_host_state = false;
+                desc.include_device_state = true;
+                if (!hybrid->exportHybridPrefixState(
+                        desc,
+                        device_state_bytes.data(),
+                        nullptr))
+                {
+                    device_state_bytes.clear();
+                }
+            }
+        }
+        size_t device_offset = 0;
 
         std::vector<PrefixGDNLayerProbe> probes;
         probes.reserve(static_cast<size_t>(std::max(0, hybrid->gdnLayerCount())));
@@ -127,6 +197,45 @@ namespace llaminar2
                 state->recurrence_state.data(), state->recurrence_state.size());
             probe.conv_all_zero = floatBufferAllZeroForPrefixProbe(
                 state->conv_state.data(), state->conv_state.size());
+            if (!device_state_bytes.empty())
+            {
+                if (auto *conv_kernel =
+                        const_cast<IHybridKVCache *>(hybrid)->getConvKernel(layer))
+                {
+                    probe.conv_device_bytes = conv_kernel->stateBytes();
+                    if (device_offset + probe.conv_device_bytes <=
+                        device_state_bytes.size())
+                    {
+                        probe.conv_device_hash =
+                            hashByteBufferForPrefixProbe(
+                                device_state_bytes.data() + device_offset,
+                                probe.conv_device_bytes);
+                        probe.device_state_hash_available = true;
+                    }
+                    device_offset += probe.conv_device_bytes;
+                }
+                if (auto *recurrence_kernel =
+                        const_cast<IHybridKVCache *>(hybrid)->getRecurrenceKernel(layer))
+                {
+                    probe.recurrence_device_bytes =
+                        recurrence_kernel->stateBytes();
+                    if (device_offset + probe.recurrence_device_bytes <=
+                        device_state_bytes.size())
+                    {
+                        probe.recurrence_device_hash =
+                            hashByteBufferForPrefixProbe(
+                                device_state_bytes.data() + device_offset,
+                                probe.recurrence_device_bytes);
+                        probe.device_state_hash_available = true;
+                    }
+                    device_offset += probe.recurrence_device_bytes;
+                }
+            }
+            if (envEnabled("LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES"))
+            {
+                probe.recurrence_sample_values = state->recurrence_state;
+                probe.conv_sample_values = state->conv_state;
+            }
             probes.push_back(probe);
         }
 
@@ -135,20 +244,21 @@ namespace llaminar2
 
     uint64_t hashFloatBufferForPrefixProbe(const float *values, size_t count)
     {
+        return hashByteBufferForPrefixProbe(values, count * sizeof(float));
+    }
+
+    uint64_t hashByteBufferForPrefixProbe(const void *values, size_t bytes)
+    {
         uint64_t hash = kFnvOffset;
-        if (!values || count == 0)
+        if (!values || bytes == 0)
         {
             return hash;
         }
 
-        for (size_t i = 0; i < count; ++i)
+        const auto *raw = static_cast<const unsigned char *>(values);
+        for (size_t i = 0; i < bytes; ++i)
         {
-            uint32_t bits = 0;
-            std::memcpy(&bits, values + i, sizeof(bits));
-            for (int byte_idx = 0; byte_idx < 4; ++byte_idx)
-            {
-                hash = fnvUpdate(hash, static_cast<unsigned char>((bits >> (byte_idx * 8)) & 0xffu));
-            }
+            hash = fnvUpdate(hash, raw[i]);
         }
         return hash;
     }

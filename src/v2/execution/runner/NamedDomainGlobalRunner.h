@@ -89,6 +89,7 @@ namespace llaminar2
 
         bool prefill(const std::vector<int32_t> &tokens) override;
         GenerationResult decodeStep() override;
+        GenerationResult forceDecodeToken(int32_t token) override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,
             int max_new_tokens,

@@ -8,6 +8,7 @@
 #include <limits>
 
 using ::testing::ElementsAre;
+using ::testing::Contains;
 
 namespace llaminar2::test
 {
@@ -102,6 +103,84 @@ namespace llaminar2::test
 
         EXPECT_EQ(token, 11);
         EXPECT_FLOAT_EQ(selected_probability, 0.3f);
+    }
+
+    TEST(Test__MTPRejectionSampler, SharedCompactVerifierSupportsOneHotGreedyDraft)
+    {
+        const int target_ids[] = {5, 7, 11, 13};
+        const float target_probs[] = {0.20f, 0.30f, 0.10f, 0.40f};
+
+        int token = -1;
+        int accepted = -1;
+        float accept_probability = -1.0f;
+        float accept_threshold = -1.0f;
+
+        sampling_math::speculative_verify_with_thresholds_one_hot_draft(
+            target_ids,
+            target_probs,
+            4,
+            /*draft_token=*/7,
+            /*accept_threshold=*/0.30f,
+            /*residual_threshold=*/0.0f,
+            &token,
+            &accepted,
+            &accept_probability,
+            &accept_threshold);
+
+        EXPECT_EQ(token, 7);
+        EXPECT_EQ(accepted, 1);
+        EXPECT_FLOAT_EQ(accept_probability, 0.30f);
+        EXPECT_FLOAT_EQ(accept_threshold, 0.30f)
+            << "one-hot verifier follows the vLLM <= acceptance convention";
+
+        sampling_math::speculative_verify_with_thresholds_one_hot_draft(
+            target_ids,
+            target_probs,
+            4,
+            /*draft_token=*/7,
+            /*accept_threshold=*/0.95f,
+            /*residual_threshold=*/0.0f,
+            &token,
+            &accepted,
+            &accept_probability,
+            &accept_threshold);
+
+        EXPECT_EQ(token, 5)
+            << "rejection residual removes the one-hot draft token and samples the first remaining mass";
+        EXPECT_EQ(accepted, 0);
+        EXPECT_FLOAT_EQ(accept_probability, 0.30f);
+        EXPECT_FLOAT_EQ(accept_threshold, 0.95f);
+    }
+
+    TEST(Test__MTPRejectionSampler, SharedCompactVerifierSupportsVLLMRecoveredTokenSampling)
+    {
+        const int target_ids[] = {5, 7, 11, 13};
+        const float target_probs[] = {0.20f, 0.30f, 0.10f, 0.40f};
+
+        int token = -1;
+        int accepted = -1;
+        float accept_probability = -1.0f;
+        float accept_threshold = -1.0f;
+        sampling_math::speculative_verify_with_thresholds_one_hot_draft_vllm_recovered(
+            target_ids,
+            target_probs,
+            4,
+            /*vocab_size=*/32,
+            /*draft_token=*/7,
+            /*accept_threshold=*/0.95f,
+            /*inverse_sample_seed=*/98765,
+            /*logical_position=*/23,
+            &token,
+            &accepted,
+            &accept_probability,
+            &accept_threshold);
+
+        EXPECT_EQ(accepted, 0);
+        EXPECT_NE(token, 7)
+            << "vLLM recovered sampling removes the one-hot draft proposal on reject";
+        EXPECT_THAT(std::vector<int>({5, 11, 13}), ::testing::Contains(token));
+        EXPECT_FLOAT_EQ(accept_probability, 0.30f);
+        EXPECT_FLOAT_EQ(accept_threshold, 0.95f);
     }
 
     TEST(Test__MTPRejectionSampler, ComputesProcessedFullLogitStats)

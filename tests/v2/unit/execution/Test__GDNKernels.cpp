@@ -37,6 +37,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
+#include "execution/mtp/MTPSpecStatePublisher.h"
 #include "execution/cache/HybridCacheManager.h"
 #include "backends/BackendManager.h"
 #include "kernels/cpu/gdn/CPUShortConvolution.h"
@@ -682,6 +683,15 @@ public:
     float *speculative_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x2345));
     int speculative_state_size = 10;
     int speculative_bind_calls = 0;
+    int restore_row_calls = 0;
+    int restore_device_index_calls = 0;
+    float *restore_capture_workspace = nullptr;
+    int restore_capture_rows = 0;
+    int restore_capture_state_size = 0;
+    float *restore_dst_state = nullptr;
+    int restore_row = -1;
+    const int *restore_device_index = nullptr;
+    void *restore_stream = nullptr;
 
     void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
     {
@@ -706,6 +716,34 @@ public:
     {
         return true;
     }
+
+    bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
+    {
+        ++restore_row_calls;
+        restore_capture_workspace = capture_workspace;
+        restore_capture_rows = capture_rows;
+        restore_capture_state_size = capture_state_size;
+        restore_dst_state = dst_state;
+        restore_row = row;
+        restore_stream = stream;
+        return capture_workspace != nullptr && dst_state != nullptr;
+    }
+
+    bool restoreVerifierStateCaptureRowFromDeviceIndex(
+        float *dst_state,
+        const int *device_row_index,
+        void *stream) override
+    {
+        ++restore_device_index_calls;
+        restore_capture_workspace = capture_workspace;
+        restore_capture_rows = capture_rows;
+        restore_capture_state_size = capture_state_size;
+        restore_dst_state = dst_state;
+        restore_device_index = device_row_index;
+        restore_stream = stream;
+        return capture_workspace != nullptr &&
+               device_row_index != nullptr && stream != nullptr;
+    }
 };
 
 class RecordingGatedDeltaNet final : public ITensorGatedDeltaNet
@@ -718,6 +756,15 @@ public:
     float *speculative_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x6789));
     int speculative_state_size = 14;
     int speculative_bind_calls = 0;
+    int restore_row_calls = 0;
+    int restore_device_index_calls = 0;
+    float *restore_capture_workspace = nullptr;
+    int restore_capture_rows = 0;
+    int restore_capture_state_size = 0;
+    float *restore_dst_state = nullptr;
+    int restore_row = -1;
+    const int *restore_device_index = nullptr;
+    void *restore_stream = nullptr;
 
     void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
     {
@@ -754,6 +801,34 @@ public:
         bool) override
     {
         return true;
+    }
+
+    bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
+    {
+        ++restore_row_calls;
+        restore_capture_workspace = capture_workspace;
+        restore_capture_rows = capture_rows;
+        restore_capture_state_size = capture_state_size;
+        restore_dst_state = dst_state;
+        restore_row = row;
+        restore_stream = stream;
+        return capture_workspace != nullptr && dst_state != nullptr;
+    }
+
+    bool restoreVerifierStateCaptureRowFromDeviceIndex(
+        float *dst_state,
+        const int *device_row_index,
+        void *stream) override
+    {
+        ++restore_device_index_calls;
+        restore_capture_workspace = capture_workspace;
+        restore_capture_rows = capture_rows;
+        restore_capture_state_size = capture_state_size;
+        restore_dst_state = dst_state;
+        restore_device_index = device_row_index;
+        restore_stream = stream;
+        return capture_workspace != nullptr &&
+               device_row_index != nullptr && stream != nullptr;
     }
 };
 
@@ -957,6 +1032,70 @@ TEST(Test__GDNKernels, ShortConvGraphReplayRebindsVerifierWorkspaceAfterSharedKe
     EXPECT_EQ(kernel.capture_state_size, 48);
 }
 
+TEST(Test__GDNKernels, ShortConvPublicationRestoreUsesStageOwnedCPUCaptureAfterSharedKernelClear)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingShortConvolution kernel;
+    std::vector<float> conv_state(48, 0.0f);
+
+    ShortConv1dStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cpu();
+    verifier_p.seq_len = 2;
+    verifier_p.channels = 16;
+    verifier_p.kernel_size = 4;
+    verifier_p.verifier_state_capture_rows = 2;
+    verifier_p.conv_state = conv_state.data();
+    verifier_p.kernel = &kernel;
+
+    ShortConv1dStage verifier_stage(verifier_p);
+    WorkspaceRequirements reqs = verifier_stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(reqs.has_required_buffers());
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    verifier_stage.bindWorkspace(&workspace);
+    float *verifier_capture = kernel.capture_workspace;
+    ASSERT_NE(verifier_capture, nullptr);
+    for (int i = 0; i < 96; ++i)
+        verifier_capture[i] = 1000.0f + static_cast<float>(i);
+
+    ShortConv1dStage::Params normal_p = verifier_p;
+    normal_p.verifier_state_capture_rows = 0;
+    ShortConv1dStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRow(1, nullptr));
+    EXPECT_EQ(kernel.restore_row_calls, 0)
+        << "CPU publication must not route through a shared kernel binding";
+    for (int i = 0; i < 48; ++i)
+    {
+        EXPECT_EQ(conv_state[static_cast<size_t>(i)],
+                  verifier_capture[48 + i]);
+    }
+
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+
+    int device_row_index = 1;
+    void *fake_stream = &device_row_index;
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRowFromDeviceIndex(
+        &device_row_index,
+        fake_stream));
+    EXPECT_EQ(kernel.restore_device_index_calls, 1);
+    EXPECT_EQ(kernel.restore_capture_workspace, verifier_capture)
+        << "Device-indexed publication must also rebind the verifier workspace";
+    EXPECT_EQ(kernel.restore_capture_rows, 2);
+    EXPECT_EQ(kernel.restore_capture_state_size, 48);
+    EXPECT_EQ(kernel.restore_dst_state, nullptr)
+        << "Device-indexed publication restores backend-owned live state only; "
+           "host mirror refresh must stay out of the hot path.";
+    EXPECT_EQ(kernel.restore_device_index, &device_row_index);
+    EXPECT_EQ(kernel.restore_stream, fake_stream);
+}
+
 TEST(Test__GDNKernels, RecurrenceGraphReplayRebindsVerifierWorkspaceAfterSharedKernelClear)
 {
     ensureCPUBackendForWorkspace();
@@ -999,6 +1138,534 @@ TEST(Test__GDNKernels, RecurrenceGraphReplayRebindsVerifierWorkspaceAfterSharedK
         << "Verifier graph replay must restore the shared kernel capture binding before MTP publication";
     EXPECT_EQ(kernel.capture_rows, 2);
     EXPECT_EQ(kernel.capture_state_size, 32);
+}
+
+TEST(Test__GDNKernels, RecurrencePublicationRestoreUsesStageOwnedCPUCaptureAfterSharedKernelClear)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingGatedDeltaNet kernel;
+    std::vector<float> recurrence_state(32, 0.0f);
+
+    GDNRecurrenceStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cpu();
+    verifier_p.seq_len = 2;
+    verifier_p.n_heads = 2;
+    verifier_p.n_k_heads = 2;
+    verifier_p.d_k = 4;
+    verifier_p.d_v = 4;
+    verifier_p.verifier_state_capture_rows = 2;
+    verifier_p.recurrence_state = recurrence_state.data();
+    verifier_p.kernel = &kernel;
+
+    GDNRecurrenceStage verifier_stage(verifier_p);
+    WorkspaceRequirements reqs = verifier_stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(reqs.has_required_buffers());
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    verifier_stage.bindWorkspace(&workspace);
+    float *verifier_capture = kernel.capture_workspace;
+    ASSERT_NE(verifier_capture, nullptr);
+    for (int i = 0; i < 64; ++i)
+        verifier_capture[i] = 2000.0f + static_cast<float>(i);
+
+    GDNRecurrenceStage::Params normal_p = verifier_p;
+    normal_p.verifier_state_capture_rows = 0;
+    GDNRecurrenceStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRow(1, nullptr));
+    EXPECT_EQ(kernel.restore_row_calls, 0)
+        << "CPU publication must not route through a shared kernel binding";
+    for (int i = 0; i < 32; ++i)
+    {
+        EXPECT_EQ(recurrence_state[static_cast<size_t>(i)],
+                  verifier_capture[32 + i]);
+    }
+
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+
+    int device_row_index = 1;
+    void *fake_stream = &device_row_index;
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRowFromDeviceIndex(
+        &device_row_index,
+        fake_stream));
+    EXPECT_EQ(kernel.restore_device_index_calls, 1);
+    EXPECT_EQ(kernel.restore_capture_workspace, verifier_capture)
+        << "Device-indexed publication must also rebind the verifier workspace";
+    EXPECT_EQ(kernel.restore_capture_rows, 2);
+    EXPECT_EQ(kernel.restore_capture_state_size, 32);
+    EXPECT_EQ(kernel.restore_dst_state, nullptr)
+        << "Device-indexed publication restores backend-owned live state only; "
+           "host mirror refresh must stay out of the hot path.";
+    EXPECT_EQ(kernel.restore_device_index, &device_row_index);
+    EXPECT_EQ(kernel.restore_stream, fake_stream);
+}
+
+TEST(Test__GDNKernels, RecurrenceCPUPublicationRestoresParallelStagesFromTheirOwnCaptureSlots)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingGatedDeltaNet shared_kernel;
+
+    std::vector<float> state0(32, 0.0f);
+    std::vector<float> state1(32, 0.0f);
+
+    auto make_stage =
+        [&](int layer, std::vector<float> &state)
+    {
+        GDNRecurrenceStage::Params p;
+        p.device_id = DeviceId::cpu();
+        p.seq_len = 2;
+        p.n_heads = 2;
+        p.n_k_heads = 2;
+        p.d_k = 4;
+        p.d_v = 4;
+        p.layer_idx = layer;
+        p.verifier_state_capture_rows = 2;
+        p.recurrence_state = state.data();
+        p.kernel = &shared_kernel;
+        return std::make_unique<GDNRecurrenceStage>(p);
+    };
+
+    auto stage0 = make_stage(0, state0);
+    auto stage1 = make_stage(1, state1);
+
+    WorkspaceRequirements req0 = stage0->getWorkspaceRequirements(/*m=*/2);
+    WorkspaceRequirements req1 = stage1->getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(req0.has_required_buffers());
+    ASSERT_TRUE(req1.has_required_buffers());
+    DeviceWorkspaceManager workspace0(
+        DeviceId::cpu(),
+        req0.total_bytes_with_alignment() + 1024);
+    DeviceWorkspaceManager workspace1(
+        DeviceId::cpu(),
+        req1.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace0.allocate(req0));
+    ASSERT_TRUE(workspace1.allocate(req1));
+
+    stage0->bindWorkspace(&workspace0);
+    float *capture0 = shared_kernel.capture_workspace;
+    ASSERT_NE(capture0, nullptr);
+    for (int i = 0; i < 64; ++i)
+        capture0[i] = 3000.0f + static_cast<float>(i);
+
+    stage1->bindWorkspace(&workspace1);
+    float *capture1 = shared_kernel.capture_workspace;
+    ASSERT_NE(capture1, nullptr);
+    ASSERT_NE(capture0, capture1);
+    for (int i = 0; i < 64; ++i)
+        capture1[i] = 4000.0f + static_cast<float>(i);
+
+    /*
+     * A normal decode graph can clear the shared kernel binding before the
+     * publication pass.  Publication must still use each stage's own capture
+     * slot rather than racing through that shared mutable binding.
+     */
+    GDNRecurrenceStage::Params normal_p = stage0->getParams();
+    normal_p.verifier_state_capture_rows = 0;
+    GDNRecurrenceStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(shared_kernel.capture_workspace, nullptr);
+
+    MTPSpecStepPlan plan;
+    plan.draft_count = 2;
+    plan.target_rows = 3;
+    plan.accepted_count = 2;
+
+    std::vector<IComputeStage *> stages = {stage0.get(), stage1.get()};
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromVerifierRow(
+            plan,
+            /*verifier_restore_row=*/1,
+            stages,
+            DeviceId::cpu(),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.restored_stage_count, 2);
+    EXPECT_EQ(shared_kernel.restore_row_calls, 0)
+        << "Parallel CPU publication must not use the shared kernel restore path";
+
+    for (int i = 0; i < 32; ++i)
+    {
+        EXPECT_EQ(state0[static_cast<size_t>(i)], capture0[32 + i]);
+        EXPECT_EQ(state1[static_cast<size_t>(i)], capture1[32 + i]);
+    }
+}
+
+TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentSteps)
+{
+    static constexpr int seq_len = 2;
+    static constexpr int n_heads = 2;
+    static constexpr int d_k = 4;
+    static constexpr int d_v = 3;
+    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int qk_stride = n_heads * d_k;
+    static constexpr int v_stride = n_heads * d_v;
+
+    CPUGatedDeltaNet verifier_kernel;
+    CPUGatedDeltaNet serial_kernel;
+    std::vector<float> q(static_cast<size_t>(seq_len) * qk_stride);
+    std::vector<float> k(q.size());
+    std::vector<float> v(static_cast<size_t>(seq_len) * v_stride);
+    std::vector<float> alpha(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> beta(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> a_log(n_heads);
+    std::vector<float> dt_bias(n_heads);
+    std::vector<float> initial_state(state_floats);
+    std::vector<float> verifier_state = initial_state;
+    std::vector<float> serial_state = initial_state;
+    std::vector<float> verifier_output(static_cast<size_t>(seq_len) * v_stride, 0.0f);
+    std::vector<float> serial_output(verifier_output.size(), 0.0f);
+    std::vector<float> capture(static_cast<size_t>(seq_len) * state_floats, 0.0f);
+    std::vector<float> work(state_floats, 0.0f);
+
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        q[i] = 0.01f * static_cast<float>((i % 17) - 8);
+        k[i] = 0.02f * static_cast<float>((i % 13) - 6);
+    }
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = 0.015f * static_cast<float>((i % 11) - 5);
+    for (size_t i = 0; i < alpha.size(); ++i)
+    {
+        alpha[i] = -0.25f + 0.03f * static_cast<float>(i);
+        beta[i] = 0.15f - 0.02f * static_cast<float>(i);
+    }
+    for (int h = 0; h < n_heads; ++h)
+    {
+        a_log[static_cast<size_t>(h)] = -0.5f - 0.1f * static_cast<float>(h);
+        dt_bias[static_cast<size_t>(h)] = 0.05f * static_cast<float>(h + 1);
+    }
+    for (int i = 0; i < state_floats; ++i)
+        initial_state[static_cast<size_t>(i)] =
+            0.001f * static_cast<float>((i % 19) - 9);
+    verifier_state = initial_state;
+    serial_state = initial_state;
+
+    verifier_kernel.bindVerifierStateCaptureWorkspace(
+        capture.data(),
+        seq_len,
+        state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(work.data(), state_floats);
+    ASSERT_TRUE(verifier_kernel.chunk_forward(
+        q.data(),
+        k.data(),
+        v.data(),
+        alpha.data(),
+        beta.data(),
+        a_log.data(),
+        dt_bias.data(),
+        verifier_output.data(),
+        verifier_state.data(),
+        seq_len,
+        n_heads,
+        d_k,
+        d_v,
+        /*chunk_size=*/64,
+        /*use_qk_l2norm=*/true));
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        ASSERT_TRUE(serial_kernel.recurrent_step(
+            q.data() + static_cast<size_t>(t) * qk_stride,
+            k.data() + static_cast<size_t>(t) * qk_stride,
+            v.data() + static_cast<size_t>(t) * v_stride,
+            alpha.data() + static_cast<size_t>(t) * n_heads,
+            beta.data() + static_cast<size_t>(t) * n_heads,
+            a_log.data(),
+            dt_bias.data(),
+            serial_output.data() + static_cast<size_t>(t) * v_stride,
+            serial_state.data(),
+            n_heads,
+            d_k,
+            d_v,
+            /*use_qk_l2norm=*/true));
+
+        for (int i = 0; i < state_floats; ++i)
+        {
+            EXPECT_NEAR(
+                capture[static_cast<size_t>(t) * state_floats + i],
+                serial_state[static_cast<size_t>(i)],
+                1e-7f)
+                << "row=" << t << " state_idx=" << i;
+        }
+    }
+
+    for (size_t i = 0; i < serial_output.size(); ++i)
+    {
+        EXPECT_NEAR(verifier_output[i], serial_output[i], 1e-7f)
+            << "output_idx=" << i;
+    }
+    EXPECT_EQ(verifier_state, initial_state)
+        << "Verifier capture must not mutate the live state buffer";
+}
+
+TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQwenSize)
+{
+    static constexpr int seq_len = 2;
+    static constexpr int n_heads = 32;
+    static constexpr int d_k = 128;
+    static constexpr int d_v = 128;
+    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int qk_stride = n_heads * d_k;
+    static constexpr int v_stride = n_heads * d_v;
+
+    CPUGatedDeltaNet verifier_kernel;
+    CPUGatedDeltaNet serial_kernel;
+    std::vector<float> q(static_cast<size_t>(seq_len) * qk_stride);
+    std::vector<float> k(q.size());
+    std::vector<float> v(static_cast<size_t>(seq_len) * v_stride);
+    std::vector<float> alpha(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> beta(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> a_log(n_heads);
+    std::vector<float> dt_bias(n_heads);
+    std::vector<float> initial_state(state_floats);
+    std::vector<float> verifier_state;
+    std::vector<float> serial_state;
+    std::vector<float> verifier_output(static_cast<size_t>(seq_len) * v_stride, 0.0f);
+    std::vector<float> serial_output(verifier_output.size(), 0.0f);
+    std::vector<float> capture(static_cast<size_t>(seq_len) * state_floats, 0.0f);
+    std::vector<float> work(state_floats, 0.0f);
+
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        q[i] = 0.002f * static_cast<float>((i % 29) - 14);
+        k[i] = 0.0015f * static_cast<float>((i % 31) - 15);
+    }
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = 0.001f * static_cast<float>((i % 23) - 11);
+    for (size_t i = 0; i < alpha.size(); ++i)
+    {
+        alpha[i] = -0.2f + 0.004f * static_cast<float>(i % 37);
+        beta[i] = 0.1f - 0.003f * static_cast<float>(i % 41);
+    }
+    for (int h = 0; h < n_heads; ++h)
+    {
+        a_log[static_cast<size_t>(h)] = -0.35f - 0.002f * static_cast<float>(h);
+        dt_bias[static_cast<size_t>(h)] = 0.01f * static_cast<float>((h % 7) - 3);
+    }
+    for (int i = 0; i < state_floats; ++i)
+        initial_state[static_cast<size_t>(i)] =
+            0.0001f * static_cast<float>((i % 43) - 21);
+    verifier_state = initial_state;
+    serial_state = initial_state;
+
+    verifier_kernel.bindVerifierStateCaptureWorkspace(
+        capture.data(),
+        seq_len,
+        state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(work.data(), state_floats);
+    ASSERT_TRUE(verifier_kernel.chunk_forward(
+        q.data(),
+        k.data(),
+        v.data(),
+        alpha.data(),
+        beta.data(),
+        a_log.data(),
+        dt_bias.data(),
+        verifier_output.data(),
+        verifier_state.data(),
+        seq_len,
+        n_heads,
+        d_k,
+        d_v,
+        /*chunk_size=*/64,
+        /*use_qk_l2norm=*/true));
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        ASSERT_TRUE(serial_kernel.recurrent_step(
+            q.data() + static_cast<size_t>(t) * qk_stride,
+            k.data() + static_cast<size_t>(t) * qk_stride,
+            v.data() + static_cast<size_t>(t) * v_stride,
+            alpha.data() + static_cast<size_t>(t) * n_heads,
+            beta.data() + static_cast<size_t>(t) * n_heads,
+            a_log.data(),
+            dt_bias.data(),
+            serial_output.data() + static_cast<size_t>(t) * v_stride,
+            serial_state.data(),
+            n_heads,
+            d_k,
+            d_v,
+            /*use_qk_l2norm=*/true));
+
+        double max_state_diff = 0.0;
+        for (int i = 0; i < state_floats; ++i)
+        {
+            max_state_diff = std::max(
+                max_state_diff,
+                static_cast<double>(std::abs(
+                    capture[static_cast<size_t>(t) * state_floats + i] -
+                    serial_state[static_cast<size_t>(i)])));
+        }
+        EXPECT_LE(max_state_diff, 1e-7)
+            << "row=" << t;
+    }
+
+    double max_output_diff = 0.0;
+    for (size_t i = 0; i < serial_output.size(); ++i)
+    {
+        max_output_diff = std::max(
+            max_output_diff,
+            static_cast<double>(std::abs(verifier_output[i] - serial_output[i])));
+    }
+    EXPECT_LE(max_output_diff, 1e-7);
+    EXPECT_EQ(verifier_state, initial_state)
+        << "Verifier capture must not mutate the live state buffer";
+}
+
+TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDecode)
+{
+    static constexpr int seq_len = 2;
+    static constexpr int n_k_heads = 2;
+    static constexpr int n_heads = 4;
+    static constexpr int d_k = 8;
+    static constexpr int d_v = 8;
+    static constexpr int q_src_dim = n_k_heads * d_k;
+    static constexpr int k_src_dim = n_k_heads * d_k;
+    static constexpr int v_dim = n_heads * d_v;
+    static constexpr int qkv_stride = q_src_dim + k_src_dim + v_dim;
+    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int output_stride = n_heads * d_v;
+
+    /*
+     * Qwen GDN graph stages pass Q, K, and V as the same merged QKV tensor.
+     * The verifier path runs a two-row chunk and restores a captured row,
+     * while true decode runs the same stage one row at a time.  This test keeps
+     * n_k_heads != n_heads so the CPU deinterleave path exercises modular
+     * Q/K tiling instead of the simple zero-copy identity case.
+     */
+    std::vector<float> merged(static_cast<size_t>(seq_len) * qkv_stride);
+    std::vector<float> alpha(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> beta(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> a_log(n_heads);
+    std::vector<float> dt_bias(n_heads);
+    std::vector<float> initial_state(state_floats);
+
+    for (size_t i = 0; i < merged.size(); ++i)
+        merged[i] = 0.004f * static_cast<float>((i % 37) - 18);
+    for (size_t i = 0; i < alpha.size(); ++i)
+    {
+        alpha[i] = -0.18f + 0.011f * static_cast<float>(i % 19);
+        beta[i] = 0.09f - 0.007f * static_cast<float>(i % 23);
+    }
+    for (int h = 0; h < n_heads; ++h)
+    {
+        a_log[static_cast<size_t>(h)] = -0.45f - 0.015f * static_cast<float>(h);
+        dt_bias[static_cast<size_t>(h)] = 0.025f * static_cast<float>((h % 5) - 2);
+    }
+    for (int i = 0; i < state_floats; ++i)
+        initial_state[static_cast<size_t>(i)] =
+            0.0003f * static_cast<float>((i % 31) - 15);
+
+    auto merged_all = makeFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(qkv_stride)},
+        merged.data());
+    auto alpha_all = makeFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(n_heads)},
+        alpha.data());
+    auto beta_all = makeFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(n_heads)},
+        beta.data());
+    auto a_log_t = makeFP32({static_cast<size_t>(n_heads)}, a_log.data());
+    auto dt_bias_t = makeFP32({static_cast<size_t>(n_heads)}, dt_bias.data());
+    auto verifier_output = makeFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(output_stride)});
+
+    std::vector<float> verifier_state = initial_state;
+    auto ctx = makeCPUContext();
+
+    CPUGatedDeltaNet verifier_kernel;
+    GDNRecurrenceStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cpu();
+    verifier_p.kernel = &verifier_kernel;
+    verifier_p.Q = merged_all.get();
+    verifier_p.K = merged_all.get();
+    verifier_p.V = merged_all.get();
+    verifier_p.alpha = alpha_all.get();
+    verifier_p.beta = beta_all.get();
+    verifier_p.A_log = a_log_t.get();
+    verifier_p.dt_bias = dt_bias_t.get();
+    verifier_p.output = verifier_output.get();
+    verifier_p.recurrence_state = verifier_state.data();
+    verifier_p.seq_len = seq_len;
+    verifier_p.n_heads = n_heads;
+    verifier_p.n_k_heads = n_k_heads;
+    verifier_p.d_k = d_k;
+    verifier_p.d_v = d_v;
+    verifier_p.use_qk_l2norm = true;
+    verifier_p.verifier_state_capture_rows = seq_len;
+    verifier_p.speculative_state_slot_rows = seq_len;
+
+    GDNRecurrenceStage verifier_stage(verifier_p);
+    ASSERT_TRUE(verifier_stage.execute(ctx.get()));
+    EXPECT_EQ(verifier_state, initial_state)
+        << "Verifier chunk capture must not mutate live recurrence state";
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRow(1, nullptr));
+
+    std::vector<float> serial_state = initial_state;
+    std::vector<float> serial_output(static_cast<size_t>(seq_len) * output_stride);
+    CPUGatedDeltaNet serial_kernel;
+    for (int row = 0; row < seq_len; ++row)
+    {
+        auto merged_row = makeFP32(
+            {1, static_cast<size_t>(qkv_stride)},
+            merged.data() + static_cast<size_t>(row) * qkv_stride);
+        auto alpha_row = makeFP32(
+            {1, static_cast<size_t>(n_heads)},
+            alpha.data() + static_cast<size_t>(row) * n_heads);
+        auto beta_row = makeFP32(
+            {1, static_cast<size_t>(n_heads)},
+            beta.data() + static_cast<size_t>(row) * n_heads);
+        auto output_row = makeFP32({1, static_cast<size_t>(output_stride)});
+
+        GDNRecurrenceStage::Params serial_p = verifier_p;
+        serial_p.kernel = &serial_kernel;
+        serial_p.Q = merged_row.get();
+        serial_p.K = merged_row.get();
+        serial_p.V = merged_row.get();
+        serial_p.alpha = alpha_row.get();
+        serial_p.beta = beta_row.get();
+        serial_p.output = output_row.get();
+        serial_p.recurrence_state = serial_state.data();
+        serial_p.seq_len = 1;
+        serial_p.verifier_state_capture_rows = 0;
+        serial_p.speculative_state_slot_rows = 0;
+
+        GDNRecurrenceStage serial_stage(serial_p);
+        ASSERT_TRUE(serial_stage.execute(ctx.get())) << "row=" << row;
+        std::copy_n(output_row->data(),
+                    output_stride,
+                    serial_output.data() + static_cast<size_t>(row) * output_stride);
+    }
+
+    double max_state_diff = 0.0;
+    for (int i = 0; i < state_floats; ++i)
+    {
+        max_state_diff = std::max(
+            max_state_diff,
+            static_cast<double>(std::abs(
+                verifier_state[static_cast<size_t>(i)] -
+                serial_state[static_cast<size_t>(i)])));
+    }
+    EXPECT_LE(max_state_diff, 1e-7)
+        << "Restored verifier capture row must equal serial row-1 state";
+
+    const float *verifier_out = verifier_output->data();
+    double max_output_diff = 0.0;
+    for (size_t i = 0; i < serial_output.size(); ++i)
+    {
+        max_output_diff = std::max(
+            max_output_diff,
+            static_cast<double>(std::abs(verifier_out[i] - serial_output[i])));
+    }
+    EXPECT_LE(max_output_diff, 1e-7)
+        << "Two-row verifier outputs must match serial decode-stage outputs";
 }
 
 TEST(Test__GDNKernels, Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKernelDispatch)

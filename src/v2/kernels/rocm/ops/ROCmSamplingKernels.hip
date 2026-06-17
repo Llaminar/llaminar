@@ -1445,6 +1445,12 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_device_tok
     float residual_threshold2,
     float residual_threshold3,
     int row_count,
+    unsigned long long inverse_sample_seed,
+    int inverse_sample_first_logical_position,
+    int inverse_sample_vocab_size,
+    unsigned long long threshold_seed,
+    int threshold_first_logical_position,
+    int thresholds_from_seed,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
     float *__restrict__ out_accept_probability,
@@ -1472,22 +1478,73 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_device_tok
         residual_threshold = residual_threshold3;
     }
 
+    if (thresholds_from_seed)
+    {
+        const int logical_position = threshold_first_logical_position + row;
+        accept_threshold =
+            llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                threshold_seed,
+                logical_position,
+                1 /* MTPSpecStochasticDrawPurpose::Accept */);
+        residual_threshold =
+            llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                threshold_seed,
+                logical_position,
+                2 /* MTPSpecStochasticDrawPurpose::Residual */);
+    }
+
     const int offset = row * distribution_stride;
-    llaminar2::sampling_math::speculative_verify_with_thresholds_and_draft_probability(
-        target_token_ids + offset,
-        target_probs + offset,
-        draft_token_ids + offset,
-        draft_probs + offset,
-        k,
-        sampled_draft_tokens[row],
-        sampled_draft_probabilities ? sampled_draft_probabilities[row] : 0.0f,
-        sampled_draft_probabilities != nullptr,
-        accept_threshold,
-        residual_threshold,
-        out_token + row,
-        out_accepted + row,
-        out_accept_probability ? out_accept_probability + row : nullptr,
-        out_accept_threshold ? out_accept_threshold + row : nullptr);
+    if (!draft_token_ids && !draft_probs)
+    {
+        if (inverse_sample_vocab_size > 0)
+        {
+            llaminar2::sampling_math::speculative_verify_with_thresholds_one_hot_draft_vllm_recovered(
+                target_token_ids + offset,
+                target_probs + offset,
+                k,
+                inverse_sample_vocab_size,
+                sampled_draft_tokens[row],
+                accept_threshold,
+                inverse_sample_seed,
+                inverse_sample_first_logical_position + row,
+                out_token + row,
+                out_accepted + row,
+                out_accept_probability ? out_accept_probability + row : nullptr,
+                out_accept_threshold ? out_accept_threshold + row : nullptr);
+        }
+        else
+        {
+            llaminar2::sampling_math::speculative_verify_with_thresholds_one_hot_draft(
+                target_token_ids + offset,
+                target_probs + offset,
+                k,
+                sampled_draft_tokens[row],
+                accept_threshold,
+                residual_threshold,
+                out_token + row,
+                out_accepted + row,
+                out_accept_probability ? out_accept_probability + row : nullptr,
+                out_accept_threshold ? out_accept_threshold + row : nullptr);
+        }
+    }
+    else
+    {
+        llaminar2::sampling_math::speculative_verify_with_thresholds_and_draft_probability(
+            target_token_ids + offset,
+            target_probs + offset,
+            draft_token_ids + offset,
+            draft_probs + offset,
+            k,
+            sampled_draft_tokens[row],
+            sampled_draft_probabilities ? sampled_draft_probabilities[row] : 0.0f,
+            sampled_draft_probabilities != nullptr,
+            accept_threshold,
+            residual_threshold,
+            out_token + row,
+            out_accepted + row,
+            out_accept_probability ? out_accept_probability + row : nullptr,
+            out_accept_threshold ? out_accept_threshold + row : nullptr);
+    }
 }
 
 constexpr int PROCESSED_LOGIT_VERIFY_THREADS = 256;
@@ -3285,8 +3342,9 @@ __global__ void rocm_summarize_greedy_speculative_verify_batch_kernel(
         stop_token5,
         stop_token6,
         stop_token7};
+    const int sampled_first_token = draft_tokens ? draft_tokens[0] : first_token;
     llaminar2::sampling_math::summarize_greedy_speculative_verify_batch(
-        first_token,
+        sampled_first_token,
         verify_tokens,
         draft_tokens,
         compare_row_count,
@@ -3294,6 +3352,92 @@ __global__ void rocm_summarize_greedy_speculative_verify_batch_kernel(
         stop_token_count,
         out_tokens,
         out_meta);
+}
+
+/**
+ * @brief Derive publication rows/counts from compact speculative metadata.
+ *
+ * This ROCm companion to the CUDA helper keeps the state-publication math in
+ * shared SamplingMath. One HIP thread handles one request, writing the
+ * graph-resident row/count metadata consumed by later MTP publication stages.
+ */
+__global__ void rocm_derive_speculative_publication_metadata_kernel(
+    const int *__restrict__ meta,
+    int meta_stride,
+    const int *__restrict__ base_cached_tokens,
+    int request_count,
+    int padded_state_rows_per_request,
+    int max_state_commit_rows,
+    int *__restrict__ out_restore_rows,
+    int *__restrict__ out_target_cached_tokens,
+    int *__restrict__ out_accepted_state_counts,
+    int *__restrict__ out_ok,
+    int32_t *__restrict__ out_next_condition_tokens,
+    const int32_t *__restrict__ output_tokens,
+    int output_token_stride,
+    int *__restrict__ out_all_drafts_accepted_flags,
+    int *__restrict__ out_stopped_flags)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    const int base_cached_tokens_for_request =
+        base_cached_tokens ? base_cached_tokens[request_index] : -1;
+    llaminar2::sampling_math::derive_speculative_publication_metadata(
+        meta,
+        meta_stride,
+        request_index,
+        padded_state_rows_per_request,
+        base_cached_tokens_for_request,
+        max_state_commit_rows,
+        out_restore_rows ? out_restore_rows + request_index : nullptr,
+        out_target_cached_tokens ? out_target_cached_tokens + request_index : nullptr,
+        out_accepted_state_counts ? out_accepted_state_counts + request_index : nullptr,
+        out_ok ? out_ok + request_index : nullptr,
+        output_tokens,
+        output_token_stride,
+        out_next_condition_tokens ? out_next_condition_tokens + request_index : nullptr,
+        out_all_drafts_accepted_flags ? out_all_drafts_accepted_flags + request_index : nullptr,
+        out_stopped_flags ? out_stopped_flags + request_index : nullptr);
+}
+
+/**
+ * @brief Derive shifted MTP KV publication counts from compact metadata.
+ *
+ * One HIP thread handles one request. The shared SamplingMath helper owns the
+ * depth-dependent off-by-one rule so CUDA and ROCm update shifted sidecar
+ * caches identically.
+ */
+__global__ void rocm_derive_shifted_speculative_publication_metadata_kernel(
+    const int *__restrict__ meta,
+    int meta_stride,
+    const int *__restrict__ base_cached_tokens,
+    int request_count,
+    int padded_state_rows_per_request,
+    int max_state_commit_rows,
+    int mtp_depth,
+    int *__restrict__ out_target_cached_tokens,
+    int *__restrict__ out_accepted_state_counts,
+    int *__restrict__ out_ok)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    const int base_cached_tokens_for_request =
+        base_cached_tokens ? base_cached_tokens[request_index] : -1;
+    llaminar2::sampling_math::derive_shifted_speculative_publication_metadata(
+        meta,
+        meta_stride,
+        request_index,
+        padded_state_rows_per_request,
+        base_cached_tokens_for_request,
+        max_state_commit_rows,
+        mtp_depth,
+        out_target_cached_tokens ? out_target_cached_tokens + request_index : nullptr,
+        out_accepted_state_counts ? out_accepted_state_counts + request_index : nullptr,
+        out_ok ? out_ok + request_index : nullptr);
 }
 
 // ============================================================================
@@ -4286,6 +4430,12 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
     float residual_threshold2,
     float residual_threshold3,
     int row_count,
+    unsigned long long inverse_sample_seed,
+    int inverse_sample_first_logical_position,
+    int inverse_sample_vocab_size,
+    unsigned long long threshold_seed,
+    int threshold_first_logical_position,
+    int thresholds_from_seed,
     int *out_token,
     int *out_accepted,
     float *out_accept_probability,
@@ -4293,11 +4443,15 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
     int device_idx,
     void *stream)
 {
+    const bool has_draft_distribution =
+        draft_token_ids != nullptr && draft_probs != nullptr;
+    const bool has_one_hot_draft_distribution =
+        draft_token_ids == nullptr && draft_probs == nullptr;
     if (k <= 0 || k > TOPK_MAX_K ||
         distribution_stride < k ||
         row_count <= 0 || row_count > 4 ||
         !target_token_ids || !target_probs ||
-        !draft_token_ids || !draft_probs ||
+        (!has_draft_distribution && !has_one_hot_draft_distribution) ||
         !sampled_draft_tokens ||
         !out_token || !out_accepted || !stream)
     {
@@ -4326,6 +4480,12 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
         residual_threshold2,
         residual_threshold3,
         row_count,
+        inverse_sample_seed,
+        inverse_sample_first_logical_position,
+        inverse_sample_vocab_size,
+        threshold_seed,
+        threshold_first_logical_position,
+        thresholds_from_seed,
         out_token,
         out_accepted,
         out_accept_probability,
@@ -4812,6 +4972,131 @@ bool rocmOps_summarize_greedy_speculative_verify_batch(
     if (err != hipSuccess)
     {
         fprintf(stderr, "ROCm Greedy Speculative Verify Batch Summary kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_derive_speculative_publication_metadata(
+    const int *meta,
+    int meta_stride,
+    const int *base_cached_tokens,
+    int request_count,
+    int padded_state_rows_per_request,
+    int max_state_commit_rows,
+    int *out_restore_rows,
+    int *out_target_cached_tokens,
+    int *out_accepted_state_counts,
+    int *out_ok,
+    int *out_next_condition_tokens,
+    const int32_t *output_tokens,
+    int output_token_stride,
+    int *out_all_drafts_accepted_flags,
+    int *out_stopped_flags,
+    int device_idx,
+    void *stream)
+{
+    if (!meta || !base_cached_tokens ||
+        !out_restore_rows || !out_target_cached_tokens ||
+        !out_accepted_state_counts || !out_ok || !stream ||
+        ((out_next_condition_tokens || output_tokens) &&
+         (!out_next_condition_tokens || !output_tokens || output_token_stride <= 0)) ||
+        meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+        request_count <= 0 ||
+        padded_state_rows_per_request <= 0 ||
+        max_state_commit_rows < 0 ||
+        max_state_commit_rows > padded_state_rows_per_request)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads_per_block = 128;
+    const int blocks =
+        (request_count + threads_per_block - 1) / threads_per_block;
+    hipLaunchKernelGGL(
+        rocm_derive_speculative_publication_metadata_kernel,
+        dim3(blocks), dim3(threads_per_block), 0,
+        static_cast<hipStream_t>(stream),
+        meta,
+        meta_stride,
+        base_cached_tokens,
+        request_count,
+        padded_state_rows_per_request,
+        max_state_commit_rows,
+        out_restore_rows,
+        out_target_cached_tokens,
+        out_accepted_state_counts,
+        out_ok,
+        reinterpret_cast<int32_t *>(out_next_condition_tokens),
+        output_tokens,
+        output_token_stride,
+        out_all_drafts_accepted_flags,
+        out_stopped_flags);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Speculative Publication Metadata kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_derive_shifted_speculative_publication_metadata(
+    const int *meta,
+    int meta_stride,
+    const int *base_cached_tokens,
+    int request_count,
+    int padded_state_rows_per_request,
+    int max_state_commit_rows,
+    int mtp_depth,
+    int *out_target_cached_tokens,
+    int *out_accepted_state_counts,
+    int *out_ok,
+    int device_idx,
+    void *stream)
+{
+    if (!meta || !base_cached_tokens ||
+        !out_target_cached_tokens ||
+        !out_accepted_state_counts ||
+        !out_ok ||
+        !stream ||
+        meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+        request_count <= 0 ||
+        padded_state_rows_per_request <= 0 ||
+        max_state_commit_rows < 0 ||
+        max_state_commit_rows > padded_state_rows_per_request ||
+        mtp_depth < 0)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads_per_block = 128;
+    const int blocks =
+        (request_count + threads_per_block - 1) / threads_per_block;
+    hipLaunchKernelGGL(
+        rocm_derive_shifted_speculative_publication_metadata_kernel,
+        dim3(blocks), dim3(threads_per_block), 0,
+        static_cast<hipStream_t>(stream),
+        meta,
+        meta_stride,
+        base_cached_tokens,
+        request_count,
+        padded_state_rows_per_request,
+        max_state_commit_rows,
+        mtp_depth,
+        out_target_cached_tokens,
+        out_accepted_state_counts,
+        out_ok);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Shifted Speculative Publication Metadata kernel launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }

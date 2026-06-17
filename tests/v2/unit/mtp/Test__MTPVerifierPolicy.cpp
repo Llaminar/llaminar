@@ -94,7 +94,7 @@ TEST(Test__MTPVerifierPolicy, StochasticCanUseAllPositionStatePublicationWhenRun
         "stochastic_uses_all_position_state_publication");
 }
 
-TEST(Test__MTPVerifierPolicy, GreedyPenaltiesAreUnsupportedUntilTransactionPathExists)
+TEST(Test__MTPVerifierPolicy, GreedyPenaltiesUseDecodeEquivalentSequentialPath)
 {
     const MTPVerifierPolicyDecision decision =
         chooseMTPVerifierPolicy(
@@ -105,11 +105,30 @@ TEST(Test__MTPVerifierPolicy, GreedyPenaltiesAreUnsupportedUntilTransactionPathE
 
     EXPECT_EQ(
         decision.path,
-        MTPVerifierExecutionPath::Unsupported);
+        MTPVerifierExecutionPath::DecodeEquivalentSequential);
     EXPECT_TRUE(decision.accepted_all_position_state_requires_replay);
     EXPECT_STREQ(
         decision.reason,
-        "greedy_penalty_mtp_requires_new_transaction_path");
+        "greedy_penalties_use_shared_decode_equivalent_verifier");
+}
+
+TEST(Test__MTPVerifierPolicy, GreedyPenaltiesDoNotUseAllPositionPublication)
+{
+    const MTPVerifierPolicyDecision decision =
+        chooseMTPVerifierPolicy(
+            MTPVerifierPolicyInput{
+                .greedy_sampling = true,
+                .uses_sampling_penalties = true,
+                .supports_spec_state_publication = true,
+            });
+
+    EXPECT_EQ(
+        decision.path,
+        MTPVerifierExecutionPath::DecodeEquivalentSequential);
+    EXPECT_TRUE(decision.accepted_all_position_state_requires_replay);
+    EXPECT_STREQ(
+        decision.reason,
+        "greedy_penalties_use_shared_decode_equivalent_verifier");
 }
 
 TEST(Test__MTPVerifierPolicy, NonGreedyWithoutStochasticVerifierIsUnsupported)

@@ -87,7 +87,8 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device,
-            const std::vector<int> *sequence_lengths = nullptr) override;
+            const std::vector<int> *sequence_lengths = nullptr,
+            const void *position_ids_device = nullptr) override;
 
         ComputeGraph buildMTPGraph(
             int depth_idx,
@@ -140,6 +141,7 @@ namespace llaminar2
             int batch_size,
             IKVCache *kv_cache,
             const int *position_ids,
+            const void *position_ids_device,
             DeviceId device,
             const std::vector<int> *sequence_lengths,
             const std::string &stage_prefix_override = {},
@@ -153,6 +155,7 @@ namespace llaminar2
             int batch_size,
             IKVCache *kv_cache,
             const int *position_ids,
+            const void *position_ids_device,
             DeviceId device,
             const std::string &stage_prefix_override = {},
             bool layer_idx_is_cache_local = false);

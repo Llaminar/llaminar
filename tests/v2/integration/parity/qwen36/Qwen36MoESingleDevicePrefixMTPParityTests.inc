@@ -14,6 +14,14 @@
 #error "QWEN36_MOE_PREFIX_MTP_DEPTH3_CASE must be defined before including this file"
 #endif
 
+#ifndef QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION
+#define QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION 0
+#endif
+
+#ifndef QWEN36_MOE_PREFIX_MTP_EXPECTS_PERSISTENT_SIDECAR_METADATA
+#define QWEN36_MOE_PREFIX_MTP_EXPECTS_PERSISTENT_SIDECAR_METADATA 0
+#endif
+
 TEST(QWEN36_MOE_PREFIX_MTP_SUITE, PrefixRestoreFullHit)
 {
     runMoEPrefixRestoreParity(
@@ -81,11 +89,100 @@ TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPBenchmarkStyleDepth1EightTokensMatchesRefer
         true);
 }
 
+#if QWEN36_MOE_PREFIX_MTP_EXPECTS_PERSISTENT_SIDECAR_METADATA
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPBenchmarkStyleUsesPersistentMoESidecarMetadata)
+{
+    runMoEMTPPersistentSidecarMetadataParity(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE());
+}
+#endif
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, VerifierRowsDecodeEquivalentM1)
+{
+    runMoEMainVerifierDecodeEquivalentRowsMatchSerialDecode(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        1);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, VerifierRowsDecodeEquivalentM2)
+{
+    runMoEMainVerifierDecodeEquivalentRowsMatchSerialDecode(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        2);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, VerifierRowsDecodeEquivalentM3)
+{
+    runMoEMainVerifierDecodeEquivalentRowsMatchSerialDecode(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        3);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, VerifierRowsDecodeEquivalentM4)
+{
+    runMoEMainVerifierDecodeEquivalentRowsMatchSerialDecode(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        4);
+}
+
+#if QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION
 TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierAllPositionRowsMatchSerialDecode)
 {
     runMoEMainVerifierAllPositionRowsMatchSerialDecode(
         QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE());
 }
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierRowIndexedAllPositionRowsMatchSerialDecode)
+{
+    runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        true);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierRowIndexedSkipGatherRowsMatchSerialDecode)
+{
+    runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        true,
+        true);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierCompactDeviceOutcomeMatchesRowArgmax)
+{
+    runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        true,
+        true,
+        true);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierDeferredCompactOutcomeMatchesRowArgmax)
+{
+    runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        true,
+        true,
+        true,
+        true);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierPublishedStateMatchesSerialContinuation)
+{
+    runMoEMainVerifierAllPositionRowsMatchSerialDecode(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        true,
+        true,
+        true,
+        true,
+        true);
+}
+#else
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierUsesDecodeEquivalentReplayWhenPublicationUnsupported)
+{
+    runMoEMainVerifierUsesDecodeEquivalentReplayWhenPublicationUnsupported(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE());
+}
+#endif
 
 TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPBudgetLimitedOneTokenStepsMatchReference)
 {
@@ -133,4 +230,6 @@ TEST(QWEN36_MOE_PREFIX_MTP_SUITE, NoMTPBenchmarkStyleSkipGatherGreedyMatchesGath
 #undef QWEN36_MOE_PREFIX_MTP_DEPTH3_CASE
 #undef QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE
 #undef QWEN36_MOE_PREFIX_MTP_CASE
+#undef QWEN36_MOE_PREFIX_MTP_EXPECTS_SIDECAR_REPLAY_PRESERVED
+#undef QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION
 #undef QWEN36_MOE_PREFIX_MTP_SUITE

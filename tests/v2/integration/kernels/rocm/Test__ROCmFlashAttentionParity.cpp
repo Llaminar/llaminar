@@ -26,10 +26,13 @@
 
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/compute_stages/stages/AttentionComputeStage.h"
+#include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "kernels/KernelFactory.h"
 #include "loaders/ModelContext.h"
 #include "transfer/TransferEngine.h"
 #include "utils/MPIContext.h"
@@ -49,6 +52,7 @@
 #include <iostream>
 #include <iomanip>
 #include <limits>
+#include <cstring>
 
 using namespace llaminar2;
 
@@ -331,6 +335,14 @@ protected:
             workspace_.reset();
         }
     }
+
+    void runAttentionStageFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        MPIContext &mpi_ctx,
+        int seq_len);
+
+    void runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        MPIContext &mpi_ctx,
+        int seq_len);
 #endif
 };
 
@@ -1481,6 +1493,625 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_MultiRowContinua
 
     cleanupWorkspace(rocm_kernel);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+void runQwen36DeviceDerivedRowsMatchSerialDecode(
+    MPIContext &mpi_ctx,
+    int seq_len)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    /*
+     * Mirror the CUDA Qwen3.6 verifier regression for every production MTP
+     * verifier depth.  The all-position verifier derives per-row attention
+     * params from the device-side KV count after the append stage, then each
+     * row must equal a serial one-token decode at its row-local KV length.
+     */
+    constexpr int kv_len = 599;
+    constexpr int n_heads = 16;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 256;
+    const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
+    const size_t kv_cols = static_cast<size_t>(n_kv_heads) * head_dim;
+    const size_t q_size = static_cast<size_t>(seq_len) * q_cols;
+    const size_t kv_size = static_cast<size_t>(kv_len) * kv_cols;
+
+    std::mt19937 rng(static_cast<unsigned>(42 + seq_len));
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    auto random_scaled = [&](size_t count) {
+        std::vector<float> data(count);
+        for (float &value : data)
+            value = dist(rng) * 0.25f;
+        return data;
+    };
+
+    auto Q_data = random_scaled(q_size);
+    auto K_data_fp32 = random_scaled(kv_size);
+    auto V_data_fp32 = random_scaled(kv_size);
+    std::vector<uint16_t> K_data_fp16(kv_size);
+    std::vector<uint16_t> V_data_fp16(kv_size);
+    quantizeToFP16(K_data_fp32.data(), K_data_fp16.data(), kv_size);
+    quantizeToFP16(V_data_fp32.data(), V_data_fp16.data(), kv_size);
+
+    auto q_grouped_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
+    auto k_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), kv_cols},
+        K_data_fp16);
+    auto v_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), kv_cols},
+        V_data_fp16);
+    auto out_grouped_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
+    std::copy(Q_data.begin(), Q_data.end(), q_grouped_tensor->mutable_data());
+
+    const DeviceId gpu_device = DeviceId::rocm(0);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+    auto &transfer = TransferEngine::instance();
+    ASSERT_TRUE(transfer.uploadFull(q_grouped_tensor.get(), gpu_device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(k_tensor.get(), gpu_device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(v_tensor.get(), gpu_device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(out_grouped_tensor.get(), gpu_device, stream).success);
+
+    int *d_cached_tokens = nullptr;
+    ASSERT_EQ(hipMalloc(&d_cached_tokens, sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(d_cached_tokens, &kv_len, sizeof(int),
+                             hipMemcpyHostToDevice, stream),
+              hipSuccess);
+
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    rocm_kernel.setGPUStream(stream);
+    auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len, n_heads, head_dim);
+    DeviceWorkspaceManager workspace(
+        gpu_device,
+        std::max(reqs.total_bytes_with_alignment() + 1024 * 1024,
+                 static_cast<size_t>(16 * 1024 * 1024)));
+    ASSERT_TRUE(workspace.allocate(reqs));
+    rocm_kernel.bindWorkspace(&workspace);
+    ASSERT_TRUE(rocm_kernel.prepareDynamicAttnParamsFromDeviceSequenceState(
+        d_cached_tokens, seq_len, seq_len, stream));
+    ASSERT_TRUE(rocm_kernel.compute_tensor(
+        q_grouped_tensor.get(), k_tensor.get(), v_tensor.get(), out_grouped_tensor.get(),
+        1, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+        true, -1, nullptr, nullptr, &mpi_ctx, 0,
+        0, n_heads, n_kv_heads, n_heads / n_kv_heads));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    std::vector<float> grouped_output(q_size, 0.0f);
+    ASSERT_EQ(hipMemcpyAsync(grouped_output.data(), out_grouped_tensor->gpu_data_ptr(),
+                             q_size * sizeof(float), hipMemcpyDeviceToHost, stream),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    for (int row = 0; row < seq_len; ++row)
+    {
+        auto q_m1_tensor = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, q_cols});
+        auto out_m1_tensor = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, q_cols});
+        std::memcpy(q_m1_tensor->mutable_data(),
+                    Q_data.data() + static_cast<size_t>(row) * q_cols,
+                    q_cols * sizeof(float));
+
+        ASSERT_TRUE(transfer.uploadFull(q_m1_tensor.get(), gpu_device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(out_m1_tensor.get(), gpu_device, stream).success);
+
+        const int row_kv_len = std::max(1, kv_len - (seq_len - 1 - row));
+        ASSERT_TRUE(rocm_kernel.prepareDynamicAttnParams(
+            row_kv_len, row_kv_len - 1, 1, stream));
+        ASSERT_TRUE(rocm_kernel.compute_tensor(
+            q_m1_tensor.get(), k_tensor.get(), v_tensor.get(), out_m1_tensor.get(),
+            1, 1, row_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            true, -1, nullptr, nullptr, &mpi_ctx, 0,
+            0, n_heads, n_kv_heads, n_heads / n_kv_heads))
+            << "single-row ROCm decode attention failed for row " << row;
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        std::vector<float> m1_output(q_cols, 0.0f);
+        ASSERT_EQ(hipMemcpyAsync(m1_output.data(), out_m1_tensor->gpu_data_ptr(),
+                                 q_cols * sizeof(float), hipMemcpyDeviceToHost, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        const float *grouped_row = grouped_output.data() + static_cast<size_t>(row) * q_cols;
+        const double cosine = cosineSimilarity(grouped_row, m1_output.data(), q_cols);
+        const double l2_error = relativeL2Error(grouped_row, m1_output.data(), q_cols);
+        const double max_error = maxAbsError(grouped_row, m1_output.data(), q_cols);
+        const std::string label =
+            "FlashDecode native FP16 KV Qwen3.6 M" + std::to_string(seq_len) +
+            " device-derived vs M1";
+        std::cout << "  " << label << ": "
+                  << "cosine=" << std::fixed << std::setprecision(6) << cosine
+                  << ", L2_error=" << std::scientific << std::setprecision(3) << l2_error
+                  << ", max_error=" << max_error
+                  << ", count=" << q_cols
+                  << std::endl;
+        EXPECT_GE(cosine, 0.999999)
+            << "ROCm Qwen3.6 M=" << seq_len << " verifier attention row " << row
+            << " diverges from serial decode attention";
+        EXPECT_LE(l2_error, 1e-5)
+            << "ROCm Qwen3.6 M=" << seq_len << " verifier attention row " << row
+            << " relative L2 differs from serial decode attention";
+    }
+
+    rocm_kernel.unbindWorkspace();
+    hipFree(d_cached_tokens);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_Qwen36M2DeviceDerivedRowsMatchSerialDecode)
+{
+    runQwen36DeviceDerivedRowsMatchSerialDecode(mpi_ctx_, 2);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_Qwen36M3DeviceDerivedRowsMatchSerialDecode)
+{
+    runQwen36DeviceDerivedRowsMatchSerialDecode(mpi_ctx_, 3);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_Qwen36M4DeviceDerivedRowsMatchSerialDecode)
+{
+    runQwen36DeviceDerivedRowsMatchSerialDecode(mpi_ctx_, 4);
+}
+
+void Test__ROCmFlashAttentionParity::runAttentionStageFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+    MPIContext &mpi_ctx,
+    int seq_len)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    /*
+     * Keep the production verifier boundary under test: the stage consumes
+     * K/V from the ring cache, asks the cache for the RoPE-on-read FP16 shadow,
+     * and derives one dynamic attention param row per verifier row from the
+     * cache's device-side token count.  The result must equal serial one-row
+     * decode at each row-local KV length.
+     */
+    constexpr int kv_len = 599;
+    constexpr int n_heads = 16;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 256;
+    constexpr float rope_theta = 10000000.0f;
+    constexpr float partial_rotary_factor = 0.25f;
+    const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
+    const size_t kv_cols = static_cast<size_t>(n_kv_heads) * head_dim;
+    const size_t q_size = static_cast<size_t>(seq_len) * q_cols;
+    const size_t kv_size = static_cast<size_t>(kv_len) * kv_cols;
+
+    auto Q_data = randomFP32Scaled(q_size, 0.25f);
+    auto K_data_fp32 = randomFP32Scaled(kv_size, 0.25f);
+    auto V_data_fp32 = randomFP32Scaled(kv_size, 0.25f);
+    std::vector<uint16_t> K_data_fp16(kv_size);
+    std::vector<uint16_t> V_data_fp16(kv_size);
+    quantizeToFP16(K_data_fp32.data(), K_data_fp16.data(), kv_size);
+    quantizeToFP16(V_data_fp32.data(), V_data_fp16.data(), kv_size);
+
+    const DeviceId device = DeviceId::rocm(0);
+    auto q_grouped_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
+    auto k_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), kv_cols},
+        K_data_fp16);
+    auto v_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), kv_cols},
+        V_data_fp16);
+    auto out_grouped_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
+    std::copy(Q_data.begin(), Q_data.end(), q_grouped_tensor->mutable_data());
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+    auto &transfer = TransferEngine::instance();
+    ASSERT_TRUE(transfer.uploadFull(q_grouped_tensor.get(), device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(k_tensor.get(), device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(v_tensor.get(), device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(out_grouped_tensor.get(), device, stream).success);
+
+    llaminar::v2::kernels::KVCacheConfig config;
+    config.precision = ActivationPrecision::FP16;
+    config.device = device;
+    config.num_layers = 1;
+    config.batch_size = 1;
+    config.max_seq_len = kv_len + 8;
+    config.n_kv_heads = n_kv_heads;
+    config.head_dim = head_dim;
+    auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(config);
+    ASSERT_NE(kv_cache, nullptr);
+    ASSERT_TRUE(kv_cache->appendWithStream(0, 0, k_tensor.get(), v_tensor.get(), kv_len, stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), kv_len);
+    ASSERT_NE(kv_cache->deviceCachedTokenCountPtr(0, 0), nullptr);
+
+    AttentionComputeStage::Params params;
+    params.device_id = device;
+    params.Q = q_grouped_tensor.get();
+    params.K = k_tensor.get();
+    params.V = v_tensor.get();
+    params.output = out_grouped_tensor.get();
+    params.batch_size = 1;
+    params.seq_len = seq_len;
+    params.kv_len = kv_len;
+    params.n_heads = n_heads;
+    params.n_kv_heads = n_kv_heads;
+    params.head_dim = head_dim;
+    params.causal = true;
+    params.auto_detect_mode = true;
+    params.kv_cache = kv_cache.get();
+    params.layer_idx = 0;
+    params.read_kv_from_cache = true;
+    params.apply_rope_to_k = true;
+    params.rope_theta = rope_theta;
+    params.partial_rotary_factor = partial_rotary_factor;
+    params.mpi_ctx = &mpi_ctx;
+
+    AttentionComputeStage stage(params);
+    stage.setGPUStream(stream);
+    const WorkspaceRequirements stage_reqs =
+        stage.getWorkspaceRequirements(/*m=*/1, /*n=*/n_heads, /*k=*/head_dim);
+    DeviceWorkspaceManager stage_workspace(
+        device, stage_reqs.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(stage_workspace.allocate(stage_reqs));
+    stage.bindWorkspace(&stage_workspace);
+
+    ASSERT_TRUE(stage.execute(nullptr));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    std::vector<float> grouped_output(q_size, 0.0f);
+    ASSERT_EQ(hipMemcpyAsync(grouped_output.data(), out_grouped_tensor->gpu_data_ptr(),
+                             q_size * sizeof(float), hipMemcpyDeviceToHost, stream),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    IKVCache::KVReadParams read_params;
+    read_params.rope_theta = rope_theta;
+    read_params.position_start = 0;
+    read_params.n_kv_heads = n_kv_heads;
+    read_params.head_dim = head_dim;
+    read_params.rope_dim = static_cast<int>(partial_rotary_factor * head_dim);
+    read_params.gpu_stream = stream;
+    ITensor *cache_k = nullptr;
+    ITensor *cache_v = nullptr;
+    int cache_kv_len = 0;
+    ASSERT_TRUE(kv_cache->get_kv_converted(
+        0, 0, ActivationPrecision::FP16, &cache_k, &cache_v, &cache_kv_len, &read_params));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(cache_kv_len, kv_len);
+    ASSERT_NE(cache_k, nullptr);
+    ASSERT_NE(cache_v, nullptr);
+
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> serial_kernel(0);
+    serial_kernel.setGPUStream(stream);
+    ASSERT_TRUE(setupWorkspace(serial_kernel, 1, n_heads, head_dim));
+
+    for (int row = 0; row < seq_len; ++row)
+    {
+        auto q_m1_tensor = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, q_cols});
+        auto out_m1_tensor = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, q_cols});
+        std::memcpy(q_m1_tensor->mutable_data(),
+                    Q_data.data() + static_cast<size_t>(row) * q_cols,
+                    q_cols * sizeof(float));
+
+        ASSERT_TRUE(transfer.uploadFull(q_m1_tensor.get(), device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(out_m1_tensor.get(), device, stream).success);
+
+        const int row_kv_len = std::max(1, kv_len - (seq_len - 1 - row));
+        ASSERT_TRUE(serial_kernel.prepareDynamicAttnParams(row_kv_len, row_kv_len - 1, 1, stream));
+        ASSERT_TRUE(serial_kernel.compute_tensor(
+            q_m1_tensor.get(), cache_k, cache_v, out_m1_tensor.get(),
+            1, 1, row_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            true, -1, nullptr, nullptr, &mpi_ctx, 0,
+            0, n_heads, n_kv_heads, n_heads / n_kv_heads));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        std::vector<float> m1_output(q_cols, 0.0f);
+        ASSERT_EQ(hipMemcpyAsync(m1_output.data(), out_m1_tensor->gpu_data_ptr(),
+                                 q_cols * sizeof(float), hipMemcpyDeviceToHost, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        const float *grouped_row = grouped_output.data() + static_cast<size_t>(row) * q_cols;
+        const double cosine = cosineSimilarity(grouped_row, m1_output.data(), q_cols);
+        const double l2_error = relativeL2Error(grouped_row, m1_output.data(), q_cols);
+        const double max_error = maxAbsError(grouped_row, m1_output.data(), q_cols);
+        const std::string label = "AttentionStage FP16 cache Qwen3.6 M" +
+                                  std::to_string(seq_len) +
+                                  " RoPE-on-read vs M1";
+        printComparisonStats(label.c_str(), cosine, l2_error, max_error, q_cols);
+        EXPECT_GE(cosine, 0.999999)
+            << "ROCm stage M=" << seq_len << " row " << row << " must match serial decode";
+        EXPECT_LE(l2_error, 1e-5)
+            << "ROCm stage M=" << seq_len << " row " << row
+            << " relative L2 differs from serial decode";
+    }
+
+    cleanupWorkspace(serial_kernel);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, AttentionStage_FP16Cache_Qwen36M2RoPEOnReadRowsMatchSerialDecode)
+{
+    runAttentionStageFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(mpi_ctx_, 2);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, AttentionStage_FP16Cache_Qwen36M3RoPEOnReadRowsMatchSerialDecode)
+{
+    runAttentionStageFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(mpi_ctx_, 3);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, AttentionStage_FP16Cache_Qwen36M4RoPEOnReadRowsMatchSerialDecode)
+{
+    runAttentionStageFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(mpi_ctx_, 4);
+}
+
+void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+    MPIContext &mpi_ctx,
+    int seq_len)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    /*
+     * Regression for vLLM-style all-position verifier capture: the graph
+     * records KV append for the current verifier rows and then consumes the
+     * same cache through AttentionComputeStage.  Warming the RoPE-on-read
+     * shadow at the history length exercises the incremental cache-shadow path
+     * that real decode graphs use before adding the verifier rows.
+     */
+    const int history_len = 599 - seq_len;
+    const int kv_len = history_len + seq_len;
+    constexpr int n_heads = 16;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 256;
+    constexpr float rope_theta = 10000000.0f;
+    constexpr float partial_rotary_factor = 0.25f;
+    const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
+    const size_t kv_cols = static_cast<size_t>(n_kv_heads) * head_dim;
+    const size_t q_size = static_cast<size_t>(seq_len) * q_cols;
+    const size_t kv_size = static_cast<size_t>(kv_len) * kv_cols;
+    const size_t history_size = static_cast<size_t>(history_len) * kv_cols;
+
+    auto Q_data = randomFP32Scaled(q_size, 0.25f);
+    auto K_data_fp32 = randomFP32Scaled(kv_size, 0.25f);
+    auto V_data_fp32 = randomFP32Scaled(kv_size, 0.25f);
+    std::vector<uint16_t> K_data_fp16(kv_size);
+    std::vector<uint16_t> V_data_fp16(kv_size);
+    quantizeToFP16(K_data_fp32.data(), K_data_fp16.data(), kv_size);
+    quantizeToFP16(V_data_fp32.data(), V_data_fp16.data(), kv_size);
+
+    const DeviceId device = DeviceId::rocm(0);
+    auto q_grouped_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
+    auto history_k_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(history_len), kv_cols},
+        std::vector<uint16_t>(K_data_fp16.begin(), K_data_fp16.begin() + static_cast<std::ptrdiff_t>(history_size)));
+    auto history_v_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(history_len), kv_cols},
+        std::vector<uint16_t>(V_data_fp16.begin(), V_data_fp16.begin() + static_cast<std::ptrdiff_t>(history_size)));
+    auto current_k_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), kv_cols},
+        std::vector<uint16_t>(K_data_fp16.begin() + static_cast<std::ptrdiff_t>(history_size), K_data_fp16.end()));
+    auto current_v_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), kv_cols},
+        std::vector<uint16_t>(V_data_fp16.begin() + static_cast<std::ptrdiff_t>(history_size), V_data_fp16.end()));
+    auto full_k_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), kv_cols},
+        K_data_fp16);
+    auto full_v_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), kv_cols},
+        V_data_fp16);
+    auto out_grouped_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
+    std::copy(Q_data.begin(), Q_data.end(), q_grouped_tensor->mutable_data());
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+    auto &transfer = TransferEngine::instance();
+    ASSERT_TRUE(transfer.uploadFull(q_grouped_tensor.get(), device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(history_k_tensor.get(), device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(history_v_tensor.get(), device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(current_k_tensor.get(), device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(current_v_tensor.get(), device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(full_k_tensor.get(), device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(full_v_tensor.get(), device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(out_grouped_tensor.get(), device, stream).success);
+
+    llaminar::v2::kernels::KVCacheConfig config;
+    config.precision = ActivationPrecision::FP16;
+    config.device = device;
+    config.num_layers = 1;
+    config.batch_size = 1;
+    config.max_seq_len = kv_len + 8;
+    config.n_kv_heads = n_kv_heads;
+    config.head_dim = head_dim;
+    auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(config);
+    ASSERT_NE(kv_cache, nullptr);
+    ASSERT_TRUE(kv_cache->appendWithStream(0, 0, history_k_tensor.get(), history_v_tensor.get(), history_len, stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), history_len);
+
+    IKVCache::KVReadParams warm_read_params;
+    warm_read_params.rope_theta = rope_theta;
+    warm_read_params.position_start = 0;
+    warm_read_params.n_kv_heads = n_kv_heads;
+    warm_read_params.head_dim = head_dim;
+    warm_read_params.rope_dim = static_cast<int>(partial_rotary_factor * head_dim);
+    warm_read_params.gpu_stream = stream;
+    ITensor *warm_k = nullptr;
+    ITensor *warm_v = nullptr;
+    int warm_len = 0;
+    ASSERT_TRUE(kv_cache->get_kv_converted(
+        0, 0, ActivationPrecision::FP16, &warm_k, &warm_v, &warm_len, &warm_read_params));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(warm_len, history_len);
+
+    AttentionComputeStage::Params attn_params;
+    attn_params.device_id = device;
+    attn_params.Q = q_grouped_tensor.get();
+    attn_params.K = current_k_tensor.get();
+    attn_params.V = current_v_tensor.get();
+    attn_params.output = out_grouped_tensor.get();
+    attn_params.batch_size = 1;
+    attn_params.seq_len = seq_len;
+    attn_params.kv_len = kv_len;
+    attn_params.n_heads = n_heads;
+    attn_params.n_kv_heads = n_kv_heads;
+    attn_params.head_dim = head_dim;
+    attn_params.causal = true;
+    attn_params.auto_detect_mode = true;
+    attn_params.kv_cache = kv_cache.get();
+    attn_params.layer_idx = 0;
+    attn_params.read_kv_from_cache = true;
+    attn_params.apply_rope_to_k = true;
+    attn_params.rope_theta = rope_theta;
+    attn_params.partial_rotary_factor = partial_rotary_factor;
+    attn_params.mpi_ctx = &mpi_ctx;
+
+    KVCacheAppendStage::Params append_params;
+    append_params.device_id = device;
+    append_params.K = current_k_tensor.get();
+    append_params.V = current_v_tensor.get();
+    append_params.kv_cache = kv_cache.get();
+    append_params.layer_idx = 0;
+    append_params.seq_idx = 0;
+    append_params.num_tokens = seq_len;
+    append_params.batch_size = 1;
+    append_params.seq_len = seq_len;
+    append_params.head_dim = head_dim;
+
+    KVCacheAppendStage append_stage(append_params);
+    AttentionComputeStage attn_stage(attn_params);
+    append_stage.setGPUStream(stream);
+    attn_stage.setGPUStream(stream);
+
+    const WorkspaceRequirements attn_reqs =
+        attn_stage.getWorkspaceRequirements(/*m=*/seq_len, /*n=*/n_heads, /*k=*/head_dim);
+    DeviceWorkspaceManager attn_workspace(device, attn_reqs.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(attn_workspace.allocate(attn_reqs));
+    attn_stage.bindWorkspace(&attn_workspace);
+
+    append_stage.updateDynamicParams(/*pos_offset=*/0, seq_len);
+    attn_stage.updateDynamicParams(history_len, seq_len);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+    bool capture_ok = false;
+    {
+        GraphCaptureGuard guard(/*host_bookkeeping=*/true);
+        capture_ok = append_stage.execute(nullptr) && attn_stage.execute(nullptr);
+    }
+    ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+    ASSERT_TRUE(capture_ok);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), hipSuccess);
+    ASSERT_NE(graph_exec, nullptr);
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), kv_len);
+
+    std::vector<float> grouped_output(q_size, 0.0f);
+    ASSERT_EQ(hipMemcpyAsync(grouped_output.data(), out_grouped_tensor->gpu_data_ptr(),
+                             q_size * sizeof(float), hipMemcpyDeviceToHost, stream),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    auto ref_cache = llaminar::v2::kernels::KernelFactory::createKVCache(config);
+    ASSERT_NE(ref_cache, nullptr);
+    ASSERT_TRUE(ref_cache->appendWithStream(0, 0, full_k_tensor.get(), full_v_tensor.get(), kv_len, stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    ITensor *cache_k = nullptr;
+    ITensor *cache_v = nullptr;
+    int cache_kv_len = 0;
+    ASSERT_TRUE(ref_cache->get_kv_converted(
+        0, 0, ActivationPrecision::FP16, &cache_k, &cache_v, &cache_kv_len, &warm_read_params));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(cache_kv_len, kv_len);
+
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> serial_kernel(0);
+    serial_kernel.setGPUStream(stream);
+    ASSERT_TRUE(setupWorkspace(serial_kernel, 1, n_heads, head_dim));
+
+    for (int row = 0; row < seq_len; ++row)
+    {
+        auto q_m1_tensor = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, q_cols});
+        auto out_m1_tensor = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, q_cols});
+        std::memcpy(q_m1_tensor->mutable_data(),
+                    Q_data.data() + static_cast<size_t>(row) * q_cols,
+                    q_cols * sizeof(float));
+        ASSERT_TRUE(transfer.uploadFull(q_m1_tensor.get(), device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(out_m1_tensor.get(), device, stream).success);
+
+        const int row_kv_len = std::max(1, kv_len - (seq_len - 1 - row));
+        ASSERT_TRUE(serial_kernel.prepareDynamicAttnParams(row_kv_len, row_kv_len - 1, 1, stream));
+        ASSERT_TRUE(serial_kernel.compute_tensor(
+            q_m1_tensor.get(), cache_k, cache_v, out_m1_tensor.get(),
+            1, 1, row_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            true, -1, nullptr, nullptr, &mpi_ctx, 0,
+            0, n_heads, n_kv_heads, n_heads / n_kv_heads));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        std::vector<float> m1_output(q_cols, 0.0f);
+        ASSERT_EQ(hipMemcpyAsync(m1_output.data(), out_m1_tensor->gpu_data_ptr(),
+                                 q_cols * sizeof(float), hipMemcpyDeviceToHost, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        const float *grouped_row = grouped_output.data() + static_cast<size_t>(row) * q_cols;
+        const double cosine = cosineSimilarity(grouped_row, m1_output.data(), q_cols);
+        const double l2_error = relativeL2Error(grouped_row, m1_output.data(), q_cols);
+        const double max_error = maxAbsError(grouped_row, m1_output.data(), q_cols);
+        const std::string label = "Captured append+attention FP16 cache Qwen3.6 M" +
+                                  std::to_string(seq_len) +
+                                  " RoPE-on-read vs M1";
+        printComparisonStats(label.c_str(), cosine, l2_error, max_error, q_cols);
+        EXPECT_GE(cosine, 0.999999)
+            << "ROCm captured append+attention M=" << seq_len << " row " << row
+            << " must match serial decode";
+        EXPECT_LE(l2_error, 1e-5)
+            << "ROCm captured append+attention M=" << seq_len << " row " << row
+            << " relative L2 differs from serial decode";
+    }
+
+    cleanupWorkspace(serial_kernel);
+    ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+    ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36M2RoPEOnReadRowsMatchSerialDecode)
+{
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(mpi_ctx_, 2);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36M3RoPEOnReadRowsMatchSerialDecode)
+{
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(mpi_ctx_, 3);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36M4RoPEOnReadRowsMatchSerialDecode)
+{
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(mpi_ctx_, 4);
 }
 
 TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)

@@ -53,6 +53,14 @@ extern "C"
     void cudaGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void cudaGDN_gpu_set_device(int ordinal);
     void cudaGDN_stream_synchronize(void *stream);
+    bool cudaGDN_gpu_copy_capture_row_from_device_index(
+        float *dst,
+        const float *capture,
+        const int *device_row_index,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream);
 }
 
 namespace llaminar2
@@ -88,7 +96,6 @@ namespace llaminar2
 
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
         {
-            (void)dst_state;
             if (!gpu_state_ || !verifier_state_capture_ ||
                 row < 0 || row >= verifier_state_capture_rows_ ||
                 verifier_state_capture_size_ != state_size_)
@@ -101,9 +108,56 @@ namespace llaminar2
                 verifier_state_capture_ +
                 static_cast<size_t>(row) * static_cast<size_t>(verifier_state_capture_size_);
             if (stream)
+            {
                 cudaGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
+                if (dst_state)
+                {
+                    /*
+                     * Keep the hybrid cache's host conv-state mirror aligned
+                     * with the device state restored for graph replay.  A graph
+                     * rebuild after publication may consult this host vector.
+                     */
+                    cudaGDN_gpu_memcpy_d2h_async(dst_state, src, static_cast<size_t>(state_size_), stream);
+                    cudaGDN_stream_synchronize(stream);
+                }
+            }
             else
+            {
                 cudaGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
+                if (dst_state)
+                    cudaGDN_gpu_memcpy_d2h(dst_state, src, static_cast<size_t>(state_size_));
+            }
+            return true;
+        }
+
+        bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            float *dst_state,
+            const int *device_row_index,
+            void *stream) override
+        {
+            /*
+             * Device-indexed MTP publication restores only implementation-owned
+             * GPU live state. Keeping the host mirror untouched avoids a D2H
+             * sync on the verifier stream and makes replay ownership explicit.
+             */
+            (void)dst_state;
+            if (!gpu_state_ || !verifier_state_capture_ || !device_row_index ||
+                !stream ||
+                verifier_state_capture_size_ != state_size_)
+            {
+                return false;
+            }
+
+            const bool ok = cudaGDN_gpu_copy_capture_row_from_device_index(
+                gpu_state_,
+                verifier_state_capture_,
+                device_row_index,
+                verifier_state_capture_rows_,
+                state_size_,
+                device_ordinal_,
+                stream);
+            if (!ok)
+                return false;
             return true;
         }
 

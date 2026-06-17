@@ -21,9 +21,12 @@
 #include <optional>
 #include "models/qwen/QwenStandardGraph.h"
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/compute_stages/stages/RMSNormStage.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "tensors/TensorFactory.h"
 #include "backends/DeviceId.h"
+
+#include <algorithm>
 
 using namespace llaminar2;
 
@@ -394,6 +397,56 @@ namespace
             }
         }
         return std::nullopt;
+    }
+
+    static bool contractHasBinding(const std::vector<BufferBinding> &bindings,
+                                   BufferId id,
+                                   BufferAccess access)
+    {
+        return std::any_of(
+            bindings.begin(),
+            bindings.end(),
+            [&](const BufferBinding &binding)
+            {
+                return binding.id == id && binding.access == access;
+            });
+    }
+
+    TEST_F(Test__QwenStandardGraph_PPLayerRange, HybridQ16FinalNormReadsResidualBuffer)
+    {
+        GraphConfig config = makeConfig(LOCAL_LAYERS, TOTAL_LAYERS);
+        config.activation_precision = ActivationPrecision::HybridQ16;
+
+        createWeightsForLayers(TOTAL_LAYERS);
+        createBuffers();
+
+        QwenStandardGraph graph(config, mpi_ctx_);
+        graph.setWeights(weights_);
+        graph.setBuffers(buffers_);
+
+        auto input = createForwardInput();
+        ForwardOutput output;
+        output.hidden = current_hidden_.get();
+
+        auto compute_graph = graph.buildPartialForwardGraph(input, output, 0, 4, true, true);
+        const ComputeNode *final_norm_node = compute_graph.getNode("final_norm");
+        ASSERT_NE(final_norm_node, nullptr);
+        ASSERT_NE(final_norm_node->stage, nullptr);
+
+        const auto *final_norm_stage =
+            dynamic_cast<const RMSNormStage *>(final_norm_node->stage.get());
+        ASSERT_NE(final_norm_stage, nullptr);
+
+        /*
+         * HybridQ16 keeps the live activation stream in RESIDUAL. The stage's
+         * raw tensor pointer and its arena contract must agree, otherwise GPU
+         * coherence may prepare HIDDEN_STATE while the final norm kernel reads
+         * stale residual data.
+         */
+        const StageBufferContract contract = final_norm_stage->bufferContract();
+        EXPECT_TRUE(contractHasBinding(contract.inputs, BufferId::RESIDUAL, BufferAccess::READ));
+        EXPECT_FALSE(contractHasBinding(contract.inputs, BufferId::HIDDEN_STATE, BufferAccess::READ));
+        EXPECT_TRUE(contractHasBinding(contract.outputs, BufferId::NORMALIZED, BufferAccess::WRITE));
     }
 
     /**

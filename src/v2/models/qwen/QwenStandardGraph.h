@@ -85,7 +85,8 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device,
-            const std::vector<int> *sequence_lengths = nullptr) override;
+            const std::vector<int> *sequence_lengths = nullptr,
+            const void *position_ids_device = nullptr) override;
     };
 
 } // namespace llaminar2

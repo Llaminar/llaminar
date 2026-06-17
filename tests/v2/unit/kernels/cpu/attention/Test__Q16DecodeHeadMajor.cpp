@@ -231,6 +231,38 @@ namespace
     }
 
     /**
+     * @brief Create a HEAD_MAJOR Q16_1Tensor with extra physical rows per head.
+     *
+     * Runtime Q16 KV caches are allocated as [kv_head][max_seq_len][head_dim],
+     * while decode attention receives a smaller logical kv_len. This helper
+     * mirrors that physical ring-cache shape so tests can prove future rows do
+     * not influence the currently active prefix.
+     */
+    std::unique_ptr<Q16_1Tensor> create_q16_head_major_physical(
+        const float *fp32_pos_major, int physical_rows_per_head, int n_kv_heads, int head_dim)
+    {
+        auto hm_data = rearrange_to_head_major(fp32_pos_major, physical_rows_per_head, n_kv_heads, head_dim);
+
+        Q16BlockSize blk_size;
+        if (head_dim <= 32)
+            blk_size = Q16BlockSize::BLOCK_32;
+        else if (head_dim <= 64)
+            blk_size = Q16BlockSize::BLOCK_64;
+        else
+            blk_size = Q16BlockSize::BLOCK_128;
+
+        const size_t rows = static_cast<size_t>(n_kv_heads) * physical_rows_per_head;
+        const size_t cols = static_cast<size_t>(head_dim);
+        auto tensor = std::make_unique<Q16_1Tensor>(
+            std::vector<size_t>{rows, cols}, blk_size);
+
+        bool ok = tensor->copyFrom_fp32_fixed_scale(hm_data.data(), KV_CACHE_SCALE, head_dim);
+        if (!ok)
+            return nullptr;
+        return tensor;
+    }
+
+    /**
      * @brief Create a Q16_1Tensor from FP32 data in POSITION_MAJOR layout
      *
      * Shape: [kv_len, n_kv_heads * head_dim]
@@ -521,6 +553,75 @@ TEST_F(Test__Q16DecodeHeadMajor, LayoutEquivalence_LongContext)
 {
     // Longer context to exercise multiple KV tiles
     runLayoutEquivalenceTest(256, 14, 2, 64, "Equiv_Long_HD64");
+}
+
+TEST_F(Test__Q16DecodeHeadMajor, HeadMajorPhysicalRowsIgnoreFuturePrefix)
+{
+    const int logical_kv_len = 37;
+    const int physical_rows_per_head = 64;
+    const int n_heads = 16;
+    const int n_kv_heads = 8;
+    const int head_dim = 128;
+    const size_t q_size = static_cast<size_t>(n_heads) * head_dim;
+    const size_t logical_kv_size = static_cast<size_t>(logical_kv_len) * n_kv_heads * head_dim;
+    const size_t physical_kv_size = static_cast<size_t>(physical_rows_per_head) * n_kv_heads * head_dim;
+
+    std::vector<float> Q(q_size), K_logical(logical_kv_size), V_logical(logical_kv_size);
+    std::vector<float> K_physical(physical_kv_size), V_physical(physical_kv_size);
+    fill_random(Q.data(), q_size);
+    fill_random(K_logical.data(), logical_kv_size);
+    fill_random(V_logical.data(), logical_kv_size);
+
+    const size_t row_width = static_cast<size_t>(n_kv_heads) * head_dim;
+    for (int row = 0; row < physical_rows_per_head; ++row)
+    {
+        float *k_row = K_physical.data() + static_cast<size_t>(row) * row_width;
+        float *v_row = V_physical.data() + static_cast<size_t>(row) * row_width;
+        if (row < logical_kv_len)
+        {
+            std::copy(K_logical.data() + static_cast<size_t>(row) * row_width,
+                      K_logical.data() + static_cast<size_t>(row + 1) * row_width,
+                      k_row);
+            std::copy(V_logical.data() + static_cast<size_t>(row) * row_width,
+                      V_logical.data() + static_cast<size_t>(row + 1) * row_width,
+                      v_row);
+        }
+        else
+        {
+            // Future physical rows should be completely invisible while the
+            // logical kv_len is still inside the prefix. Large values make any
+            // accidental read show up as a large numerical mismatch.
+            fill_random(k_row, row_width, 80.0f, 120.0f);
+            fill_random(v_row, row_width, -120.0f, -80.0f);
+        }
+    }
+
+    auto K_compact = create_q16_head_major(K_logical.data(), logical_kv_len, n_kv_heads, head_dim);
+    auto V_compact = create_q16_head_major(V_logical.data(), logical_kv_len, n_kv_heads, head_dim);
+    auto K_physical_q16 = create_q16_head_major_physical(
+        K_physical.data(), physical_rows_per_head, n_kv_heads, head_dim);
+    auto V_physical_q16 = create_q16_head_major_physical(
+        V_physical.data(), physical_rows_per_head, n_kv_heads, head_dim);
+    ASSERT_NE(K_compact, nullptr);
+    ASSERT_NE(V_compact, nullptr);
+    ASSERT_NE(K_physical_q16, nullptr);
+    ASSERT_NE(V_physical_q16, nullptr);
+
+    std::vector<float> out_compact(q_size, 0.0f);
+    std::vector<float> out_physical(q_size, 0.0f);
+    ASSERT_TRUE(callQ16Decode(
+        Q.data(), out_compact.data(),
+        K_compact.get(), V_compact.get(),
+        logical_kv_len, n_heads, n_kv_heads, head_dim));
+    ASSERT_TRUE(callQ16Decode(
+        Q.data(), out_physical.data(),
+        K_physical_q16.get(), V_physical_q16.get(),
+        logical_kv_len, n_heads, n_kv_heads, head_dim));
+
+    const float cos = cosine_similarity(out_physical.data(), out_compact.data(), q_size);
+    const float mae = max_abs_error(out_physical.data(), out_compact.data(), q_size);
+    EXPECT_GE(cos, 0.9999f) << "Physical HEAD_MAJOR cache rows leaked into logical prefix";
+    EXPECT_LE(mae, 0.001f) << "Physical HEAD_MAJOR cache rows changed logical prefix decode";
 }
 
 // ===========================================================================

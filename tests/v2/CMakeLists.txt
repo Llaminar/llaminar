@@ -4713,8 +4713,31 @@ endif()
 # Test: CUDA Flash Attention Parity
 # Tests Flash Attention 2 (prefill) and Flash Decoding (decode) CUDA kernels
 # against CPU attention reference with cosine similarity metrics
-add_executable(v2_integration_cuda_flash_attention_parity integration/kernels/cuda/attention/Test__CUDAFlashAttentionParity.cpp)
-target_link_libraries(v2_integration_cuda_flash_attention_parity llaminar2_core GTest::gtest GTest::gtest_main)
+find_package(ZLIB QUIET)
+set(CUDA_FLASH_ATTENTION_PARITY_CNPY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../external/cnpy")
+set(CUDA_FLASH_ATTENTION_PARITY_EXTRA_SOURCES)
+if(ZLIB_FOUND AND EXISTS "${CUDA_FLASH_ATTENTION_PARITY_CNPY_DIR}/cnpy.cpp")
+    list(APPEND CUDA_FLASH_ATTENTION_PARITY_EXTRA_SOURCES
+        "${CUDA_FLASH_ATTENTION_PARITY_CNPY_DIR}/cnpy.cpp")
+endif()
+add_executable(v2_integration_cuda_flash_attention_parity
+    integration/kernels/cuda/attention/Test__CUDAFlashAttentionParity.cpp
+    ${CUDA_FLASH_ATTENTION_PARITY_EXTRA_SOURCES}
+)
+target_compile_definitions(v2_integration_cuda_flash_attention_parity PRIVATE
+    LLAMINAR_CUDA_ATTENTION_PARITY_HAS_CNPY=$<BOOL:${CUDA_FLASH_ATTENTION_PARITY_EXTRA_SOURCES}>
+)
+target_include_directories(v2_integration_cuda_flash_attention_parity PRIVATE
+    "${CUDA_FLASH_ATTENTION_PARITY_CNPY_DIR}"
+)
+target_link_libraries(v2_integration_cuda_flash_attention_parity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+if(CUDA_FLASH_ATTENTION_PARITY_EXTRA_SOURCES)
+    target_link_libraries(v2_integration_cuda_flash_attention_parity ZLIB::ZLIB)
+endif()
 add_v2_test(V2_Integration_CUDAFlashAttentionParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
     LABELS "V2;Integration;CUDA;Parity;Attention;FlashAttention;FlashDecode;GQA;FP32;CosineSimilarity"

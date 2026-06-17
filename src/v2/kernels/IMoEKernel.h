@@ -270,12 +270,13 @@ namespace llaminar2
          * @brief Gate shared expert output and add routed MoE output in one step.
          *
          * Computes, for each token row:
-         *   combined[t, j] = routed_residual[t, j]
-         *                    + sigmoid(dot(gate_inp, input[t])) * shared_output[t, j]
+         *   shared_output[t, j] = sigmoid(dot(gate_inp, input[t])) * shared_output[t, j]
+         *   combined[t, j] = routed_residual[t, j] + shared_output[t, j]
          *
-         * The default CPU implementation is intentionally generic and preserves
-         * @p shared_output as read-only. GPU backends override this with a fused
-         * kernel so graph-captured MoE decode avoids a separate residual-add node.
+         * The in-place write to @p shared_output is intentional: the fused path
+         * still publishes the same diagnostic and parity-visible intermediate as
+         * the standalone shared-gate stage while avoiding a separate residual-add
+         * node.
          */
         virtual void sharedExpertGateAddFromTensors(
             ITensor *input, ITensor *gate_inp, ITensor *shared_output,

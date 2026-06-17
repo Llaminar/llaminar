@@ -260,6 +260,35 @@ namespace llaminar2
         return reinterpret_cast<void *>(event);
     }
 
+    void *CUDABackend::createTimingEvent(int device_id)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            return nullptr;
+        }
+
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            return nullptr;
+        }
+
+        cudaEvent_t event;
+        /*
+         * Unlike createEvent(), this intentionally keeps timing enabled.  It
+         * is used only under perfstats instrumentation so normal inference
+         * synchronization events remain cheap.
+         */
+        err = cudaEventCreate(&event);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::createTimingEvent] cudaEventCreate failed: " << cudaGetErrorString(err));
+            return nullptr;
+        }
+
+        return reinterpret_cast<void *>(event);
+    }
+
     void CUDABackend::destroyEvent(void *event, int device_id)
     {
         if (!event || device_id >= device_count_ || device_id < 0)
@@ -304,6 +333,36 @@ namespace llaminar2
             return false;
         }
 
+        return true;
+    }
+
+    bool CUDABackend::eventElapsedTimeMs(
+        void *start_event,
+        void *stop_event,
+        int device_id,
+        float *out_ms)
+    {
+        if (!start_event || !stop_event || !out_ms ||
+            device_id >= device_count_ || device_id < 0)
+        {
+            return false;
+        }
+
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            return false;
+        }
+
+        err = cudaEventElapsedTime(
+            out_ms,
+            reinterpret_cast<cudaEvent_t>(start_event),
+            reinterpret_cast<cudaEvent_t>(stop_event));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::eventElapsedTimeMs] cudaEventElapsedTime failed: " << cudaGetErrorString(err));
+            return false;
+        }
         return true;
     }
 
@@ -791,7 +850,7 @@ namespace llaminar2
         const float *data, int rows, int cols, int row_stride,
         float *out_values, int *out_indices,
         float *partial_vals, int *partial_idxs, int partial_capacity,
-        int device_idx, void *stream);
+        int device_idx, void *stream, int output_stride);
 
     extern "C" bool cudaOps_topk_f32(
         const float *data, int n, int k, float *out_values, int *out_indices,
@@ -938,6 +997,12 @@ namespace llaminar2
         float residual_threshold0, float residual_threshold1,
         float residual_threshold2, float residual_threshold3,
         int row_count,
+        unsigned long long inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int inverse_sample_vocab_size,
+        unsigned long long threshold_seed,
+        int threshold_first_logical_position,
+        int thresholds_from_seed,
         int *out_token,
         int *out_accepted,
         float *out_accept_probability,
@@ -1064,6 +1129,37 @@ namespace llaminar2
         int *out_meta,
         int device_idx,
         void *stream);
+    extern "C" bool cudaOps_derive_speculative_publication_metadata(
+        const int *meta,
+        int meta_stride,
+        const int *base_cached_tokens,
+        int request_count,
+        int padded_state_rows_per_request,
+        int max_state_commit_rows,
+        int *out_restore_rows,
+        int *out_target_cached_tokens,
+        int *out_accepted_state_counts,
+        int *out_ok,
+        int *out_next_condition_tokens,
+        const int32_t *output_tokens,
+        int output_token_stride,
+        int *out_all_drafts_accepted_flags,
+        int *out_stopped_flags,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_derive_shifted_speculative_publication_metadata(
+        const int *meta,
+        int meta_stride,
+        const int *base_cached_tokens,
+        int request_count,
+        int padded_state_rows_per_request,
+        int max_state_commit_rows,
+        int mtp_depth,
+        int *out_target_cached_tokens,
+        int *out_accepted_state_counts,
+        int *out_ok,
+        int device_idx,
+        void *stream);
 
     bool CUDABackend::argmaxF32(const void *data_device, int n, int device_id,
                                 float *out_value, int *out_index, void *stream,
@@ -1187,7 +1283,8 @@ namespace llaminar2
                     static_cast<int *>(partial_idxs),
                     partial_capacity,
                     device_id,
-                    s))
+                    s,
+                    /*output_stride=*/1))
             {
                 return false;
             }
@@ -1225,12 +1322,14 @@ namespace llaminar2
         void *out_indices_device,
         void *partial_vals,
         void *partial_idxs,
-        int partial_capacity)
+        int partial_capacity,
+        int output_stride)
     {
         if (device_id >= device_count_ || device_id < 0 || !data_device ||
             rows <= 0 || cols <= 0 || !stream ||
             !out_values_device || !out_indices_device ||
-            !partial_vals || !partial_idxs || partial_capacity < rows)
+            !partial_vals || !partial_idxs || partial_capacity < rows ||
+            output_stride <= 0)
         {
             return false;
         }
@@ -1249,7 +1348,8 @@ namespace llaminar2
             static_cast<int *>(partial_idxs),
             partial_capacity,
             device_id,
-            static_cast<cudaStream_t>(stream));
+            static_cast<cudaStream_t>(stream),
+            output_stride);
     }
 
     bool CUDABackend::topKF32(const void *data_device, int n, int k, int device_id,
@@ -1956,16 +2056,32 @@ namespace llaminar2
         void *out_accepted_device,
         void *out_accept_probability_device,
         void *out_accept_threshold_device,
-        const void *draft_token_probabilities_device)
+        const void *draft_token_probabilities_device,
+        uint64_t inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int inverse_sample_vocab_size)
     {
+        const bool has_draft_distribution =
+            draft_token_ids_device != nullptr && draft_probs_device != nullptr;
+        const bool has_one_hot_draft_distribution =
+            draft_token_ids_device == nullptr && draft_probs_device == nullptr;
+        const bool has_host_thresholds =
+            accept_thresholds_host != nullptr &&
+            residual_thresholds_host != nullptr;
+        const bool uses_seeded_device_thresholds =
+            accept_thresholds_host == nullptr &&
+            residual_thresholds_host == nullptr &&
+            has_one_hot_draft_distribution &&
+            inverse_sample_seed != 0 &&
+            inverse_sample_first_logical_position >= 0;
         if (device_id >= device_count_ || device_id < 0 ||
             !target_token_ids_device || !target_probs_device ||
-            !draft_token_ids_device || !draft_probs_device ||
+            (!has_draft_distribution && !has_one_hot_draft_distribution) ||
             !draft_tokens_device ||
             top_k <= 0 || top_k > 256 ||
             distribution_stride < top_k ||
             row_count <= 0 || row_count > 4 ||
-            !accept_thresholds_host || !residual_thresholds_host ||
+            (!has_host_thresholds && !uses_seeded_device_thresholds) ||
             !stream || !out_token_device || !out_accepted_device)
         {
             return false;
@@ -1973,10 +2089,13 @@ namespace llaminar2
 
         float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         float residual_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int i = 0; i < row_count; ++i)
+        if (has_host_thresholds)
         {
-            accept_thresholds[i] = accept_thresholds_host[i];
-            residual_thresholds[i] = residual_thresholds_host[i];
+            for (int i = 0; i < row_count; ++i)
+            {
+                accept_thresholds[i] = accept_thresholds_host[i];
+                residual_thresholds[i] = residual_thresholds_host[i];
+            }
         }
 
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
@@ -1998,6 +2117,12 @@ namespace llaminar2
             residual_thresholds[2],
             residual_thresholds[3],
             row_count,
+            inverse_sample_seed,
+            inverse_sample_first_logical_position,
+            inverse_sample_vocab_size,
+            uses_seeded_device_thresholds ? inverse_sample_seed : 0ull,
+            inverse_sample_first_logical_position,
+            uses_seeded_device_thresholds ? 1 : 0,
             static_cast<int *>(out_token_device),
             static_cast<int *>(out_accepted_device),
             static_cast<float *>(out_accept_probability_device),
@@ -2412,6 +2537,113 @@ namespace llaminar2
             stop_token_count,
             static_cast<int *>(out_tokens_device),
             static_cast<int *>(out_meta_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueDeriveSpeculativePublicationMetadata(
+        const void *meta_device,
+        int meta_stride,
+        const void *base_cached_tokens_device,
+        int request_count,
+        int padded_state_rows_per_request,
+        int max_state_commit_rows,
+        int device_id,
+        void *stream,
+        void *out_restore_rows_device,
+        void *out_target_cached_tokens_device,
+        void *out_accepted_state_counts_device,
+        void *out_ok_device,
+        void *out_next_condition_tokens_device,
+        const void *output_tokens_device,
+        int output_token_stride,
+        void *out_all_drafts_accepted_flags_device,
+        void *out_stopped_flags_device)
+    {
+        using namespace sampling_math;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !meta_device || !base_cached_tokens_device ||
+            meta_stride < kSpeculativeBatchMetaCount ||
+            request_count <= 0 ||
+            padded_state_rows_per_request <= 0 ||
+            max_state_commit_rows < 0 ||
+            max_state_commit_rows > padded_state_rows_per_request ||
+            !stream ||
+            !out_restore_rows_device ||
+            !out_target_cached_tokens_device ||
+            !out_accepted_state_counts_device ||
+            !out_ok_device ||
+            ((out_next_condition_tokens_device || output_tokens_device) &&
+             (!out_next_condition_tokens_device ||
+              !output_tokens_device ||
+              output_token_stride <= 0)))
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_derive_speculative_publication_metadata(
+            static_cast<const int *>(meta_device),
+            meta_stride,
+            static_cast<const int *>(base_cached_tokens_device),
+            request_count,
+            padded_state_rows_per_request,
+            max_state_commit_rows,
+            static_cast<int *>(out_restore_rows_device),
+            static_cast<int *>(out_target_cached_tokens_device),
+            static_cast<int *>(out_accepted_state_counts_device),
+            static_cast<int *>(out_ok_device),
+            static_cast<int *>(out_next_condition_tokens_device),
+            static_cast<const int32_t *>(output_tokens_device),
+            output_token_stride,
+            static_cast<int *>(out_all_drafts_accepted_flags_device),
+            static_cast<int *>(out_stopped_flags_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueDeriveShiftedSpeculativePublicationMetadata(
+        const void *meta_device,
+        int meta_stride,
+        const void *base_cached_tokens_device,
+        int request_count,
+        int padded_state_rows_per_request,
+        int max_state_commit_rows,
+        int mtp_depth,
+        int device_id,
+        void *stream,
+        void *out_target_cached_tokens_device,
+        void *out_accepted_state_counts_device,
+        void *out_ok_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !meta_device || !base_cached_tokens_device ||
+            meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
+            request_count <= 0 ||
+            padded_state_rows_per_request <= 0 ||
+            max_state_commit_rows < 0 ||
+            max_state_commit_rows > padded_state_rows_per_request ||
+            mtp_depth < 0 ||
+            !stream ||
+            !out_target_cached_tokens_device ||
+            !out_accepted_state_counts_device ||
+            !out_ok_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_derive_shifted_speculative_publication_metadata(
+            static_cast<const int *>(meta_device),
+            meta_stride,
+            static_cast<const int *>(base_cached_tokens_device),
+            request_count,
+            padded_state_rows_per_request,
+            max_state_commit_rows,
+            mtp_depth,
+            static_cast<int *>(out_target_cached_tokens_device),
+            static_cast<int *>(out_accepted_state_counts_device),
+            static_cast<int *>(out_ok_device),
             device_id,
             stream);
     }

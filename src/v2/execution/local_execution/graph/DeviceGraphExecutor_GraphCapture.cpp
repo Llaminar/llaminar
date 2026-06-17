@@ -516,7 +516,20 @@ namespace llaminar2
         {
             if (!arena_)
                 return;
-            arena_->markWrittenFlagsOnly(id, device);
+
+            /*
+             * Steady-state graph replay normally stays fully device-owned, so a
+             * flags-only transition is enough and avoids an event per stage.
+             * Parity snapshot callbacks are different: they immediately read
+             * intermediate outputs on the host after replay.  Record the same
+             * stream event used by the non-captured execution path so
+             * ensureOnHost() waits for the captured kernels that produced the
+             * tensor instead of racing a stale host copy.
+             */
+            if (config_.snapshot_callback && segment_cache.capture_stream)
+                arena_->markWritten(id, device, segment_cache.capture_stream);
+            else
+                arena_->markWrittenFlagsOnly(id, device);
         };
 
         // ===== FAST PATH: Phase 3 (Replay) =====
@@ -763,10 +776,15 @@ namespace llaminar2
                 }
             }
 
-            // Warmup executes all stages normally (no capture) to ensure
-            // lazy kernel initialization and workspace allocation complete
-            // on the capture stream.
-            return executeFastDecode(graph, ctx, collective_nodes);
+            // Warmup executes all stages normally (no capture) to ensure lazy
+            // kernel initialization and workspace allocation complete on the
+            // capture stream.  Preserve the capture-stream assignment above:
+            // the generic fast-decode entry point intentionally rebinds eager
+            // fallback passes to the worker stream to avoid stale stream
+            // ownership of live device state.
+            auto warmup_policy = StageRunPolicy::fastDecode();
+            warmup_policy.preserve_gpu_streams = true;
+            return runStages(graph, ctx, warmup_policy, collective_nodes);
         }
 
         // ===== Phase 2: Capture (second call) — record capturable segments =====

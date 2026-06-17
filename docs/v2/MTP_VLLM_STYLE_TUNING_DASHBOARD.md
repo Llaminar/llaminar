@@ -1,68 +1,68 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Scope: Qwen3.6 dense/MoE MTP on CUDA, ROCm, and CPU across SingleDevice,
+Scope: Qwen3.6 dense/MoE MTP on CUDA, ROCm, CPU across SingleDevice,
 LocalTP, LocalPP, NodeLocalTP, and ExpertOverlay. Keep this file near 6KB.
 
-RAG: **G** = correct and speed-positive near target. **A** = correct but slow,
-partial, policy-sensitive, or missing fresh same-run numbers. **R** = failing,
-speed-negative, or unproven. Every iteration refreshes no-MTP, fixed d1/d2/d3,
-and dynamic for the active lane; broad units plus touched parity pass before a
-WiP commit.
+RAG: **G** = correct and speed-positive. **A** = correct but slow,
+partial, policy-sensitive, or stale. **R** = failing, speed-negative, or
+unproven. Every iteration refreshes no-MTP, fixed d1/d2/d3, and dynamic for the
+active lane; broad units plus touched parity pass before a WiP commit.
 
 ## Phase 10 Snapshot
 
-Active blocker: MoE stochastic. Dense lanes are generally accepted, but MoE
-stochastic still spends too much time in verifier, condition replay, and device
-outcome publication.
+Active blocker: MoE stochastic fixed-depth throughput. Dense lanes are
+accepted or close; ROCm d3 now beats baseline after the replay-safety split,
+but the win is small and CUDA MoE stochastic remains short of target.
 
-Fresh diagnostic run:
-`benchmark_results/mtp_vllm_style/20260613T_phase10_moe_stochastic_gpu_stage_deep`
+Fresh audits: `20260614T012855Z`, `20260614T035626Z`, `20260614T041420Z`.
+Correctness checkpoint: Phase 9.5/9.6 are green. CPU/CUDA/ROCm
+state-publication parity passes; CUDA/ROCm depth-3 guards prove Qwen3.6 MoE
+M=2/3/4 verifier rows stay grouped; ROCm keeps M=3/4 on tuned tile-M=2 K-part.
+
+Phase 9.7 MoE shared decode-equivalent verifier rows are green on CPU/CUDA/ROCm
+for M=1..4 with strict raw-logit cosine, relative L2, symmetric KL,
+sampled-token, and four-token continuation checks. Dense CPU/CUDA/ROCm grouped
+row proofs are green for M=2..4 with strict cosine, relative L2, symmetric KL,
+and sampled-token checks; the latest CPU grouped gate took 135.31s real time,
+so Phase 9.8 still keeps CPU perf suspect. MoE direct all-position publication stays disabled after the rejected
+CUDA M=2 candidate (`row0 cos=0.9826 rel_l2=0.1855`). Phase 9.8 kernel slice:
+NativeVNNI static gates, CPU/CUDA/ROCm M=2..4 serial-equivalence, and focused
+trainer CSV smoke all pass. Greedy GPU all-position now keeps first+draft
+tokens in device slots, removes the resident verifier token-row H2D fallback,
+snapshots base-cache counts D2D, keeps scalar GDN/short-conv device-index
+publication device-only, lets dense request batches pass the hybrid guard, and
+names remaining D2H as response materialization. GDN/short-conv request-batch
+restore now has a shared hard-fail stage/kernel API; backend live-state banks
+are still open. Publisher batch helper is wired; no lane is promoted yet.
 
 | Lane | Baseline | Best MTP | RAG | Evidence |
 |---|---:|---:|:---:|---|
-| CUDA MoE stochastic d3 | 138.6 | 137.1 | R | stage-timed; verifier 808 ms, condition 255 ms |
-| ROCm MoE stochastic d3 | 77.7 | 84.6 | A | stage-timed only; verifier 1287 ms, condition 357 ms, outcome/D2H 265 ms |
+| CUDA MoE stochastic | 129.0 | d3 124.4 (0.96x) | R | d3 76.9% acc, verifier/producer limited |
+| ROCm MoE stochastic | 78.6 | d3 82.0 (1.04x) | A | d3 74.3% acc after MoE sidecar recapture |
 
-Guarded bonus/row-counter run:
-`benchmark_results/mtp_vllm_style/20260613T_phase10_lazy_bonus_moe_stochastic`
-
-| Lane | Baseline | d2 | d3 | Wasted rows |
-|---|---:|---:|---:|---:|
-| CUDA MoE stochastic | 138.8 | 125.8 (0.91x) | 133.8 (0.96x) | d2 7/132, d3 19/157 |
-| ROCm MoE stochastic | 77.5 | 56.5 (0.73x) | 70.9 (0.92x) | d2 50/160, d3 51/180 |
-
-2026-06-13 instrumentation slice: `stochastic_device_physical_verify_rows`,
-`stochastic_device_semantic_verify_rows`, and
-`stochastic_device_post_reject_rows` now separate real verifier rows from rows
-past the first rejection. The standard matrix `summary.tsv` now includes these
-as `stochastic_*_verify_rows`, so future dashboard refreshes do not require
-manual perfstats extraction. The RB=2 unit regression pins scalar-equivalent
-accept/residual/bonus RNG positions and row accounting. The guarded
-device-side bonus sampler is graph-captured and skips full-vocab bonus sampling
-when a batch rejects before the bonus row, but ROCm is still dominated by
-summary/D2H sync rather than bonus-row work.
-
-2026-06-13 resident-outcome slices: `DeviceSpeculativeOutcomeHandle` now exposes
-runner-owned compact summary rows on the verifier stream. Request-batch and
-scalar host APIs share the resident enqueue path; the compatibility host bridge
-queues token+metadata D2H on that stream and synchronizes once. The next
-structural win is publishing accepted state and feeding the next token directly
-from the handle.
+Latest signal: compact one-hot draft verification is accepted. Compact D2H
+enqueue is sub-ms; large ROCm bridge waits are upstream producer work. Recapturing
+MoE sidecars after publication recovers ROCm d3 to 82.0 tok/s vs 78.6 baseline,
+but reset is not the floor: `sidecar_replay_reset_ms=10.7`, while
+`main_verifier_graph_replay_gpu_ms=1503`; sampled verifier time is led by MoE
+expert FFN at 151 ms and router at 21 ms. Phase 10 needs persistent vLLM-style
+MoE metadata and fused verifier work, not more D2H/reset plumbing.
 
 ## Device And Topology Matrix
 
 | Mode | Device / degree | Dense greedy | Dense stochastic | MoE greedy | MoE stochastic | Status |
 |---|---|:---:|:---:|:---:|:---:|---|
-| SingleDevice | CPU d1 | G | G | A | A | Correct; host verifier/condition cost is high |
-| SingleDevice | CUDA d1 | G | G | A | R | Dense accepted; MoE stoch speed-negative |
-| SingleDevice | ROCm d1 | G | G | A | A | Dense accepted; MoE stoch needs non-instrumented confirmation |
-| LocalTP | CUDA deg2 | A | R | R | R | Unit path exists; fresh parity/bench matrix needed |
-| LocalTP | ROCm deg2 | G | A | R | R | Dense greedy d3 55.4 vs 34.1 tok/s (1.62x) |
-| LocalTP | ROCm deg4 | A | R | R | R | Hardware expected; fresh Phase 10 matrix pending |
+| SingleDevice | CPU d1 | G | G | A | A | Correct; CPU verifier still costly |
+| SingleDevice | CUDA d1 | G | G | A | R | MoE M=1..4 verifier proof green; stochastic not speed-positive |
+| SingleDevice | ROCm d1 | G | G | A | A | MoE M=1..4 verifier proof green; M3/M4 proof slow |
+| LocalTP | CUDA deg2 | A | R | R | R | Fresh parity/bench matrix needed |
+| LocalTP | ROCm deg2 | G | A | R | R | Dense greedy d3 55.4 vs 34.1 tok/s |
+| LocalTP | ROCm deg4 | A | R | R | R | Hardware expected; fresh matrix pending |
 | LocalPP | CUDA stages | A | R | R | R | Correctness/bench refresh pending |
-| LocalPP | ROCm deg2 stages | G | A | R | R | Dense dynamic 62.9 vs 30.3 tok/s (2.08x) |
-| NodeLocalTP | CPU sockets | A | A | R | R | Dense parity green; same-run benchmark pending |
-| ExpertOverlay | ROCm2TP + CPU2LocalTP | A | R | A | R | MoE parity green; speed remains amber/red |
+| LocalPP | ROCm deg2 stages | G | A | R | R | Dense dynamic 62.9 vs 30.3 tok/s |
+| NodeLocalTP | CPU sockets | A | A | R | R | Dense parity green; benchmark pending |
+| ExpertOverlay | ROCm2TP + CPU2LocalTP | A | R | A | R | MoE parity green; speed unaccepted |
+| ExpertOverlay | GPU hot + remote CPU cold | R | R | R | R | Missing matched MPI sparse participant graph; fail-closed |
 
 ## SingleDevice Numbers
 
@@ -74,30 +74,24 @@ from the handle.
 | ROCm | Dense 27B | stochastic | base 31.3; 37.0/28.7/27.0/36.9 | G | d2/d3 cost |
 | CPU | Dense 27B | greedy | base 4.7; 5.9/6.0/9.3/6.1 | G | dynamic shallow |
 | CPU | Dense 27B | stochastic | base 4.46; 5.06/5.78/4.85/5.41 | G | verifier/condition |
-| CUDA | MoE 35B | greedy | base 139.2; 129.6/136.6/139.1/146.1 | A | weak win, needs repeat |
-| CUDA | MoE 35B | stochastic | base 138.8; d2 125.8; d3 133.8 | R | verifier+condition |
+| CUDA | MoE 35B | greedy | base 139.2; 129.6/136.6/139.1/146.1 | A | weak win, repeat needed |
+| CUDA | MoE 35B | stochastic | base 128.8; d1/d2/d3 124.5/114.4/128.7 | R | break-even only |
 | ROCm | MoE 35B | greedy | base 77.0; 79.0/91.5/90.3/86.1 | A | below dense-class win |
-| ROCm | MoE 35B | stochastic | base 77.5; d2 56.5; d3 70.9 | R | D2H sync and low d2 acceptance |
+| ROCm | MoE 35B | stochastic | base 78.6; d3 82.0 | A | recapture restores acc; win small |
 | CPU | MoE 35B | greedy | base 17.7; 13.5/13.9/12.4/13.3 | A | host verifier |
 | CPU | MoE 35B | stochastic | base 17.6; 14.5/13.3/14.1/14.0 | A | host verifier |
-
-## Current Read
-
-The vLLM-style greedy-draft, one-hot-q sampler path is correct. MoE stochastic
-does not need more compact-table tuning right now; it needs cheaper
-target/condition execution and cheaper device outcome publication. CUDA remains
-near-neutral but not accepted. ROCm d3 improved to 0.92x with guarded bonus
-sampling, but still spends about 1.9 s of the short run at the outcome/D2H
-sync boundary; the next win must remove or batch that sync.
 
 Target anchors from `ggml-org/llama.cpp@6ddc943`: CUDA dense no-MTP 41.83, d1
 54.9, d3 52.5 tok/s; CUDA MoE no-MTP 118.26, d1 142.0, d3 132.8 tok/s.
 
 ## Next Phase 10 Moves
 
-1. Consume `DeviceSpeculativeOutcomeHandle` in accepted-state publication and
-   next-token staging so stochastic decode can skip the per-step D2H boundary.
-2. Reduce condition-forward replay after rejection; it remains visible on both
-   CUDA and ROCm MoE stochastic.
-3. Refresh LocalTP CUDA2, LocalTP ROCm4, NodeLocalTP CPU, and ExpertOverlay
-   benchmark matrices before any rollout claim for those modes.
+1. Close Phase 9.8 dense economy: remove remaining row-plan/control host
+   bridges and prove grouped verifier perf beats serial on CPU/CUDA/ROCm.
+2. Reduce full MoE verifier graph replay cost; align routed/shared expert work
+   with vLLM fused-MoE runner semantics before polishing controller policy.
+3. Move transaction-output adoption behind resident device metadata so response
+   D2H is only an output flush.
+4. Add hybrid `[request,row,state]` GDN/short-conv capture and live-state banks.
+5. Refresh LocalTP CUDA2, LocalTP ROCm4, NodeLocalTP CPU, and ExpertOverlay
+   matrices before rollout claims.

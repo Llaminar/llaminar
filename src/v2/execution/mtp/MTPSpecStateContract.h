@@ -46,6 +46,17 @@ namespace llaminar2
          * non-final PP stages truncate sidecar state they never produced.
          */
         bool publish_mtp_shifted_kv = true;
+        /**
+         * @brief Whether the first accepted shifted KV row is already resident.
+         *
+         * Dense vLLM-style sidecars can leave the row corresponding to verifier
+         * target row zero in the shifted MTP KV cache. MoE/non-preserving
+         * sidecars restore that speculative row away, then explicitly publish
+         * the same row from the verifier-base terminal hidden before this plan
+         * reaches the KV publisher. In both cases, true means publication may
+         * use the ordinary shifted target `target_cached_tokens - (depth + 1)`.
+         */
+        bool reuse_initial_mtp_shifted_kv_row = true;
 
         bool publishesAcceptedState() const { return accepted_count > 0; }
         bool requiresCorrectionReplay() const { return correction_replay_count > 0; }

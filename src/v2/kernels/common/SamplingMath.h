@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -22,6 +23,8 @@ namespace llaminar2::sampling_math
     constexpr int kSpeculativeBatchMaxStopTokens = 8;
     constexpr int kSpeculativeBatchMetaCount = 10;
     constexpr float kMaxUnitThreshold = 0.99999994f;
+    constexpr uint64_t kInverseSampleDomain = 0xA0761D6478BD642FULL;
+    constexpr uint64_t kMTPSpecDrawPurposesPerToken = 8;
 
     enum SpeculativeBatchMetaIndex : int
     {
@@ -50,6 +53,30 @@ namespace llaminar2::sampling_math
         const uint64_t bits = splitmix64(seed + offset);
         return static_cast<float>((bits >> 40) & 0xFFFFFFull) *
                (1.0f / 16777216.0f);
+    }
+
+    /**
+     * @brief Deterministic MTP stochastic draw keyed by token position.
+     *
+     * vLLM-style speculative decoding may consume a draw in different graph
+     * shapes: a bonus-ready row in one step can become the first token in the
+     * next step, and verifier rows may be reduced entirely on device.  The draw
+     * must therefore be keyed by logical output position and purpose instead
+     * of by the host call order.  Keeping this helper shared lets CPU tests,
+     * CUDA kernels, and ROCm kernels prove the same seeded thresholds.
+     */
+    LLAMINAR_SAMPLING_HD float mtp_spec_threshold_from_seed(
+        uint64_t seed,
+        int logical_position,
+        int draw_purpose)
+    {
+        const uint64_t position =
+            static_cast<uint64_t>(logical_position > 0 ? logical_position : 0);
+        const uint64_t purpose =
+            static_cast<uint64_t>(draw_purpose >= 0 ? draw_purpose : 0);
+        return uniform01(
+            seed,
+            position * kMTPSpecDrawPurposesPerToken + purpose);
     }
 
     LLAMINAR_SAMPLING_HD float clamp_unit_threshold(float threshold)
@@ -401,6 +428,168 @@ namespace llaminar2::sampling_math
     }
 
     /**
+     * @brief Verify a sampled greedy draft token against a compact target table.
+     *
+     * The vLLM-style greedy MTP proposal is a one-hot draft distribution:
+     * `q(draft_token) = 1` and `q(other) = 0`.  The compact verifier can apply
+     * the same rejection-sampling math without materializing a full draft
+     * probability row.  On rejection, the residual distribution is therefore
+     * the target distribution with the draft token removed.
+     *
+     * This helper deliberately uses the vLLM/no-draft acceptance convention
+     * `threshold <= p/q`.  The older compact draft-table helper keeps its
+     * historical strict comparison for backwards compatibility.
+     */
+    LLAMINAR_SAMPLING_HD void speculative_verify_with_thresholds_one_hot_draft(
+        const int *target_token_ids,
+        const float *target_probs,
+        int k,
+        int draft_token,
+        float accept_threshold,
+        float residual_threshold,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold)
+    {
+        const float p = distribution_probability(
+            target_token_ids, target_probs, k, draft_token);
+        const float accept_probability = speculative_accept_probability(p, 1.0f);
+        const float threshold = clamp_unit_threshold(accept_threshold);
+
+        if (out_accept_probability)
+            *out_accept_probability = accept_probability;
+        if (out_accept_threshold)
+            *out_accept_threshold = threshold;
+
+        if (threshold <= accept_probability)
+        {
+            *out_token = draft_token;
+            *out_accepted = 1;
+            return;
+        }
+
+        float residual_weights[kMaxTopK];
+        float residual_total = 0.0f;
+        for (int i = 0; i < k; ++i)
+        {
+            if (target_token_ids[i] < 0)
+            {
+                residual_weights[i] = 0.0f;
+                continue;
+            }
+
+            const float q_i = target_token_ids[i] == draft_token ? 1.0f : 0.0f;
+            const float w = fmaxf(0.0f, target_probs[i] - q_i);
+            residual_weights[i] = w;
+            residual_total += w;
+        }
+
+        if (!(residual_total > 0.0f))
+        {
+            residual_total = 0.0f;
+            for (int i = 0; i < k; ++i)
+            {
+                residual_weights[i] = target_token_ids[i] >= 0 ? target_probs[i] : 0.0f;
+                residual_total += residual_weights[i];
+            }
+        }
+
+        const float r = clamp_unit_threshold(residual_threshold) * residual_total;
+        float cumulative = 0.0f;
+        int selected = target_token_ids[0] >= 0 ? target_token_ids[0] : draft_token;
+        for (int i = 0; i < k; ++i)
+        {
+            cumulative += residual_weights[i];
+            if (r <= cumulative)
+            {
+                selected = target_token_ids[i] >= 0 ? target_token_ids[i] : selected;
+                break;
+            }
+        }
+
+        *out_token = selected;
+        *out_accepted = 0;
+    }
+
+    /**
+     * @brief Verify one-hot greedy draft against a compact vLLM target table.
+     *
+     * This is the compact-table equivalent of the processed/full-probability
+     * vLLM rejection kernels. Acceptance still uses `q(draft)=1`; rejection
+     * samples the recovered token with inverse-exponential noise keyed by the
+     * logical position and absolute vocabulary token id. Passing the full
+     * vocabulary size preserves the same RNG offsets as the full-vocab path
+     * even though this helper scans only the active compact support.
+     */
+    LLAMINAR_SAMPLING_HD void speculative_verify_with_thresholds_one_hot_draft_vllm_recovered(
+        const int *target_token_ids,
+        const float *target_probs,
+        int k,
+        int vocab_size,
+        int draft_token,
+        float accept_threshold,
+        uint64_t inverse_sample_seed,
+        int logical_position,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold)
+    {
+        const float p = distribution_probability(
+            target_token_ids, target_probs, k, draft_token);
+        const float accept_probability = speculative_accept_probability(p, 1.0f);
+        const float threshold = clamp_unit_threshold(accept_threshold);
+
+        if (out_accept_probability)
+            *out_accept_probability = accept_probability;
+        if (out_accept_threshold)
+            *out_accept_threshold = threshold;
+
+        if (threshold <= accept_probability)
+        {
+            *out_token = draft_token;
+            *out_accepted = 1;
+            return;
+        }
+
+        const uint64_t safe_position =
+            static_cast<uint64_t>(logical_position > 0 ? logical_position : 0);
+        const uint64_t safe_vocab =
+            static_cast<uint64_t>(vocab_size > 0 ? vocab_size : k);
+        float best_value = -1.0f;
+        int best_token = -1;
+        for (int i = 0; i < k; ++i)
+        {
+            const int token = target_token_ids[i];
+            if (token < 0)
+                continue;
+
+            const float q_i = token == draft_token ? 1.0f : 0.0f;
+            const float probability = fmaxf(0.0f, target_probs[i] - q_i);
+            const uint64_t offset =
+                safe_position * safe_vocab + static_cast<uint64_t>(token);
+            const float uniform =
+                uniform01(inverse_sample_seed ^ kInverseSampleDomain, offset);
+            const float inverse_sample =
+                inverse_exponential_from_uniform(uniform);
+            const float value = probability * inverse_sample;
+            if (value > best_value ||
+                (value == best_value &&
+                 (best_token < 0 || token < best_token)))
+            {
+                best_value = value;
+                best_token = token;
+            }
+        }
+
+        *out_token = best_token >= 0
+                         ? best_token
+                         : (target_token_ids[0] >= 0 ? target_token_ids[0] : draft_token);
+        *out_accepted = 0;
+    }
+
+    /**
      * @brief Reduce row-wise speculative verifier decisions into one commit plan.
      *
      * Row kernels decide the stochastic accept/reject token independently. This
@@ -523,6 +712,192 @@ namespace llaminar2::sampling_math
         out_meta[kSpecBatchMetaAllSpeculativeAccepted] = all_accepted ? 1 : 0;
         out_meta[kSpecBatchMetaConsumedVerifierRows] = consumed_rows;
         out_meta[kSpecBatchMetaSampledTerminal] = sampled_terminal;
+    }
+
+    /**
+     * @brief Derive live-state publication rows from compact verifier metadata.
+     *
+     * The compact stochastic verifier summary intentionally has two different
+     * counts:
+     *
+     * - kSpecBatchMetaAcceptedSpeculativePrefix counts accepted MTP draft rows.
+     * - kSpecBatchMetaTargetVerifierStateCommitCount counts verifier input
+     *   rows whose target-model state may be published. This includes row zero,
+     *   the first main-model token.
+     *
+     * Accepted-state publication must use the second count. Keeping this tiny
+     * helper shared between CPU tests and GPU kernels prevents CUDA, ROCm, and
+     * CPU from drifting on the off-by-one boundary after a rejection.
+     */
+    LLAMINAR_SAMPLING_HD void derive_speculative_publication_metadata(
+        const int *meta,
+        int meta_stride,
+        int request_index,
+        int padded_state_rows_per_request,
+        int base_cached_tokens,
+        int max_state_commit_rows,
+        int *out_restore_row,
+        int *out_target_cached_tokens,
+        int *out_accepted_state_count,
+        int *out_ok,
+        const int32_t *output_tokens = nullptr,
+        int output_token_stride = 0,
+        int32_t *out_next_condition_token = nullptr,
+        int *out_all_drafts_accepted = nullptr,
+        int *out_stopped = nullptr)
+    {
+        if (out_restore_row)
+            *out_restore_row = -1;
+        if (out_target_cached_tokens)
+            *out_target_cached_tokens = base_cached_tokens;
+        if (out_accepted_state_count)
+            *out_accepted_state_count = 0;
+        if (out_next_condition_token)
+            *out_next_condition_token = -1;
+        if (out_all_drafts_accepted)
+            *out_all_drafts_accepted = 0;
+        if (out_stopped)
+            *out_stopped = 0;
+        if (out_ok)
+            *out_ok = 0;
+
+        if (!meta ||
+            meta_stride < kSpeculativeBatchMetaCount ||
+            request_index < 0 ||
+            padded_state_rows_per_request <= 0 ||
+            base_cached_tokens < 0 ||
+            max_state_commit_rows < 0 ||
+            max_state_commit_rows > padded_state_rows_per_request)
+        {
+            return;
+        }
+
+        const int *request_meta =
+            meta + static_cast<size_t>(request_index) *
+                       static_cast<size_t>(meta_stride);
+        if (request_meta[kSpecBatchMetaOk] == 0)
+            return;
+
+        const int accepted_state_count =
+            request_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
+        if (accepted_state_count < 0 ||
+            accepted_state_count > max_state_commit_rows)
+        {
+            return;
+        }
+
+        if (out_accepted_state_count)
+            *out_accepted_state_count = accepted_state_count;
+        if (out_target_cached_tokens)
+            *out_target_cached_tokens =
+                base_cached_tokens + accepted_state_count;
+        if (out_all_drafts_accepted)
+            *out_all_drafts_accepted =
+                request_meta[kSpecBatchMetaAllSpeculativeAccepted] != 0 ? 1 : 0;
+        if (out_stopped)
+            *out_stopped =
+                request_meta[kSpecBatchMetaStoppedOnOutput] != 0 ? 1 : 0;
+        if (out_next_condition_token && output_tokens && output_token_stride > 0)
+        {
+            const int ready_token =
+                request_meta[kSpecBatchMetaReadyToken];
+            const bool sampled_terminal =
+                request_meta[kSpecBatchMetaSampledTerminal] != 0;
+            if (sampled_terminal && ready_token >= 0)
+            {
+                *out_next_condition_token = ready_token;
+            }
+
+            const int output_count =
+                request_meta[kSpecBatchMetaOutputCount];
+            if (*out_next_condition_token < 0 &&
+                output_count > 0 && output_count <= output_token_stride)
+            {
+                *out_next_condition_token =
+                    output_tokens[static_cast<size_t>(request_index) *
+                                      static_cast<size_t>(output_token_stride) +
+                                  static_cast<size_t>(output_count - 1)];
+            }
+        }
+        if (out_restore_row && accepted_state_count > 0)
+        {
+            *out_restore_row =
+                request_index * padded_state_rows_per_request +
+                accepted_state_count - 1;
+        }
+        if (out_ok)
+            *out_ok = 1;
+    }
+
+    /**
+     * @brief Derive shifted MTP-KV publication counts from compact metadata.
+     *
+     * The main verifier publication advances the target model cache to
+     * `base + accepted_state_count`.  Depth `d` of the shifted sidecar cache is
+     * one-or-more rows behind the main model and must instead expose
+     * `max(0, target - d - 1)` rows.  The accepted count passed to a ring cache
+     * is the delta from its prior shifted length so wrapped heads advance by the
+     * same number of newly valid shifted rows as the old host publisher used.
+     */
+    LLAMINAR_SAMPLING_HD void derive_shifted_speculative_publication_metadata(
+        const int *meta,
+        int meta_stride,
+        int request_index,
+        int padded_state_rows_per_request,
+        int base_cached_tokens,
+        int max_state_commit_rows,
+        int mtp_depth,
+        int *out_target_cached_tokens,
+        int *out_accepted_state_count,
+        int *out_ok)
+    {
+        if (out_target_cached_tokens)
+            *out_target_cached_tokens = 0;
+        if (out_accepted_state_count)
+            *out_accepted_state_count = 0;
+        if (out_ok)
+            *out_ok = 0;
+
+        if (mtp_depth < 0)
+            return;
+
+        int restore_row = -1;
+        int main_target_cached_tokens = base_cached_tokens;
+        int main_accepted_state_count = 0;
+        int ok = 0;
+        derive_speculative_publication_metadata(
+            meta,
+            meta_stride,
+            request_index,
+            padded_state_rows_per_request,
+            base_cached_tokens,
+            max_state_commit_rows,
+            &restore_row,
+            &main_target_cached_tokens,
+            &main_accepted_state_count,
+            &ok);
+
+        if (!ok)
+            return;
+
+        const int shift = mtp_depth + 1;
+        const int base_shifted =
+            base_cached_tokens > shift ? base_cached_tokens - shift : 0;
+        const int target_shifted =
+            main_target_cached_tokens > shift
+                ? main_target_cached_tokens - shift
+                : 0;
+        const int accepted_shifted =
+            target_shifted >= base_shifted
+                ? target_shifted - base_shifted
+                : 0;
+
+        if (out_target_cached_tokens)
+            *out_target_cached_tokens = target_shifted;
+        if (out_accepted_state_count)
+            *out_accepted_state_count = accepted_shifted;
+        if (out_ok)
+            *out_ok = 1;
     }
 
     /**

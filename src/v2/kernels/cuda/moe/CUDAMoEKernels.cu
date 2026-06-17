@@ -679,7 +679,7 @@ namespace
     __global__ void shared_expert_gate_add_kernel(
         const float *__restrict__ input,
         const float *__restrict__ gate_inp,
-        const float *__restrict__ shared_output,
+        float *__restrict__ shared_output,
         const float *__restrict__ routed_residual,
         float *__restrict__ combined_output,
         int seq_len, int d_model)
@@ -716,22 +716,27 @@ namespace
         }
 
         const float gate = 1.0f / (1.0f + expf(-partial[0]));
-        const float4 *shared4 = reinterpret_cast<const float4 *>(shared_output + row_offset);
+        float4 *shared4 = reinterpret_cast<float4 *>(shared_output + row_offset);
         const float4 *residual4 = reinterpret_cast<const float4 *>(routed_residual + row_offset);
         float4 *out4 = reinterpret_cast<float4 *>(combined_output + row_offset);
         for (int i = threadIdx.x; i < n4; i += blockDim.x)
         {
             const float4 s = shared4[i];
             const float4 r = residual4[i];
+            const float4 gated = make_float4(gate * s.x, gate * s.y, gate * s.z, gate * s.w);
+            shared4[i] = gated;
             out4[i] = make_float4(
-                r.x + gate * s.x,
-                r.y + gate * s.y,
-                r.z + gate * s.z,
-                r.w + gate * s.w);
+                r.x + gated.x,
+                r.y + gated.y,
+                r.z + gated.z,
+                r.w + gated.w);
         }
         for (int i = (n4 << 2) + threadIdx.x; i < d_model; i += blockDim.x)
-            combined_output[row_offset + i] =
-                routed_residual[row_offset + i] + gate * shared_output[row_offset + i];
+        {
+            const float gated = gate * shared_output[row_offset + i];
+            shared_output[row_offset + i] = gated;
+            combined_output[row_offset + i] = routed_residual[row_offset + i] + gated;
+        }
     }
 
     __global__ void swiglu_kernel(float *__restrict__ gate, const float *__restrict__ up, int count)
@@ -2591,7 +2596,7 @@ extern "C"
     }
 
     bool cudaMoE_shared_expert_gate_add(
-        const float *input, const float *gate_inp, const float *shared_output,
+        const float *input, const float *gate_inp, float *shared_output,
         const float *routed_residual, float *combined_output,
         int seq_len, int d_model, int device_idx, void *stream)
     {

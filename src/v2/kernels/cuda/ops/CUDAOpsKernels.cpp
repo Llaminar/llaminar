@@ -813,10 +813,36 @@ namespace llaminar2
             const int *position_ids,
             int seq_len)
         {
+            dynamic_position_ids_device_ptr_ = nullptr;
             uploadCudaRoPEPositionIds(
                 workspace_, position_ids, seq_len, static_cast<cudaStream_t>(gpu_stream_),
                 dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
                 "CUDARoPEKernelT<FP32>");
+        }
+
+        void CUDARoPEKernelT<ActivationPrecision::FP32>::setDynamicDevicePositionIds(
+            const void *position_ids_device,
+            int seq_len)
+        {
+            dynamic_position_ids_device_valid_ = false;
+            dynamic_position_ids_seq_len_ = 0;
+            dynamic_position_ids_device_ptr_ = nullptr;
+
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<FP32>] Cannot bind device position_ids on a null/default CUDA stream");
+                return;
+            }
+            if (!position_ids_device || seq_len <= 0)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<FP32>] Cannot bind empty device position_ids");
+                return;
+            }
+
+            dynamic_position_ids_device_ptr_ =
+                static_cast<const int *>(position_ids_device);
+            dynamic_position_ids_seq_len_ = seq_len;
+            dynamic_position_ids_device_valid_ = true;
         }
 
         bool CUDARoPEKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -868,7 +894,9 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
+            const bool has_device_position_ids = dynamic_position_ids_device_ptr_ != nullptr;
+            const bool force_device_positions =
+                (gpu_stream_ != nullptr && (position_ids != nullptr || has_device_position_ids));
 
             // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
             // GRAPH CAPTURE: Skip decode fast path when gpu_stream_ is set — the scalar `pos`
@@ -941,7 +969,11 @@ namespace llaminar2
                 }
             }
 
-            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            const int *d_position_ids = dynamic_position_ids_device_ptr_;
+            if (!d_position_ids)
+            {
+                d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            }
             if (!d_position_ids)
             {
                 LOG_ERROR("[CUDARoPEKernelT<FP32>] POSITION_IDS buffer not allocated in workspace");
@@ -1007,10 +1039,36 @@ namespace llaminar2
             const int *position_ids,
             int seq_len)
         {
+            dynamic_position_ids_device_ptr_ = nullptr;
             uploadCudaRoPEPositionIds(
                 workspace_, position_ids, seq_len, static_cast<cudaStream_t>(gpu_stream_),
                 dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
                 "CUDARoPEKernelT<BF16>");
+        }
+
+        void CUDARoPEKernelT<ActivationPrecision::BF16>::setDynamicDevicePositionIds(
+            const void *position_ids_device,
+            int seq_len)
+        {
+            dynamic_position_ids_device_valid_ = false;
+            dynamic_position_ids_seq_len_ = 0;
+            dynamic_position_ids_device_ptr_ = nullptr;
+
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<BF16>] Cannot bind device position_ids on a null/default CUDA stream");
+                return;
+            }
+            if (!position_ids_device || seq_len <= 0)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<BF16>] Cannot bind empty device position_ids");
+                return;
+            }
+
+            dynamic_position_ids_device_ptr_ =
+                static_cast<const int *>(position_ids_device);
+            dynamic_position_ids_seq_len_ = seq_len;
+            dynamic_position_ids_device_valid_ = true;
         }
 
         bool CUDARoPEKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -1060,7 +1118,9 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
+            const bool has_device_position_ids = dynamic_position_ids_device_ptr_ != nullptr;
+            const bool force_device_positions =
+                (gpu_stream_ != nullptr && (position_ids != nullptr || has_device_position_ids));
 
             // GRAPH CAPTURE: Skip decode fast path when gpu_stream_ is set — scalar pos frozen in graph.
             if (seq_len == 1 && !force_device_positions && !gpu_stream_)
@@ -1128,7 +1188,11 @@ namespace llaminar2
                 }
             }
 
-            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            const int *d_position_ids = dynamic_position_ids_device_ptr_;
+            if (!d_position_ids)
+            {
+                d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            }
             if (!d_position_ids)
             {
                 LOG_ERROR("[CUDARoPEKernelT<BF16>] POSITION_IDS buffer not allocated in workspace");
@@ -1194,10 +1258,36 @@ namespace llaminar2
             const int *position_ids,
             int seq_len)
         {
+            dynamic_position_ids_device_ptr_ = nullptr;
             uploadCudaRoPEPositionIds(
                 workspace_, position_ids, seq_len, static_cast<cudaStream_t>(gpu_stream_),
                 dynamic_position_ids_device_valid_, dynamic_position_ids_seq_len_,
                 "CUDARoPEKernelT<FP16>");
+        }
+
+        void CUDARoPEKernelT<ActivationPrecision::FP16>::setDynamicDevicePositionIds(
+            const void *position_ids_device,
+            int seq_len)
+        {
+            dynamic_position_ids_device_valid_ = false;
+            dynamic_position_ids_seq_len_ = 0;
+            dynamic_position_ids_device_ptr_ = nullptr;
+
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<FP16>] Cannot bind device position_ids on a null/default CUDA stream");
+                return;
+            }
+            if (!position_ids_device || seq_len <= 0)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<FP16>] Cannot bind empty device position_ids");
+                return;
+            }
+
+            dynamic_position_ids_device_ptr_ =
+                static_cast<const int *>(position_ids_device);
+            dynamic_position_ids_seq_len_ = seq_len;
+            dynamic_position_ids_device_valid_ = true;
         }
 
         bool CUDARoPEKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -1247,7 +1337,9 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
+            const bool has_device_position_ids = dynamic_position_ids_device_ptr_ != nullptr;
+            const bool force_device_positions =
+                (gpu_stream_ != nullptr && (position_ids != nullptr || has_device_position_ids));
 
             // GRAPH CAPTURE: Skip decode fast path when gpu_stream_ is set — scalar pos frozen in graph.
             if (seq_len == 1 && !force_device_positions && !gpu_stream_)
@@ -1315,7 +1407,11 @@ namespace llaminar2
                 }
             }
 
-            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            const int *d_position_ids = dynamic_position_ids_device_ptr_;
+            if (!d_position_ids)
+            {
+                d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            }
             if (!d_position_ids)
             {
                 LOG_ERROR("[CUDARoPEKernelT<FP16>] POSITION_IDS buffer not allocated in workspace");

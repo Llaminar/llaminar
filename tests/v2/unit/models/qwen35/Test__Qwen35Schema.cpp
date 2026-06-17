@@ -254,7 +254,11 @@ namespace
 
         // --- IKVCache stubs (never called by graph builders) ---
         ActivationPrecision k_precision() const override { return ActivationPrecision::FP32; }
-        int get_cached_tokens(int, int) const override { return 0; }
+        int get_cached_tokens(int layer, int) const override
+        {
+            queried_cache_layers.push_back(layer);
+            return 0;
+        }
         int max_seq_len() const override { return 32; }
         int n_layers() const override { return n_layers_; }
         bool get_kv(int, int, ITensor **, ITensor **, int *) override { return false; }
@@ -267,6 +271,8 @@ namespace
         void clear() override {}
         void clear_sequence(int, int) override {}
         void clear_layer(int) override {}
+
+        mutable std::vector<int> queried_cache_layers;
 
     private:
         int n_layers_ = 0;
@@ -1166,6 +1172,108 @@ TEST_F(Qwen35GraphBuildTest, GDNProjection_AllWeightsWired)
     EXPECT_EQ(params.w_z, layer_.attn_gate);
     EXPECT_EQ(params.w_a, layer_.ssm_alpha);
     EXPECT_EQ(params.w_b, layer_.ssm_beta);
+}
+
+TEST_F(Qwen35GraphBuildTest, HybridPPFullAttentionUsesGlobalLayerIdsForCacheStages)
+{
+    /*
+     * Regression for LocalPP Qwen3.5/Qwen3.6 hybrid caches.  A PP stage such as
+     * [20, 64) owns a hybrid cache whose layer map starts at global layer 20.
+     * The graph must pass global FA layer ids (for example 43) into that cache;
+     * passing a PP-local id (23) lets the cache subtract first_layer_index again
+     * and aliases layer 43 onto layer 23's compressed KV slot.
+     */
+    GraphConfig pp_config = config_;
+    pp_config.pp_layer_offset = 20;
+    pp_config.n_layers = 44;
+    pp_config.total_n_layers = 64;
+    pp_config.layer_types.clear();
+    pp_config.layer_types.reserve(static_cast<size_t>(pp_config.n_layers));
+    for (int global_layer = pp_config.pp_layer_offset;
+         global_layer < pp_config.pp_layer_offset + pp_config.n_layers;
+         ++global_layer)
+    {
+        pp_config.layer_types.push_back((global_layer % 4 == 3) ? "full_attention" : "gdn");
+    }
+
+    Qwen35Graph graph(pp_config, nullptr);
+    StubHybridKVCache cache(pp_config);
+
+    const size_t d = static_cast<size_t>(pp_config.d_model);
+    const size_t q_dim = static_cast<size_t>(pp_config.n_heads * pp_config.head_dim);
+    const size_t kv_dim = static_cast<size_t>(pp_config.n_kv_heads * pp_config.head_dim);
+    constexpr int seq_len = 2;
+
+    auto attn_norm = TestTensorFactory::createFP32Ones({d});
+    auto wq = TestTensorFactory::createFP32Random({q_dim * 2, d});
+    auto wk = TestTensorFactory::createFP32Random({kv_dim, d});
+    auto wv = TestTensorFactory::createFP32Random({kv_dim, d});
+    auto wo = TestTensorFactory::createFP32Random({d, q_dim});
+
+    LayerWeights fa_layer;
+    fa_layer.attn_norm = attn_norm.get();
+    fa_layer.wq = wq.get();
+    fa_layer.wk = wk.get();
+    fa_layer.wv = wv.get();
+    fa_layer.wo = wo.get();
+
+    ActivationBuffers fa_buffers;
+    auto hidden = TestTensorFactory::createFP32({seq_len, d});
+    auto residual = TestTensorFactory::createFP32({seq_len, d});
+    auto normalized = TestTensorFactory::createFP32({seq_len, d});
+    auto fa_q_raw = TestTensorFactory::createFP32({seq_len, q_dim * 2});
+    auto fa_gate = TestTensorFactory::createFP32({seq_len, q_dim});
+    auto q = TestTensorFactory::createFP32({seq_len, q_dim});
+    auto k = TestTensorFactory::createFP32({seq_len, kv_dim});
+    auto v = TestTensorFactory::createFP32({seq_len, kv_dim});
+    auto attn_output = TestTensorFactory::createFP32({seq_len, q_dim});
+    auto attn_proj = TestTensorFactory::createFP32({seq_len, d});
+
+    fa_buffers.current_hidden = hidden.get();
+    fa_buffers.residual = residual.get();
+    fa_buffers.normalized = normalized.get();
+    fa_buffers.Q = q.get();
+    fa_buffers.K = k.get();
+    fa_buffers.V = v.get();
+    fa_buffers.attn_output = attn_output.get();
+    fa_buffers.attn_proj = attn_proj.get();
+    fa_buffers.extensions[BufferId::FA_Q_RAW] = fa_q_raw.get();
+    fa_buffers.extensions[BufferId::FA_GATE] = fa_gate.get();
+
+    int position_ids[seq_len] = {0, 1};
+    ComputeGraph attn_graph = graph.buildAttentionGraph(
+        fa_layer,
+        fa_buffers,
+        /*layer_idx=*/43,
+        /*seq_len=*/seq_len,
+        /*batch_size=*/1,
+        &cache,
+        position_ids,
+        DeviceId::cpu(),
+        /*sequence_lengths=*/nullptr,
+        /*position_ids_device=*/nullptr);
+
+    EXPECT_NE(std::find(cache.queried_cache_layers.begin(), cache.queried_cache_layers.end(), 43),
+              cache.queried_cache_layers.end());
+    EXPECT_EQ(std::find(cache.queried_cache_layers.begin(), cache.queried_cache_layers.end(), 23),
+              cache.queried_cache_layers.end());
+
+    auto expectStageLayer = [&](const char *node_name)
+    {
+        auto *node = attn_graph.getNode(node_name);
+        ASSERT_NE(node, nullptr) << node_name;
+        const auto &dump = node->stage->getDumpInfo();
+        auto it = std::find_if(dump.scalars.begin(), dump.scalars.end(),
+                               [](const StageDumpInfo::ScalarParam &scalar)
+                               {
+                                   return std::strcmp(scalar.name, "layer_idx") == 0;
+                               });
+        ASSERT_NE(it, dump.scalars.end()) << node_name << " did not expose layer_idx";
+        EXPECT_EQ(static_cast<int>(it->value), 43) << node_name;
+    };
+
+    expectStageLayer("layer43_kv_append");
+    expectStageLayer("layer43_attention");
 }
 
 TEST_F(Qwen35GraphBuildTest, OutputGate_NotUsedInGDNLayers)

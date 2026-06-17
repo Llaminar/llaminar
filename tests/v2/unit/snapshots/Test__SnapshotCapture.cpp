@@ -131,6 +131,27 @@ TEST(Test__SnapshotCapture_KeyConversion, MTPSidecarStages)
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_moe_combine"), "MTP0_MOE_COMBINED_OUTPUT");
 }
 
+TEST(Test__SnapshotCapture_Capture, SharedExpertGateFusedOutputsUseSemanticKeys)
+{
+    const std::vector<float> gated_shared = {1.0f, 2.0f, 3.0f, 4.0f};
+    const std::vector<float> combined = {5.0f, 6.0f, 7.0f, 8.0f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("shared_output", gated_shared.data(), 1, 4));
+    dump.outputs.push_back(makeFP32Output("combined_output", combined.data(), 1, 4));
+
+    SnapshotCapture capture;
+    capture.captureStage("MTP0_shared_expert_gate", dump);
+
+    const auto *shared_snap = capture.get("MTP0_MOE_SHARED_GATE_OUTPUT");
+    ASSERT_NE(shared_snap, nullptr);
+    EXPECT_EQ(shared_snap->data, gated_shared);
+
+    const auto *combined_snap = capture.get("MTP0_MOE_COMBINED_OUTPUT");
+    ASSERT_NE(combined_snap, nullptr);
+    EXPECT_EQ(combined_snap->data, combined);
+}
+
 TEST(Test__SnapshotCapture_KeyConversion, FallbackUpperCase)
 {
     // Unknown suffix: just uppercase the whole thing

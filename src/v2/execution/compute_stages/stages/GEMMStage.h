@@ -12,6 +12,7 @@
 #include "../../../memory/BufferId.h"
 #include "../../../loaders/WeightPlan.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
@@ -19,6 +20,7 @@ namespace llaminar2
 
     // Forward declarations
     class ITensorGemm;
+    class FP32Tensor;
     class PreparedWeightStore;
 
     /**
@@ -118,6 +120,18 @@ namespace llaminar2
             std::optional<BufferId> gate_buffer_id;
             std::optional<BufferId> c_buffer_id;
 
+            /**
+             * @brief Execute tiny verifier batches through repeated M=1 GEMMs.
+             *
+             * MTP all-position publication restores state from individual verifier
+             * rows. Quantized kernels may choose different M=2..4 dispatches than
+             * serial decode's M=1 route, and even tiny output-projection drift can
+             * flip later MoE routes. When enabled, this stage preserves the same
+             * graph-level output tensor but computes each row through the exact
+             * one-token GEMM contract used by serial decode.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
+
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution
             // =================================================================
@@ -176,6 +190,18 @@ namespace llaminar2
         // registry maps), so raw pointers are safe here.
         ITensorGemm *cached_gemm_ = nullptr;
         bool cache_resolved_ = false;
+
+        bool executeDecodeEquivalentVerifierPrefill(
+            const TensorBase *A_base,
+            TensorBase *C_base,
+            ITensorGemm *gemm,
+            int effective_n);
+
+        // Reused one-row verifier scratch. Keeping this state on the stage avoids
+        // allocating transient tensors while the hot verifier path is iterating rows.
+        std::shared_ptr<FP32Tensor> verifier_gate_row_;
+        std::shared_ptr<FP32Tensor> verifier_input_row_;
+        std::shared_ptr<FP32Tensor> verifier_output_row_;
     };
 
 } // namespace llaminar2

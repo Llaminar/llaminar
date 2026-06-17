@@ -36,22 +36,34 @@ namespace
 
         PrefixKVCacheProbe main_kv;
         main_kv.owner = "main";
-        main_kv.layers.push_back({
-            /*cache_layer=*/0,
-            /*global_layer=*/0,
-            /*seq_idx=*/0,
-            /*cached_tokens=*/logical_tokens,
-            /*ring_head=*/0});
+        PrefixKVLayerProbe main_layer;
+        main_layer.cache_layer = 0;
+        main_layer.global_layer = 0;
+        main_layer.seq_idx = 0;
+        main_layer.cached_tokens = logical_tokens;
+        main_layer.ring_head = 0;
+        main_layer.payload_hash_available = true;
+        main_layer.k_payload_bytes = 128;
+        main_layer.v_payload_bytes = 128;
+        main_layer.k_payload_hash = 0xaaaa;
+        main_layer.v_payload_hash = 0xbbbb;
+        main_kv.layers.push_back(main_layer);
         snapshot.kv_caches.push_back(main_kv);
 
         PrefixKVCacheProbe mtp_kv;
         mtp_kv.owner = "mtp";
-        mtp_kv.layers.push_back({
-            /*cache_layer=*/0,
-            /*global_layer=*/0,
-            /*seq_idx=*/0,
-            /*cached_tokens=*/expectedShiftedMTPTokens(logical_tokens),
-            /*ring_head=*/0});
+        PrefixKVLayerProbe mtp_layer;
+        mtp_layer.cache_layer = 0;
+        mtp_layer.global_layer = 0;
+        mtp_layer.seq_idx = 0;
+        mtp_layer.cached_tokens = expectedShiftedMTPTokens(logical_tokens);
+        mtp_layer.ring_head = 0;
+        mtp_layer.payload_hash_available = true;
+        mtp_layer.k_payload_bytes = 64;
+        mtp_layer.v_payload_bytes = 64;
+        mtp_layer.k_payload_hash = 0xcccc;
+        mtp_layer.v_payload_hash = 0xdddd;
+        mtp_kv.layers.push_back(mtp_layer);
         snapshot.mtp_kv_caches.push_back(mtp_kv);
 
         PrefixGDNLayerProbe gdn;
@@ -62,6 +74,8 @@ namespace
         gdn.conv_hash = 0x5678;
         gdn.recurrence_all_zero = false;
         gdn.conv_all_zero = false;
+        gdn.recurrence_sample_values = {1.0f, 2.0f, 3.0f};
+        gdn.conv_sample_values = {4.0f, 5.0f};
         snapshot.gdn_layers.push_back(gdn);
         return snapshot;
     }
@@ -226,6 +240,41 @@ TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceRejectsShiftedKVDrift)
     EXPECT_NE(result.reason.find("shifted MTP"), std::string::npos);
 }
 
+TEST(Test__MTPStateTransaction, RuntimeSnapshotSerialOracleCanIgnoreShiftedMTPKV)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    candidate.mtp_kv_caches.front().layers.front().cached_tokens += 2;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.compare_shifted_mtp_kv = false;
+
+    auto result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    EXPECT_TRUE(result) << result.reason;
+}
+
+TEST(Test__MTPStateTransaction, RuntimeSnapshotSerialOracleCanIgnoreMainKVPayloadHashes)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
+    candidate.kv_caches.front().layers.front().v_payload_hash ^= 0x2;
+
+    auto result = compareMTPRuntimeStateSnapshots(oracle, candidate);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("main KV payload hash"), std::string::npos);
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.compare_main_kv_payload_hashes = false;
+    result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    EXPECT_TRUE(result) << result.reason;
+
+    candidate.kv_caches.front().layers.front().cached_tokens -= 1;
+    result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("main KV cached token count"), std::string::npos);
+}
+
 TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceRejectsGDNHashDrift)
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
@@ -235,6 +284,29 @@ TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceRejectsGDNHashDrift)
     auto result = compareMTPRuntimeStateSnapshots(oracle, candidate);
     ASSERT_FALSE(result);
     EXPECT_NE(result.reason.find("GDN recurrence hash"), std::string::npos);
+}
+
+TEST(Test__MTPStateTransaction, RuntimeSnapshotCanUseToleranceAwareGDNValues)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    candidate.gdn_layers.front().recurrence_hash ^= 0x1;
+    candidate.gdn_layers.front().recurrence_sample_values[1] += 1e-7f;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.compare_gdn_hashes = false;
+    options.compare_gdn_values_if_available = true;
+    options.gdn_relative_l2_tolerance = 1e-5;
+    options.gdn_max_abs_tolerance = 1e-5;
+    options.gdn_min_cosine = 0.999999;
+
+    auto result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    EXPECT_TRUE(result) << result.reason;
+
+    candidate.gdn_layers.front().recurrence_sample_values[1] += 1e-2f;
+    result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("GDN recurrence value mismatch"), std::string::npos);
 }
 
 } // namespace llaminar2

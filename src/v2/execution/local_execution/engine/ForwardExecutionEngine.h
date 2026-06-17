@@ -406,7 +406,9 @@ namespace llaminar2
          * @param host   Host interface for model-specific callbacks
          * @return true on success
          *
-         * @pre input.position_ids != nullptr (caller must build if needed)
+         * @pre input.position_ids != nullptr, or input.position_ids_device is
+         *      set for a GPU graph whose position consumer supports resident
+         *      device rows.
          * @pre external_hidden_state already set in input (if applicable)
          */
         bool execute(const ForwardInput &input,
@@ -438,15 +440,16 @@ namespace llaminar2
             uint64_t segment_decode_step = 0;
             uint64_t segmented_capture_live_state_epoch = 0;
             bool requires_live_state_epoch_recapture = false;
+            bool all_position_verifier_recapture_pending = false;
         };
 
         /**
          * @brief Counts the replay-state action chosen for a live-state mutation.
          *
-         * MTP publication is a precise boundary: ordinary decode captures must
-         * be recaptured before correction replay, while all-position verifier
-         * captures may keep their executable and only rebind explicit streams.
-         * Returning this summary makes that split testable and exportable.
+         * MTP publication is a precise boundary: live-state-versioned captures
+         * must be recaptured before reuse, while single-row condition decode can
+         * keep its executable and only rebind explicit streams. Returning this
+         * summary makes that split testable and exportable.
          */
         struct ReplayStateResetSummary
         {
@@ -455,6 +458,7 @@ namespace llaminar2
             size_t ordinary_decode_reset = 0;
             size_t all_position_verifier_preserved = 0;
             size_t other_preserved = 0;
+            bool all_position_verifier_recapture_requested = false;
         };
 
         /**
@@ -469,12 +473,30 @@ namespace llaminar2
         std::optional<LastExecutedForwardGraphView> lastExecutedForwardGraph();
 
         /**
+         * @brief Return the most recent all-position verifier graph.
+         *
+         * Accepted-state publication needs the graph whose GDN/short-conv stages
+         * captured verifier row snapshots. A shifted-MTP sidecar commit may run
+         * another graph before publication, so this handle is intentionally
+         * separate from lastExecutedForwardGraph().
+         */
+        std::optional<LastExecutedForwardGraphView> lastAllPositionVerifierForwardGraph();
+
+        /**
+         * @brief Drop the retained verifier graph publication handle.
+         *
+         * Callers clear this after accepting, rejecting, or abandoning the
+         * publication transaction so a later request cannot publish from stale
+         * row snapshots.
+         */
+        void clearLastAllPositionVerifierForwardGraph();
+
+        /**
          * @brief Snapshot replay-cache version/capture state for diagnostics/tests.
          *
          * The returned state is intentionally read-only. It lets unit and
          * integration guards prove that live-state mutations advance epochs and
-         * force stale ordinary decode captures to recapture, while verifier
-         * captures remain governed by the accepted-state publication contract.
+         * force stale multi-row decode/verifier captures to recapture.
          */
         std::vector<ReplayCacheObservation> replayCacheObservations(
             uint64_t live_state_epoch) const;
@@ -539,15 +561,35 @@ namespace llaminar2
          *
          * Rejected speculative steps publish an accepted verifier prefix, then
          * immediately replay the corrected token through the ordinary main
-         * decode path. That main decode capture must be fresh. All-position
-         * verifier captures are not used for the correction replay itself, so
-         * preserving them lets repeated M=2..4 verifier rows mature to replay.
+         * decode path. Any capture that encodes multi-row live-state progression
+         * must be fresh. Dense single-token decode can preserve its executable
+         * because every dynamic input is rebound before launch; MoE callers may
+         * set @p preserve_single_token_decode_replay to false until routed
+         * scratch/expert metadata preservation has its own equivalence proof.
          * Preserved caches still have their stage stream bindings dirtied so a
          * KernelFactory dynamic-state reset cannot leave backend kernels with
          * null streams before the next updateDynamicParams() call.
          */
         ReplayStateResetSummary resetCapturedReplayStateForCorrectionReplay(
-            uint64_t live_state_epoch = 0);
+            uint64_t live_state_epoch = 0,
+            bool preserve_single_token_decode_replay = true);
+
+        /**
+         * @brief Drop captured all-position verifier replay after verifier-input mutation.
+         *
+         * Shifted MTP KV catch-up mutates an auxiliary cache read only by
+         * multi-row verifier graphs.  Ordinary decode and sidecar captures do
+         * not need to be discarded for that boundary, but ROCm verifier graph
+         * replay has proven unsafe when only the live-state epoch advances.
+         *
+         * This method also records a one-shot recapture request for the next
+         * all-position verifier graph.  That matters when the shifted-cache
+         * mutation happens before the verifier cache exists, or while it is
+         * between warmup/capture/replay phases: the next verifier execution
+         * still has to settle on a freshly captured executable before the
+         * request is consumed.
+         */
+        ReplayStateResetSummary resetAllPositionVerifierReplayState();
 
         /**
          * @brief Reset request/replay state without discarding cached forward graphs.
@@ -559,6 +601,7 @@ namespace llaminar2
          */
         void resetSessionReplayState()
         {
+            all_position_verifier_recapture_pending_ = false;
             for (auto &entry : cache_)
                 entry.second.resetSessionState();
         }
@@ -637,6 +680,8 @@ namespace llaminar2
         void recordLastExecutedForwardGraph(
             const ForwardGraphSignature &signature,
             bool cache_hit);
+        std::optional<LastExecutedForwardGraphView> viewForLastExecutedForwardGraphState(
+            const LastExecutedForwardGraphState &state);
 
         // ----- Cache HIT execution path -----
         bool executeCacheHit(
@@ -695,6 +740,16 @@ namespace llaminar2
         uint64_t bucketed_prefill_forward_access_counter_ = 0;
         uint64_t bucketed_prefill_forward_eviction_count_ = 0;
         LastExecutedForwardGraphState last_executed_forward_graph_;
+        LastExecutedForwardGraphState last_all_position_verifier_graph_;
+
+        /*
+         * Shifted MTP KV mutation is verifier-input mutation, not ordinary
+         * live-prefix mutation.  A cache scan can drop existing verifier
+         * captures, but it cannot protect a verifier graph that is created
+         * after the mutation.  Keep a pending intent until an all-position
+         * verifier has reached a fresh replay-ready capture.
+         */
+        bool all_position_verifier_recapture_pending_ = false;
 
         // ----- Mutable execution flags -----
         bool suppress_timeline_ = false;

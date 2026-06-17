@@ -181,6 +181,16 @@ public:
         return supports_mtp_spec_state_publication_;
     }
 
+    MTPVerifierRowCapability mtpVerifierRowCapability() const override
+    {
+        return mtp_verifier_row_capability_;
+    }
+
+    MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override
+    {
+        return mtp_verifier_economy_capability_;
+    }
+
     bool publishAcceptedMTPSpecState(
         const MTPSpecStepPlan &plan,
         std::string *error = nullptr) override
@@ -314,8 +324,10 @@ public:
         int already_appended_tokens,
         int main_forward_token_count,
         bool allow_speculative_discard = false,
-        int position_offset_override = -1) override
+        int position_offset_override = -1,
+        int already_appended_shifted_kv_tokens = -1) override
     {
+        (void)already_appended_shifted_kv_tokens;
         ++commit_mtp_shifted_rows_calls_;
         last_commit_mtp_already_appended_ = already_appended_tokens;
         last_commit_mtp_main_forward_token_count_ = main_forward_token_count;
@@ -343,12 +355,45 @@ public:
             position_offset_override);
     }
 
+    bool ensureMTPCheckpointTerminalHidden() override
+    {
+        ++ensure_mtp_checkpoint_terminal_hidden_calls_;
+        return ensure_mtp_checkpoint_terminal_hidden_ok_;
+    }
+
     bool hasMTPLogitsLocal() const override
     {
         return mtp_logits_local_ != nullptr;
     }
 
     LogitsLocalInfo getMTPLogitsLocalInfo() const override
+    {
+        get_mtp_logits_local_info_calls_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        if (!mtp_logits_local_)
+            return {};
+        const auto &shape = mtp_logits_local_->shape();
+        return LogitsLocalInfo{
+            nullptr,
+            std::nullopt,
+            shape.size() >= 2 ? shape[1] : 0,
+            mtp_logits_local_.get(),
+            nullptr,
+            nullptr,
+            nullptr,
+            0};
+    }
+
+    LogitsLocalInfo consumeMTPLogitsLocalInfoForSampling() override
+    {
+        consume_mtp_logits_local_info_calls_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        return makeMTPLocalInfo();
+    }
+
+    LogitsLocalInfo makeMTPLocalInfo() const
     {
         if (!mtp_logits_local_)
             return {};
@@ -470,6 +515,11 @@ public:
     bool supportsMTPSidecarPreservesMainState() const override
     {
         return supports_mtp_sidecar_preserves_main_state_;
+    }
+
+    bool supportsMTPShiftedRowReuseFromSidecar() const override
+    {
+        return supports_mtp_shifted_row_reuse_from_sidecar_;
     }
 
     bool applyPenaltiesOnDevice(
@@ -646,6 +696,62 @@ public:
         float threshold) override
     {
         return sampleStochasticDistributionOnDevice(buffer, slot, threshold) >= 0;
+    }
+
+    const void *prepareMTPVerifierInputTokensOnDevice(
+        int32_t first_token,
+        int first_draft_slot,
+        int draft_token_count,
+        int total_verifier_input_tokens) override
+    {
+        ++prepare_mtp_verifier_input_tokens_calls_;
+        last_verifier_first_token_ = first_token;
+        last_verifier_first_draft_slot_ = first_draft_slot;
+        last_verifier_draft_token_count_ = draft_token_count;
+        last_verifier_total_input_tokens_ = total_verifier_input_tokens;
+        if (!stochastic_device_ops_ok_)
+            return nullptr;
+
+        verifier_device_tokens_[0] = first_token;
+        return verifier_device_tokens_.data();
+    }
+
+    const void *prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+        int first_target_sample_slot,
+        int first_draft_slot,
+        int draft_token_count,
+        int total_verifier_input_tokens) override
+    {
+        ++prepare_mtp_verifier_input_tokens_from_device_calls_;
+        last_verifier_first_target_sample_slot_ = first_target_sample_slot;
+        last_verifier_first_draft_slot_ = first_draft_slot;
+        last_verifier_draft_token_count_ = draft_token_count;
+        last_verifier_total_input_tokens_ = total_verifier_input_tokens;
+        if (!stochastic_device_ops_ok_)
+            return nullptr;
+
+        return verifier_device_tokens_from_device_first_.data();
+    }
+
+    bool stageStochasticDraftTokensForDeviceVerification(
+        const int32_t *draft_tokens,
+        int draft_token_count,
+        int first_draft_slot = 0) override
+    {
+        ++stage_stochastic_draft_tokens_calls_;
+        last_staged_first_draft_slot_ = first_draft_slot;
+        last_staged_draft_tokens_.clear();
+        if (!stochastic_device_ops_ok_ ||
+            !draft_tokens ||
+            draft_token_count <= 0 ||
+            first_draft_slot < 0)
+        {
+            return false;
+        }
+        last_staged_draft_tokens_.assign(
+            draft_tokens,
+            draft_tokens + draft_token_count);
+        return true;
     }
 
     bool verifyStochasticDistributionsBatchOutcomeOnDevice(
@@ -877,12 +983,26 @@ public:
     void set_supports_chained_mtp_drafts(bool supported) { supports_chained_mtp_drafts_ = supported; }
     void set_forward_mtp_from_last_draft_ok(bool ok) { forward_mtp_from_last_draft_ok_ = ok; }
     void set_commit_mtp_shifted_rows_ok(bool ok) { commit_mtp_shifted_rows_ok_ = ok; }
+    void set_ensure_mtp_checkpoint_terminal_hidden_ok(bool ok)
+    {
+        ensure_mtp_checkpoint_terminal_hidden_ok_ = ok;
+    }
     void set_supports_mtp_spec_state_publication(bool supported) { supports_mtp_spec_state_publication_ = supported; }
+    void set_mtp_verifier_row_capability(MTPVerifierRowCapability capability)
+    {
+        mtp_verifier_row_capability_ = capability;
+    }
+
+    void set_mtp_verifier_economy_capability(MTPVerifierEconomyCapability capability)
+    {
+        mtp_verifier_economy_capability_ = capability;
+    }
     void set_publish_mtp_spec_state_ok(bool ok) { publish_mtp_spec_state_ok_ = ok; }
     void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
     void set_mtp_unsupported_reason(std::string reason) { mtp_unsupported_reason_ = std::move(reason); }
     void set_primary_device_id(DeviceId device_id) { device_id_ = device_id; }
     void set_supports_mtp_sidecar_preserves_main_state(bool supported) { supports_mtp_sidecar_preserves_main_state_ = supported; }
+    void set_supports_mtp_shifted_row_reuse_from_sidecar(bool supported) { supports_mtp_shifted_row_reuse_from_sidecar_ = supported; }
     void set_supports_device_stochastic_mtp_verification(bool supported) { supports_device_stochastic_mtp_verification_ = supported; }
     void set_stochastic_sample_token(int token) { stochastic_sample_token_ = token; }
     void set_prefix_live_capture_ok(bool ok) { prefix_live_capture_ok_ = ok; }
@@ -918,7 +1038,13 @@ public:
     size_t forward_mtp_call_count() const { return forward_mtp_calls_.load(std::memory_order_relaxed); }
     size_t forward_mtp_from_last_draft_call_count() const { return forward_mtp_from_last_draft_calls_.load(std::memory_order_relaxed); }
     size_t sample_mtp_logits_call_count() const { return sample_mtp_logits_calls_; }
+    size_t get_mtp_logits_local_info_call_count() const { return get_mtp_logits_local_info_calls_.load(std::memory_order_relaxed); }
+    size_t consume_mtp_logits_local_info_call_count() const { return consume_mtp_logits_local_info_calls_.load(std::memory_order_relaxed); }
     size_t commit_mtp_shifted_rows_call_count() const { return commit_mtp_shifted_rows_calls_; }
+    size_t ensure_mtp_checkpoint_terminal_hidden_call_count() const
+    {
+        return ensure_mtp_checkpoint_terminal_hidden_calls_;
+    }
     size_t publish_mtp_spec_state_call_count() const { return publish_mtp_spec_state_calls_.load(std::memory_order_relaxed); }
     size_t publish_mtp_spec_state_batch_call_count() const { return publish_mtp_spec_state_batch_calls_.load(std::memory_order_relaxed); }
     int32_t last_mtp_condition_token() const { return last_mtp_condition_token_; }
@@ -935,6 +1061,8 @@ public:
     size_t set_row_indexed_all_position_logits_call_count() const { return set_row_indexed_all_position_logits_calls_.load(std::memory_order_relaxed); }
     size_t set_mtp_spec_verifier_input_plan_call_count() const { return set_mtp_spec_verifier_input_plan_calls_.load(std::memory_order_relaxed); }
     size_t clear_mtp_spec_verifier_input_plan_call_count() const { return clear_mtp_spec_verifier_input_plan_calls_.load(std::memory_order_relaxed); }
+    size_t apply_penalties_on_device_call_count() const { return apply_penalties_on_device_calls_; }
+    size_t apply_penalties_to_mtp_logits_call_count() const { return apply_penalties_to_mtp_logits_calls_; }
     size_t get_all_position_logits_local_info_call_count() const { return get_all_position_logits_local_info_calls_.load(std::memory_order_relaxed); }
     size_t consume_all_position_logits_local_info_call_count() const { return consume_all_position_logits_local_info_calls_.load(std::memory_order_relaxed); }
     bool compute_all_position_logits() const { return compute_all_position_logits_; }
@@ -944,8 +1072,30 @@ public:
     size_t build_stochastic_processed_rows_call_count() const { return build_stochastic_processed_rows_calls_; }
     size_t sample_stochastic_draft_proposal_call_count() const { return sample_stochastic_draft_proposal_calls_; }
     size_t sample_stochastic_distribution_call_count() const { return sample_stochastic_distribution_calls_; }
+    size_t prepare_mtp_verifier_input_tokens_call_count() const
+    {
+        return prepare_mtp_verifier_input_tokens_calls_;
+    }
+    size_t prepare_mtp_verifier_input_tokens_from_device_call_count() const
+    {
+        return prepare_mtp_verifier_input_tokens_from_device_calls_;
+    }
+    size_t stage_stochastic_draft_tokens_call_count() const
+    {
+        return stage_stochastic_draft_tokens_calls_;
+    }
     size_t verify_stochastic_batch_outcome_call_count() const { return verify_stochastic_batch_outcome_calls_; }
     size_t verify_greedy_all_position_batch_outcome_call_count() const { return verify_greedy_all_position_batch_outcome_calls_; }
+    int32_t last_verifier_first_token() const { return last_verifier_first_token_; }
+    int last_verifier_first_target_sample_slot() const { return last_verifier_first_target_sample_slot_; }
+    int last_verifier_first_draft_slot() const { return last_verifier_first_draft_slot_; }
+    int last_verifier_draft_token_count() const { return last_verifier_draft_token_count_; }
+    int last_verifier_total_input_tokens() const { return last_verifier_total_input_tokens_; }
+    int last_staged_first_draft_slot() const { return last_staged_first_draft_slot_; }
+    const std::vector<int32_t> &last_staged_draft_tokens() const
+    {
+        return last_staged_draft_tokens_;
+    }
     int last_stochastic_row_count() const { return last_stochastic_row_count_; }
     bool last_use_vllm_probability_rejection() const { return last_use_vllm_probability_rejection_; }
     size_t prefix_live_capture_call_count() const { return prefix_live_capture_calls_.load(std::memory_order_relaxed); }
@@ -960,16 +1110,23 @@ public:
         forward_mtp_from_last_draft_calls_.store(0, std::memory_order_relaxed);
         sample_mtp_logits_calls_ = 0;
         commit_mtp_shifted_rows_calls_ = 0;
+        ensure_mtp_checkpoint_terminal_hidden_calls_ = 0;
         publish_mtp_spec_state_calls_.store(0, std::memory_order_relaxed);
         set_all_position_logits_calls_.store(0, std::memory_order_relaxed);
         set_row_indexed_all_position_logits_calls_.store(0, std::memory_order_relaxed);
         set_mtp_spec_verifier_input_plan_calls_.store(0, std::memory_order_relaxed);
         clear_mtp_spec_verifier_input_plan_calls_.store(0, std::memory_order_relaxed);
+        get_mtp_logits_local_info_calls_.store(0, std::memory_order_relaxed);
+        consume_mtp_logits_local_info_calls_.store(0, std::memory_order_relaxed);
         get_all_position_logits_local_info_calls_.store(0, std::memory_order_relaxed);
         consume_all_position_logits_local_info_calls_.store(0, std::memory_order_relaxed);
         prefix_live_capture_calls_.store(0, std::memory_order_relaxed);
         prefix_live_restore_calls_.store(0, std::memory_order_relaxed);
         prefix_live_truncate_calls_.store(0, std::memory_order_relaxed);
+        prepare_mtp_verifier_input_tokens_calls_ = 0;
+        prepare_mtp_verifier_input_tokens_from_device_calls_ = 0;
+        stage_stochastic_draft_tokens_calls_ = 0;
+        last_staged_draft_tokens_.clear();
     }
 
 private:
@@ -993,7 +1150,10 @@ private:
     bool supports_chained_mtp_drafts_ = false;
     bool forward_mtp_from_last_draft_ok_ = true;
     bool commit_mtp_shifted_rows_ok_ = true;
+    bool ensure_mtp_checkpoint_terminal_hidden_ok_ = true;
     bool supports_mtp_spec_state_publication_ = false;
+    MTPVerifierRowCapability mtp_verifier_row_capability_;
+    MTPVerifierEconomyCapability mtp_verifier_economy_capability_;
     bool supports_greedy_all_position_batch_outcome_ = true;
     bool publish_mtp_spec_state_ok_ = true;
     bool set_all_position_logits_ok_ = true;
@@ -1007,6 +1167,7 @@ private:
     bool supports_mtp_sidecar_logits_stream_handoff_ = false;
     bool supports_mtp_device_draft_token_input_ = false;
     bool supports_mtp_sidecar_preserves_main_state_ = false;
+    bool supports_mtp_shifted_row_reuse_from_sidecar_ = false;
     bool supports_device_stochastic_mtp_verification_ = false;
     bool apply_penalties_on_device_ok_ = true;
     bool apply_penalties_to_mtp_logits_ok_ = true;
@@ -1024,6 +1185,7 @@ private:
     int last_commit_mtp_already_appended_ = 0;
     int last_commit_mtp_main_forward_token_count_ = 0;
     int last_commit_mtp_position_offset_override_ = -1;
+    size_t ensure_mtp_checkpoint_terminal_hidden_calls_ = 0;
     bool last_commit_mtp_allow_speculative_discard_ = false;
     MTPSpecStepPlan last_mtp_spec_state_plan_;
     MTPSpecStepPlanBatch last_mtp_spec_state_batch_;
@@ -1038,6 +1200,9 @@ private:
     size_t build_stochastic_processed_rows_calls_ = 0;
     size_t sample_stochastic_draft_proposal_calls_ = 0;
     size_t sample_stochastic_distribution_calls_ = 0;
+    size_t prepare_mtp_verifier_input_tokens_calls_ = 0;
+    size_t prepare_mtp_verifier_input_tokens_from_device_calls_ = 0;
+    size_t stage_stochastic_draft_tokens_calls_ = 0;
     size_t verify_stochastic_batch_outcome_calls_ = 0;
     size_t verify_greedy_all_position_batch_outcome_calls_ = 0;
     size_t last_penalty_count_ = 0;
@@ -1048,8 +1213,17 @@ private:
     int last_stochastic_row_count_ = 0;
     int last_stochastic_vocab_size_ = 0;
     int last_stop_token_count_ = 0;
+    int32_t last_verifier_first_token_ = -1;
+    int last_verifier_first_target_sample_slot_ = -1;
+    int last_verifier_first_draft_slot_ = -1;
+    int last_verifier_draft_token_count_ = 0;
+    int last_verifier_total_input_tokens_ = 0;
+    int last_staged_first_draft_slot_ = -1;
     float last_stochastic_threshold_ = 0.0f;
     bool last_use_vllm_probability_rejection_ = false;
+    std::array<int32_t, 8> verifier_device_tokens_{};
+    std::array<int32_t, 8> verifier_device_tokens_from_device_first_{};
+    std::vector<int32_t> last_staged_draft_tokens_;
     size_t prefix_lookup_calls_ = 0;
     size_t prefix_populate_calls_ = 0;
     size_t prefix_harvest_calls_ = 0;
@@ -1070,6 +1244,8 @@ private:
     mutable std::atomic<size_t> set_row_indexed_all_position_logits_calls_{0};
     mutable std::atomic<size_t> set_mtp_spec_verifier_input_plan_calls_{0};
     mutable std::atomic<size_t> clear_mtp_spec_verifier_input_plan_calls_{0};
+    mutable std::atomic<size_t> get_mtp_logits_local_info_calls_{0};
+    mutable std::atomic<size_t> consume_mtp_logits_local_info_calls_{0};
     mutable std::atomic<size_t> get_all_position_logits_local_info_calls_{0};
     mutable std::atomic<size_t> consume_all_position_logits_local_info_calls_{0};
     mutable std::atomic<size_t> prefix_live_capture_calls_{0};
@@ -2363,6 +2539,37 @@ TEST_F(Test__RankOrchestrator, LocalPPSidecarMethodsDelegateOnlyToFinalStage)
            "stage can publish its own accepted verifier row state.";
 }
 
+TEST_F(Test__RankOrchestrator, LocalPPCheckpointTerminalHiddenDelegatesOnlyToFinalStage)
+{
+    auto stage0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage0_ptr = stage0.get();
+    stage0_ptr->set_ensure_mtp_checkpoint_terminal_hidden_ok(false);
+
+    auto stage1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage1_ptr = stage1.get();
+    stage1_ptr->set_ensure_mtp_checkpoint_terminal_hidden_ok(true);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    stages.push_back(std::move(stage0));
+    stages.push_back(std::move(stage1));
+
+    auto orchestrator = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(stages),
+        makeRankConfigForRunnerCount(2));
+
+    /*
+     * ensureMTPCheckpointTerminalHidden() materializes the stable terminal row
+     * used by MTP sidecar replay.  In LocalPP that row exists only on the final
+     * pipeline stage.  Earlier stages still checkpoint their KV/GDN state through
+     * captureLivePrefixState(), but they must not row-select from activation
+     * tensors that have already been handed to the next stage.
+     */
+    EXPECT_TRUE(orchestrator->ensureMTPCheckpointTerminalHidden());
+    EXPECT_EQ(stage0_ptr->ensure_mtp_checkpoint_terminal_hidden_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->ensure_mtp_checkpoint_terminal_hidden_call_count(), 1u);
+}
+
 TEST_F(Test__RankOrchestrator, LocalPPAllPositionPublicationRunsOnEveryStage)
 {
     auto stage0 = std::make_unique<MockDeviceGraphOrchestrator>();
@@ -2492,6 +2699,49 @@ TEST_F(Test__RankOrchestrator, LocalPPStochasticDeviceHooksDelegateOnlyToFinalSt
            "explicit pipeline-head ownership contract";
     EXPECT_FALSE(orchestrator->supportsMTPDeviceDraftTokenInput());
 
+    const void *host_first_tokens =
+        orchestrator->prepareMTPVerifierInputTokensOnDevice(
+            /*first_token=*/11,
+            /*first_draft_slot=*/2,
+            /*draft_token_count=*/3,
+            /*total_verifier_input_tokens=*/4);
+    ASSERT_NE(host_first_tokens, nullptr);
+    EXPECT_EQ(stage0_ptr->prepare_mtp_verifier_input_tokens_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->prepare_mtp_verifier_input_tokens_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->last_verifier_first_token(), 11);
+    EXPECT_EQ(stage1_ptr->last_verifier_first_draft_slot(), 2);
+    EXPECT_EQ(stage1_ptr->last_verifier_draft_token_count(), 3);
+    EXPECT_EQ(stage1_ptr->last_verifier_total_input_tokens(), 4);
+
+    const void *device_first_tokens =
+        orchestrator->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+            /*first_target_sample_slot=*/1,
+            /*first_draft_slot=*/0,
+            /*draft_token_count=*/2,
+            /*total_verifier_input_tokens=*/3);
+    ASSERT_NE(device_first_tokens, nullptr);
+    EXPECT_NE(device_first_tokens, host_first_tokens)
+        << "The mock exposes separate stable buffers for host-first and "
+           "device-first verifier token rows.";
+    EXPECT_EQ(stage0_ptr->prepare_mtp_verifier_input_tokens_from_device_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->prepare_mtp_verifier_input_tokens_from_device_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->last_verifier_first_target_sample_slot(), 1);
+    EXPECT_EQ(stage1_ptr->last_verifier_first_draft_slot(), 0);
+    EXPECT_EQ(stage1_ptr->last_verifier_draft_token_count(), 2);
+    EXPECT_EQ(stage1_ptr->last_verifier_total_input_tokens(), 3);
+
+    const int32_t staged_drafts[] = {19, 23};
+    EXPECT_TRUE(orchestrator->stageStochasticDraftTokensForDeviceVerification(
+        staged_drafts,
+        /*draft_token_count=*/2,
+        /*first_draft_slot=*/1));
+    EXPECT_EQ(stage0_ptr->stage_stochastic_draft_tokens_call_count(), 0u);
+    EXPECT_EQ(stage1_ptr->stage_stochastic_draft_tokens_call_count(), 1u);
+    EXPECT_EQ(stage1_ptr->last_staged_first_draft_slot(), 1);
+    EXPECT_THAT(
+        stage1_ptr->last_staged_draft_tokens(),
+        ::testing::ElementsAre(19, 23));
+
     std::vector<LogitPenalty> penalties;
     penalties.push_back(LogitPenalty{7, -1.0f});
     EXPECT_TRUE(orchestrator->applyPenaltiesToAllPositionLogitsOnDeviceRow(
@@ -2572,6 +2822,45 @@ TEST_F(Test__RankOrchestrator, ForwardMTPRunsOnEveryLocalTPChild)
     EXPECT_EQ(runner1_ptr->forward_mtp_call_count(), 1u);
     EXPECT_EQ(runner0_ptr->last_mtp_condition_token(), 42);
     EXPECT_EQ(runner1_ptr->last_mtp_condition_token(), 42);
+}
+
+TEST_F(Test__RankOrchestrator, LocalTPSidecarStateReuseRequiresEveryChildSupport)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_mtp_sidecar_preserves_main_state(true);
+    runner0_ptr->set_supports_mtp_shifted_row_reuse_from_sidecar(true);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_supports_mtp_sidecar_preserves_main_state(true);
+    runner1_ptr->set_supports_mtp_shifted_row_reuse_from_sidecar(true);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_TRUE(orchestrator->supportsMTPSidecarPreservesMainState())
+        << "LocalTP sidecar preservation is a domain-wide all-child capability.";
+    EXPECT_TRUE(orchestrator->supportsMTPShiftedRowReuseFromSidecar())
+        << "Dense LocalTP may reuse the first shifted row only when every shard can.";
+
+    runner1_ptr->set_supports_mtp_sidecar_preserves_main_state(false);
+    EXPECT_FALSE(orchestrator->supportsMTPSidecarPreservesMainState());
+    EXPECT_TRUE(orchestrator->supportsMTPShiftedRowReuseFromSidecar())
+        << "The reuse predicate is independent so tests can catch either "
+           "capability drifting on a child runner.";
+
+    runner1_ptr->set_supports_mtp_sidecar_preserves_main_state(true);
+    runner0_ptr->set_supports_mtp_shifted_row_reuse_from_sidecar(false);
+    EXPECT_TRUE(orchestrator->supportsMTPSidecarPreservesMainState());
+    EXPECT_FALSE(orchestrator->supportsMTPShiftedRowReuseFromSidecar());
 }
 
 TEST_F(Test__RankOrchestrator, ForwardMTPEntersLocalTPChildrenConcurrently)
@@ -2817,6 +3106,95 @@ TEST_F(Test__RankOrchestrator, SpecStatePublicationRequiresEveryLocalTPChildSupp
     EXPECT_NE(error.find("participant 1"), std::string::npos);
     EXPECT_EQ(runner0_ptr->publish_mtp_spec_state_call_count(), 0u);
     EXPECT_EQ(runner1_ptr->publish_mtp_spec_state_call_count(), 0u);
+}
+
+TEST_F(Test__RankOrchestrator, VerifierRowCapabilityClampsToWeakestParticipant)
+{
+    MTPVerifierRowCapability strong;
+    strong.dense_decode_equivalent =
+        MTPVerifierRowEquivalenceSpec::proven(4);
+    strong.dense_direct_all_position =
+        MTPVerifierRowEquivalenceSpec::proven(4);
+    strong.moe_decode_equivalent =
+        MTPVerifierRowEquivalenceSpec::proven(4);
+    strong.device_resident_direct_publication = true;
+
+    MTPVerifierRowCapability weak = strong;
+    weak.dense_direct_all_position =
+        MTPVerifierRowEquivalenceSpec::proven(2);
+    weak.moe_decode_equivalent =
+        MTPVerifierRowEquivalenceSpec::proven(3);
+    weak.device_resident_direct_publication = false;
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner0->set_mtp_verifier_row_capability(strong);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner1->set_mtp_verifier_row_capability(weak);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    const MTPVerifierRowCapability capability =
+        orchestrator->mtpVerifierRowCapability();
+    EXPECT_TRUE(capability.supportsDenseDecodeEquivalentRows(4, true));
+    EXPECT_TRUE(capability.supportsDenseDirectAllPositionRows(2, true));
+    EXPECT_FALSE(capability.supportsDenseDirectAllPositionRows(3, false))
+        << "Rank-level direct publication must clamp to the weakest child.";
+    EXPECT_TRUE(capability.supportsMoEDecodeEquivalentRows(3, true));
+    EXPECT_FALSE(capability.supportsMoEDecodeEquivalentRows(4, false));
+    EXPECT_FALSE(capability.device_resident_direct_publication)
+        << "Device-resident publication is an all-participant contract.";
+}
+
+TEST_F(Test__RankOrchestrator, VerifierEconomyCapabilityClampsToWeakestParticipant)
+{
+    MTPVerifierEconomyCapability strong;
+    strong.dense = MTPVerifierEconomyLane::groupedPromoted(4);
+    strong.moe = MTPVerifierEconomyLane::groupedPromoted(4);
+
+    MTPVerifierEconomyCapability weak;
+    weak.dense = MTPVerifierEconomyLane::serialFallbackCorrect(4);
+    weak.moe = MTPVerifierEconomyLane::groupedPromoted(2);
+    weak.moe.host_bridge_free_hot_path = false;
+    weak.moe.perf_gate_status = "device_bridge_pending";
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner0->set_mtp_verifier_economy_capability(strong);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner1->set_mtp_verifier_economy_capability(weak);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    const MTPVerifierEconomyCapability capability =
+        orchestrator->mtpVerifierEconomyCapability();
+    EXPECT_TRUE(capability.supportsDenseRows(4, true));
+    EXPECT_FALSE(capability.hasEconomicalDensePath(4, false))
+        << "A correct serial fallback must not be advertised as an "
+           "economical grouped verifier.";
+    EXPECT_TRUE(capability.supportsMoERows(2, true));
+    EXPECT_FALSE(capability.supportsMoERows(3, false))
+        << "Rank-level MoE economy must clamp row count to the weakest child.";
+    EXPECT_FALSE(capability.hasEconomicalMoEPath(2, true))
+        << "Every participant must be host-bridge free before the rank path is "
+           "economical.";
+    EXPECT_EQ(capability.moe.perf_gate_status, "mixed_capability");
 }
 
 TEST_F(Test__RankOrchestrator, SpecStatePublicationRunsOnEveryLocalTPChild)
@@ -3120,9 +3498,11 @@ TEST_F(Test__RankOrchestrator, MultiChildMTPSamplingUsesColumnParallelShardInfos
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     runner0->set_mock_mtp_logits_local(2, {0.1f, 0.4f});
+    auto *runner0_ptr = runner0.get();
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     runner1->set_mock_mtp_logits_local(3, {0.8f, 0.7f, 0.6f});
+    auto *runner1_ptr = runner1.get();
 
     std::vector<std::unique_ptr<IInferenceRunner>> runners;
     runners.push_back(std::move(runner0));
@@ -3138,6 +3518,45 @@ TEST_F(Test__RankOrchestrator, MultiChildMTPSamplingUsesColumnParallelShardInfos
         makeRankConfigForRunnerCount(2));
 
     EXPECT_EQ(orchestrator->sampleGreedyFromMTPLogitsOnDevice(), 2);
+    EXPECT_EQ(runner0_ptr->consume_mtp_logits_local_info_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->consume_mtp_logits_local_info_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->get_mtp_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->get_mtp_logits_local_info_call_count(), 0u);
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildMTPPenaltyApplicationFansOutToEveryShard)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
+    model_ctx->setVocabSize(5);
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        std::move(model_ctx),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    const std::vector<LogitPenalty> penalties = {{2, 1.25f}};
+    EXPECT_TRUE(orchestrator->applyPenaltiesToMTPLogitsOnDevice(penalties, 5))
+        << "LocalTP MTP logits are sharded; rank orchestration must ask every "
+           "participant to apply its local slice of the global sparse map.";
+    EXPECT_EQ(runner0_ptr->apply_penalties_to_mtp_logits_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->apply_penalties_to_mtp_logits_call_count(), 1u);
+
+    EXPECT_TRUE(orchestrator->applyPenaltiesOnDevice(penalties, 5))
+        << "The main LM-head penalty path should mirror MTP so temperature-zero "
+           "requests with model-default penalties remain TP-capable.";
+    EXPECT_EQ(runner0_ptr->apply_penalties_on_device_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->apply_penalties_on_device_call_count(), 1u);
 }
 
 TEST_F(Test__RankOrchestrator, MultiChildMTPLogitsRejectMixedLocalAndReplicatedShards)

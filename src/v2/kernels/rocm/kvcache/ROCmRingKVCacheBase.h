@@ -60,8 +60,20 @@ namespace llaminar2
         // =====================================================================
 
         bool isGraphCaptureReady() const override { return d_head_params_ != nullptr; }
+        bool supportsDeviceResidentSequenceStatePublication() const override
+        {
+            return d_head_params_ != nullptr && d_count_params_ != nullptr;
+        }
         void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override;
         void advanceHead(int layer, int seq_idx, int num_tokens) override;
+        const int *deviceCachedTokenCountPtr(int layer, int seq_idx = 0) const override;
+        const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const override;
+        bool publishSequenceStateFromDeviceMetadata(
+            const DeviceSequenceStatePublicationRequest &request,
+            std::string *error = nullptr) override;
+        bool adoptSequenceStateFromHostMetadata(
+            const HostSequenceStatePublicationRequest &request,
+            std::string *error = nullptr) override;
 
         // =====================================================================
         // Common Accessors
@@ -95,11 +107,15 @@ namespace llaminar2
 
         // Graph capture device params
         // Layout: [n_layers_ * batch_size_] ints
-        int *d_head_params_ = nullptr; ///< Device-side head position buffer
-        int *h_head_params_ = nullptr; ///< Pinned host-side head position buffer
+        int *d_head_params_ = nullptr;  ///< Device-side head position buffer
+        int *h_head_params_ = nullptr;  ///< Pinned host-side head position buffer
+        int *d_count_params_ = nullptr; ///< Device-side cached-token count buffer
+        int *h_count_params_ = nullptr; ///< Pinned host-side cached-token count buffer
 
         void allocateDeviceParams();
         void freeDeviceParams();
+        void refreshHostDeviceParamMirror(int layer, int seq_idx);
+        bool uploadHostDeviceParamMirror(int layer, int seq_idx, void *gpu_stream);
 
         bool validLayerSeq(int layer, int seq_idx) const
         {

@@ -651,7 +651,7 @@ namespace llaminar2::test
         ASSERT_NE(ffn_end, std::string::npos);
         const std::string ffn_body = contents.substr(ffn_start, ffn_end - ffn_start);
 
-        EXPECT_NE(ffn_body.find("use_mtp_runtime_table = mtp_sidecar_context && layer_idx >= config_.n_layers"),
+        EXPECT_NE(ffn_body.find("use_mtp_runtime_table = mtp_sidecar_context"),
                   std::string::npos);
         EXPECT_NE(ffn_body.find("std::max(config_.n_layers, layer_idx + 1)"),
                   std::string::npos);
@@ -679,12 +679,23 @@ namespace llaminar2::test
         ASSERT_NE(execute_end, std::string::npos);
         const std::string execute_body = contents.substr(execute_start, execute_end - execute_start);
 
+        const size_t fused_gate_call = execute_body.find("kernel->sharedExpertGateAddFromTensors(");
+        const size_t fused_publish = execute_body.find("markGpuTensorWritten(params_.shared_output, params_.device_id, gpuStream())",
+                                                       fused_gate_call);
+        const size_t fused_combined_publish = execute_body.find("markGpuTensorWritten(params_.combined_output, params_.device_id, gpuStream())",
+                                                               fused_gate_call);
         const size_t gate_call = execute_body.find("kernel->sharedExpertGateFromTensors(");
-        const size_t publish = execute_body.find("markGpuTensorWritten(params_.shared_output, params_.device_id, gpuStream())");
-        const size_t upload_fallback = execute_body.find("params_.shared_output->needsUpload()");
+        const size_t publish = execute_body.find("markGpuTensorWritten(params_.shared_output, params_.device_id, gpuStream())",
+                                                 gate_call);
+        const size_t upload_fallback = execute_body.find("params_.shared_output->needsUpload()", publish);
+        ASSERT_NE(fused_gate_call, std::string::npos);
+        ASSERT_NE(fused_publish, std::string::npos);
+        ASSERT_NE(fused_combined_publish, std::string::npos);
         ASSERT_NE(gate_call, std::string::npos);
         ASSERT_NE(publish, std::string::npos);
         ASSERT_NE(upload_fallback, std::string::npos);
+        EXPECT_LT(fused_gate_call, fused_publish);
+        EXPECT_LT(fused_gate_call, fused_combined_publish);
         EXPECT_LT(gate_call, publish);
         EXPECT_LT(publish, upload_fallback);
     }

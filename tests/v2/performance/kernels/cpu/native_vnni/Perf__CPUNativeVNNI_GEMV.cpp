@@ -34,13 +34,19 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <csignal>
 #include <cstring>
 #include <iomanip>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <random>
+#include <set>
+#include <sstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -221,6 +227,79 @@ namespace
         {"IQ4_XS"}, {"IQ3_S"}, {"IQ3_XXS"}, {"IQ2_S"},
         {"IQ2_XS"}, {"IQ2_XXS"}, {"IQ1_S"}, {"IQ1_M"},
     };
+
+    std::string trim(std::string value)
+    {
+        const auto begin = value.find_first_not_of(" \t\n\r");
+        if (begin == std::string::npos)
+            return {};
+        const auto end = value.find_last_not_of(" \t\n\r");
+        return value.substr(begin, end - begin + 1);
+    }
+
+    std::string toLower(std::string value)
+    {
+        std::transform(
+            value.begin(),
+            value.end(),
+            value.begin(),
+            [](unsigned char c)
+            {
+                return static_cast<char>(std::tolower(c));
+            });
+        return value;
+    }
+
+    /**
+     * @brief Read an optional environment variable as a trimmed string.
+     */
+    std::string getEnvString(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return {};
+        return trim(raw);
+    }
+
+    /**
+     * @brief Read an optional environment variable as an integer.
+     */
+    std::optional<int> getEnvInt(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return std::nullopt;
+        return std::atoi(raw);
+    }
+
+    /**
+     * @brief Read a comma-separated environment variable as lowercase tokens.
+     */
+    std::set<std::string> getEnvCsvSet(const char *name)
+    {
+        std::set<std::string> values;
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return values;
+
+        std::stringstream ss(raw);
+        std::string item;
+        while (std::getline(ss, item, ','))
+        {
+            item = toLower(trim(item));
+            if (!item.empty())
+                values.insert(item);
+        }
+        return values;
+    }
+
+    /**
+     * @brief Return true when a test case name is allowed by an optional filter.
+     */
+    bool shouldRunName(const std::set<std::string> &filters, const std::string &name)
+    {
+        return filters.empty() || filters.count(toLower(name)) > 0;
+    }
 
     std::unique_ptr<TensorBase> createWeightsForFormat(
         const std::string &fmt_name, size_t N, size_t K)
@@ -1093,6 +1172,152 @@ namespace
         std::cout << "\n=== MTP Small-M CPU NativeVNNI Fused Projection Perf ===\n"
                   << "Rows M=2/3/4, two projections, activation quantized once per fused call.\n\n"
                   << table.to_string() << std::endl;
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_TrainerCsv_AllFormats)
+    {
+        /**
+         * This is the CPU analogue of the CUDA/ROCm NativeVNNI trainer smoke:
+         * emit stable, machine-readable rows for the current default CPU small-M
+         * route. CPU does not yet consume a generated dispatch include, so the
+         * only variant is "DEFAULT"; later analyzer work can add override
+         * candidates without changing the CSV schema.
+         *
+         * Useful knobs:
+         * - LLAMINAR_CPU_NVNNI_SMALL_M_FORMATS=Q4_0,IQ4_XS
+         * - LLAMINAR_CPU_NVNNI_SMALL_M_M=2,3,4
+         * - LLAMINAR_CPU_NVNNI_SMALL_M_CSV=/tmp/cpu_small_m.csv
+         */
+        constexpr int K = 512;
+        constexpr int N0 = 768;
+        constexpr int N1 = 512;
+        const std::array<int, 3> default_rows = {2, 3, 4};
+
+        const std::set<std::string> format_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_SMALL_M_FORMATS");
+        const std::set<std::string> m_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_SMALL_M_M");
+        const int max_cases =
+            std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_SMALL_M_MAX_CASES").value_or(1000000));
+        const int warmup =
+            std::max(0, getEnvInt("LLAMINAR_CPU_NVNNI_SMALL_M_WARMUP").value_or(3));
+        const int iters =
+            std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_SMALL_M_ITERS").value_or(10));
+        const std::string csv_path =
+            getEnvString("LLAMINAR_CPU_NVNNI_SMALL_M_CSV");
+
+        std::FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr)
+                << "Failed to open CPU NativeVNNI small-M trainer CSV: " << csv_path;
+            std::fprintf(
+                csv,
+                "backend,phase,format,codebook,shape,k,m,projections,total_n,projection_ns,variant,min_us,mean_us,stddev_us,correctness_pass,is_best\n");
+        }
+
+        int executed_cases = 0;
+        int emitted_rows = 0;
+        for (const auto &fmt : MTP_SMALL_M_FORMATS)
+        {
+            if (!shouldRunName(format_filters, fmt.name))
+                continue;
+
+            auto weights0 = createWeightsForFormat(fmt.name, N0, K);
+            auto weights1 = createWeightsForFormat(fmt.name, N1, K);
+            ASSERT_NE(weights0, nullptr) << fmt.name;
+            ASSERT_NE(weights1, nullptr) << fmt.name;
+
+            CPUNativeVNNIGemmKernel kernel0(weights0.get());
+            CPUNativeVNNIGemmKernel kernel1(weights1.get());
+            ASSERT_TRUE(kernel0.isValid()) << fmt.name;
+            ASSERT_TRUE(kernel1.isValid()) << fmt.name;
+            const uint8_t codebook = kernel0.packedWeights().codebook_id;
+
+            for (int M : default_rows)
+            {
+                if (!m_filters.empty() && m_filters.count(std::to_string(M)) == 0)
+                    continue;
+                if (executed_cases >= max_cases)
+                    break;
+
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)},
+                    -1.0f,
+                    1.0f,
+                    static_cast<uint32_t>(9000 + M + fmt.name.size()));
+                FP32Tensor out0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+                FP32Tensor out1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {&kernel0, &out0, N0, nullptr, "mtp_projection_0"},
+                    {&kernel1, &out1, N1, nullptr, "mtp_projection_1"}};
+
+                for (int i = 0; i < warmup; ++i)
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+
+                std::vector<double> times;
+                times.reserve(static_cast<size_t>(iters));
+                for (int i = 0; i < iters; ++i)
+                {
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    times.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+                }
+                const double min_us = *std::min_element(times.begin(), times.end());
+                const double mean_us =
+                    std::accumulate(times.begin(), times.end(), 0.0) / static_cast<double>(times.size());
+                double variance = 0.0;
+                for (double value : times)
+                {
+                    const double delta = value - mean_us;
+                    variance += delta * delta;
+                }
+                variance /= static_cast<double>(times.size());
+                const double stddev_us = std::sqrt(variance);
+
+                if (csv)
+                {
+                    std::fprintf(
+                        csv,
+                        "cpu,small_m_fused_projection,%s,%u,SmallM_FusedProjection,%d,%d,2,%d,%d+%d,DEFAULT,%.3f,%.3f,%.3f,1,1\n",
+                        fmt.name.c_str(),
+                        static_cast<unsigned>(codebook),
+                        K,
+                        M,
+                        N0 + N1,
+                        N0,
+                        N1,
+                        min_us,
+                        mean_us,
+                        stddev_us);
+                    std::fflush(csv);
+                    ++emitted_rows;
+                }
+
+                std::fprintf(
+                    stderr,
+                    "[CPUNativeVNNI][SMALL_M][TRAINER] format=%s codebook=%u M=%d variant=DEFAULT time_us=%.3f\n",
+                    fmt.name.c_str(),
+                    static_cast<unsigned>(codebook),
+                    M,
+                    min_us);
+                ++executed_cases;
+            }
+
+            if (executed_cases >= max_cases)
+                break;
+        }
+
+        if (csv)
+        {
+            std::fclose(csv);
+            ASSERT_GT(emitted_rows, 0)
+                << "CPU NativeVNNI small-M trainer CSV had no rows.";
+        }
+        ASSERT_GT(executed_cases, 0)
+            << "No CPU NativeVNNI small-M trainer cases selected.";
     }
 
 } // anonymous namespace

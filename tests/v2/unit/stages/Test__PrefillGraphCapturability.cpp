@@ -115,6 +115,10 @@ namespace
     class StubMoEKernel : public IMoEKernel
     {
     public:
+        mutable int gateup_table_uploads = 0;
+        mutable int down_table_uploads = 0;
+        mutable int fused_runtime_decode_calls = 0;
+
         bool supports_device(int) const override { return true; }
         bool route(const float *, const float *, int, int, int, int, bool,
                    MoERoutingResult &) override
@@ -126,6 +130,36 @@ namespace
                                 int, int) override {}
         void sharedExpertGate(const float *, const float *, float *, int, int) override {}
         void swiGLU(float *, const float *, int) override {}
+        int uploadGroupedExpertGateUpDescriptorTables(
+            const DeviceNativeVNNIMatrixDesc *,
+            const DeviceNativeVNNIMatrixDesc *,
+            int,
+            int,
+            int) override
+        {
+            return gateup_table_uploads++;
+        }
+        int uploadGroupedExpertDownDescriptorTable(
+            const DeviceNativeVNNIMatrixDesc *,
+            int,
+            int,
+            int) override
+        {
+            return down_table_uploads++;
+        }
+        bool groupedExpertDecodeFromRuntime(
+            DeviceMoELayerRuntime *,
+            const TensorBase *,
+            int,
+            int,
+            int,
+            ITensor *,
+            int,
+            int) override
+        {
+            ++fused_runtime_decode_calls;
+            return true;
+        }
     };
 
     // =========================================================================
@@ -183,6 +217,12 @@ namespace
     class StubGemmEngine : public ITensorGemm
     {
     public:
+        void setNativeDescShape(int n, int k)
+        {
+            desc_n_ = n;
+            desc_k_ = k;
+        }
+
         bool supports_device(int) const override { return true; }
         bool multiply_tensor(
             const TensorBase *, TensorBase *,
@@ -196,6 +236,15 @@ namespace
         {
             return true;
         }
+        bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+        {
+            out = runtimeDesc(0x71000000u, desc_n_, desc_k_);
+            return true;
+        }
+
+    private:
+        int desc_n_ = 128;
+        int desc_k_ = 64;
     };
 
 } // anonymous namespace
@@ -519,6 +568,9 @@ protected:
 
         for (int e = 0; e < NUM_EXPERTS; ++e)
         {
+            stub_gemms_[static_cast<size_t>(e * 3 + 0)].setNativeDescShape(INTERMEDIATE, D_MODEL);
+            stub_gemms_[static_cast<size_t>(e * 3 + 1)].setNativeDescShape(INTERMEDIATE, D_MODEL);
+            stub_gemms_[static_cast<size_t>(e * 3 + 2)].setNativeDescShape(D_MODEL, INTERMEDIATE);
             gate_gemm_ptrs_[static_cast<size_t>(e)] = &stub_gemms_[static_cast<size_t>(e * 3 + 0)];
             up_gemm_ptrs_[static_cast<size_t>(e)] = &stub_gemms_[static_cast<size_t>(e * 3 + 1)];
             down_gemm_ptrs_[static_cast<size_t>(e)] = &stub_gemms_[static_cast<size_t>(e * 3 + 2)];
@@ -626,6 +678,46 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithPartialExpertOwnership)
         << "Should reject when not all experts are locally owned";
 }
 
+TEST_F(MoEExpertPrefillGraphCapture, ForcedDecodeReplayFixedTopologyRequiresFullOwnership)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto expect_backend = [&](DeviceId device, bool backend_supported, const char *backend_name)
+    {
+        auto full_params = makeValidPrefillParams();
+        full_params.device_id = device;
+        full_params.seq_len = 1;
+        full_params.force_grouped_verifier_prefill_for_decode = true;
+
+        MoEExpertComputeStage full_stage(full_params);
+        full_stage.setMoEKernelForTesting(&stub_kernel_);
+        EXPECT_EQ(full_stage.usesFixedTopologyGroupedVerifierReplayForTesting(),
+                  backend_supported)
+            << backend_name << " full-ownership verifier correction replay should "
+            << "advertise the fixed descriptor-table route only when the backend supports it";
+
+        auto partial_params = full_params;
+        partial_params.local_expert_count = NUM_EXPERTS - 1;
+        MoEExpertComputeStage partial_stage(partial_params);
+        partial_stage.setMoEKernelForTesting(&stub_kernel_);
+        EXPECT_FALSE(partial_stage.usesFixedTopologyGroupedVerifierReplayForTesting())
+            << backend_name << " LocalTP partial expert ownership must not claim the "
+            << "full-ownership fixed descriptor-table verifier replay path";
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true, "CUDA");
+#else
+    expect_backend(DeviceId::cuda(0), false, "CUDA");
+#endif
+
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true, "ROCm");
+#else
+    expect_backend(DeviceId::rocm(0), false, "ROCm");
+#endif
+}
+
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWithExpertMaskHavingDisabled)
 {
     ScopedRocmMoEFlags flags(true, true, true);
@@ -681,6 +773,90 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsDecodeSeqLen)
     // Without runtime table, decode path also fails
     EXPECT_FALSE(stage.isGraphCapturable())
         << "seq_len=1 without runtime table should not be capturable via either path";
+}
+
+TEST_F(MoEExpertPrefillGraphCapture, DeviceRoutedDecodeRequiresFusedRuntimeWarmupBeforeCapture)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+
+    auto expectWarmupContract = [&](DeviceId device)
+    {
+        auto params = makeValidPrefillParams();
+        params.device_id = device;
+        params.seq_len = 1;
+        params.layer_idx = 0;
+        params.moe_runtime_table = &runtime_table;
+
+        MoEExpertComputeStage stage(params);
+        stage.setMoEKernelForTesting(&stub_kernel_);
+
+        EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture())
+            << "Cold routed MoE decode should advertise that warmup can make it capturable on "
+            << device.to_string();
+        EXPECT_FALSE(stage.isGraphCapturable())
+            << "Routed MoE decode must not capture before fused runtime pointer arrays are staged on "
+            << device.to_string();
+
+        stage.setRuntimeGroupedDecodeWarmedForTesting(true);
+        EXPECT_TRUE(stage.isGraphCapturable())
+            << "After fused runtime warmup, routed MoE decode is graph-capturable on "
+            << device.to_string();
+
+        stage.resetSessionState();
+        EXPECT_FALSE(stage.isGraphCapturable())
+            << "Session reset clears backend pointer-table readiness; routed MoE decode must warm again on "
+            << device.to_string();
+    };
+
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    expectWarmupContract(DeviceId::rocm(0));
+#endif
+#if defined(HAVE_CUDA) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    expectWarmupContract(DeviceId::cuda(0));
+#endif
+#if (!defined(HAVE_ROCM) && !defined(HAVE_CUDA)) || defined(ENABLE_PIPELINE_SNAPSHOTS)
+    GTEST_SKIP() << "GPU routed MoE decode graph capture is not compiled in this build";
+#endif
+}
+
+TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndFusedDecode)
+{
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+
+    auto params = makeValidPrefillParams();
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = 1;
+    params.layer_idx = 0;
+    params.moe_runtime_table = &runtime_table;
+    params.output_registered_in_arena = true;
+
+    MoEExpertComputeStage stage(params);
+    stage.setMoEKernelForTesting(&stub_kernel_);
+    stage.releaseRawExpertWeights();
+
+    ASSERT_TRUE(stage.supportsWarmupDependentGraphCapture());
+    ASSERT_FALSE(stage.isGraphCapturable())
+        << "The cold stage should require one explicit warmup pass.";
+
+    ASSERT_TRUE(stage.execute(nullptr))
+        << "The first warmup after clear_cache() must initialize the runtime "
+           "placement bank and immediately use the fused runtime decode path.";
+    EXPECT_EQ(stub_kernel_.fused_runtime_decode_calls, 1)
+        << "Fused runtime decode must be warmed on the first post-reset token, "
+           "not deferred until after an avoidable capture failure.";
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "After the first warmup token, segmented capture should be armed "
+           "without requiring a fallback decode step.";
+#else
+    GTEST_SKIP() << "Release GPU graph-capture path is disabled in this build";
+#endif
 }
 
 // =========================================================================
@@ -1068,6 +1244,9 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalDecodeUsesWorkspaceBackedGr
     stage.setGroupedDecodeWarmedForTesting(true);
     EXPECT_TRUE(stage.isGraphCapturable())
         << "After successful warmup, grouped decode is safe for graph capture.";
+    stage.resetSessionState();
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "Session reset clears backend pointer-table readiness, so grouped decode must warm again.";
 #else
     (void)stage;
 #endif

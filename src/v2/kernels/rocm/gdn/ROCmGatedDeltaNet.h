@@ -64,6 +64,14 @@ extern "C"
     void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void rocmGDN_gpu_set_device(int ordinal);
     void rocmGDN_stream_synchronize(void *stream);
+    bool rocmGDN_gpu_copy_capture_row_from_device_index(
+        float *dst,
+        const float *capture,
+        const int *device_row_index,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream);
     // QKV deinterleave on device
     bool rocmGDN_deinterleave_qkv(
         const float *merged, float *out_q, float *out_k, float *out_v,
@@ -104,7 +112,6 @@ namespace llaminar2
 
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
         {
-            (void)dst_state;
             if (!gpu_state_ || !verifier_state_capture_ ||
                 row < 0 || row >= verifier_state_capture_rows_ ||
                 verifier_state_capture_size_ != state_size_)
@@ -117,9 +124,57 @@ namespace llaminar2
                 verifier_state_capture_ +
                 static_cast<size_t>(row) * static_cast<size_t>(verifier_state_capture_size_);
             if (stream)
+            {
                 rocmGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
+                if (dst_state)
+                {
+                    /*
+                     * Publication owns both the HIP live state and the hybrid
+                     * cache's host mirror.  Updating the mirror here keeps any
+                     * post-publication graph rebuild decode-equivalent.
+                     */
+                    rocmGDN_gpu_memcpy_d2h_async(dst_state, src, static_cast<size_t>(state_size_), stream);
+                    rocmGDN_stream_synchronize(stream);
+                }
+            }
             else
+            {
                 rocmGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
+                if (dst_state)
+                    rocmGDN_gpu_memcpy_d2h(dst_state, src, static_cast<size_t>(state_size_));
+            }
+            return true;
+        }
+
+        bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            float *dst_state,
+            const int *device_row_index,
+            void *stream) override
+        {
+            /*
+             * Device-indexed publication consumes GPU-resident accepted-row
+             * metadata and restores HIP live state only. Do not update the host
+             * mirror from this method; that would force a stream sync and split
+             * live-state ownership across host and device.
+             */
+            (void)dst_state;
+            if (!gpu_state_ || !verifier_state_capture_ || !device_row_index ||
+                !stream ||
+                verifier_state_capture_size_ != state_size_)
+            {
+                return false;
+            }
+
+            const bool ok = rocmGDN_gpu_copy_capture_row_from_device_index(
+                gpu_state_,
+                verifier_state_capture_,
+                device_row_index,
+                verifier_state_capture_rows_,
+                state_size_,
+                device_ordinal_,
+                stream);
+            if (!ok)
+                return false;
             return true;
         }
 
@@ -292,15 +347,24 @@ namespace llaminar2
             if (!effective_state)
                 return false;
 
-            // One-token decode must use the recurrent-step contract.  The
-            // multi-row verifier path remains chunk-based and publishes state
-            // through accepted-count metadata, but forcing ordinary decode
-            // through the chunk kernel changes the Qwen3.6 GDN trajectory on
-            // control-token continuations such as <think>.
-            return rocmGDN_recurrent_step(
+            /*
+             * Keep ordinary one-token decode on the same row-split chunk
+             * kernel used by all-position MTP verification.  Publication
+             * restores verifier-captured GDN rows into the live state; if the
+             * next decode step uses a mathematically different recurrent-step
+             * kernel, the accepted prefix can match immediately and still drift
+             * on the following continuation tokens.  CUDA already follows this
+             * contract, so ROCm must do the same to make state publication a
+             * true replay-equivalent handoff rather than a backend-specific
+             * approximation.
+             */
+            return rocmGDN_chunk_forward(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,
-                n_heads, d_k, d_v, use_qk_l2norm,
+                /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
+                verifier_state_capture_,
+                verifier_state_capture_size_,
+                verifier_state_capture_rows_,
                 device_ordinal_, stream_);
         }
 

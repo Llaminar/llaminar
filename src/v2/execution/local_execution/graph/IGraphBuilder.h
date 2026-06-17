@@ -66,7 +66,18 @@ namespace llaminar2
          * cache bookkeeping, and CPU-only helpers.
          */
         const void *token_ids_device = nullptr;
-        const int *position_ids = nullptr; ///< Position IDs [batch_size * seq_len]
+        const int *position_ids = nullptr; ///< Host position IDs [batch_size * seq_len]
+        /**
+         * @brief Optional device-resident INT32 position IDs.
+         *
+         * Phase 10 resident MTP continuation can publish the next logical
+         * positions directly in device memory.  GPU RoPE stages should consume
+         * this pointer without recording a host-to-device copy.  The host
+         * `position_ids` pointer may still be set for CPU execution, logging,
+         * and graph-key bookkeeping, but device execution must treat this
+         * pointer as the source of truth when it is present.
+         */
+        const void *position_ids_device = nullptr;
         int batch_size = 1;                ///< Number of sequences
         int seq_len = 0;                   ///< Sequence length per batch
         int position_offset = 0;           ///< KV cache position offset (legacy fallback)
@@ -142,7 +153,8 @@ namespace llaminar2
         int seq_len = 0;                   ///< Sequence length
         int batch_size = 1;                ///< Batch size (number of sequences)
         DeviceId device = DeviceId::cpu(); ///< Target device
-        const int *position_ids = nullptr; ///< Position IDs for RoPE
+        const int *position_ids = nullptr; ///< Host position IDs for RoPE
+        const void *position_ids_device = nullptr; ///< Device INT32 position IDs for GPU RoPE
         IKVCache *kv_cache = nullptr;      ///< KV cache
         /// Sequence lengths for variable-length batching (nullptr = all equal)
         const std::vector<int> *sequence_lengths = nullptr;
@@ -417,7 +429,8 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device,
-            const std::vector<int> *sequence_lengths = nullptr)
+            const std::vector<int> *sequence_lengths = nullptr,
+            const void *position_ids_device = nullptr)
         {
             (void)layer;
             (void)buffers;
@@ -426,6 +439,7 @@ namespace llaminar2
             (void)batch_size;
             (void)kv_cache;
             (void)position_ids;
+            (void)position_ids_device;
             (void)device;
             (void)sequence_lengths;
             return {};

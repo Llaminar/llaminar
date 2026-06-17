@@ -5,8 +5,10 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/mtp/MTPDecodeCatchup.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
+#include "kernels/common/SamplingMath.h"
 
 #include <algorithm>
+#include <array>
 
 using namespace llaminar2;
 using namespace testing;
@@ -30,7 +32,7 @@ TEST(Test__MTPSpecDecodeMetadata, DeclaresGraphFacingWorkspaceBuffers)
     WorkspaceRequirements reqs =
         buildMTPSpecDecodeWorkspaceRequirements(shape);
 
-    ASSERT_THAT(reqs.buffers, SizeIs(23));
+    ASSERT_THAT(reqs.buffers, SizeIs(28));
     const WorkspaceDescriptor *draft_counts =
         findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::DRAFT_COUNTS);
     ASSERT_NE(draft_counts, nullptr);
@@ -42,6 +44,31 @@ TEST(Test__MTPSpecDecodeMetadata, DeclaresGraphFacingWorkspaceBuffers)
         findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS);
     ASSERT_NE(query_starts, nullptr);
     EXPECT_EQ(query_starts->size_bytes, 3u * sizeof(int32_t));
+
+    const WorkspaceDescriptor *base_cached_tokens =
+        findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::BASE_CACHED_TOKENS);
+    ASSERT_NE(base_cached_tokens, nullptr);
+    EXPECT_EQ(base_cached_tokens->size_bytes, 2u * sizeof(int32_t));
+
+    const WorkspaceDescriptor *target_cached_tokens =
+        findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::TARGET_CACHED_TOKENS);
+    ASSERT_NE(target_cached_tokens, nullptr);
+    EXPECT_EQ(target_cached_tokens->size_bytes, 2u * sizeof(int32_t));
+
+    const WorkspaceDescriptor *shifted_target_cached_tokens =
+        findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::SHIFTED_TARGET_CACHED_TOKENS);
+    ASSERT_NE(shifted_target_cached_tokens, nullptr);
+    EXPECT_EQ(shifted_target_cached_tokens->size_bytes, 2u * sizeof(int32_t));
+
+    const WorkspaceDescriptor *shifted_accepted_state_counts =
+        findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::SHIFTED_ACCEPTED_STATE_COUNTS);
+    ASSERT_NE(shifted_accepted_state_counts, nullptr);
+    EXPECT_EQ(shifted_accepted_state_counts->size_bytes, 2u * sizeof(int32_t));
+
+    const WorkspaceDescriptor *publication_ok_flags =
+        findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::PUBLICATION_OK_FLAGS);
+    ASSERT_NE(publication_ok_flags, nullptr);
+    EXPECT_EQ(publication_ok_flags->size_bytes, 2u * sizeof(int32_t));
 
     const WorkspaceDescriptor *state_indices =
         findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::STATE_INDICES);
@@ -120,6 +147,12 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingBindsEveryDeclaredBuffer)
               workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::DRAFT_COUNTS));
     EXPECT_EQ(ptrs.accepted_draft_prefixes,
               workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::ACCEPTED_DRAFT_PREFIXES));
+    EXPECT_EQ(ptrs.base_cached_tokens,
+              workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::BASE_CACHED_TOKENS));
+    EXPECT_EQ(ptrs.target_cached_tokens,
+              workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::TARGET_CACHED_TOKENS));
+    EXPECT_EQ(ptrs.publication_ok_flags,
+              workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::PUBLICATION_OK_FLAGS));
     EXPECT_EQ(ptrs.query_start_locs,
               workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS));
     EXPECT_EQ(ptrs.accepted_state_counts,
@@ -140,6 +173,9 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingBindsEveryDeclaredBuffer)
               workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS));
 
     ptrs.accepted_draft_prefixes[0] = 2;
+    ptrs.base_cached_tokens[0] = 100;
+    ptrs.target_cached_tokens[0] = 103;
+    ptrs.publication_ok_flags[0] = 1;
     ptrs.accepted_state_counts[0] = 2;
     ptrs.speculative_state_slot_indices[0] = 4;
     ptrs.committed_state_rows[0] = 1;
@@ -147,6 +183,9 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingBindsEveryDeclaredBuffer)
     ptrs.sampled_tokens[3] = 42;
     ptrs.verifier_logit_rows[0] = 1;
     EXPECT_EQ(ptrs.accepted_draft_prefixes[0], 2);
+    EXPECT_EQ(ptrs.base_cached_tokens[0], 100);
+    EXPECT_EQ(ptrs.target_cached_tokens[0], 103);
+    EXPECT_EQ(ptrs.publication_ok_flags[0], 1);
     EXPECT_EQ(ptrs.accepted_state_counts[0], 2);
     EXPECT_EQ(ptrs.speculative_state_slot_indices[0], 4);
     EXPECT_EQ(ptrs.committed_state_rows[0], 1);
@@ -1026,6 +1065,260 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsMetadataFromAcceptedOutcomeWithoutSynthe
            "being populated with host-invented placeholder tokens";
     EXPECT_THAT(batch.sampled_tokens,
                 ElementsAre(7, 9, 3, kMTPSpecDecodeInvalidToken));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactAcceptAllOutcome)
+{
+    using namespace sampling_math;
+
+    /*
+     * The compact reducer emits first-token output plus one token per compared
+     * draft row. When both compared rows accept, publication commits three
+     * verifier-state rows: first token, draft_1, draft_2. The bonus-ready token
+     * is sampled for the next step but is not committed into live state here.
+     */
+    std::array<int, kSpeculativeBatchMaxRows> row_tokens{9, 8, -1, -1};
+    std::array<int, kSpeculativeBatchMaxRows> row_accepted{1, 1, 0, 0};
+    std::array<int32_t, 2 * kSpeculativeBatchMaxOutputTokens> output_tokens{};
+    std::array<int, kSpeculativeBatchMetaCount> meta{};
+
+    summarize_speculative_verify_batch(
+        /*first_token=*/7,
+        row_tokens.data(),
+        row_accepted.data(),
+        /*row_count=*/2,
+        /*stop_tokens=*/nullptr,
+        /*stop_token_count=*/0,
+        /*bonus_ready_token=*/4,
+        /*has_bonus_ready_token=*/1,
+        output_tokens.data(),
+        meta.data());
+
+    ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
+    EXPECT_EQ(meta[kSpecBatchMetaAcceptedSpeculativePrefix], 2)
+        << "accepted speculative prefix excludes the first main-model token";
+    EXPECT_EQ(meta[kSpecBatchMetaTargetVerifierStateCommitCount], 3)
+        << "publication must commit the first token plus accepted drafts";
+    EXPECT_EQ(meta[kSpecBatchMetaSampledTerminal], 1);
+
+    int restore_row = -1;
+    int target_cached_tokens = -1;
+    int accepted_state_count = -1;
+    int32_t next_condition_token = -1;
+    int all_drafts_accepted = 0;
+    int stopped = 0;
+    int ok = 0;
+    derive_speculative_publication_metadata(
+        meta.data(),
+        kSpeculativeBatchMetaCount,
+        /*request_index=*/0,
+        /*padded_state_rows_per_request=*/3,
+        /*base_cached_tokens=*/100,
+        /*max_state_commit_rows=*/3,
+        &restore_row,
+        &target_cached_tokens,
+        &accepted_state_count,
+        &ok,
+        output_tokens.data(),
+        kSpeculativeBatchMaxOutputTokens,
+        &next_condition_token,
+        &all_drafts_accepted,
+        &stopped);
+
+    EXPECT_EQ(ok, 1);
+    EXPECT_EQ(accepted_state_count, 3);
+    EXPECT_EQ(restore_row, 2);
+    EXPECT_EQ(target_cached_tokens, 103);
+    EXPECT_EQ(all_drafts_accepted, 1);
+    EXPECT_EQ(stopped, 0);
+    ASSERT_GT(meta[kSpecBatchMetaOutputCount], 0);
+    EXPECT_EQ(next_condition_token, meta[kSpecBatchMetaReadyToken])
+        << "When every verifier row accepts, the sampled terminal ready token "
+           "is the next decode condition.";
+}
+
+TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactRejectFirstOutcome)
+{
+    using namespace sampling_math;
+
+    /*
+     * Rejection on the first speculative row accepts zero MTP draft tokens, but
+     * the first main-model token has still been forwarded by the verifier. The
+     * publication count is therefore one, and request 1 maps to flattened row 3
+     * for a three-row padded verifier graph.
+     */
+    std::array<int, kSpeculativeBatchMaxRows> row_tokens{77, 13, -1, -1};
+    std::array<int, kSpeculativeBatchMaxRows> row_accepted{0, 1, 0, 0};
+    std::array<int32_t, 2 * kSpeculativeBatchMaxOutputTokens> output_tokens{};
+    std::array<int, 2 * kSpeculativeBatchMetaCount> meta{};
+    int *request_meta = meta.data() + kSpeculativeBatchMetaCount;
+
+    summarize_speculative_verify_batch(
+        /*first_token=*/11,
+        row_tokens.data(),
+        row_accepted.data(),
+        /*row_count=*/2,
+        /*stop_tokens=*/nullptr,
+        /*stop_token_count=*/0,
+        /*bonus_ready_token=*/-1,
+        /*has_bonus_ready_token=*/0,
+        output_tokens.data() + kSpeculativeBatchMaxOutputTokens,
+        request_meta);
+
+    ASSERT_EQ(request_meta[kSpecBatchMetaOk], 1);
+    EXPECT_EQ(request_meta[kSpecBatchMetaAcceptedSpeculativePrefix], 0);
+    EXPECT_EQ(request_meta[kSpecBatchMetaTargetVerifierStateCommitCount], 1);
+    EXPECT_EQ(request_meta[kSpecBatchMetaRejectedVerifiedToken], 77);
+
+    int restore_row = -1;
+    int target_cached_tokens = -1;
+    int accepted_state_count = -1;
+    int32_t next_condition_token = -1;
+    int all_drafts_accepted = 1;
+    int stopped = 1;
+    int ok = 0;
+    derive_speculative_publication_metadata(
+        meta.data(),
+        kSpeculativeBatchMetaCount,
+        /*request_index=*/1,
+        /*padded_state_rows_per_request=*/3,
+        /*base_cached_tokens=*/200,
+        /*max_state_commit_rows=*/3,
+        &restore_row,
+        &target_cached_tokens,
+        &accepted_state_count,
+        &ok,
+        output_tokens.data(),
+        kSpeculativeBatchMaxOutputTokens,
+        &next_condition_token,
+        &all_drafts_accepted,
+        &stopped);
+
+    EXPECT_EQ(ok, 1);
+    EXPECT_EQ(accepted_state_count, 1);
+    EXPECT_EQ(restore_row, 3);
+    EXPECT_EQ(target_cached_tokens, 201);
+    EXPECT_EQ(all_drafts_accepted, 0);
+    EXPECT_EQ(stopped, 0);
+    ASSERT_GT(request_meta[kSpecBatchMetaOutputCount], 0);
+    EXPECT_EQ(
+        next_condition_token,
+        output_tokens[kSpeculativeBatchMaxOutputTokens + static_cast<size_t>(
+            request_meta[kSpecBatchMetaOutputCount] - 1)]);
+}
+
+TEST(Test__MTPSpecDecodeMetadata, DerivesShiftedPublicationMetadataForMTPKVDepths)
+{
+    using namespace sampling_math;
+
+    std::array<int, kSpeculativeBatchMaxRows> row_tokens{9, 8, -1, -1};
+    std::array<int, kSpeculativeBatchMaxRows> row_accepted{1, 1, 0, 0};
+    std::array<int32_t, kSpeculativeBatchMaxOutputTokens> output_tokens{};
+    std::array<int, kSpeculativeBatchMetaCount> meta{};
+
+    summarize_speculative_verify_batch(
+        /*first_token=*/7,
+        row_tokens.data(),
+        row_accepted.data(),
+        /*row_count=*/2,
+        /*stop_tokens=*/nullptr,
+        /*stop_token_count=*/0,
+        /*bonus_ready_token=*/4,
+        /*has_bonus_ready_token=*/1,
+        output_tokens.data(),
+        meta.data());
+
+    ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
+    ASSERT_EQ(meta[kSpecBatchMetaTargetVerifierStateCommitCount], 3);
+
+    int target_cached_tokens = -1;
+    int accepted_state_count = -1;
+    int ok = 0;
+
+    derive_shifted_speculative_publication_metadata(
+        meta.data(),
+        kSpeculativeBatchMetaCount,
+        /*request_index=*/0,
+        /*padded_state_rows_per_request=*/3,
+        /*base_cached_tokens=*/10,
+        /*max_state_commit_rows=*/3,
+        /*mtp_depth=*/0,
+        &target_cached_tokens,
+        &accepted_state_count,
+        &ok);
+    EXPECT_EQ(ok, 1);
+    EXPECT_EQ(target_cached_tokens, 12);
+    EXPECT_EQ(accepted_state_count, 3)
+        << "At normal context lengths depth-0 shifted KV advances by every "
+           "committed verifier row.";
+
+    derive_shifted_speculative_publication_metadata(
+        meta.data(),
+        kSpeculativeBatchMetaCount,
+        /*request_index=*/0,
+        /*padded_state_rows_per_request=*/3,
+        /*base_cached_tokens=*/10,
+        /*max_state_commit_rows=*/3,
+        /*mtp_depth=*/2,
+        &target_cached_tokens,
+        &accepted_state_count,
+        &ok);
+    EXPECT_EQ(ok, 1);
+    EXPECT_EQ(target_cached_tokens, 10);
+    EXPECT_EQ(accepted_state_count, 3)
+        << "Deeper shifted caches use the same accepted delta once the base "
+           "context is longer than the shift.";
+
+    derive_shifted_speculative_publication_metadata(
+        meta.data(),
+        kSpeculativeBatchMetaCount,
+        /*request_index=*/0,
+        /*padded_state_rows_per_request=*/3,
+        /*base_cached_tokens=*/0,
+        /*max_state_commit_rows=*/3,
+        /*mtp_depth=*/0,
+        &target_cached_tokens,
+        &accepted_state_count,
+        &ok);
+    EXPECT_EQ(ok, 1);
+    EXPECT_EQ(target_cached_tokens, 2);
+    EXPECT_EQ(accepted_state_count, 2)
+        << "Short-prefix sidecar caches cannot publish the unshifted row zero.";
+}
+
+TEST(Test__MTPSpecDecodeMetadata, RejectsCompactPublicationMetadataPastStateShape)
+{
+    using namespace sampling_math;
+
+    std::array<int, kSpeculativeBatchMetaCount> meta{};
+    meta[kSpecBatchMetaOk] = 1;
+    meta[kSpecBatchMetaTargetVerifierStateCommitCount] = 4;
+
+    int restore_row = 99;
+    int target_cached_tokens = 99;
+    int accepted_state_count = 99;
+    int32_t next_condition_token = 99;
+    int ok = 1;
+    derive_speculative_publication_metadata(
+        meta.data(),
+        kSpeculativeBatchMetaCount,
+        /*request_index=*/0,
+        /*padded_state_rows_per_request=*/3,
+        /*base_cached_tokens=*/50,
+        /*max_state_commit_rows=*/3,
+        &restore_row,
+        &target_cached_tokens,
+        &accepted_state_count,
+        &ok,
+        /*output_tokens=*/nullptr,
+        /*output_token_stride=*/0,
+        &next_condition_token);
+
+    EXPECT_EQ(ok, 0);
+    EXPECT_EQ(restore_row, -1);
+    EXPECT_EQ(target_cached_tokens, 50);
+    EXPECT_EQ(accepted_state_count, 0);
+    EXPECT_EQ(next_condition_token, -1);
 }
 
 TEST(Test__MTPSpecDecodeMetadata, BuildsAcceptedOutcomeWithBonusReadyToken)

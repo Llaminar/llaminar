@@ -11,6 +11,7 @@
 #include "../../../memory/BufferId.h"
 #include "../../../loaders/WeightPlan.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
@@ -18,7 +19,9 @@ namespace llaminar2
 
     // Forward declarations
     class ITensorGemm;
+    class FP32Tensor;
     class PreparedWeightStore;
+    class TensorBase;
 
     /**
      * @brief Language model head projection stage
@@ -53,6 +56,15 @@ namespace llaminar2
             int effective_last_row_idx = -1;           ///< Dynamic last real token row for padded prefill replay.
             bool use_prefill_replay_row_offset = true; ///< False when input is already a one-row scratch.
             bool compute_all_positions = false;        ///< Compute logits for every input row instead of only the selected row.
+            /**
+             * @brief Execute tiny all-position verifier rows through M=1 LM-head GEMVs.
+             *
+             * Logit equivalence tests compare grouped verifier rows against
+             * serial decode.  When enabled, compact all-position rows are still
+             * materialized in the same output tensor, but each row uses the exact
+             * one-token LM-head path used by serial decoding.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
 
             // Optional bias tensor [vocab_size] - passed to GEMM for fused addition
             const TensorBase *bias_tensor = nullptr;
@@ -127,8 +139,15 @@ namespace llaminar2
     private:
         Params params_;
         ITensorGemm *cached_gemm_ = nullptr;
+        std::shared_ptr<FP32Tensor> verifier_hidden_row_;
+        std::shared_ptr<FP32Tensor> verifier_logits_row_;
 
         ITensorGemm *resolvePreparedKernel(const char *caller);
+        bool executeDecodeEquivalentVerifierPrefill(
+            const TensorBase *hidden_states,
+            TensorBase *logits,
+            ITensorGemm *lm_gemm,
+            int lm_m);
     };
 
 } // namespace llaminar2

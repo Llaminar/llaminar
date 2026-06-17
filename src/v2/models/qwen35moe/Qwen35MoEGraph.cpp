@@ -22,6 +22,7 @@
 #include "../../execution/local_execution/graph/GraphResolver.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/DebugEnv.h"
+#include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <cctype>
@@ -550,6 +551,18 @@ namespace llaminar2
         {
             if (prefill_token_capacity > 0)
                 it->second->ensurePrefillRouteScratchCapacity(prefill_token_capacity);
+            if (!key_suffix.empty() && key_suffix.rfind("mtp_depth", 0) == 0)
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "moe_mtp_sidecar_runtime_table_reuses",
+                    1.0,
+                    "graph",
+                    device.to_string(),
+                    {{"key_suffix", key_suffix},
+                     {"layers", std::to_string(table_layers)},
+                     {"histogram_sync", "disabled"}});
+            }
             return it->second.get();
         }
 
@@ -570,6 +583,22 @@ namespace llaminar2
                                                     { return ptr->syncDecodeHistogramToHost(*histogram); });
         }
         moe_runtime_tables_.emplace(key, std::move(table));
+        if (!key_suffix.empty() && key_suffix.rfind("mtp_depth", 0) == 0)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "moe_mtp_sidecar_runtime_table_creations",
+                1.0,
+                "graph",
+                device.to_string(),
+                {{"key_suffix", key_suffix},
+                 {"layers", std::to_string(table_layers)},
+                 {"num_experts", std::to_string(config_.moe.num_experts)},
+                 {"top_k", std::to_string(config_.moe.top_k)},
+                 {"histogram_sync", register_decode_histogram
+                                        ? "enabled"
+                                        : "disabled"}});
+        }
         return ptr;
 #endif
     }
@@ -653,9 +682,13 @@ namespace llaminar2
                                  : "layer" + std::to_string(layer_idx) + "_";
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
-        // Verifier batches are tiny (draft depth + 1 rows). CUDA and ROCm both
-        // use the graph-capturable grouped verifier path so routed and shared
-        // experts publish a single combined MoE output for MTP verification.
+        // Verifier batches are tiny (draft depth + 1 rows).  Published rows are
+        // later committed as if they came from ordinary one-token decode, so the
+        // verifier MoE FFN must reuse the same expert execution contract as
+        // serial decode on every backend.  The grouped small-M path remains valid
+        // for one-token correction replay and MTP sidecars, but multi-row main
+        // verifier publication takes the decode-equivalent path until the
+        // grouped kernels are proven bit-for-contract equivalent per row.
         auto forceCudaSmallMMoEPrefill = [&](DeviceId candidate)
         {
             return (candidate.is_cuda() || candidate.is_rocm()) &&
@@ -663,9 +696,9 @@ namespace llaminar2
                    total_tokens <= 4 &&
                    (config_.compute_all_position_logits || mtp_sidecar_context);
         };
-        auto forceCPUDecodeEquivalentMoEVerifier = [&](DeviceId candidate)
+        auto forceDecodeEquivalentMoEVerifier = [&](DeviceId candidate)
         {
-            return candidate.is_cpu() &&
+            return (candidate.is_cpu() || candidate.is_cuda() || candidate.is_rocm()) &&
                    total_tokens > 1 &&
                    total_tokens <= 4 &&
                    config_.compute_all_position_logits &&
@@ -703,7 +736,18 @@ namespace llaminar2
 
         IMoERuntimeTable *moe_runtime_table = nullptr;
         const auto &rocm_env = debugEnv().rocm;
-        const bool use_mtp_runtime_table = mtp_sidecar_context && layer_idx >= config_.n_layers;
+        /*
+         * MTP sidecars need their own persistent MoE metadata even when their
+         * logical layer index aliases a main-model layer.  The runtime table
+         * stores device-resident top-k route IDs, route weights, placement
+         * banks, and prefill scratch pointers that graph replay can capture by
+         * address.  Sharing those slots with ordinary decode would make an
+         * accepted-state publication boundary able to invalidate a warm sidecar
+         * graph without changing any graph shape.  Depth-scoped tables match the
+         * vLLM-style contract: sidecar metadata is stable, persistent, and owned
+         * by the sidecar graph fragment.
+         */
+        const bool use_mtp_runtime_table = mtp_sidecar_context;
         const int runtime_table_layers = use_mtp_runtime_table
                                              ? std::max(config_.n_layers, layer_idx + 1)
                                              : config_.n_layers;
@@ -778,6 +822,8 @@ namespace llaminar2
             route_params.moe_runtime_table = moe_runtime_table;
             route_params.force_grouped_verifier_prefill_for_decode =
                 forceCudaSmallMMoEPrefill(device) && total_tokens == 1;
+            route_params.force_decode_equivalent_verifier_prefill =
+                forceDecodeEquivalentMoEVerifier(device);
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
             route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
@@ -836,13 +882,28 @@ namespace llaminar2
                 expert_params.force_grouped_verifier_prefill_for_decode =
                     forceCudaSmallMMoEPrefill(stage_device) && total_tokens == 1;
                 expert_params.force_decode_equivalent_verifier_prefill =
-                    forceCPUDecodeEquivalentMoEVerifier(stage_device);
+                    forceDecodeEquivalentMoEVerifier(stage_device);
 
                 if (config_.moe.expert_mode == MoEExpertMode::ExpertParallel &&
                     expert_params.expert_mask.empty())
                 {
                     expert_params.local_expert_start = config_.moe.local_expert_start;
                     expert_params.local_expert_count = config_.moe.local_expert_count;
+                    if (expert_params.local_expert_count >= 0)
+                    {
+                        // LocalTP expert-parallel runners own a contiguous
+                        // global expert-id range. Express that static range as
+                        // the same explicit mask used by dynamic rebalance and
+                        // overlay paths so GPU graph construction only
+                        // requires resident GEMM engines for local experts,
+                        // not the entire global MoE layer.
+                        expert_params.expert_mask.assign(config_.moe.num_experts, false);
+                        const int start = std::max(0, expert_params.local_expert_start);
+                        const int end = std::min(config_.moe.num_experts,
+                                                 start + expert_params.local_expert_count);
+                        for (int expert = start; expert < end; ++expert)
+                            expert_params.expert_mask[static_cast<size_t>(expert)] = true;
+                    }
                 }
 
                 const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
@@ -999,6 +1060,7 @@ namespace llaminar2
                 !overlay_runtime_plan &&
                 !needsTPAllreduce() &&
                 forceCudaSmallMMoEPrefill(device) &&
+                !forceDecodeEquivalentMoEVerifier(device) &&
                 total_tokens > 1 &&
                 total_tokens <= 4 &&
                 layer.shared_expert_gate &&
@@ -1484,7 +1546,7 @@ namespace llaminar2
             shared_params.force_grouped_verifier_prefill_for_decode =
                 forceCudaSmallMMoEPrefill(shared_device);
             shared_params.force_decode_equivalent_verifier_prefill =
-                forceCPUDecodeEquivalentMoEVerifier(shared_device);
+                forceDecodeEquivalentMoEVerifier(shared_device);
             shared_params.prepared_ref_gate = preparedRefForGraphWeight(
                 layer_bindings.shared_expert_gate, shared_device);
             shared_params.prepared_ref_up = preparedRefForGraphWeight(

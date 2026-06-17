@@ -84,6 +84,8 @@ namespace llaminar2
             float *recurrence_state = nullptr;
 
             int seq_len = 0;
+            int request_count = 1;   ///< Number of independent requests in the flattened verifier tensor.
+            int request_seq_len = 0; ///< Per-request rows before flattening; 0 means seq_len for legacy graphs.
             int n_heads = 0;     ///< Value head count (recurrence operates with this)
             int n_k_heads = 0;   ///< Key head count (for QKV split; 0 = same as n_heads)
             int d_k = 0;         ///< Key head dimension
@@ -99,6 +101,15 @@ namespace llaminar2
             int global_v_head_offset = 0;
 
             int layer_idx = -1; ///< Layer index for logging
+            /**
+             * @brief Stable graph/workspace namespace for capture-sensitive buffers.
+             *
+             * Main verifier graphs and MTP sidecar graphs can both contain a GDN
+             * recurrence stage for the same logical layer.  Their verifier-row
+             * snapshot slots must not alias, so graph builders pass a role prefix
+             * such as `layer12` or `MTP0` here.
+             */
+            std::string workspace_namespace;
             int verifier_state_capture_rows = 0; ///< Compatibility spelling for speculative state slots.
             int speculative_state_slot_rows = 0; ///< Phase 13.8 temporary state slots for MTP verifier rows.
 
@@ -138,6 +149,10 @@ namespace llaminar2
             params_.seq_len = seq_len;
         }
         bool hasDynamicParams() const override { return true; }
+        bool supportsDeviceResidentDynamicPositionReplay() const override
+        {
+            return true;
+        }
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
@@ -155,7 +170,27 @@ namespace llaminar2
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
         bool supportsPaddedPrefillRealLengthContract() const override;
         bool hasVerifierStateCapture() const override;
+        bool requiresVerifierStateCaptureForPublication() const override
+        {
+            return verifierStateCaptureWorkspaceRequired();
+        }
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            const int *device_row_index,
+            void *stream) override;
+        /**
+         * @brief Restore one captured recurrent state row per request.
+         *
+         * This is the request-batched companion to the scalar device-indexed
+         * restore path.  It deliberately delegates to the backend tensor-kernel
+         * contract rather than looping scalar restores, because GDN recurrence
+         * state must be request-owned before batched publication is correct.
+         */
+        bool restoreVerifierStateCaptureRowsFromDeviceIndices(
+            const int *device_row_indices,
+            int request_count,
+            int row_index_stride,
+            void *stream) override;
         void onGraphReplayed() override;
         bool needsOnGraphReplayed() const override { return params_.kernel != nullptr; }
         /// @brief Allows cold GPU padded-prefill graph preflight before warmup allocates recurrence state.
@@ -201,6 +236,8 @@ namespace llaminar2
         void releaseGpuEffectiveSeqLenState();
         void bindKernelWorkspace();
         void clearKernelVerifierStateWorkspace();
+        const float *cpuVerifierStateCaptureSource() const;
+        bool restoreCPUVerifierStateCaptureRowDirect(int row);
         size_t deinterleaveScratchFloats(int seq_len) const;
         bool ensureGpuDeinterleaveWorkspaceBound(int seq_len) const;
     };

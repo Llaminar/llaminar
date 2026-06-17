@@ -18,6 +18,9 @@
 
 namespace llaminar2
 {
+    extern "C" void cuda_kv_sequence_state_advance(
+        int *d_head, int *d_count, int num_tokens, int max_seq_len,
+        cudaStream_t stream);
 
     // =========================================================================
     // Construction / Destruction
@@ -413,6 +416,12 @@ namespace llaminar2
                     d_K_new, d_V_new, d_rot,
                     entry.d_K, entry.d_V,
                     &d_head_params_[idx], n_kv_heads_, head_dim_, stream);
+                if (ok && d_count_params_)
+                {
+                    cuda_kv_sequence_state_advance(
+                        &d_head_params_[idx], &d_count_params_[idx],
+                        /*num_tokens=*/1, max_seq_len_, stream);
+                }
             }
             else
             {
@@ -590,11 +599,19 @@ namespace llaminar2
         const int entry_idx = layer * batch_size_ + seq_idx;
         if (h_head_params_)
             h_head_params_[entry_idx] = 0;
+        if (h_count_params_)
+            h_count_params_[entry_idx] = 0;
         if (d_head_params_)
         {
             cudaError_t err = cudaMemsetAsync(&d_head_params_[entry_idx], 0, sizeof(int), stream);
             if (err != cudaSuccess)
                 LOG_WARN("[CUDARingKVCacheTQ::clear] head param memset failed: " << cudaGetErrorString(err));
+        }
+        if (d_count_params_)
+        {
+            cudaError_t err = cudaMemsetAsync(&d_count_params_[entry_idx], 0, sizeof(int), stream);
+            if (err != cudaSuccess)
+                LOG_WARN("[CUDARingKVCacheTQ::clear] count param memset failed: " << cudaGetErrorString(err));
         }
 
         if (h_dequant_params_)

@@ -680,6 +680,144 @@ namespace
         freeDevice(d_ptr);
     }
 
+    TEST_P(GPUSamplingTest, Argmax_DeviceBatchedRowsSupportsOutputStride)
+    {
+        /*
+         * Request-batched MTP stores sampled draft tokens in request-major
+         * slots: slot = draft_index + request * draft_depth.  The GPU argmax
+         * primitive therefore needs strided output stores so the runner does
+         * not sample on GPU and then re-upload a host shadow before verifier
+         * execution.
+         */
+        constexpr int rows = 3;
+        constexpr int cols = 64;
+        constexpr int output_stride = 4;
+        constexpr int output_span = 1 + (rows - 1) * output_stride;
+
+        std::vector<float> logits(
+            static_cast<size_t>(rows) * static_cast<size_t>(cols),
+            -20.0f);
+        logits[7] = 10.0f;
+        logits[static_cast<size_t>(cols) + 31] = 12.0f;
+        logits[2 * static_cast<size_t>(cols) + 9] = 11.0f;
+
+        void *d_logits = nullptr;
+        void *d_values = nullptr;
+        void *d_indices = nullptr;
+        void *d_partial_values = nullptr;
+        void *d_partial_indices = nullptr;
+        auto cleanup = [&]()
+        {
+            void *ptrs[] = {
+                d_logits,
+                d_values,
+                d_indices,
+                d_partial_values,
+                d_partial_indices};
+            for (void *ptr : ptrs)
+            {
+                if (ptr)
+                    backend_->free(ptr, device_id_);
+            }
+        };
+
+        d_logits = backend_->allocate(logits.size() * sizeof(float), device_id_);
+        d_values = backend_->allocate(output_span * sizeof(float), device_id_);
+        d_indices = backend_->allocate(output_span * sizeof(int), device_id_);
+        d_partial_values = backend_->allocate(1024 * sizeof(float), device_id_);
+        d_partial_indices = backend_->allocate(1024 * sizeof(int), device_id_);
+        ASSERT_NE(d_logits, nullptr);
+        ASSERT_NE(d_values, nullptr);
+        ASSERT_NE(d_indices, nullptr);
+        ASSERT_NE(d_partial_values, nullptr);
+        ASSERT_NE(d_partial_indices, nullptr);
+
+        std::array<float, output_span> initial_values{};
+        initial_values.fill(-999.0f);
+        std::array<int, output_span> initial_indices{};
+        initial_indices.fill(-99);
+
+        auto run = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_logits,
+                    logits.data(),
+                    logits.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_values,
+                    initial_values.data(),
+                    initial_values.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_indices,
+                    initial_indices.data(),
+                    initial_indices.size() * sizeof(int),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->enqueueArgmaxF32BatchedRowsDevice(
+                    d_logits,
+                    rows,
+                    cols,
+                    device_id_,
+                    stream,
+                    d_values,
+                    d_indices,
+                    d_partial_values,
+                    d_partial_indices,
+                    1024,
+                    output_stride));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run(ctx);
+        }
+
+        std::array<float, output_span> values{};
+        std::array<int, output_span> indices{};
+        ASSERT_TRUE(backend_->deviceToHost(
+            values.data(),
+            d_values,
+            values.size() * sizeof(float),
+            device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            indices.data(),
+            d_indices,
+            indices.size() * sizeof(int),
+            device_id_));
+
+        EXPECT_FLOAT_EQ(values[0], 10.0f);
+        EXPECT_FLOAT_EQ(values[output_stride], 12.0f);
+        EXPECT_FLOAT_EQ(values[2 * output_stride], 11.0f);
+        EXPECT_EQ(indices[0], 7);
+        EXPECT_EQ(indices[output_stride], 31);
+        EXPECT_EQ(indices[2 * output_stride], 9);
+        for (int slot = 0; slot < output_span; ++slot)
+        {
+            if (slot == 0 || slot == output_stride || slot == 2 * output_stride)
+                continue;
+            EXPECT_FLOAT_EQ(values[slot], -999.0f) << "slot " << slot;
+            EXPECT_EQ(indices[slot], -99) << "slot " << slot;
+        }
+
+        cleanup();
+    }
+
     TEST_P(GPUSamplingTest, GreedySpeculativeSummaryIsGraphCapturable)
     {
         using namespace sampling_math;
@@ -865,6 +1003,405 @@ namespace
             EXPECT_EQ(gpu_tokens[i], expected_tokens[i]) << "token index " << i;
 
         cleanup();
+    }
+
+    TEST_P(GPUSamplingTest, GreedySpeculativeSummaryQwen36VocabMatchesHostRows)
+    {
+        using namespace sampling_math;
+
+        /*
+         * Regression shape for Qwen3.6 MoE all-position MTP.  The compact
+         * vLLM-style path leaves row argmax tokens on device and feeds them
+         * directly into the greedy verifier summary.  Keep this equivalent to
+         * the host-visible batched argmax path at the real Qwen3.6 vocab size,
+         * including the final bonus-ready row.
+         */
+        constexpr int rows = 2;
+        constexpr int cols = 248320;
+        constexpr int compare_rows = 1;
+        const int32_t draft_tokens[rows] = {198, 248045};
+        const int expected_verifier_tokens[rows] = {248045, 248068};
+
+        std::vector<float> logits(
+            static_cast<size_t>(rows) * static_cast<size_t>(cols),
+            -12.0f);
+        logits[248045] = 20.0f;
+        logits[74455] = 19.0f;
+        logits[static_cast<size_t>(cols) + 248068] = 20.0f;
+        logits[static_cast<size_t>(cols) + 74455] = 18.5f;
+
+        int expected_tokens[kSpeculativeBatchMaxOutputTokens] = {};
+        int expected_meta[kSpeculativeBatchMetaCount] = {};
+        summarize_greedy_speculative_verify_batch(
+            draft_tokens[0],
+            expected_verifier_tokens,
+            draft_tokens,
+            compare_rows,
+            /*stop_tokens=*/nullptr,
+            /*stop_token_count=*/0,
+            expected_tokens,
+            expected_meta);
+        ASSERT_EQ(expected_meta[kSpecBatchMetaOk], 1);
+        ASSERT_EQ(expected_meta[kSpecBatchMetaReadyToken], 248068);
+
+        void *d_logits = nullptr;
+        void *d_argmax_values = nullptr;
+        void *d_argmax_indices = nullptr;
+        void *d_partial_values = nullptr;
+        void *d_partial_indices = nullptr;
+        void *d_draft_tokens = nullptr;
+        void *d_output_tokens = nullptr;
+        void *d_output_meta = nullptr;
+        auto cleanup = [&]()
+        {
+            void *ptrs[] = {
+                d_logits,
+                d_argmax_values,
+                d_argmax_indices,
+                d_partial_values,
+                d_partial_indices,
+                d_draft_tokens,
+                d_output_tokens,
+                d_output_meta};
+            for (void *ptr : ptrs)
+            {
+                if (ptr)
+                    backend_->free(ptr, device_id_);
+            }
+        };
+
+        d_logits = backend_->allocate(logits.size() * sizeof(float), device_id_);
+        d_argmax_values = backend_->allocate(rows * sizeof(float), device_id_);
+        d_argmax_indices = backend_->allocate(rows * sizeof(int), device_id_);
+        d_partial_values = backend_->allocate(1024 * sizeof(float), device_id_);
+        d_partial_indices = backend_->allocate(1024 * sizeof(int), device_id_);
+        d_draft_tokens = backend_->allocate(rows * sizeof(int32_t), device_id_);
+        d_output_tokens =
+            backend_->allocate(kSpeculativeBatchMaxOutputTokens * sizeof(int), device_id_);
+        d_output_meta =
+            backend_->allocate(kSpeculativeBatchMetaCount * sizeof(int), device_id_);
+        ASSERT_NE(d_logits, nullptr);
+        ASSERT_NE(d_argmax_values, nullptr);
+        ASSERT_NE(d_argmax_indices, nullptr);
+        ASSERT_NE(d_partial_values, nullptr);
+        ASSERT_NE(d_partial_indices, nullptr);
+        ASSERT_NE(d_draft_tokens, nullptr);
+        ASSERT_NE(d_output_tokens, nullptr);
+        ASSERT_NE(d_output_meta, nullptr);
+
+        auto run_on_stream = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_logits,
+                    logits.data(),
+                    logits.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_draft_tokens,
+                    draft_tokens,
+                    sizeof(draft_tokens),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->enqueueArgmaxF32BatchedRowsDevice(
+                    d_logits,
+                    rows,
+                    cols,
+                    device_id_,
+                    stream,
+                    d_argmax_values,
+                    d_argmax_indices,
+                    d_partial_values,
+                    d_partial_indices,
+                    1024));
+                ASSERT_TRUE(backend_->enqueueSummarizeGreedySpeculativeVerifyBatch(
+                    d_argmax_indices,
+                    d_draft_tokens,
+                    compare_rows,
+                    draft_tokens[0],
+                    /*stop_tokens_host=*/nullptr,
+                    /*stop_token_count=*/0,
+                    device_id_,
+                    stream,
+                    d_output_tokens,
+                    d_output_meta));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_on_stream(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_on_stream(ctx);
+        }
+
+        int gpu_indices[rows] = {};
+        int gpu_tokens[kSpeculativeBatchMaxOutputTokens] = {};
+        int gpu_meta[kSpeculativeBatchMetaCount] = {};
+        ASSERT_TRUE(backend_->deviceToHost(
+            gpu_indices,
+            d_argmax_indices,
+            sizeof(gpu_indices),
+            device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            gpu_tokens,
+            d_output_tokens,
+            sizeof(gpu_tokens),
+            device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            gpu_meta,
+            d_output_meta,
+            sizeof(gpu_meta),
+            device_id_));
+
+        EXPECT_EQ(gpu_indices[0], expected_verifier_tokens[0]);
+        EXPECT_EQ(gpu_indices[1], expected_verifier_tokens[1]);
+        for (int i = 0; i < kSpeculativeBatchMetaCount; ++i)
+            EXPECT_EQ(gpu_meta[i], expected_meta[i]) << "meta index " << i;
+        for (int i = 0; i < kSpeculativeBatchMaxOutputTokens; ++i)
+            EXPECT_EQ(gpu_tokens[i], expected_tokens[i]) << "token index " << i;
+
+        cleanup();
+    }
+
+    TEST_P(GPUSamplingTest, SpeculativePublicationMetadataDerivationCaptures)
+    {
+        using namespace sampling_math;
+
+        constexpr int request_count = 3;
+        constexpr int padded_state_rows_per_request = 4;
+        constexpr int max_state_commit_rows = 3;
+        constexpr int meta_stride = kSpeculativeBatchMetaCount;
+
+        std::array<int, request_count * meta_stride> meta{};
+        std::array<int, request_count * kSpeculativeBatchMaxOutputTokens>
+            output_tokens{};
+        std::array<int, request_count> base_cached_tokens = {100, 200, 300};
+
+        const int accept_rows[] = {11, 12};
+        const int accept_flags[] = {1, 1};
+        summarize_speculative_verify_batch(
+            /*first_token=*/10,
+            accept_rows,
+            accept_flags,
+            /*row_count=*/2,
+            /*stop_tokens=*/nullptr,
+            /*stop_token_count=*/0,
+            /*bonus_ready_token=*/13,
+            /*has_bonus_ready_token=*/1,
+            output_tokens.data(),
+            meta.data());
+
+        const int reject_rows[] = {21, 22};
+        const int reject_flags[] = {0, 1};
+        summarize_speculative_verify_batch(
+            /*first_token=*/20,
+            reject_rows,
+            reject_flags,
+            /*row_count=*/2,
+            /*stop_tokens=*/nullptr,
+            /*stop_token_count=*/0,
+            /*bonus_ready_token=*/23,
+            /*has_bonus_ready_token=*/1,
+            output_tokens.data() + kSpeculativeBatchMaxOutputTokens,
+            meta.data() + meta_stride);
+
+        meta[2 * meta_stride + kSpecBatchMetaOk] = 1;
+        meta[2 * meta_stride + kSpecBatchMetaTargetVerifierStateCommitCount] =
+            max_state_commit_rows + 1;
+
+        void *d_meta = backend_->allocate(meta.size() * sizeof(int), device_id_);
+        void *d_base = backend_->allocate(base_cached_tokens.size() * sizeof(int), device_id_);
+        void *d_output_tokens = backend_->allocate(output_tokens.size() * sizeof(int), device_id_);
+        void *d_restore_rows = backend_->allocate(request_count * sizeof(int), device_id_);
+        void *d_target_cached_tokens = backend_->allocate(request_count * sizeof(int), device_id_);
+        void *d_accepted_state_counts = backend_->allocate(request_count * sizeof(int), device_id_);
+        void *d_ok = backend_->allocate(request_count * sizeof(int), device_id_);
+        void *d_next_condition_tokens = backend_->allocate(request_count * sizeof(int), device_id_);
+        void *d_all_drafts_accepted = backend_->allocate(request_count * sizeof(int), device_id_);
+        void *d_stopped = backend_->allocate(request_count * sizeof(int), device_id_);
+
+        auto cleanup = [&]()
+        {
+            void *ptrs[] = {
+                d_meta,
+                d_base,
+                d_output_tokens,
+                d_restore_rows,
+                d_target_cached_tokens,
+                d_accepted_state_counts,
+                d_ok,
+                d_next_condition_tokens,
+                d_all_drafts_accepted,
+                d_stopped};
+            for (void *ptr : ptrs)
+            {
+                if (ptr)
+                    backend_->free(ptr, device_id_);
+            }
+        };
+
+        ASSERT_NE(d_meta, nullptr);
+        ASSERT_NE(d_base, nullptr);
+        ASSERT_NE(d_output_tokens, nullptr);
+        ASSERT_NE(d_restore_rows, nullptr);
+        ASSERT_NE(d_target_cached_tokens, nullptr);
+        ASSERT_NE(d_accepted_state_counts, nullptr);
+        ASSERT_NE(d_ok, nullptr);
+        ASSERT_NE(d_next_condition_tokens, nullptr);
+        ASSERT_NE(d_all_drafts_accepted, nullptr);
+        ASSERT_NE(d_stopped, nullptr);
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_meta,
+                    meta.data(),
+                    meta.size() * sizeof(int),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_base,
+                    base_cached_tokens.data(),
+                    base_cached_tokens.size() * sizeof(int),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_output_tokens,
+                    output_tokens.data(),
+                    output_tokens.size() * sizeof(int),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                EXPECT_FALSE(backend_->enqueueDeriveSpeculativePublicationMetadata(
+                    d_meta,
+                    meta_stride,
+                    d_base,
+                    request_count,
+                    padded_state_rows_per_request,
+                    max_state_commit_rows,
+                    device_id_,
+                    nullptr,
+                    d_restore_rows,
+                    d_target_cached_tokens,
+                    d_accepted_state_counts,
+                    d_ok,
+                    d_next_condition_tokens,
+                    d_output_tokens,
+                    kSpeculativeBatchMaxOutputTokens,
+                    d_all_drafts_accepted,
+                    d_stopped))
+                    << "publication metadata derivation must reject the legacy default/null stream";
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueDeriveSpeculativePublicationMetadata(
+                    d_meta,
+                    meta_stride,
+                    d_base,
+                    request_count,
+                    padded_state_rows_per_request,
+                    max_state_commit_rows,
+                    device_id_,
+                    stream,
+                    d_restore_rows,
+                    d_target_cached_tokens,
+                    d_accepted_state_counts,
+                    d_ok,
+                    d_next_condition_tokens,
+                    d_output_tokens,
+                    kSpeculativeBatchMaxOutputTokens,
+                    d_all_drafts_accepted,
+                    d_stopped));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        std::array<int, request_count> restore_rows{};
+        std::array<int, request_count> target_cached_tokens{};
+        std::array<int, request_count> accepted_state_counts{};
+        std::array<int, request_count> ok{};
+        std::array<int, request_count> next_condition_tokens{};
+        std::array<int, request_count> all_drafts_accepted{};
+        std::array<int, request_count> stopped{};
+        ASSERT_TRUE(backend_->deviceToHost(
+            restore_rows.data(), d_restore_rows,
+            restore_rows.size() * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            target_cached_tokens.data(), d_target_cached_tokens,
+            target_cached_tokens.size() * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            accepted_state_counts.data(), d_accepted_state_counts,
+            accepted_state_counts.size() * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            ok.data(), d_ok,
+            ok.size() * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            next_condition_tokens.data(), d_next_condition_tokens,
+            next_condition_tokens.size() * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            all_drafts_accepted.data(), d_all_drafts_accepted,
+            all_drafts_accepted.size() * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            stopped.data(), d_stopped,
+            stopped.size() * sizeof(int), device_id_));
+
+        cleanup();
+
+        EXPECT_EQ(ok[0], 1);
+        EXPECT_EQ(accepted_state_counts[0], 3);
+        EXPECT_EQ(restore_rows[0], 2);
+        EXPECT_EQ(target_cached_tokens[0], 103);
+        EXPECT_EQ(next_condition_tokens[0], 13);
+        EXPECT_EQ(all_drafts_accepted[0], 1);
+        EXPECT_EQ(stopped[0], 0);
+
+        EXPECT_EQ(ok[1], 1);
+        EXPECT_EQ(accepted_state_counts[1], 1);
+        EXPECT_EQ(restore_rows[1], 4);
+        EXPECT_EQ(target_cached_tokens[1], 201);
+        EXPECT_EQ(next_condition_tokens[1], 21);
+        EXPECT_EQ(all_drafts_accepted[1], 0);
+        EXPECT_EQ(stopped[1], 0);
+
+        EXPECT_EQ(ok[2], 0);
+        EXPECT_EQ(accepted_state_counts[2], 0);
+        EXPECT_EQ(restore_rows[2], -1);
+        EXPECT_EQ(target_cached_tokens[2], 300);
+        EXPECT_EQ(next_condition_tokens[2], -1);
+        EXPECT_EQ(all_drafts_accepted[2], 0);
+        EXPECT_EQ(stopped[2], 0);
     }
 
     // =========================================================================
@@ -1922,6 +2459,20 @@ namespace
         float accept_threshold,
         float residual_threshold);
 
+    static ExpectedSpeculativeVerify expectedSpeculativeVerifyOneHotDraftWithThresholds(
+        const std::vector<ExpectedDistributionEntry> &target,
+        int draft_token,
+        float accept_threshold,
+        float residual_threshold);
+
+    static ExpectedSpeculativeVerify expectedSpeculativeVerifyOneHotDraftVLLMWithThresholds(
+        const std::vector<ExpectedDistributionEntry> &target,
+        int draft_token,
+        float accept_threshold,
+        uint64_t inverse_sample_seed,
+        int logical_position,
+        int vocab_size);
+
     static ExpectedSpeculativeVerify expectedSpeculativeVerifyDistribution(
         const std::vector<ExpectedDistributionEntry> &target,
         const std::vector<ExpectedDistributionEntry> &draft,
@@ -1989,6 +2540,68 @@ namespace
             draft_token,
             accept_threshold,
             residual_threshold,
+            &result.token_id,
+            &result.accepted,
+            &result.accept_probability,
+            &result.accept_threshold);
+        return result;
+    }
+
+    static ExpectedSpeculativeVerify expectedSpeculativeVerifyOneHotDraftWithThresholds(
+        const std::vector<ExpectedDistributionEntry> &target,
+        int draft_token,
+        float accept_threshold,
+        float residual_threshold)
+    {
+        ExpectedSpeculativeVerify result;
+        std::vector<int> target_ids(target.size(), -1);
+        std::vector<float> target_probs(target.size(), 0.0f);
+        for (size_t i = 0; i < target.size(); ++i)
+        {
+            target_ids[i] = target[i].token_id;
+            target_probs[i] = target[i].probability;
+        }
+
+        sampling_math::speculative_verify_with_thresholds_one_hot_draft(
+            target_ids.data(),
+            target_probs.data(),
+            static_cast<int>(target.size()),
+            draft_token,
+            accept_threshold,
+            residual_threshold,
+            &result.token_id,
+            &result.accepted,
+            &result.accept_probability,
+            &result.accept_threshold);
+        return result;
+    }
+
+    static ExpectedSpeculativeVerify expectedSpeculativeVerifyOneHotDraftVLLMWithThresholds(
+        const std::vector<ExpectedDistributionEntry> &target,
+        int draft_token,
+        float accept_threshold,
+        uint64_t inverse_sample_seed,
+        int logical_position,
+        int vocab_size)
+    {
+        ExpectedSpeculativeVerify result;
+        std::vector<int> target_ids(target.size(), -1);
+        std::vector<float> target_probs(target.size(), 0.0f);
+        for (size_t i = 0; i < target.size(); ++i)
+        {
+            target_ids[i] = target[i].token_id;
+            target_probs[i] = target[i].probability;
+        }
+
+        sampling_math::speculative_verify_with_thresholds_one_hot_draft_vllm_recovered(
+            target_ids.data(),
+            target_probs.data(),
+            static_cast<int>(target.size()),
+            vocab_size,
+            draft_token,
+            accept_threshold,
+            inverse_sample_seed,
+            logical_position,
             &result.token_id,
             &result.accepted,
             &result.accept_probability,
@@ -5594,6 +6207,343 @@ namespace
         EXPECT_EQ(output_tokens[0], first_token);
         EXPECT_EQ(output_tokens[1], verify_tokens[0]);
         EXPECT_EQ(output_tokens[2], verify_tokens[1]);
+    }
+
+    TEST_P(GPUSamplingTest, CompactOneHotDraftVLLMSpeculativeVerifyMatchesReferenceAndCaptures)
+    {
+        constexpr int top_k = 4;
+        constexpr int row_count = 2;
+        constexpr int distribution_stride = top_k;
+
+        const std::vector<ExpectedDistributionEntry> target_distribution = {
+            {5, 0.20f},
+            {7, 0.30f},
+            {11, 0.10f},
+            {13, 0.40f}};
+        const std::vector<int> target_ids = {
+            5, 7, 11, 13,
+            5, 7, 11, 13};
+        const std::vector<float> target_probs = {
+            0.20f, 0.30f, 0.10f, 0.40f,
+            0.20f, 0.30f, 0.10f, 0.40f};
+        constexpr uint64_t inverse_sample_seed = 98765;
+        constexpr int inverse_sample_first_logical_position = 0;
+        constexpr int inverse_sample_vocab_size = 32;
+        const int draft_tokens[row_count] = {7, 7};
+        const float accept_thresholds[row_count] = {
+            sampling_math::mtp_spec_threshold_from_seed(
+                inverse_sample_seed,
+                inverse_sample_first_logical_position,
+                1 /* MTPSpecStochasticDrawPurpose::Accept */),
+            sampling_math::mtp_spec_threshold_from_seed(
+                inverse_sample_seed,
+                inverse_sample_first_logical_position + 1,
+                1 /* MTPSpecStochasticDrawPurpose::Accept */)};
+        const float residual_thresholds[row_count] = {
+            sampling_math::mtp_spec_threshold_from_seed(
+                inverse_sample_seed,
+                inverse_sample_first_logical_position,
+                2 /* MTPSpecStochasticDrawPurpose::Residual */),
+            sampling_math::mtp_spec_threshold_from_seed(
+                inverse_sample_seed,
+                inverse_sample_first_logical_position + 1,
+                2 /* MTPSpecStochasticDrawPurpose::Residual */)};
+
+        const auto expected_accept =
+            expectedSpeculativeVerifyOneHotDraftVLLMWithThresholds(
+                target_distribution,
+                draft_tokens[0],
+                accept_thresholds[0],
+                inverse_sample_seed,
+                inverse_sample_first_logical_position,
+                inverse_sample_vocab_size);
+        const auto expected_reject =
+            expectedSpeculativeVerifyOneHotDraftVLLMWithThresholds(
+                target_distribution,
+                draft_tokens[1],
+                accept_thresholds[1],
+                inverse_sample_seed,
+                inverse_sample_first_logical_position + 1,
+                inverse_sample_vocab_size);
+        ASSERT_EQ(expected_accept.accepted, 1);
+        ASSERT_EQ(expected_accept.token_id, 7);
+        ASSERT_EQ(expected_reject.accepted, 0);
+
+        void *d_target_ids = nullptr;
+        void *d_target_probs = nullptr;
+        void *d_draft_tokens = nullptr;
+        void *d_out_tokens = nullptr;
+        void *d_out_accepted = nullptr;
+        void *d_out_accept_probability = nullptr;
+        void *d_out_accept_threshold = nullptr;
+        void *d_seeded_out_tokens = nullptr;
+        void *d_seeded_out_accepted = nullptr;
+        void *d_seeded_out_accept_probability = nullptr;
+        void *d_seeded_out_accept_threshold = nullptr;
+
+        auto cleanup = [&]()
+        {
+            void *ptrs[] = {
+                d_target_ids,
+                d_target_probs,
+                d_draft_tokens,
+                d_out_tokens,
+                d_out_accepted,
+                d_out_accept_probability,
+                d_out_accept_threshold,
+                d_seeded_out_tokens,
+                d_seeded_out_accepted,
+                d_seeded_out_accept_probability,
+                d_seeded_out_accept_threshold};
+            for (void *ptr : ptrs)
+            {
+                if (ptr)
+                    backend_->free(ptr, device_id_);
+            }
+        };
+
+        d_target_ids = backend_->allocate(target_ids.size() * sizeof(int), device_id_);
+        d_target_probs = backend_->allocate(target_probs.size() * sizeof(float), device_id_);
+        d_draft_tokens = backend_->allocate(sizeof(draft_tokens), device_id_);
+        d_out_tokens = backend_->allocate(row_count * sizeof(int), device_id_);
+        d_out_accepted = backend_->allocate(row_count * sizeof(int), device_id_);
+        d_out_accept_probability = backend_->allocate(row_count * sizeof(float), device_id_);
+        d_out_accept_threshold = backend_->allocate(row_count * sizeof(float), device_id_);
+        d_seeded_out_tokens = backend_->allocate(row_count * sizeof(int), device_id_);
+        d_seeded_out_accepted = backend_->allocate(row_count * sizeof(int), device_id_);
+        d_seeded_out_accept_probability = backend_->allocate(row_count * sizeof(float), device_id_);
+        d_seeded_out_accept_threshold = backend_->allocate(row_count * sizeof(float), device_id_);
+
+        ASSERT_NE(d_target_ids, nullptr);
+        ASSERT_NE(d_target_probs, nullptr);
+        ASSERT_NE(d_draft_tokens, nullptr);
+        ASSERT_NE(d_out_tokens, nullptr);
+        ASSERT_NE(d_out_accepted, nullptr);
+        ASSERT_NE(d_out_accept_probability, nullptr);
+        ASSERT_NE(d_out_accept_threshold, nullptr);
+        ASSERT_NE(d_seeded_out_tokens, nullptr);
+        ASSERT_NE(d_seeded_out_accepted, nullptr);
+        ASSERT_NE(d_seeded_out_accept_probability, nullptr);
+        ASSERT_NE(d_seeded_out_accept_threshold, nullptr);
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_target_ids,
+                    target_ids.data(),
+                    target_ids.size() * sizeof(int),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_target_probs,
+                    target_probs.data(),
+                    target_probs.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_draft_tokens,
+                    draft_tokens,
+                    sizeof(draft_tokens),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                EXPECT_FALSE(backend_->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+                    d_target_ids,
+                    d_target_probs,
+                    nullptr,
+                    nullptr,
+                    top_k,
+                    distribution_stride,
+                    d_draft_tokens,
+                    accept_thresholds,
+                    residual_thresholds,
+                    row_count,
+                    device_id_,
+                    nullptr,
+                    d_out_tokens,
+                    d_out_accepted,
+                    d_out_accept_probability,
+                    d_out_accept_threshold,
+                    /*draft_token_probabilities_device=*/nullptr,
+                    inverse_sample_seed,
+                    inverse_sample_first_logical_position,
+                    inverse_sample_vocab_size))
+                    << "one-hot compact verifier must still reject the legacy default/null stream";
+                EXPECT_FALSE(backend_->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+                    d_target_ids,
+                    d_target_probs,
+                    nullptr,
+                    d_target_probs,
+                    top_k,
+                    distribution_stride,
+                    d_draft_tokens,
+                    accept_thresholds,
+                    residual_thresholds,
+                    row_count,
+                    device_id_,
+                    stream,
+                    d_out_tokens,
+                    d_out_accepted,
+                    d_out_accept_probability,
+                    d_out_accept_threshold,
+                    /*draft_token_probabilities_device=*/nullptr,
+                    inverse_sample_seed,
+                    inverse_sample_first_logical_position,
+                    inverse_sample_vocab_size))
+                    << "passing only one null draft-distribution pointer is invalid";
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+                    d_target_ids,
+                    d_target_probs,
+                    nullptr,
+                    nullptr,
+                    top_k,
+                    distribution_stride,
+                    d_draft_tokens,
+                    accept_thresholds,
+                    residual_thresholds,
+                    row_count,
+                    device_id_,
+                    stream,
+                    d_out_tokens,
+                    d_out_accepted,
+                    d_out_accept_probability,
+                    d_out_accept_threshold,
+                    /*draft_token_probabilities_device=*/nullptr,
+                    inverse_sample_seed,
+                    inverse_sample_first_logical_position,
+                    inverse_sample_vocab_size));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+
+                auto seeded_capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(seeded_capture, nullptr);
+                ASSERT_TRUE(seeded_capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+                    d_target_ids,
+                    d_target_probs,
+                    nullptr,
+                    nullptr,
+                    top_k,
+                    distribution_stride,
+                    d_draft_tokens,
+                    /*accept_thresholds_host=*/nullptr,
+                    /*residual_thresholds_host=*/nullptr,
+                    row_count,
+                    device_id_,
+                    stream,
+                    d_seeded_out_tokens,
+                    d_seeded_out_accepted,
+                    d_seeded_out_accept_probability,
+                    d_seeded_out_accept_threshold,
+                    /*draft_token_probabilities_device=*/nullptr,
+                    inverse_sample_seed,
+                    inverse_sample_first_logical_position,
+                    inverse_sample_vocab_size));
+                ASSERT_TRUE(seeded_capture->endCapture());
+                ASSERT_TRUE(seeded_capture->instantiate());
+                ASSERT_TRUE(seeded_capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        std::vector<int> out_tokens(row_count, -1);
+        std::vector<int> out_accepted(row_count, -1);
+        std::vector<float> out_accept_probabilities(row_count, -1.0f);
+        std::vector<float> out_accept_thresholds(row_count, -1.0f);
+        std::vector<int> seeded_out_tokens(row_count, -1);
+        std::vector<int> seeded_out_accepted(row_count, -1);
+        std::vector<float> seeded_out_accept_probabilities(row_count, -1.0f);
+        std::vector<float> seeded_out_accept_thresholds(row_count, -1.0f);
+
+        ASSERT_TRUE(backend_->deviceToHost(
+            out_tokens.data(),
+            d_out_tokens,
+            row_count * sizeof(int),
+            device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            out_accepted.data(),
+            d_out_accepted,
+            row_count * sizeof(int),
+            device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            out_accept_probabilities.data(),
+            d_out_accept_probability,
+            row_count * sizeof(float),
+            device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            out_accept_thresholds.data(),
+            d_out_accept_threshold,
+            row_count * sizeof(float),
+            device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            seeded_out_tokens.data(),
+            d_seeded_out_tokens,
+            row_count * sizeof(int),
+            device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            seeded_out_accepted.data(),
+            d_seeded_out_accepted,
+            row_count * sizeof(int),
+            device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            seeded_out_accept_probabilities.data(),
+            d_seeded_out_accept_probability,
+            row_count * sizeof(float),
+            device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(
+            seeded_out_accept_thresholds.data(),
+            d_seeded_out_accept_threshold,
+            row_count * sizeof(float),
+            device_id_));
+
+        cleanup();
+
+        EXPECT_EQ(out_tokens[0], expected_accept.token_id);
+        EXPECT_EQ(out_accepted[0], expected_accept.accepted);
+        EXPECT_NEAR(out_accept_probabilities[0], expected_accept.accept_probability, 1e-6f);
+        EXPECT_NEAR(out_accept_thresholds[0], expected_accept.accept_threshold, 1e-6f);
+
+        EXPECT_EQ(out_tokens[1], expected_reject.token_id);
+        EXPECT_EQ(out_accepted[1], expected_reject.accepted);
+        EXPECT_NEAR(out_accept_probabilities[1], expected_reject.accept_probability, 1e-6f);
+        EXPECT_NEAR(out_accept_thresholds[1], expected_reject.accept_threshold, 1e-6f);
+
+        EXPECT_EQ(seeded_out_tokens, out_tokens);
+        EXPECT_EQ(seeded_out_accepted, out_accepted);
+        EXPECT_NEAR(seeded_out_accept_probabilities[0],
+                    out_accept_probabilities[0],
+                    1e-6f);
+        EXPECT_NEAR(seeded_out_accept_probabilities[1],
+                    out_accept_probabilities[1],
+                    1e-6f);
+        EXPECT_NEAR(seeded_out_accept_thresholds[0],
+                    out_accept_thresholds[0],
+                    1e-6f);
+        EXPECT_NEAR(seeded_out_accept_thresholds[1],
+                    out_accept_thresholds[1],
+                    1e-6f);
     }
 
     TEST_P(GPUSamplingTest, SpeculativeVerifyDistributionsAreGraphCapturable)

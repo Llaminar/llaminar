@@ -453,6 +453,9 @@ namespace llaminar2
         bool forwardMTPFromDeviceTargetForDeviceSampling(
             int target_sample_slot,
             int position_id) override;
+        bool forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index = 0) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -463,7 +466,8 @@ namespace llaminar2
             int already_appended_tokens,
             int main_forward_token_count,
             bool allow_speculative_discard = false,
-            int position_offset_override = -1) override;
+            int position_offset_override = -1,
+            int already_appended_shifted_kv_tokens = -1) override;
         bool commitMTPShiftedRowFromCurrentTerminalHidden(
             int32_t token,
             int already_appended_tokens,
@@ -474,13 +478,21 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromDeviceResidentLogicalState(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
         bool flushPendingMTPWork() override;
+        bool ensureMTPCheckpointTerminalHidden() override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override;
         bool setMTPSpecVerifierInputPlan(
             const MTPSpecDecodeVerifierInputPlan &plan) override;
         void clearMTPSpecVerifierInputPlan() override;
+        bool supportsLogicalMTPVerifierBaseCheckpoint() const override;
         /**
          * @brief True when every active LocalTP participant can publish accepted
          *        verifier state from the current MTP target verifier graph.
@@ -490,6 +502,8 @@ namespace llaminar2
          * own KV/recurrent/terminal-hidden slice from the same speculative step.
          */
         bool supportsMTPSpecStatePublication() const override;
+        MTPVerifierRowCapability mtpVerifierRowCapability() const override;
+        MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override;
 
         /**
          * @brief Publish accepted MTP verifier state on every LocalTP child.
@@ -520,6 +534,7 @@ namespace llaminar2
         bool supportsMTPSidecarLogitsStreamHandoff() const override;
         bool supportsMTPDeviceDraftTokenInput() const override;
         bool supportsMTPSidecarPreservesMainState() const override;
+        bool supportsMTPShiftedRowReuseFromSidecar() const override;
         bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
         bool applyPenaltiesOnDevice(
             const std::vector<LogitPenalty> &penalties,
@@ -532,6 +547,12 @@ namespace llaminar2
             const std::vector<LogitPenalty> &penalties,
             int vocab_size) override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
+        bool sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+            int draft_sample_slot,
+            int32_t *out_token) override;
+        bool sampleGreedyFromMainLogitsToDeviceTargetSlot(
+            int target_sample_slot,
+            int32_t *out_token) override;
         int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
         bool sampleGreedyFromAllPositionLogitsOnDeviceRows(
             int start_row,
@@ -543,6 +564,12 @@ namespace llaminar2
             const int32_t *stop_tokens,
             int stop_token_count,
             DeviceSpeculativeVerifyBatchOutcome *out) override;
+        bool verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
         bool supportsDeviceStochasticMTPVerification() const override;
         bool buildStochasticDistributionOnDevice(
             DeviceLogitsSource source,
@@ -589,6 +616,10 @@ namespace llaminar2
             DeviceDistributionBuffer buffer,
             int slot,
             float threshold) override;
+        bool stageStochasticDraftTokensForDeviceVerification(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            int first_draft_slot = 0) override;
         const void *prepareMTPVerifierInputTokensOnDevice(
             int32_t first_token,
             int first_draft_slot,
@@ -664,6 +695,7 @@ namespace llaminar2
          * per device, then host-side merge + softmax + top-p + sample.
          */
         int sampleOnDevice(const SamplingParams &params) override;
+        bool requiresMPICoordinatedDecodeSampling(const SamplingParams &params) const override;
 
         /**
          * @brief Enable GPU-side decode sampling (skip D2H gatherLogits for seq_len=1)
@@ -731,7 +763,13 @@ namespace llaminar2
         ParallelismMode effectiveMode() const { return mode_; }
 
         /**
-         * @brief Clear KV cache on all devices
+         * @brief Reset request-scoped live inference state on every participant.
+         *
+         * This is the multi-device request boundary corresponding to
+         * IInferenceRunner::clear_cache().  It must clear KV/recurrent state,
+         * logical positions, pending handoffs, and request-local metadata across
+         * all child runners in lockstep while preserving child graph topology,
+         * prepared weights, workspaces, and device contexts.
          */
         void clear_cache() override;
 

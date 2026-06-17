@@ -591,6 +591,23 @@ namespace llaminar2
         return saw_runner && ok;
     }
 
+    bool StageRunnerRegistry::ensureMTPCheckpointTerminalHiddenAll()
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner && entry.runner->ensureMTPCheckpointTerminalHidden() && ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            ok = compatibility_runner_->ensureMTPCheckpointTerminalHidden() && ok;
+        }
+        return saw_runner && ok;
+    }
+
     uint64_t StageRunnerRegistry::moePlacementEpochAll() const
     {
         uint64_t epoch = 0;
@@ -1393,6 +1410,13 @@ namespace llaminar2
             already_appended_tokens,
             allow_speculative_discard,
             position_offset_override);
+    }
+
+    bool GlobalOrchestrator::ensureMTPCheckpointTerminalHidden()
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.ensureMTPCheckpointTerminalHiddenAll();
     }
 
     const float *GlobalOrchestrator::mtpLogits() const

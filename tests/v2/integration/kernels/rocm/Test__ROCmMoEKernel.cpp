@@ -27,6 +27,7 @@
 #include <hip/hip_runtime.h>
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/ROCmWeightPacker.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
 #include "kernels/KernelFactory.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -165,6 +166,8 @@ namespace
             norm_a += static_cast<double>(a[i]) * a[i];
             norm_b += static_cast<double>(b[i]) * b[i];
         }
+        if (norm_a < 1e-30 && norm_b < 1e-30)
+            return 1.0;
         if (norm_a < 1e-30 || norm_b < 1e-30)
             return 0.0;
         return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
@@ -180,7 +183,7 @@ namespace
             ref_sq += static_cast<double>(reference[i]) * reference[i];
         }
         if (ref_sq < 1e-30)
-            return 0.0;
+            return err_sq < 1e-30 ? 0.0 : std::numeric_limits<double>::infinity();
         return std::sqrt(err_sq / ref_sq);
     }
 
@@ -193,6 +196,148 @@ namespace
             max_diff = std::max(max_diff, diff);
         }
         return max_diff;
+    }
+
+    struct StrictVerifierSimilarityMetrics
+    {
+        double cosine = 0.0;
+        double relative_l2 = 0.0;
+        double max_abs = 0.0;
+        double min_row_cosine = 1.0;
+        double max_row_relative_l2 = 0.0;
+        double max_row_kl = 0.0;
+        size_t worst_row = 0;
+    };
+
+    /**
+     * @brief KL(reference || actual) after a stable row-wise softmax.
+     *
+     * Hidden-state vectors are not probabilities, but row-softmax KL is a useful
+     * verifier guard: it catches shape changes in the largest coordinates that a
+     * raw cosine can hide.  MTP verifier rows are short and near token decisions,
+     * so a path that cannot satisfy this check is not decode-equivalent enough to
+     * justify publishing accepted speculative state.
+     */
+    double rowSoftmaxKLDivergence(const float *actual, const float *reference, size_t row_width)
+    {
+        if (row_width == 0)
+            return 0.0;
+
+        double max_actual = -std::numeric_limits<double>::infinity();
+        double max_reference = -std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < row_width; ++i)
+        {
+            max_actual = std::max(max_actual, static_cast<double>(actual[i]));
+            max_reference = std::max(max_reference, static_cast<double>(reference[i]));
+        }
+
+        double sum_actual = 0.0;
+        double sum_reference = 0.0;
+        for (size_t i = 0; i < row_width; ++i)
+        {
+            sum_actual += std::exp(static_cast<double>(actual[i]) - max_actual);
+            sum_reference += std::exp(static_cast<double>(reference[i]) - max_reference);
+        }
+
+        constexpr double kEps = 1.0e-30;
+        double kl = 0.0;
+        for (size_t i = 0; i < row_width; ++i)
+        {
+            const double p = std::exp(static_cast<double>(reference[i]) - max_reference) /
+                             std::max(sum_reference, kEps);
+            const double q = std::exp(static_cast<double>(actual[i]) - max_actual) /
+                             std::max(sum_actual, kEps);
+            kl += p * (std::log(std::max(p, kEps)) - std::log(std::max(q, kEps)));
+        }
+        return kl;
+    }
+
+    StrictVerifierSimilarityMetrics computeStrictVerifierSimilarity(
+        const float *actual,
+        const float *reference,
+        size_t count,
+        size_t row_width)
+    {
+        StrictVerifierSimilarityMetrics metrics;
+        metrics.cosine = cosineSimilarity(actual, reference, count);
+        metrics.relative_l2 = relativeL2Error(actual, reference, count);
+        metrics.max_abs = maxAbsDiff(actual, reference, count);
+
+        if (row_width == 0 || count % row_width != 0)
+            row_width = count;
+        const size_t rows = (row_width == 0) ? 0 : count / row_width;
+
+        for (size_t row = 0; row < rows; ++row)
+        {
+            const float *row_actual = actual + row * row_width;
+            const float *row_reference = reference + row * row_width;
+            const double row_cosine = cosineSimilarity(row_actual, row_reference, row_width);
+            const double row_rel_l2 = relativeL2Error(row_actual, row_reference, row_width);
+            const double row_kl = rowSoftmaxKLDivergence(row_actual, row_reference, row_width);
+
+            if (row_rel_l2 > metrics.max_row_relative_l2 ||
+                row_kl > metrics.max_row_kl ||
+                row_cosine < metrics.min_row_cosine)
+            {
+                metrics.worst_row = row;
+            }
+            metrics.min_row_cosine = std::min(metrics.min_row_cosine, row_cosine);
+            metrics.max_row_relative_l2 = std::max(metrics.max_row_relative_l2, row_rel_l2);
+            metrics.max_row_kl = std::max(metrics.max_row_kl, row_kl);
+        }
+
+        return metrics;
+    }
+
+    void expectStrictVerifierSimilarity(
+        const char *label,
+        const float *actual,
+        const float *reference,
+        size_t count,
+        size_t row_width,
+        double min_cosine = 0.9999,
+        double max_relative_l2 = 0.006,
+        double min_row_cosine = 0.9998,
+        double max_row_relative_l2 = 0.008,
+        double max_row_kl = 1.0e-4)
+    {
+        SCOPED_TRACE(label);
+        ASSERT_NE(actual, nullptr);
+        ASSERT_NE(reference, nullptr);
+        ASSERT_GT(count, 0u);
+        const auto metrics = computeStrictVerifierSimilarity(actual, reference, count, row_width);
+        EXPECT_GE(metrics.cosine, min_cosine)
+            << "relative_l2=" << metrics.relative_l2
+            << " max_abs=" << metrics.max_abs
+            << " min_row_cosine=" << metrics.min_row_cosine
+            << " max_row_relative_l2=" << metrics.max_row_relative_l2
+            << " max_row_kl=" << metrics.max_row_kl
+            << " worst_row=" << metrics.worst_row;
+        EXPECT_LE(metrics.relative_l2, max_relative_l2)
+            << "cosine=" << metrics.cosine
+            << " max_abs=" << metrics.max_abs
+            << " min_row_cosine=" << metrics.min_row_cosine
+            << " max_row_relative_l2=" << metrics.max_row_relative_l2
+            << " max_row_kl=" << metrics.max_row_kl
+            << " worst_row=" << metrics.worst_row;
+        EXPECT_GE(metrics.min_row_cosine, min_row_cosine)
+            << "cosine=" << metrics.cosine
+            << " relative_l2=" << metrics.relative_l2
+            << " max_row_relative_l2=" << metrics.max_row_relative_l2
+            << " max_row_kl=" << metrics.max_row_kl
+            << " worst_row=" << metrics.worst_row;
+        EXPECT_LE(metrics.max_row_relative_l2, max_row_relative_l2)
+            << "cosine=" << metrics.cosine
+            << " relative_l2=" << metrics.relative_l2
+            << " min_row_cosine=" << metrics.min_row_cosine
+            << " max_row_kl=" << metrics.max_row_kl
+            << " worst_row=" << metrics.worst_row;
+        EXPECT_LE(metrics.max_row_kl, max_row_kl)
+            << "cosine=" << metrics.cosine
+            << " relative_l2=" << metrics.relative_l2
+            << " min_row_cosine=" << metrics.min_row_cosine
+            << " max_row_relative_l2=" << metrics.max_row_relative_l2
+            << " worst_row=" << metrics.worst_row;
     }
 
     class ScopedEnvOverride
@@ -602,8 +747,12 @@ TEST(Test__ROCmMoEKernel, Route_DecodeSmall)
     double logits_cosine = cosineSimilarity(
         gpu_result.router_logits.data(), cpu_result.router_logits.data(),
         gpu_result.router_logits.size());
-    EXPECT_GE(logits_cosine, 0.999)
-        << "Router logits cosine similarity too low: " << logits_cosine;
+    expectStrictVerifierSimilarity(
+        "decode router logits should match CPU routing row-by-row",
+        gpu_result.router_logits.data(),
+        cpu_result.router_logits.data(),
+        gpu_result.router_logits.size(),
+        static_cast<size_t>(num_experts));
 
     // Verify top-k expert selections match
     ASSERT_EQ(gpu_result.expert_indices.size(), cpu_result.expert_indices.size());
@@ -623,7 +772,7 @@ TEST(Test__ROCmMoEKernel, Route_DecodeSmall)
     double weights_cosine = cosineSimilarity(
         gpu_result.expert_weights.data(), cpu_result.expert_weights.data(),
         gpu_result.expert_weights.size());
-    EXPECT_GE(weights_cosine, 0.99)
+    EXPECT_GE(weights_cosine, 0.999)
         << "Expert weights cosine similarity too low: " << weights_cosine;
 
     std::cout << "[Route_DecodeSmall] logits_cosine=" << std::fixed << std::setprecision(6)
@@ -680,18 +829,9 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeStateUpdatesTopKAndHistogram)
         output_indices.get(), output_weights.get(),
         true, true));
 
-#if LLAMINAR_ASSERTIONS_ACTIVE
-    DeviceMoELayerRuntime zero_runtime{};
-    ASSERT_EQ(hipMemcpy(device_runtime, &zero_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
-    EXPECT_FALSE(gpu_kernel.decodeRouteSelect(
-        device_runtime,
-        hidden.get(), gate_weights.get(),
-        d_model, num_experts, top_k,
-        true,
-        output_indices.get(), output_weights.get(),
-        true, true));
-    ASSERT_EQ(hipMemcpy(device_runtime, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
-#endif
+    // Runtime-table semantic validation belongs to the graph-build/stage setup
+    // boundary.  decodeRouteSelect() is part of the captured hot path, so this
+    // test deliberately avoids expecting a D2H validation pass here.
 
     ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
         device_runtime,
@@ -1681,7 +1821,12 @@ TEST(Test__ROCmMoEKernel, Route_PrefillLarge)
     double logits_cosine = cosineSimilarity(
         gpu_result.router_logits.data(), cpu_result.router_logits.data(),
         gpu_result.router_logits.size());
-    EXPECT_GE(logits_cosine, 0.999);
+    expectStrictVerifierSimilarity(
+        "prefill router logits should match CPU routing row-by-row",
+        gpu_result.router_logits.data(),
+        cpu_result.router_logits.data(),
+        gpu_result.router_logits.size(),
+        static_cast<size_t>(num_experts));
 
     // Count matching top-1 experts across all tokens
     int top1_matches = 0;
@@ -1817,10 +1962,12 @@ TEST(Test__ROCmMoEKernel, ScatterAddWeighted)
     ASSERT_FALSE(hasNaNOrInf(gpu_output.data(), gpu_output.size()));
     double cosine = cosineSimilarity(gpu_output.data(), cpu_output.data(), gpu_output.size());
     double l2_err = relativeL2Error(gpu_output.data(), cpu_output.data(), gpu_output.size());
-    EXPECT_GE(cosine, 0.999)
-        << "ScatterAdd cosine: " << cosine;
-    EXPECT_LE(l2_err, 0.01)
-        << "ScatterAdd relative L2 error: " << l2_err;
+    expectStrictVerifierSimilarity(
+        "scatterAddWeighted should match CPU reference rows",
+        gpu_output.data(),
+        cpu_output.data(),
+        gpu_output.size(),
+        static_cast<size_t>(d_model));
 
     std::cout << "[ScatterAddWeighted] cosine=" << std::fixed << std::setprecision(6)
               << cosine << " l2_err=" << l2_err << std::endl;
@@ -1880,10 +2027,12 @@ TEST(Test__ROCmMoEKernel, SharedExpertGate_Decode)
                                      cpu_shared_output.size());
     double l2_err = relativeL2Error(gpu_shared_output_host.data(), cpu_shared_output.data(),
                                     cpu_shared_output.size());
-    EXPECT_GE(cosine, 0.999)
-        << "SharedExpertGate cosine: " << cosine;
-    EXPECT_LE(l2_err, 0.01)
-        << "SharedExpertGate L2 error: " << l2_err;
+    expectStrictVerifierSimilarity(
+        "sharedExpertGate decode should match CPU reference rows",
+        gpu_shared_output_host.data(),
+        cpu_shared_output.data(),
+        cpu_shared_output.size(),
+        static_cast<size_t>(d_model));
 
     std::cout << "[SharedExpertGate_Decode_Fused] cosine=" << std::fixed << std::setprecision(6)
               << cosine << " l2_err=" << l2_err << std::endl;
@@ -1931,10 +2080,12 @@ TEST(Test__ROCmMoEKernel, SharedExpertGate_DecodeFusedFromTensorsMarksOutputDirt
     ASSERT_FALSE(hasNaNOrInf(actual, expected_shared_output.size()));
     double cosine = cosineSimilarity(actual, expected_shared_output.data(), expected_shared_output.size());
     double l2_err = relativeL2Error(actual, expected_shared_output.data(), expected_shared_output.size());
-    EXPECT_GE(cosine, 0.999)
-        << "SharedExpertGate tensor decode cosine: " << cosine;
-    EXPECT_LE(l2_err, 0.01)
-        << "SharedExpertGate tensor decode L2 error: " << l2_err;
+    expectStrictVerifierSimilarity(
+        "sharedExpertGate tensor decode should match CPU reference rows",
+        actual,
+        expected_shared_output.data(),
+        expected_shared_output.size(),
+        static_cast<size_t>(d_model));
 
     std::cout << "[SharedExpertGate_DecodeFusedFromTensors] cosine=" << std::fixed << std::setprecision(6)
               << cosine << " l2_err=" << l2_err << std::endl;
@@ -1957,35 +2108,43 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateAddFromTensorsMatchesCPU)
     fillRandom(shared_output, -1.0f, 1.0f, 643);
     fillRandom(routed_residual, -0.5f, 0.5f, 644);
 
-    auto input_tensor = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-    auto gate_tensor = TestTensorFactory::createFP32({static_cast<size_t>(d_model)});
-    auto shared_tensor = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-    auto residual_tensor = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    auto input_cpu = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    auto input_gpu = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    auto gate_cpu = TestTensorFactory::createFP32({static_cast<size_t>(d_model)});
+    auto gate_gpu = TestTensorFactory::createFP32({static_cast<size_t>(d_model)});
+    auto shared_cpu = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    auto shared_gpu = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    auto residual_cpu = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    auto residual_gpu = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
     auto combined_tensor = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
     auto expected_tensor = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-    std::copy(input.begin(), input.end(), input_tensor->mutable_data());
-    std::copy(gate_inp.begin(), gate_inp.end(), gate_tensor->mutable_data());
-    std::copy(shared_output.begin(), shared_output.end(), shared_tensor->mutable_data());
-    std::copy(routed_residual.begin(), routed_residual.end(), residual_tensor->mutable_data());
+    std::copy(input.begin(), input.end(), input_cpu->mutable_data());
+    std::copy(input.begin(), input.end(), input_gpu->mutable_data());
+    std::copy(gate_inp.begin(), gate_inp.end(), gate_cpu->mutable_data());
+    std::copy(gate_inp.begin(), gate_inp.end(), gate_gpu->mutable_data());
+    std::copy(shared_output.begin(), shared_output.end(), shared_cpu->mutable_data());
+    std::copy(shared_output.begin(), shared_output.end(), shared_gpu->mutable_data());
+    std::copy(routed_residual.begin(), routed_residual.end(), residual_cpu->mutable_data());
+    std::copy(routed_residual.begin(), routed_residual.end(), residual_gpu->mutable_data());
     std::fill(combined_tensor->mutable_data(), combined_tensor->mutable_data() + combined_tensor->numel(), 0.0f);
     std::fill(expected_tensor->mutable_data(), expected_tensor->mutable_data() + expected_tensor->numel(), 0.0f);
 
     CPUMoEKernel cpu_kernel;
     cpu_kernel.sharedExpertGateAddFromTensors(
-        input_tensor.get(), gate_tensor.get(), shared_tensor.get(),
-        residual_tensor.get(), expected_tensor.get(), seq_len, d_model);
+        input_cpu.get(), gate_cpu.get(), shared_cpu.get(),
+        residual_cpu.get(), expected_tensor.get(), seq_len, d_model);
 
-    ASSERT_TRUE(input_tensor->ensureOnDevice(device));
-    ASSERT_TRUE(gate_tensor->ensureOnDevice(device));
-    ASSERT_TRUE(shared_tensor->ensureOnDevice(device));
-    ASSERT_TRUE(residual_tensor->ensureOnDevice(device));
+    ASSERT_TRUE(input_gpu->ensureOnDevice(device));
+    ASSERT_TRUE(gate_gpu->ensureOnDevice(device));
+    ASSERT_TRUE(shared_gpu->ensureOnDevice(device));
+    ASSERT_TRUE(residual_gpu->ensureOnDevice(device));
     ASSERT_TRUE(combined_tensor->ensureOnDevice(device));
 
     ROCmMoEKernel gpu_kernel(0);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     gpu_kernel.sharedExpertGateAddFromTensors(
-        input_tensor.get(), gate_tensor.get(), shared_tensor.get(),
-        residual_tensor.get(), combined_tensor.get(), seq_len, d_model);
+        input_gpu.get(), gate_gpu.get(), shared_gpu.get(),
+        residual_gpu.get(), combined_tensor.get(), seq_len, d_model);
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
     EXPECT_EQ(combined_tensor->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
@@ -1993,10 +2152,12 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateAddFromTensorsMatchesCPU)
     ASSERT_FALSE(hasNaNOrInf(actual, expected_tensor->numel()));
     double cosine = cosineSimilarity(actual, expected_tensor->data(), expected_tensor->numel());
     double l2_err = relativeL2Error(actual, expected_tensor->data(), expected_tensor->numel());
-    EXPECT_GE(cosine, 0.999)
-        << "SharedExpertGateAdd tensor cosine: " << cosine;
-    EXPECT_LE(l2_err, 0.01)
-        << "SharedExpertGateAdd tensor L2 error: " << l2_err;
+    expectStrictVerifierSimilarity(
+        "sharedExpertGateAdd tensor path should match CPU reference rows",
+        actual,
+        expected_tensor->data(),
+        expected_tensor->numel(),
+        static_cast<size_t>(d_model));
 
     std::cout << "[SharedExpertGateAddFromTensors] cosine=" << std::fixed << std::setprecision(6)
               << cosine << " l2_err=" << l2_err << std::endl;
@@ -2046,7 +2207,12 @@ TEST(Test__ROCmMoEKernel, SharedExpertGate_Prefill)
     ASSERT_FALSE(hasNaNOrInf(gpu_shared_output_host.data(), gpu_shared_output_host.size()));
     double cosine = cosineSimilarity(gpu_shared_output_host.data(), cpu_shared_output.data(),
                                      cpu_shared_output.size());
-    EXPECT_GE(cosine, 0.999);
+    expectStrictVerifierSimilarity(
+        "sharedExpertGate prefill should match CPU reference rows",
+        gpu_shared_output_host.data(),
+        cpu_shared_output.data(),
+        cpu_shared_output.size(),
+        static_cast<size_t>(d_model));
 
     std::cout << "[SharedExpertGate_Prefill] cosine=" << std::fixed << std::setprecision(6)
               << cosine << std::endl;
@@ -2094,10 +2260,12 @@ TEST(Test__ROCmMoEKernel, SwiGLU)
     ASSERT_FALSE(hasNaNOrInf(gpu_gate_host.data(), gpu_gate_host.size()));
     double cosine = cosineSimilarity(gpu_gate_host.data(), cpu_gate.data(), count);
     double l2_err = relativeL2Error(gpu_gate_host.data(), cpu_gate.data(), count);
-    EXPECT_GE(cosine, 0.9999)
-        << "SwiGLU cosine: " << cosine;
-    EXPECT_LE(l2_err, 0.001)
-        << "SwiGLU L2 error: " << l2_err;
+    expectStrictVerifierSimilarity(
+        "swiGLU should match CPU reference rows",
+        gpu_gate_host.data(),
+        cpu_gate.data(),
+        count,
+        count);
 
     std::cout << "[SwiGLU] cosine=" << std::fixed << std::setprecision(6)
               << cosine << " l2_err=" << l2_err << std::endl;
@@ -2214,13 +2382,14 @@ TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q4_0MatchesSequential)
     const float *seq = sequential_output->data();
     const float *grouped = grouped_output->data();
     ASSERT_FALSE(hasNaNOrInf(grouped, d_model));
+    expectStrictVerifierSimilarity(
+        "ROCm grouped expert down decode Q4_0 must match sequential decode",
+        grouped,
+        seq,
+        static_cast<size_t>(d_model),
+        static_cast<size_t>(d_model));
     const double cosine = cosineSimilarity(grouped, seq, d_model);
     const double l2_err = relativeL2Error(grouped, seq, d_model);
-
-    EXPECT_GE(cosine, 0.999)
-        << "Grouped expert down cosine mismatch: " << cosine;
-    EXPECT_LE(l2_err, 0.02)
-        << "Grouped expert down relative L2 too high: " << l2_err;
 
     std::cout << "[GroupedExpertDownDecode_Q4_0MatchesSequential] cosine="
               << std::fixed << std::setprecision(6) << cosine
@@ -2408,22 +2577,30 @@ void runGroupedExpertDownDecodeFormatMatch(const char *label, WeightFactory crea
     const double parallel_vs_runtime_l2_err = relativeL2Error(parallel_runtime, runtime, d_model);
     const double parallel_vs_runtime_max_abs = maxAbsDiff(parallel_runtime, runtime, d_model);
 
-    EXPECT_GE(cosine, 0.999)
-        << label << " grouped expert down cosine mismatch: " << cosine;
-    EXPECT_LE(l2_err, 0.02)
-        << label << " grouped expert down relative L2 too high: " << l2_err;
-    EXPECT_GE(device_cosine, 0.999)
-        << label << " device-routed grouped expert down cosine mismatch: " << device_cosine;
-    EXPECT_LE(device_l2_err, 0.02)
-        << label << " device-routed grouped expert down relative L2 too high: " << device_l2_err;
-    EXPECT_GE(runtime_cosine, 0.999)
-        << label << " runtime grouped expert down cosine mismatch: " << runtime_cosine;
-    EXPECT_LE(runtime_l2_err, 0.02)
-        << label << " runtime grouped expert down relative L2 too high: " << runtime_l2_err;
-    EXPECT_GE(parallel_runtime_cosine, 0.999)
-        << label << " parallel runtime grouped expert down cosine mismatch: " << parallel_runtime_cosine;
-    EXPECT_LE(parallel_runtime_l2_err, 0.025)
-        << label << " parallel runtime grouped expert down relative L2 too high: " << parallel_runtime_l2_err;
+    expectStrictVerifierSimilarity(
+        (std::string(label) + " grouped expert down decode must match sequential").c_str(),
+        grouped,
+        seq,
+        static_cast<size_t>(d_model),
+        static_cast<size_t>(d_model));
+    expectStrictVerifierSimilarity(
+        (std::string(label) + " device-routed grouped expert down decode must match sequential").c_str(),
+        device_routed,
+        seq,
+        static_cast<size_t>(d_model),
+        static_cast<size_t>(d_model));
+    expectStrictVerifierSimilarity(
+        (std::string(label) + " runtime grouped expert down decode must match sequential").c_str(),
+        runtime,
+        seq,
+        static_cast<size_t>(d_model),
+        static_cast<size_t>(d_model));
+    expectStrictVerifierSimilarity(
+        (std::string(label) + " parallel runtime grouped expert down decode must match sequential").c_str(),
+        parallel_runtime,
+        seq,
+        static_cast<size_t>(d_model),
+        static_cast<size_t>(d_model));
     EXPECT_GE(parallel_vs_runtime_cosine, 0.99999)
         << label << " parallel runtime should closely match serial runtime, cosine=" << parallel_vs_runtime_cosine;
     EXPECT_LE(parallel_vs_runtime_l2_err, 0.002)
@@ -2766,30 +2943,42 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
         const double kpart_gate_l2 = relativeL2Error(kpart_gate, runtime_gate, intermediate);
         const double kpart_up_l2 = relativeL2Error(kpart_up, runtime_up, intermediate);
 
-        EXPECT_GE(gate_cosine, 0.999)
-            << label << " grouped gate cosine mismatch for active slot " << i;
-        EXPECT_GE(up_cosine, 0.999)
-            << label << " grouped up cosine mismatch for active slot " << i;
-        EXPECT_LE(gate_l2, 0.02)
-            << label << " grouped gate relative L2 too high for active slot " << i;
-        EXPECT_LE(up_l2, 0.02)
-            << label << " grouped up relative L2 too high for active slot " << i;
-        EXPECT_GE(device_gate_cosine, 0.999)
-            << label << " device-routed grouped gate cosine mismatch for active slot " << i;
-        EXPECT_GE(device_up_cosine, 0.999)
-            << label << " device-routed grouped up cosine mismatch for active slot " << i;
-        EXPECT_LE(device_gate_l2, 0.02)
-            << label << " device-routed grouped gate relative L2 too high for active slot " << i;
-        EXPECT_LE(device_up_l2, 0.02)
-            << label << " device-routed grouped up relative L2 too high for active slot " << i;
-        EXPECT_GE(runtime_gate_cosine, 0.999)
-            << label << " runtime grouped gate cosine mismatch for active slot " << i;
-        EXPECT_GE(runtime_up_cosine, 0.999)
-            << label << " runtime grouped up cosine mismatch for active slot " << i;
-        EXPECT_LE(runtime_gate_l2, 0.02)
-            << label << " runtime grouped gate relative L2 too high for active slot " << i;
-        EXPECT_LE(runtime_up_l2, 0.02)
-            << label << " runtime grouped up relative L2 too high for active slot " << i;
+        expectStrictVerifierSimilarity(
+            (std::string(label) + " grouped gate output must match sequential").c_str(),
+            grouped_gate,
+            seq_gate,
+            static_cast<size_t>(intermediate),
+            static_cast<size_t>(intermediate));
+        expectStrictVerifierSimilarity(
+            (std::string(label) + " grouped up output must match sequential").c_str(),
+            grouped_up,
+            seq_up,
+            static_cast<size_t>(intermediate),
+            static_cast<size_t>(intermediate));
+        expectStrictVerifierSimilarity(
+            (std::string(label) + " device-routed grouped gate output must match sequential").c_str(),
+            device_gate,
+            seq_gate,
+            static_cast<size_t>(intermediate),
+            static_cast<size_t>(intermediate));
+        expectStrictVerifierSimilarity(
+            (std::string(label) + " device-routed grouped up output must match sequential").c_str(),
+            device_up,
+            seq_up,
+            static_cast<size_t>(intermediate),
+            static_cast<size_t>(intermediate));
+        expectStrictVerifierSimilarity(
+            (std::string(label) + " runtime grouped gate output must match sequential").c_str(),
+            runtime_gate,
+            seq_gate,
+            static_cast<size_t>(intermediate),
+            static_cast<size_t>(intermediate));
+        expectStrictVerifierSimilarity(
+            (std::string(label) + " runtime grouped up output must match sequential").c_str(),
+            runtime_up,
+            seq_up,
+            static_cast<size_t>(intermediate),
+            static_cast<size_t>(intermediate));
         EXPECT_GE(kpart_gate_cosine, 0.99999)
             << label << " kpart grouped gate cosine mismatch vs runtime for active slot " << i;
         EXPECT_GE(kpart_up_cosine, 0.99999)
@@ -3003,6 +3192,208 @@ TEST(Test__ROCmMoEKernel, GroupedSharedExpertDecodeCapturesWithStablePointerCach
 
     EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
     EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures)
+{
+    SKIP_IF_NO_ROCM();
+
+    ScopedEnvOverride perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+
+    constexpr int d_model = 128;
+    constexpr int intermediate = 128;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 4;
+    const DeviceId device = DeviceId::rocm(0);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    ASSERT_TRUE(llaminar2::rocm::ensureIQGridTablesInitialized(0));
+
+    ROCmMoEKernel moe_kernel(0);
+    static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
+    auto moe_workspace = bindDefaultMoEWorkspace(
+        moe_kernel,
+        /*max_seq_len=*/1,
+        d_model,
+        intermediate,
+        num_experts,
+        top_k);
+
+    auto make_kernel = [&](auto weights)
+    {
+        auto packed = std::make_unique<rocm::ROCmPackedWeights>();
+        EXPECT_TRUE(rocm::packWeightsToROCm(weights.get(), *packed));
+        auto kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(packed.get(), 0);
+        static_cast<ITensorKernel *>(kernel.get())->setGPUStream(stream);
+        return std::tuple{
+            std::move(weights),
+            std::move(packed),
+            std::move(kernel)};
+    };
+
+    std::vector<std::unique_ptr<TensorBase>> gate_weights;
+    std::vector<std::unique_ptr<TensorBase>> up_weights;
+    std::vector<std::unique_ptr<TensorBase>> down_weights;
+    std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> gate_packed;
+    std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> up_packed;
+    std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> down_packed;
+    std::vector<std::unique_ptr<rocm::ROCmQuantisedGemmKernel>> gate_kernels;
+    std::vector<std::unique_ptr<rocm::ROCmQuantisedGemmKernel>> up_kernels;
+    std::vector<std::unique_ptr<rocm::ROCmQuantisedGemmKernel>> down_kernels;
+    gate_weights.reserve(num_experts);
+    up_weights.reserve(num_experts);
+    down_weights.reserve(num_experts);
+    gate_packed.reserve(num_experts);
+    up_packed.reserve(num_experts);
+    down_packed.reserve(num_experts);
+    gate_kernels.reserve(num_experts);
+    up_kernels.reserve(num_experts);
+    down_kernels.reserve(num_experts);
+
+    WorkspaceRequirements gemm_reqs;
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        auto [gate_w, gate_p, gate_k] = make_kernel(
+            TestTensorFactory::createQ4_0Random(
+                {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}));
+        auto [up_w, up_p, up_k] = make_kernel(
+            TestTensorFactory::createQ4_0Random(
+                {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}));
+        auto [down_w, down_p, down_k] = make_kernel(
+            TestTensorFactory::createQ4_0Random(
+                {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)}));
+
+        gemm_reqs.merge(gate_k->getWorkspaceRequirements(1, intermediate, d_model));
+        gemm_reqs.merge(up_k->getWorkspaceRequirements(1, intermediate, d_model));
+        gemm_reqs.merge(down_k->getWorkspaceRequirements(1, d_model, intermediate));
+
+        gate_weights.push_back(std::move(gate_w));
+        up_weights.push_back(std::move(up_w));
+        down_weights.push_back(std::move(down_w));
+        gate_packed.push_back(std::move(gate_p));
+        up_packed.push_back(std::move(up_p));
+        down_packed.push_back(std::move(down_p));
+        gate_kernels.push_back(std::move(gate_k));
+        up_kernels.push_back(std::move(up_k));
+        down_kernels.push_back(std::move(down_k));
+    }
+
+    auto gemm_workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024 * 1024);
+    ASSERT_TRUE(gemm_workspace->allocate(gemm_reqs));
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        gate_kernels[expert]->bindWorkspace(gemm_workspace.get());
+        up_kernels[expert]->bindWorkspace(gemm_workspace.get());
+        down_kernels[expert]->bindWorkspace(gemm_workspace.get());
+        gate_kernels[expert]->prepareWeights();
+        up_kernels[expert]->prepareWeights();
+        down_kernels[expert]->prepareWeights();
+    }
+
+    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        ASSERT_TRUE(gate_kernels[expert]->exportNativeVNNIMatrixDesc(gate_descs[expert]));
+        ASSERT_TRUE(up_kernels[expert]->exportNativeVNNIMatrixDesc(up_descs[expert]));
+        ASSERT_TRUE(down_kernels[expert]->exportNativeVNNIMatrixDesc(down_descs[expert]));
+    }
+
+    const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(gateup_table, 0);
+    const int down_table = moe_kernel.uploadGroupedExpertDownDescriptorTable(
+        down_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(down_table, 0);
+
+    auto hidden = TestTensorFactory::createFP32Random(
+        {1, static_cast<size_t>(d_model)}, -0.5f, 0.5f, 8181);
+    auto two_step_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    auto fused_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+    ASSERT_TRUE(two_step_output->ensureOnDevice(device, stream));
+    ASSERT_TRUE(fused_output->ensureOnDevice(device, stream));
+
+    std::array<std::shared_ptr<FP32Tensor>, top_k> gate_tensors;
+    std::array<std::shared_ptr<FP32Tensor>, top_k> up_tensors;
+    std::array<ITensor *, top_k> gate_ptrs = {};
+    std::array<ITensor *, top_k> up_ptrs = {};
+    for (int slot = 0; slot < top_k; ++slot)
+    {
+        gate_tensors[slot] = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
+        up_tensors[slot] = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
+        ASSERT_TRUE(gate_tensors[slot]->ensureOnDevice(device, stream));
+        ASSERT_TRUE(up_tensors[slot]->ensureOnDevice(device, stream));
+        gate_ptrs[slot] = gate_tensors[slot].get();
+        up_ptrs[slot] = up_tensors[slot].get();
+    }
+
+    DeviceMoELayerRuntime host_runtime{};
+    host_runtime.expert_count = static_cast<uint32_t>(num_experts);
+    host_runtime.top_k = static_cast<uint32_t>(top_k);
+    for (int slot = 0; slot < top_k; ++slot)
+    {
+        host_runtime.topk_expert_ids[slot] = slot;
+        host_runtime.topk_weights[slot] = 0.10f + 0.05f * static_cast<float>(slot);
+    }
+    DeviceMoELayerRuntime *device_runtime = nullptr;
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  device_runtime, &host_runtime, sizeof(DeviceMoELayerRuntime),
+                  hipMemcpyHostToDevice, stream),
+              hipSuccess);
+
+    moe_kernel.zeroBuffer(two_step_output.get(), static_cast<size_t>(d_model) * sizeof(float));
+    moe_kernel.zeroBuffer(fused_output.get(), static_cast<size_t>(d_model) * sizeof(float));
+    ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromRuntime(
+        device_runtime, hidden.get(), gateup_table, top_k,
+        gate_ptrs.data(), up_ptrs.data(), d_model, intermediate));
+    ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRuntime(
+        gate_ptrs.data(), up_ptrs.data(), device_runtime, down_table, top_k,
+        two_step_output.get(), d_model, intermediate));
+
+    PerfStatsCollector::reset();
+    ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRuntime(
+        device_runtime, hidden.get(), gateup_table, down_table, top_k,
+        fused_output.get(), d_model, intermediate));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    two_step_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    fused_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    expectStrictVerifierSimilarity(
+        "ROCm fused grouped decode must match two-step decode",
+        fused_output->data(),
+        two_step_output->data(),
+        static_cast<size_t>(d_model),
+        static_cast<size_t>(d_model));
+
+    const auto counters = PerfStatsCollector::snapshot(
+        {"kernel.rocm_moe_grouped_decode_fused_calls"});
+    ASSERT_FALSE(counters.empty()) << PerfStatsCollector::summaryString(
+        {"kernel.rocm_moe_grouped_decode_fused_calls"});
+
+    hipGraph_t graph = nullptr;
+    ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+    const bool captured_fused = moe_kernel.groupedExpertDecodeFromRuntime(
+        device_runtime, hidden.get(), gateup_table, down_table, top_k,
+        fused_output.get(), d_model, intermediate);
+    const hipError_t capture_status = hipStreamEndCapture(stream, &graph);
+    EXPECT_TRUE(captured_fused);
+    ASSERT_EQ(capture_status, hipSuccess) << hipGetErrorString(capture_status);
+    ASSERT_NE(graph, nullptr);
+
+    hipGraphExec_t exec = nullptr;
+    ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
+    ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
+    ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
+    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+    ASSERT_EQ(hipFree(device_runtime), hipSuccess);
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
@@ -3254,10 +3645,12 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Q4KGateUp_Q5KDownMatchesSequentialGemm)
 
     grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *grouped = grouped_output->data();
-    const double cosine = cosineSimilarity(grouped, expected.data(), expected.size());
-    const double rel_l2 = relativeL2Error(grouped, expected.data(), expected.size());
-    EXPECT_GE(cosine, 0.999) << "relative L2=" << rel_l2;
-    EXPECT_LE(rel_l2, 0.02) << "cosine=" << cosine;
+    expectStrictVerifierSimilarity(
+        "ROCm grouped prefill must match sequential GPU rows",
+        grouped,
+        expected.data(),
+        expected.size(),
+        static_cast<size_t>(d_model));
 }
 
 TEST(Test__ROCmMoEKernel, GroupedPrefill_Qwen35RouteTable_Q4KQ5KMatchesCpuDequantReference)
@@ -5289,10 +5682,17 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
     const float *reference = reference_output->data();
     const float *fixed = fixed_output->data();
     const size_t output_count = static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
-    const double cosine = cosineSimilarity(reference, fixed, output_count);
-    const double rel_l2 = relativeL2Error(fixed, reference, output_count);
-    EXPECT_GT(cosine, 0.9999) << "relative L2=" << rel_l2;
-    EXPECT_LT(rel_l2, 1.0e-3) << "cosine=" << cosine;
+    expectStrictVerifierSimilarity(
+        "fixed-topology runtime grouped prefill should match existing prefill path",
+        fixed,
+        reference,
+        output_count,
+        static_cast<size_t>(d_model),
+        /*min_cosine=*/0.99999,
+        /*max_relative_l2=*/0.001,
+        /*min_row_cosine=*/0.99999,
+        /*max_row_relative_l2=*/0.0015,
+        /*max_row_kl=*/1.0e-6);
 }
 
 TEST(Test__ROCmMoEKernel, SharedExpertGroupedPrefillMatchesSequentialPath)
@@ -5409,10 +5809,12 @@ TEST(Test__ROCmMoEKernel, SharedExpertGroupedPrefillMatchesSequentialPath)
     const float *grouped = grouped_output->data();
     ASSERT_FALSE(hasNaNOrInf(grouped, output_count));
 
-    const double cosine = cosineSimilarity(grouped, reference, output_count);
-    const double rel_l2 = relativeL2Error(grouped, reference, output_count);
-    EXPECT_GE(cosine, 0.999) << "relative L2=" << rel_l2;
-    EXPECT_LE(rel_l2, 0.02) << "cosine=" << cosine;
+    expectStrictVerifierSimilarity(
+        "ROCm shared-expert grouped verifier prefill must match sequential GEMV",
+        grouped,
+        reference,
+        output_count,
+        static_cast<size_t>(d_model));
 }
 
 TEST(Test__ROCmMoEKernel, CombinedSharedVerifierPrefillMatchesSplitPathAndCaptures)
@@ -5624,12 +6026,13 @@ TEST(Test__ROCmMoEKernel, CombinedSharedVerifierPrefillMatchesSplitPathAndCaptur
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
         combined_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
 
-        const double cosine = cosineSimilarity(
-            combined_output->data(), expected.data(), expected.size());
-        const double rel_l2 = relativeL2Error(
-            combined_output->data(), expected.data(), expected.size());
-        EXPECT_GE(cosine, 0.990) << "seq_len=" << seq_len << " relative L2=" << rel_l2;
-        EXPECT_LE(rel_l2, 0.08) << "seq_len=" << seq_len << " cosine=" << cosine;
+        expectStrictVerifierSimilarity(
+            ("ROCm combined routed+shared verifier split-path parity seq_len=" +
+             std::to_string(seq_len)).c_str(),
+            combined_output->data(),
+            expected.data(),
+            expected.size(),
+            static_cast<size_t>(d_model));
 
         hipGraph_t graph = nullptr;
         ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
@@ -5651,6 +6054,71 @@ TEST(Test__ROCmMoEKernel, CombinedSharedVerifierPrefillMatchesSplitPathAndCaptur
         ASSERT_EQ(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0), hipSuccess);
         ASSERT_EQ(hipGraphLaunch(executable, stream), hipSuccess);
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        std::vector<float> mutated_indices(static_cast<size_t>(seq_len * routed_top_k));
+        std::vector<float> mutated_weights(static_cast<size_t>(seq_len * routed_top_k));
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const int first = (row * 3 + 1) % routed_experts;
+            const int second = (first + 3) % routed_experts;
+            mutated_indices[static_cast<size_t>(row * routed_top_k + 0)] =
+                static_cast<float>(first);
+            mutated_indices[static_cast<size_t>(row * routed_top_k + 1)] =
+                static_cast<float>(second);
+            mutated_weights[static_cast<size_t>(row * routed_top_k + 0)] =
+                0.25f + 0.03f * static_cast<float>(row % 2);
+            mutated_weights[static_cast<size_t>(row * routed_top_k + 1)] =
+                0.75f - 0.03f * static_cast<float>(row % 2);
+        }
+
+        // Replay must consume the current contents of the persistent routing
+        // buffers.  This catches graphs that accidentally bake per-step route
+        // state into kernel object fields or captured host decisions.
+        ASSERT_EQ(hipMemcpyAsync(
+                      routing_indices->gpu_data_ptr(),
+                      mutated_indices.data(),
+                      mutated_indices.size() * sizeof(float),
+                      hipMemcpyHostToDevice,
+                      stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(
+                      routing_weights->gpu_data_ptr(),
+                      mutated_weights.data(),
+                      mutated_weights.size() * sizeof(float),
+                      hipMemcpyHostToDevice,
+                      stream),
+                  hipSuccess);
+        ASSERT_EQ(hipGraphLaunch(executable, stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        auto eager_mutated_output = TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+        ASSERT_TRUE(eager_mutated_output->ensureOnDevice(device, stream));
+        ASSERT_TRUE(moe_kernel.prepareExpertGroupsWithSharedGateAsync(
+            routing_indices.get(), routing_weights.get(),
+            hidden.get(), shared_gate.get(),
+            seq_len, d_model, routed_experts, routed_top_k));
+        ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
+            hidden.get(), eager_mutated_output.get(),
+            combined_gateup_table, combined_down_table,
+            seq_len, d_model, intermediate, combined_experts, combined_top_k));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        combined_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        eager_mutated_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        expectStrictVerifierSimilarity(
+            ("ROCm combined routed+shared verifier captured replay seq_len=" +
+             std::to_string(seq_len)).c_str(),
+            combined_output->data(),
+            eager_mutated_output->data(),
+            combined_output->numel(),
+            static_cast<size_t>(d_model),
+            /*min_cosine=*/0.99999,
+            /*max_relative_l2=*/0.001,
+            /*min_row_cosine=*/0.99999,
+            /*max_row_relative_l2=*/0.0015,
+            /*max_row_kl=*/1.0e-6);
+
         EXPECT_EQ(hipGraphExecDestroy(executable), hipSuccess);
         EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
     }
@@ -6037,11 +6505,12 @@ TEST(Test__ROCmMoEKernel, CombinedSharedVerifierPrefill_Qwen36ShapeMatchesSerial
     combined->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
     const size_t output_count = static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
     ASSERT_FALSE(hasNaNOrInf(combined->data(), output_count));
-    const double cosine = cosineSimilarity(combined->data(), expected->data(), output_count);
-    const double rel_l2 = relativeL2Error(combined->data(), expected->data(), output_count);
-    const double max_abs = maxAbsDiff(combined->data(), expected->data(), output_count);
-    EXPECT_GE(cosine, 0.999) << "relative L2=" << rel_l2 << " max_abs=" << max_abs;
-    EXPECT_LE(rel_l2, 0.02) << "cosine=" << cosine << " max_abs=" << max_abs;
+    expectStrictVerifierSimilarity(
+        "ROCm Qwen3.6-shaped combined routed+shared verifier must match row-by-row verifier",
+        combined->data(),
+        expected->data(),
+        output_count,
+        static_cast<size_t>(d_model));
 
     const auto group_records = PerfStatsCollector::snapshot(
         {"kernel.rocm_moe_combined_shared_prefill_group_calls"});
@@ -6049,6 +6518,359 @@ TEST(Test__ROCmMoEKernel, CombinedSharedVerifierPrefill_Qwen36ShapeMatchesSerial
         << "production-shaped combined routed+shared ROCm verifier grouping counter was not emitted";
 
     PerfStatsCollector::reset();
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+TEST(Test__ROCmMoEKernel, CombinedSharedVerifierPrefill_IQ3S_M2MatchesRowByRowVerifier)
+{
+    SKIP_IF_NO_ROCM();
+
+    const DeviceId device = DeviceId::rocm(0);
+    constexpr int seq_len = 2;
+    constexpr int d_model = 2048;
+    constexpr int intermediate = 512;
+    constexpr int routed_experts = 256;
+    constexpr int routed_top_k = 8;
+    constexpr int shared_slot = routed_experts;
+    constexpr int combined_experts = routed_experts + 1;
+    constexpr int combined_top_k = routed_top_k + 1;
+    constexpr int routed_variants = 16;
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+    ROCmMoEKernel moe_kernel(0);
+    static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
+    auto moe_workspace = bindDefaultMoEWorkspace(
+        moe_kernel,
+        seq_len,
+        d_model,
+        intermediate,
+        combined_experts,
+        combined_top_k);
+
+    std::vector<std::unique_ptr<TensorBase>> owned_weights;
+    std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> packed_weights;
+    std::vector<std::unique_ptr<rocm::ROCmQuantisedGemmKernel>> owned_kernels;
+    owned_weights.reserve(static_cast<size_t>((routed_variants + 1) * 3));
+    packed_weights.reserve(static_cast<size_t>((routed_variants + 1) * 3));
+    owned_kernels.reserve(static_cast<size_t>((routed_variants + 1) * 3));
+
+    auto add_prepared_iq3 = [&](int rows,
+                                int cols,
+                                int seed,
+                                const char *role) -> ITensorGemm *
+    {
+        auto weight = TestTensorFactory::createIQ3_SRandom(
+            {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+            static_cast<uint32_t>(seed));
+        auto *weight_ptr = weight.get();
+        auto packed = std::make_unique<rocm::ROCmPackedWeights>();
+        if (!rocm::packWeightsToROCm(weight_ptr, *packed))
+        {
+            ADD_FAILURE() << "Failed to pack IQ3_S weight for role " << role;
+            return nullptr;
+        }
+
+        auto owned_kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(
+            packed.get(), device.ordinal);
+        auto *kernel = owned_kernel.get();
+        auto *tensor_kernel = dynamic_cast<ITensorKernel *>(kernel);
+        if (tensor_kernel == nullptr)
+        {
+            ADD_FAILURE() << "Prepared IQ3_S GEMM kernel does not expose ITensorKernel for role "
+                          << role;
+            return nullptr;
+        }
+        tensor_kernel->setGPUStream(stream);
+        owned_weights.push_back(std::move(weight));
+        packed_weights.push_back(std::move(packed));
+        owned_kernels.push_back(std::move(owned_kernel));
+        return kernel;
+    };
+
+    struct GemmTriplet
+    {
+        ITensorGemm *gate = nullptr;
+        ITensorGemm *up = nullptr;
+        ITensorGemm *down = nullptr;
+    };
+
+    std::array<GemmTriplet, routed_variants> routed{};
+    for (int variant = 0; variant < routed_variants; ++variant)
+    {
+        routed[static_cast<size_t>(variant)].gate =
+            add_prepared_iq3(intermediate, d_model, 881000 + variant, "routed_gate");
+        ASSERT_NE(routed[static_cast<size_t>(variant)].gate, nullptr);
+        routed[static_cast<size_t>(variant)].up =
+            add_prepared_iq3(intermediate, d_model, 882000 + variant, "routed_up");
+        ASSERT_NE(routed[static_cast<size_t>(variant)].up, nullptr);
+        routed[static_cast<size_t>(variant)].down =
+            add_prepared_iq3(d_model, intermediate, 883000 + variant, "routed_down");
+        ASSERT_NE(routed[static_cast<size_t>(variant)].down, nullptr);
+    }
+    GemmTriplet shared;
+    shared.gate = add_prepared_iq3(intermediate, d_model, 884000, "shared_gate");
+    ASSERT_NE(shared.gate, nullptr);
+    shared.up = add_prepared_iq3(intermediate, d_model, 885000, "shared_up");
+    ASSERT_NE(shared.up, nullptr);
+    shared.down = add_prepared_iq3(d_model, intermediate, 886000, "shared_down");
+    ASSERT_NE(shared.down, nullptr);
+
+    auto *workspace_probe = dynamic_cast<IWorkspaceConsumer *>(routed[0].gate);
+    ASSERT_NE(workspace_probe, nullptr);
+    WorkspaceRequirements gemm_reqs;
+    gemm_reqs.merge(workspace_probe->getWorkspaceRequirements(seq_len, intermediate, d_model));
+    if (auto *up_workspace = dynamic_cast<IWorkspaceConsumer *>(routed[0].up))
+        gemm_reqs.merge(up_workspace->getWorkspaceRequirements(seq_len, intermediate, d_model));
+    if (auto *down_workspace = dynamic_cast<IWorkspaceConsumer *>(routed[0].down))
+        gemm_reqs.merge(down_workspace->getWorkspaceRequirements(seq_len, d_model, intermediate));
+    auto gemm_workspace = std::make_unique<DeviceWorkspaceManager>(device, 256 * 1024 * 1024);
+    ASSERT_TRUE(gemm_workspace->allocate(gemm_reqs));
+
+    auto bind_gemm = [&](ITensorGemm *kernel) -> bool
+    {
+        auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+        if (consumer == nullptr)
+        {
+            ADD_FAILURE() << "Prepared IQ3_S GEMM kernel does not expose IWorkspaceConsumer";
+            return false;
+        }
+        consumer->bindWorkspace(gemm_workspace.get());
+        kernel->prepareWeights();
+        return kernel->weights_converted();
+    };
+    for (const auto &triplet : routed)
+    {
+        ASSERT_TRUE(bind_gemm(triplet.gate));
+        ASSERT_TRUE(bind_gemm(triplet.up));
+        ASSERT_TRUE(bind_gemm(triplet.down));
+    }
+    ASSERT_TRUE(bind_gemm(shared.gate));
+    ASSERT_TRUE(bind_gemm(shared.up));
+    ASSERT_TRUE(bind_gemm(shared.down));
+
+    auto variant_for_expert = [&](int expert_id) -> size_t
+    {
+        return static_cast<size_t>(expert_id % routed_variants);
+    };
+
+    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(static_cast<size_t>(combined_experts));
+    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(static_cast<size_t>(combined_experts));
+    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(static_cast<size_t>(combined_experts));
+    for (int expert = 0; expert < routed_experts; ++expert)
+    {
+        const auto &triplet = routed[variant_for_expert(expert)];
+        ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert)]));
+    }
+    ASSERT_TRUE(shared.gate->exportNativeVNNIMatrixDesc(gate_descs[shared_slot]));
+    ASSERT_TRUE(shared.up->exportNativeVNNIMatrixDesc(up_descs[shared_slot]));
+    ASSERT_TRUE(shared.down->exportNativeVNNIMatrixDesc(down_descs[shared_slot]));
+
+    const int combined_gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), combined_experts, d_model, intermediate);
+    ASSERT_GE(combined_gateup_table, 0);
+    const int combined_down_table = moe_kernel.uploadGroupedExpertDownDescriptorTable(
+        down_descs.data(), combined_experts, d_model, intermediate);
+    ASSERT_GE(combined_down_table, 0);
+    const int routed_gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), routed_experts, d_model, intermediate);
+    ASSERT_GE(routed_gateup_table, 0);
+    const int routed_down_table = moe_kernel.uploadGroupedExpertDownDescriptorTable(
+        down_descs.data(), routed_experts, d_model, intermediate);
+    ASSERT_GE(routed_down_table, 0);
+    const int shared_gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data() + shared_slot, up_descs.data() + shared_slot,
+        1, d_model, intermediate);
+    ASSERT_GE(shared_gateup_table, 0);
+    const int shared_down_table = moe_kernel.uploadGroupedExpertDownDescriptorTable(
+        down_descs.data() + shared_slot, 1, d_model, intermediate);
+    ASSERT_GE(shared_down_table, 0);
+
+    auto hidden = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    for (size_t i = 0; i < hidden->numel(); ++i)
+    {
+        // Keep activations large enough that IQ3_S gate/up products do not all
+        // quantize away to zero.  This regression needs to exercise real
+        // verifier math, not just the zero-output path.
+        hidden->mutable_data()[i] =
+            0.13f * static_cast<float>(static_cast<int>(i % 43) - 21) +
+            0.047f * static_cast<float>(static_cast<int>((i / 17) % 19) - 9);
+    }
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+
+    auto shared_gate = TestTensorFactory::createFP32({static_cast<size_t>(d_model)});
+    for (int i = 0; i < d_model; ++i)
+    {
+        shared_gate->mutable_data()[static_cast<size_t>(i)] =
+            0.0025f * static_cast<float>((i % 37) - 18);
+    }
+    ASSERT_TRUE(shared_gate->ensureOnDevice(device, stream));
+
+    std::vector<float> route_indices(static_cast<size_t>(seq_len * routed_top_k));
+    std::vector<float> route_weights(static_cast<size_t>(seq_len * routed_top_k));
+    const std::array<int, routed_top_k * seq_len> experts = {
+        0, 13, 41, 96, 131, 159, 220, 238,
+        3, 17, 42, 99, 144, 171, 221, 251};
+    for (int row = 0; row < seq_len; ++row)
+    {
+        float sum = 0.0f;
+        for (int route = 0; route < routed_top_k; ++route)
+        {
+            const int slot = row * routed_top_k + route;
+            route_indices[static_cast<size_t>(slot)] =
+                static_cast<float>(experts[static_cast<size_t>(slot)]);
+            route_weights[static_cast<size_t>(slot)] =
+                0.09f + 0.013f * static_cast<float>((slot * 5 + 3) % 11);
+            sum += route_weights[static_cast<size_t>(slot)];
+        }
+        for (int route = 0; route < routed_top_k; ++route)
+        {
+            const int slot = row * routed_top_k + route;
+            route_weights[static_cast<size_t>(slot)] /= sum;
+        }
+    }
+
+    auto routing_indices = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(routed_top_k)});
+    auto routing_weights = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(routed_top_k)});
+    std::copy(route_indices.begin(), route_indices.end(), routing_indices->mutable_data());
+    std::copy(route_weights.begin(), route_weights.end(), routing_weights->mutable_data());
+    ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
+    ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+
+    std::vector<float> row_by_row_expected(
+        static_cast<size_t>(seq_len) * static_cast<size_t>(d_model));
+    for (int row = 0; row < seq_len; ++row)
+    {
+        auto hidden_row = TestTensorFactory::createFP32({1u, static_cast<size_t>(d_model)});
+        std::copy(hidden->data() + static_cast<size_t>(row) * d_model,
+                  hidden->data() + static_cast<size_t>(row + 1) * d_model,
+                  hidden_row->mutable_data());
+        ASSERT_TRUE(hidden_row->ensureOnDevice(device, stream));
+
+        auto shared_output = TestTensorFactory::createFP32({1u, static_cast<size_t>(d_model)});
+        auto expected_row = TestTensorFactory::createFP32({1u, static_cast<size_t>(d_model)});
+        ASSERT_TRUE(shared_output->ensureOnDevice(device, stream));
+        ASSERT_TRUE(expected_row->ensureOnDevice(device, stream));
+
+        std::vector<float> routed_accum(static_cast<size_t>(d_model), 0.0f);
+        for (int route = 0; route < routed_top_k; ++route)
+        {
+            const int slot = row * routed_top_k + route;
+            const int expert = static_cast<int>(route_indices[static_cast<size_t>(slot)]);
+            const float route_weight = route_weights[static_cast<size_t>(slot)];
+            const GemmTriplet &triplet = routed[variant_for_expert(expert)];
+
+            auto gate = TestTensorFactory::createFP32({1u, static_cast<size_t>(intermediate)});
+            auto up = TestTensorFactory::createFP32({1u, static_cast<size_t>(intermediate)});
+            auto expert_out = TestTensorFactory::createFP32({1u, static_cast<size_t>(d_model)});
+            ASSERT_TRUE(gate->ensureOnDevice(device, stream));
+            ASSERT_TRUE(up->ensureOnDevice(device, stream));
+            ASSERT_TRUE(expert_out->ensureOnDevice(device, stream));
+
+            std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                {triplet.gate, gate.get(), intermediate, nullptr, "routed_gate"},
+                {triplet.up, up.get(), intermediate, nullptr, "routed_up"}};
+            ASSERT_TRUE(triplet.gate->multiply_fused_tensor(
+                hidden_row.get(), projections, 1, d_model));
+            ASSERT_TRUE(triplet.down->multiply_tensor_with_fused_swiglu(
+                gate.get(), up.get(), expert_out.get(), 1, d_model, intermediate));
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+            expert_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            const float *expert_data = expert_out->data();
+            for (int col = 0; col < d_model; ++col)
+            {
+                routed_accum[static_cast<size_t>(col)] +=
+                    route_weight * expert_data[static_cast<size_t>(col)];
+            }
+        }
+
+        auto routed_output = TestTensorFactory::createFP32({1u, static_cast<size_t>(d_model)});
+        std::copy(routed_accum.begin(), routed_accum.end(), routed_output->mutable_data());
+        ASSERT_TRUE(routed_output->ensureOnDevice(device, stream));
+
+        auto shared_gate_out = TestTensorFactory::createFP32({1u, static_cast<size_t>(intermediate)});
+        auto shared_up_out = TestTensorFactory::createFP32({1u, static_cast<size_t>(intermediate)});
+        ASSERT_TRUE(shared_gate_out->ensureOnDevice(device, stream));
+        ASSERT_TRUE(shared_up_out->ensureOnDevice(device, stream));
+        std::vector<ITensorGemm::TensorProjectionDesc> shared_projections = {
+            {shared.gate, shared_gate_out.get(), intermediate, nullptr, "shared_gate"},
+            {shared.up, shared_up_out.get(), intermediate, nullptr, "shared_up"}};
+        ASSERT_TRUE(shared.gate->multiply_fused_tensor(
+            hidden_row.get(), shared_projections, 1, d_model));
+        ASSERT_TRUE(shared.down->multiply_tensor_with_fused_swiglu(
+            shared_gate_out.get(), shared_up_out.get(), shared_output.get(),
+            1, d_model, intermediate));
+
+        moe_kernel.sharedExpertGateAddFromTensors(
+            hidden_row.get(),
+            shared_gate.get(),
+            shared_output.get(),
+            routed_output.get(),
+            expected_row.get(),
+            1,
+            d_model);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        expected_row->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        std::copy(expected_row->data(),
+                  expected_row->data() + d_model,
+                  row_by_row_expected.begin() + static_cast<size_t>(row) * d_model);
+    }
+
+    auto combined = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    ASSERT_TRUE(combined->ensureOnDevice(device, stream));
+    ASSERT_TRUE(moe_kernel.prepareExpertGroupsWithSharedGateAsync(
+        routing_indices.get(),
+        routing_weights.get(),
+        hidden.get(),
+        shared_gate.get(),
+        seq_len,
+        d_model,
+        routed_experts,
+        routed_top_k));
+    ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
+        hidden.get(),
+        combined.get(),
+        combined_gateup_table,
+        combined_down_table,
+        seq_len,
+        d_model,
+        intermediate,
+        combined_experts,
+        combined_top_k));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    combined->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    const size_t output_count = static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+    double combined_norm_sq = 0.0;
+    double expected_norm_sq = 0.0;
+    for (size_t i = 0; i < output_count; ++i)
+    {
+        combined_norm_sq += static_cast<double>(combined->data()[i]) *
+                            static_cast<double>(combined->data()[i]);
+        expected_norm_sq += static_cast<double>(row_by_row_expected[i]) *
+                            static_cast<double>(row_by_row_expected[i]);
+    }
+    ASSERT_GT(expected_norm_sq, 0.0)
+        << "row-by-row verifier fixture produced an all-zero output; combined_norm_sq="
+        << combined_norm_sq;
+    ASSERT_GT(combined_norm_sq, 0.0)
+        << "combined verifier fixture produced an all-zero output; expected_norm_sq="
+        << expected_norm_sq;
+    expectStrictVerifierSimilarity(
+        "ROCm M=2 IQ3_S combined verifier output must match row-by-row verifier execution",
+        combined->data(),
+        row_by_row_expected.data(),
+        output_count,
+        static_cast<size_t>(d_model));
+
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 

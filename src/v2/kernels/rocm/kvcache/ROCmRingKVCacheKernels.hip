@@ -21,6 +21,7 @@
 #include <hip/hip_bfloat16.h>
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/TensorType.h"
+#include <cstdint>
 
 namespace llaminar2
 {
@@ -105,6 +106,73 @@ namespace llaminar2
 
         d_K_cache[dst_offset] = d_K_new[src_offset];
         d_V_cache[dst_offset] = d_V_new[src_offset];
+    }
+
+    /**
+     * @brief Advance graph-captured KV sequence metadata on device.
+     *
+     * This is launched after ring_append_kernel_dynamic on the same stream.
+     * Keeping it separate prevents a write-after-read race on d_head while
+     * append blocks are still using the pre-append ring position.
+     */
+    __global__ void hip_kv_sequence_state_advance_kernel(
+        int *__restrict__ d_head,
+        int *__restrict__ d_count,
+        int num_tokens,
+        int max_seq_len)
+    {
+        if (threadIdx.x != 0 || blockIdx.x != 0)
+            return;
+        const int old_head = *d_head;
+        const int old_count = *d_count;
+        *d_head = (old_head + num_tokens) % max_seq_len;
+        const int next_count = old_count + num_tokens;
+        *d_count = next_count > max_seq_len ? max_seq_len : next_count;
+    }
+
+    /**
+     * @brief Publish accepted verifier-row sequence metadata on device.
+     *
+     * Each block owns one [request, layer] pair.  The live device head is the
+     * only safe source for wrapped-ring position; the target cached-token count
+     * is only the new valid-token count.
+     */
+    __global__ void hip_kv_sequence_state_publish_kernel(
+        int *__restrict__ d_heads,
+        int *__restrict__ d_counts,
+        const int32_t *__restrict__ target_cached_tokens,
+        const int32_t *__restrict__ accepted_state_counts,
+        const int32_t *__restrict__ publication_ok_flags,
+        int batch_size,
+        int first_seq_idx,
+        int request_count,
+        int max_seq_len)
+    {
+        const int request_idx = static_cast<int>(blockIdx.x);
+        const int layer = static_cast<int>(blockIdx.y);
+        if (threadIdx.x != 0 || request_idx >= request_count)
+            return;
+
+        if (publication_ok_flags[request_idx] == 0)
+            return;
+
+        const int seq_idx = first_seq_idx + request_idx;
+        if (seq_idx < 0 || seq_idx >= batch_size)
+            return;
+
+        const int accepted_count = accepted_state_counts[request_idx];
+        const int target_count = target_cached_tokens[request_idx];
+        if (accepted_count < 0 ||
+            target_count < 0 ||
+            target_count > max_seq_len)
+        {
+            return;
+        }
+
+        const int entry_idx = layer * batch_size + seq_idx;
+        const int old_head = d_heads[entry_idx];
+        d_heads[entry_idx] = (old_head + accepted_count) % max_seq_len;
+        d_counts[entry_idx] = target_count;
     }
 
     /**
@@ -383,8 +451,11 @@ namespace llaminar2
                                static_cast<const hip_bfloat16 *>(d_src), d_dst, count);
             break;
         case TensorType::FP32:
-            hipMemcpyAsync(d_dst, d_src, static_cast<size_t>(count) * sizeof(float),
-                           hipMemcpyDeviceToDevice, stream);
+            if (hipMemcpyAsync(d_dst, d_src, static_cast<size_t>(count) * sizeof(float),
+                               hipMemcpyDeviceToDevice, stream) != hipSuccess)
+            {
+                return false;
+            }
             break;
         case TensorType::Q8_1:
         {
@@ -429,8 +500,11 @@ namespace llaminar2
                                count);
             break;
         case TensorType::FP16:
-            hipMemcpyAsync(d_dst, d_src, static_cast<size_t>(count) * sizeof(uint16_t),
-                           hipMemcpyDeviceToDevice, stream);
+            if (hipMemcpyAsync(d_dst, d_src, static_cast<size_t>(count) * sizeof(uint16_t),
+                               hipMemcpyDeviceToDevice, stream) != hipSuccess)
+            {
+                return false;
+            }
             break;
         case TensorType::BF16:
             hipLaunchKernelGGL(convert_to_fp16_kernel<hip_bfloat16>, grid, block, 0, stream,
@@ -483,9 +557,12 @@ namespace llaminar2
                                static_cast<const hip_bfloat16 *>(d_src), d_dst, rows, cols, blocks_per_row);
             break;
         case TensorType::Q8_1:
-            hipMemcpyAsync(d_dst, d_src,
-                           static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row) * sizeof(Q8_1Block),
-                           hipMemcpyDeviceToDevice, stream);
+            if (hipMemcpyAsync(d_dst, d_src,
+                               static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row) * sizeof(Q8_1Block),
+                               hipMemcpyDeviceToDevice, stream) != hipSuccess)
+            {
+                return false;
+            }
             break;
         default:
             return false;
@@ -816,6 +893,56 @@ namespace llaminar2
                            d_K_cache, d_V_cache,
                            d_K_new, d_V_new,
                            d_head, max_seq_len, kv_blocks, num_tokens);
+    }
+
+    extern "C" void hip_kv_sequence_state_advance(
+        int *d_head, int *d_count, int num_tokens, int max_seq_len,
+        hipStream_t stream)
+    {
+        if (!d_head || !d_count || num_tokens <= 0 || max_seq_len <= 0)
+            return;
+
+        hipLaunchKernelGGL(hip_kv_sequence_state_advance_kernel,
+                           dim3(1), dim3(1), 0, stream,
+                           d_head, d_count, num_tokens, max_seq_len);
+    }
+
+    extern "C" bool hip_kv_sequence_state_publish(
+        int *d_heads,
+        int *d_counts,
+        const int32_t *target_cached_tokens,
+        const int32_t *accepted_state_counts,
+        const int32_t *publication_ok_flags,
+        int n_layers,
+        int batch_size,
+        int first_seq_idx,
+        int request_count,
+        int max_seq_len,
+        hipStream_t stream)
+    {
+        if (!d_heads || !d_counts ||
+            !target_cached_tokens || !accepted_state_counts ||
+            !publication_ok_flags || !stream ||
+            n_layers <= 0 || batch_size <= 0 ||
+            first_seq_idx < 0 || request_count <= 0 ||
+            first_seq_idx + request_count > batch_size ||
+            max_seq_len <= 0)
+        {
+            return false;
+        }
+
+        hipLaunchKernelGGL(hip_kv_sequence_state_publish_kernel,
+                           dim3(request_count, n_layers), dim3(1), 0, stream,
+                           d_heads,
+                           d_counts,
+                           target_cached_tokens,
+                           accepted_state_counts,
+                           publication_ok_flags,
+                           batch_size,
+                           first_seq_idx,
+                           request_count,
+                           max_seq_len);
+        return hipGetLastError() == hipSuccess;
     }
 
 } // namespace llaminar2

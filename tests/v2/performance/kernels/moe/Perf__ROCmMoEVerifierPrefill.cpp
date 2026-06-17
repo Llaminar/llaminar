@@ -21,6 +21,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,6 +44,10 @@ namespace
         double cosine = 0.0;
         double relative_l2 = 0.0;
         double max_abs = 0.0;
+        double min_row_cosine = 1.0;
+        double max_row_relative_l2 = 0.0;
+        double max_row_kl = 0.0;
+        size_t worst_row = 0;
     };
 
     struct BenchResult
@@ -182,9 +187,48 @@ namespace
         return values;
     }
 
+    /**
+     * @brief KL(reference || actual) after stable row-wise softmax.
+     *
+     * This performance harness doubles as a drift detector for verifier-sized
+     * MoE rows.  Row-wise KL gives us a sharper signal than aggregate cosine
+     * when a fast path changes the dominant coordinates of one accepted row.
+     */
+    double rowSoftmaxKLDivergence(const float *actual, const float *expected, size_t row_width)
+    {
+        double max_actual = -std::numeric_limits<double>::infinity();
+        double max_expected = -std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < row_width; ++i)
+        {
+            max_actual = std::max(max_actual, static_cast<double>(actual[i]));
+            max_expected = std::max(max_expected, static_cast<double>(expected[i]));
+        }
+
+        double sum_actual = 0.0;
+        double sum_expected = 0.0;
+        for (size_t i = 0; i < row_width; ++i)
+        {
+            sum_actual += std::exp(static_cast<double>(actual[i]) - max_actual);
+            sum_expected += std::exp(static_cast<double>(expected[i]) - max_expected);
+        }
+
+        constexpr double kEps = 1.0e-30;
+        double kl = 0.0;
+        for (size_t i = 0; i < row_width; ++i)
+        {
+            const double p = std::exp(static_cast<double>(expected[i]) - max_expected) /
+                             std::max(sum_expected, kEps);
+            const double q = std::exp(static_cast<double>(actual[i]) - max_actual) /
+                             std::max(sum_actual, kEps);
+            kl += p * (std::log(std::max(p, kEps)) - std::log(std::max(q, kEps)));
+        }
+        return kl;
+    }
+
     CloseMetrics compareVectors(
         const std::vector<float> &actual,
-        const std::vector<float> &expected)
+        const std::vector<float> &expected,
+        size_t row_width)
     {
         EXPECT_EQ(actual.size(), expected.size());
         CloseMetrics metrics;
@@ -205,19 +249,90 @@ namespace
             diff2 += diff * diff;
             metrics.max_abs = std::max(metrics.max_abs, std::abs(diff));
         }
-        metrics.cosine =
-            dot / (std::sqrt(norm_actual) * std::sqrt(norm_expected) + 1.0e-30);
-        metrics.relative_l2 =
-            std::sqrt(diff2) / (std::sqrt(norm_expected) + 1.0e-30);
+        metrics.cosine = (norm_actual < 1.0e-30 && norm_expected < 1.0e-30)
+                             ? 1.0
+                             : dot / (std::sqrt(norm_actual) * std::sqrt(norm_expected) + 1.0e-30);
+        metrics.relative_l2 = (norm_expected < 1.0e-30)
+                                  ? ((diff2 < 1.0e-30)
+                                         ? 0.0
+                                         : std::numeric_limits<double>::infinity())
+                                  : std::sqrt(diff2) / std::sqrt(norm_expected);
+        if (row_width != 0 && actual.size() % row_width == 0)
+        {
+            const size_t rows = actual.size() / row_width;
+            for (size_t row = 0; row < rows; ++row)
+            {
+                const float *row_actual = actual.data() + row * row_width;
+                const float *row_expected = expected.data() + row * row_width;
+                double row_dot = 0.0;
+                double row_norm_actual = 0.0;
+                double row_norm_expected = 0.0;
+                double row_diff2 = 0.0;
+                for (size_t i = 0; i < row_width; ++i)
+                {
+                    const double a = row_actual[i];
+                    const double e = row_expected[i];
+                    const double diff = a - e;
+                    row_dot += a * e;
+                    row_norm_actual += a * a;
+                    row_norm_expected += e * e;
+                    row_diff2 += diff * diff;
+                }
+                const double row_cosine =
+                    (row_norm_actual < 1.0e-30 && row_norm_expected < 1.0e-30)
+                        ? 1.0
+                        : row_dot / (std::sqrt(row_norm_actual) * std::sqrt(row_norm_expected) + 1.0e-30);
+                const double row_relative_l2 =
+                    (row_norm_expected < 1.0e-30)
+                        ? ((row_diff2 < 1.0e-30)
+                               ? 0.0
+                               : std::numeric_limits<double>::infinity())
+                        : std::sqrt(row_diff2) / std::sqrt(row_norm_expected);
+                const double row_kl = rowSoftmaxKLDivergence(row_actual, row_expected, row_width);
+                if (row_cosine < metrics.min_row_cosine ||
+                    row_relative_l2 > metrics.max_row_relative_l2 ||
+                    row_kl > metrics.max_row_kl)
+                {
+                    metrics.worst_row = row;
+                }
+                metrics.min_row_cosine = std::min(metrics.min_row_cosine, row_cosine);
+                metrics.max_row_relative_l2 =
+                    std::max(metrics.max_row_relative_l2, row_relative_l2);
+                metrics.max_row_kl = std::max(metrics.max_row_kl, row_kl);
+            }
+        }
         return metrics;
     }
 
     void expectClose(const CloseMetrics &metrics)
     {
-        EXPECT_GE(metrics.cosine, 0.990)
-            << "relative_l2=" << metrics.relative_l2 << " max_abs=" << metrics.max_abs;
-        EXPECT_LE(metrics.relative_l2, 0.08)
-            << "cosine=" << metrics.cosine << " max_abs=" << metrics.max_abs;
+        EXPECT_GE(metrics.cosine, 0.9999)
+            << "relative_l2=" << metrics.relative_l2 << " max_abs=" << metrics.max_abs
+            << " min_row_cosine=" << metrics.min_row_cosine
+            << " max_row_relative_l2=" << metrics.max_row_relative_l2
+            << " max_row_kl=" << metrics.max_row_kl
+            << " worst_row=" << metrics.worst_row;
+        EXPECT_LE(metrics.relative_l2, 0.006)
+            << "cosine=" << metrics.cosine << " max_abs=" << metrics.max_abs
+            << " min_row_cosine=" << metrics.min_row_cosine
+            << " max_row_relative_l2=" << metrics.max_row_relative_l2
+            << " max_row_kl=" << metrics.max_row_kl
+            << " worst_row=" << metrics.worst_row;
+        EXPECT_GE(metrics.min_row_cosine, 0.9998)
+            << "cosine=" << metrics.cosine << " relative_l2=" << metrics.relative_l2
+            << " max_row_relative_l2=" << metrics.max_row_relative_l2
+            << " max_row_kl=" << metrics.max_row_kl
+            << " worst_row=" << metrics.worst_row;
+        EXPECT_LE(metrics.max_row_relative_l2, 0.008)
+            << "cosine=" << metrics.cosine << " relative_l2=" << metrics.relative_l2
+            << " min_row_cosine=" << metrics.min_row_cosine
+            << " max_row_kl=" << metrics.max_row_kl
+            << " worst_row=" << metrics.worst_row;
+        EXPECT_LE(metrics.max_row_kl, 1.0e-4)
+            << "cosine=" << metrics.cosine << " relative_l2=" << metrics.relative_l2
+            << " min_row_cosine=" << metrics.min_row_cosine
+            << " max_row_relative_l2=" << metrics.max_row_relative_l2
+            << " worst_row=" << metrics.worst_row;
     }
 
     void printResult(const BenchResult &result)
@@ -227,7 +342,8 @@ namespace
         {
             std::cout
                 << "backend,case,m,top_k,num_experts,d_model,intermediate,"
-                   "eager_ms,graph_ms,rowwise_ms,cosine,relative_l2,max_abs\n";
+                   "eager_ms,graph_ms,rowwise_ms,cosine,relative_l2,max_abs,"
+                   "min_row_cosine,max_row_relative_l2,max_row_kl,worst_row\n";
             printed_header = true;
         }
 
@@ -244,7 +360,11 @@ namespace
                   << result.rowwise_ms << ','
                   << std::setprecision(8) << result.metrics.cosine << ','
                   << result.metrics.relative_l2 << ','
-                  << result.metrics.max_abs << '\n';
+                  << result.metrics.max_abs << ','
+                  << result.metrics.min_row_cosine << ','
+                  << result.metrics.max_row_relative_l2 << ','
+                  << result.metrics.max_row_kl << ','
+                  << result.metrics.worst_row << '\n';
     }
 
     struct PreparedExpertTables
@@ -688,7 +808,7 @@ namespace
             moe, stream, hidden_values, routing_indices, routing_weights,
             rows, top_k, d_model, intermediate,
             tables.gateup_table_id, tables.down_table_id, &rowwise_ms);
-        CloseMetrics metrics = compareVectors(grouped, rowwise);
+        CloseMetrics metrics = compareVectors(grouped, rowwise, static_cast<size_t>(d_model));
 
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 
@@ -845,7 +965,7 @@ namespace
         std::vector<float> split(
             split_output->data(),
             split_output->data() + split_output->numel());
-        CloseMetrics metrics = compareVectors(combined, split);
+        CloseMetrics metrics = compareVectors(combined, split, static_cast<size_t>(d_model));
 
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 

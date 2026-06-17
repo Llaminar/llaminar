@@ -104,10 +104,27 @@ namespace
         return hybrid;
     }
 
-    /// @brief Creates a ROCm hybrid cache through KernelFactory so GDN kernels are initialized.
-    HybridCacheHandle createHybridCache()
+    /// @brief Builds an offset FA map where global FA layer 3 compresses to parent KV slot 0.
+    llaminar2::HybridKVCacheConfig makeOffsetFullAttentionHybridConfig()
     {
-        auto hybrid_config = makeHybridConfig();
+        llaminar2::HybridKVCacheConfig hybrid;
+        hybrid.layer_types = {
+            "gdn", "gdn", "gdn",
+            "full_attention", "full_attention", "full_attention", "full_attention",
+            "gdn"};
+        hybrid.gdn_conv_kernel_size = 3;
+        hybrid.gdn_state_size = 2;
+        hybrid.gdn_inner_size = 2;
+        hybrid.gdn_group_count = 1;
+        hybrid.gdn_time_step_rank = 1;
+        hybrid.n_heads = 1;
+        hybrid.local_n_heads = 0;
+        return hybrid;
+    }
+
+    /// @brief Creates a ROCm hybrid cache through KernelFactory so GDN kernels are initialized.
+    HybridCacheHandle createHybridCache(const llaminar2::HybridKVCacheConfig &hybrid_config)
+    {
         llaminar::v2::kernels::KVCacheConfig config;
         config.precision = llaminar2::ActivationPrecision::FP32;
         config.device = llaminar2::DeviceId::rocm(0);
@@ -124,6 +141,12 @@ namespace
         if (!handle.hybrid)
             throw std::runtime_error("KernelFactory did not create an IHybridKVCache");
         return handle;
+    }
+
+    /// @brief Creates the default tiny ROCm hybrid cache used by reset tests.
+    HybridCacheHandle createHybridCache()
+    {
+        return createHybridCache(makeHybridConfig());
     }
 
     /// @brief Compares two vectors elementwise with a label that names the failing phase.
@@ -281,6 +304,19 @@ namespace
         auto *rocm_cache = dynamic_cast<llaminar2::IROCmRingKVCache *>(cache);
         ASSERT_NE(rocm_cache, nullptr);
         ASSERT_TRUE(rocm_cache->append(layer, 0, d_k.ptr, d_v.ptr, tokens, 0));
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    }
+
+    /// @brief Copies one device-owned sequence metadata integer back for assertions.
+    int copyDeviceInt(const int *device_value, const char *label)
+    {
+        if (!device_value)
+            throw std::runtime_error(std::string(label) + " returned a null device pointer");
+
+        int host_value = -1;
+        if (hipMemcpy(&host_value, device_value, sizeof(int), hipMemcpyDeviceToHost) != hipSuccess)
+            throw std::runtime_error(std::string(label) + " failed");
+        return host_value;
     }
 #endif
 } // namespace
@@ -566,6 +602,37 @@ TEST(Test__ROCmHybridKVCacheReset, ClearLayerResetsCompressedFullAttentionEntry)
 
     EXPECT_EQ(cache.owner->get_cached_tokens(1, 0), 0)
         << "clear_layer(global FA layer) must reset the compressed parent-cache entry";
+}
+
+TEST(Test__ROCmHybridKVCacheReset, DeviceSequenceMetadataPointersUseCompressedFullAttentionSlot)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    auto cache = createHybridCache(makeOffsetFullAttentionHybridConfig());
+
+    ASSERT_EQ(cache.owner->n_layers(), 8);
+    ASSERT_EQ(cache.hybrid->kvLayerCount(), 4);
+    ASSERT_EQ(cache.owner->deviceCachedTokenCountPtr(/*layer=*/0, /*seq_idx=*/0), nullptr)
+        << "GDN layers do not own KV sequence metadata";
+
+    appendFullAttentionToken(cache.owner.get(), /*layer=*/3);
+
+    EXPECT_EQ(cache.owner->get_cached_tokens(/*layer=*/3, /*seq_idx=*/0), 2);
+    EXPECT_EQ(copyDeviceInt(cache.owner->deviceCachedTokenCountPtr(/*layer=*/3, /*seq_idx=*/0),
+                            "hipMemcpy cached-token count"),
+              2)
+        << "Global FA layer 3 must read compressed parent KV slot 0, not parent slot 3.";
+    EXPECT_EQ(copyDeviceInt(cache.owner->deviceRingHeadPtr(/*layer=*/3, /*seq_idx=*/0),
+                            "hipMemcpy ring head"),
+              2)
+        << "Device-owned ring-head metadata must be remapped with the KV payload.";
+
+    EXPECT_EQ(cache.owner->get_cached_tokens(/*layer=*/6, /*seq_idx=*/0), 0);
+    EXPECT_EQ(copyDeviceInt(cache.owner->deviceCachedTokenCountPtr(/*layer=*/6, /*seq_idx=*/0),
+                            "hipMemcpy unrelated cached-token count"),
+              0)
+        << "The old un-remapped path would read this parent slot for global layer 3.";
 }
 
 #else

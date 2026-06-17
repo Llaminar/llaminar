@@ -73,7 +73,8 @@ namespace llaminar2
         GDNWithPaddedBucket,    ///< GDN/short-conv state would advance through padding rows
         NoGPUContext,           ///< GPU context unavailable
         InvalidatedByPlacement, ///< Expert placement mutation since last capture
-        SessionReset            ///< Request/session reset invalidated captured dynamic state
+        SessionReset,           ///< Legacy name for request/session reset invalidation
+        RequestStateReset       ///< Request/session reset invalidated captured live-state mutation
     };
 
     /// Convert PrefillGraphRejectReason to string for logging.

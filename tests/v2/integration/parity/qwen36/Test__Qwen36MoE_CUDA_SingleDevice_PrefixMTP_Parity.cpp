@@ -99,75 +99,8 @@ namespace
 #define QWEN36_MOE_PREFIX_MTP_CASE cudaSingleDeviceCase
 #define QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE cudaSingleDeviceBenchmarkPromptCase
 #define QWEN36_MOE_PREFIX_MTP_DEPTH3_CASE cudaSingleDeviceDepth3Case
+#define QWEN36_MOE_PREFIX_MTP_EXPECTS_PERSISTENT_SIDECAR_METADATA 1
 #include "Qwen36MoESingleDevicePrefixMTPParityTests.inc"
-
-TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, MTPBenchmarkStyleUsesFusedVerifierPrefillPath)
-{
-    ScopedEnvironmentValues perf_stats_enabled({
-        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
-    });
-    PerfStatsCollector::reset();
-    runMoEMTPBenchmarkStyleSkipGatherParity(
-        cudaSingleDeviceBenchmarkPromptCase(),
-        4);
-    expectCudaMoEMTPVerifierGDNProjectionFusedPath();
-    expectCudaMoEMTPVerifierFusedPrefillPath();
-    expectCudaMoEMTPVerifierSharedExpertFusedPrefillPath();
-    PerfStatsCollector::reset();
-}
-
-TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, Depth1RejectedCorrectionDefersToConditionToken)
-{
-    ScopedEnvironmentValues perf_stats_enabled({
-        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
-    });
-    PerfStatsCollector::reset();
-    runMoEMTPBenchmarkStyleSkipGatherParity(
-        cudaSingleDeviceBenchmarkPromptCase(),
-        16,
-        1,
-        {},
-        true);
-
-    const auto records = PerfStatsCollector::snapshot({"mtp"});
-    auto tag_equals = [](const PerfStatRecord &record,
-                         const char *key,
-                         const char *value) -> bool
-    {
-        const auto it = record.tags.find(key);
-        return it != record.tags.end() && it->second == value;
-    };
-
-    const auto deferred_correction = std::find_if(
-        records.begin(),
-        records.end(),
-        [&](const PerfStatRecord &record)
-        {
-            return record.kind == PerfStatRecord::Kind::Counter &&
-                   record.domain == "mtp" &&
-                   record.name == "all_position_deferred_correction_condition_tokens" &&
-                   tag_equals(record, "verifier_path", "all_position_state_publication");
-        });
-    ASSERT_NE(deferred_correction, records.end())
-        << "CUDA MoE depth-1 MTP rejection should emit the correction token "
-        << "without a same-step correction forward; the correction is consumed "
-        << "by the next ordinary condition forward.\n"
-        << PerfStatsCollector::summaryString({"mtp"});
-
-    const auto correction_forward = std::find_if(
-        records.begin(),
-        records.end(),
-        [&](const PerfStatRecord &record)
-        {
-            return record.domain == "mtp" &&
-                   record.name == "all_position_correction_forward";
-        });
-    ASSERT_EQ(correction_forward, records.end())
-        << "All-position MTP rejection reintroduced the expensive same-step "
-        << "correction forward path.\n"
-        << PerfStatsCollector::summaryString({"mtp"});
-    PerfStatsCollector::reset();
-}
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, NoMTPBenchmarkStyleUsesWorkspaceBackedGroupedSharedExpertTablePath)
 {

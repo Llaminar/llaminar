@@ -251,6 +251,13 @@ Done:
   accepted architecture remains vLLM's default greedy draft proposal with
   one-hot `q`. The MoE work stays focused on verifier, condition, and outcome
   costs.
+- Scalar GPU stochastic rejection now preserves the direct-publication
+  logical-state mailbox as the next pending condition source. The host token is
+  still returned to the caller, but the following fixed-depth sidecar consumes
+  the correction token and logical position from resident device metadata
+  instead of the host-token entry point. Focused
+  `V2_Unit_PrefillDecodeTransition` coverage proves the path and
+  `V2_Unit_GpuWorkspaceAllocationPolicy` keeps the ownership boundary guarded.
 - GPU stochastic MTP now follows the vLLM default draft branch: draft proposal
   uses device argmax, the processed-target verifier treats `q` as one-hot
   (`no_draft_probabilities=true`), and null draft-probability buffers hard-fail
@@ -554,6 +561,17 @@ Done:
   and `20260613T_phase10_lazy_bonus_moe_stochastic` shows CUDA MoE stochastic
   d3 at 133.8 tok/s (0.96x) and ROCm d3 at 70.9 tok/s (0.92x). This is kept as
   a cleanup and modest ROCm d3 improvement, but it does not close Phase 10.
+- Phase 10 now exposes resident sidecar-token and pending-condition counters in
+  the iteration matrix. The unsafe shared top-k partial scratch between
+  target/verifier and MTP-draft stochastic distribution builders was split into
+  arena-owned target and draft buffers and guarded by
+  `V2_Unit_GpuWorkspaceAllocationPolicy`. This is a real graph-capture hygiene
+  fix, but it did not close the ROCm MoE stochastic blocker:
+  `20260614T014124Z-phase10-rocm-moe-d3-split-topk-scratch` still shows ROCm
+  fixed d3 at 38.4 tok/s vs 73.7 baseline with only 15.1% acceptance. A
+  graph-timing attribution run of the same lane reports much higher acceptance,
+  so the next target is the all-position verifier graph/state handoff whose
+  correctness changes when GPU-stage timing inserts extra stream ordering.
 - Same-run stochastic accepted-prefix histograms explain why this is primarily
   a ROCm MoE target today. CUDA fixed d3 accepts all three drafts in about 54%
   of verifier steps and averages about 2.09 accepted drafts, so eager batched
@@ -2355,6 +2373,832 @@ Closure status:
   benchmark presets still need refreshed same-run matrices before any rollout
   claim.
 
+### Phase 9.5: Device-Owned Live-State Cleanup
+
+Goal: remove split host/device ownership from the MTP hot path so verifier
+publication, replay, and graph rebuilds cannot observe incoherent GDN, KV, or
+logical sequence state. Host mirrors are allowed for diagnostics, snapshots,
+prefix-cache serialization, and response materialization, but they must not be
+the source of truth for GPU state mutation or graph-captured inference.
+
+Why this phase exists:
+
+- The CUDA Qwen3.6 MoE published-state regression was a coherence bug, not a
+  verifier-math bug: GDN and short-conv verifier publication restored the
+  backend-owned device state but left hybrid host mirrors stale, and a later
+  graph rebuild could resume from the stale host state.
+- Similar split-ownership hazards remain in KV ring head/count mirrors,
+  `DeviceGraphOrchestrator` logical positions/sequence lengths, MTP compact
+  transaction metadata, and MoE sidecar router/expert replay metadata.
+- Phase 10 performance work depends on keeping the host out of the live-state
+  mutation boundary. Tuning around hidden host dependencies risks preserving
+  the wrong architecture.
+
+Work:
+
+- Inventory every live-state surface with both host and device representations:
+  GDN recurrence, short-conv history, main KV ring state, shifted MTP KV ring
+  state, logical positions, sequence lengths, terminal hidden/logits, compact
+  stochastic outcomes, next-condition tokens, and MoE routed/shared expert
+  metadata.
+- Declare one owner per surface in GPU mode. Device-owned surfaces expose typed
+  handles, explicit producer streams, readiness events, and validity epochs.
+  Host mirrors expose explicit adoption/flush APIs and are marked stale until
+  adoption succeeds.
+- Replace ad hoc D2H mirror refreshes in state-publication code with
+  device-owned publication followed by optional host adoption. Adoption must
+  never be required before the next graph-captured state mutation.
+- Add poison-mirror regression tests: publish on device, deliberately corrupt
+  the corresponding host mirror, force the graph rebuild/replay path under
+  test, and prove output/state remains decode-equivalent. These tests should
+  exist first for CUDA/ROCm GDN and KV, then for DGO logical state, then for MoE
+  sidecar metadata.
+- Extend the hygiene guards so new GPU stages cannot introduce unsanctioned
+  live-state host ownership, default/null streams, direct tensor
+  `ensureOnDevice()` hot-path transfers, or raw CUDA/HIP allocations outside
+  workspace/back-end infrastructure.
+- Keep CPU on host-owned implementations for now, but use the same typed state
+  contracts so CPU can later gain a device-like mailbox abstraction without
+  changing runner logic.
+
+Exit gate:
+
+- CUDA and ROCm GDN/short-conv publication tests prove accepted-row device
+  restore and host-mirror adoption independently.
+- CUDA and ROCm KV publication tests prove device head/count metadata remains
+  authoritative across append, truncate, prefix restore, resident MTP
+  publication, and graph replay.
+- DGO logical-state tests prove `get_position()`/`sequence_lengths()` are never
+  read for GPU MTP planning while a resident mailbox is newer than the adopted
+  host mirror.
+- MoE sidecar preservation is promoted only after a dedicated replay
+  equivalence test covers router metadata, routed/shared expert scratch,
+  shifted MTP KV, terminal hidden, and accepted-state publication.
+- Phase 10 benchmarks report no state-mutation dependency on compact outcome
+  D2H. Remaining host work must be response/output flushing or diagnostics.
+
+Current status:
+
+- Closed on the focused Phase 9.5 gate. CUDA and ROCm GDN/short-conv
+  publication tests prove accepted verifier rows restore backend device state
+  and refresh host mirrors before graph rebuild.
+- CUDA and ROCm KV publication tests now prove device head/count metadata is
+  authoritative: publishing accepted resident state updates device metadata
+  while host mirrors stay stale until explicit adoption.
+- CUDA and ROCm hybrid KV caches now use the same compressed full-attention
+  layer mapping for payload, host metadata, and device-owned head/count
+  pointers. The regression uses an offset map where global FA layer 3 maps to
+  compressed slot 0 while parent slot 3 still exists, proving the device
+  metadata path cannot silently read a valid but wrong slot. Legacy null-stream
+  direct append now resolves to the backend's explicit worker stream outside
+  graph capture so the payload append and device metadata upload stay ordered;
+  capture-time append without an explicit stream hard-fails.
+- DGO resident shifted-row commits now hard-fail without a device-derived
+  `position_offset_override`. The structural guard proves this resident path
+  cannot derive commit positions from `state_.positions`, `get_position()`, or
+  other stale host mirrors.
+- The focused split backend gate passed on 2026-06-16. CUDA may skip ROCm
+  startup, but ROCm must run with normal AMD backend registration:
+
+```bash
+cmake --build build_v2_integration --parallel
+LLAMINAR_LOG_LEVEL=ERROR LLAMINAR_SKIP_ROCM_STARTUP=1 \
+ctest --test-dir build_v2_integration \
+  -R '^(V2_Unit_GpuWorkspaceAllocationPolicy|V2_Unit_PrefillDecodeTransition)$' \
+  --output-on-failure --parallel --timeout 300
+LLAMINAR_LOG_LEVEL=ERROR LLAMINAR_SKIP_ROCM_STARTUP=1 \
+ctest --test-dir build_v2_integration \
+  -R '^(V2_Integration_CUDARingKVCacheParity|V2_Integration_CUDAHybridKVCacheReset|V2_Integration_Parity_Qwen35_SingleDevice_Qwen35_Qwen35SingleDeviceParityTest_DecodeParity_Qwen35_4B_CUDA_KV_FP16)$' \
+  --output-on-failure --parallel --timeout 300
+LLAMINAR_LOG_LEVEL=ERROR \
+ctest --test-dir build_v2_integration \
+  -R '^(V2_Integration_ROCmRingKVCache|V2_Integration_ROCmHybridKVCacheReset|V2_Integration_Parity_Qwen35_SingleDevice_Qwen35_Qwen35SingleDeviceParityTest_DecodeParity_Qwen35_4B_ROCm_KV_FP16)$' \
+  --output-on-failure --parallel --timeout 300
+```
+
+- MoE persistent sidecar metadata, compact outcome hostlessness, and
+  graph-captured resident transaction consumption remain Phase 10 performance
+  work. Phase 9.5's role is complete: stale host mirrors are no longer allowed
+  to be implicit sources of truth for the covered live-state handoffs.
+
+### Phase 9.6: Persistent MoE Sidecar Metadata
+
+Goal: give MoE MTP sidecars vLLM-style persistent runtime metadata with stable
+graph-captured addresses. This phase removes shared/transient MoE routing
+metadata from the sidecar path and keeps the production capability boundary
+honest: MoE direct all-position live-state publication remains disabled until
+its verifier rows are proven serial-equivalent on each backend.
+
+Why this phase exists:
+
+- Phase 9.5 made live-state ownership explicit, but Phase 10 profiling still
+  shows MoE sidecars depending on router/expert metadata whose ownership is
+  hard to reason about under graph replay.
+- vLLM keeps speculative decode metadata in persistent device-side structures
+  with stable addresses. Llaminar must do the same for MoE routing/expert
+  metadata so graph replay does not depend on transient host vectors or shared
+  main-decode route slots.
+- MoE sidecar graph replay safety is narrower than sidecar main-state
+  preservation. The sidecar may own persistent metadata without claiming that
+  the all-position verifier can publish live KV/GDN state.
+- A focused CUDA/ROCm investigation found that MoE all-position verifier rows
+  are not yet serial-equivalent for this fixture, so direct MoE publication is
+  explicitly outside Phase 9.6 acceptance.
+
+Implementation plan:
+
+1. Give every Qwen3.6 MoE MTP sidecar depth its own persistent
+   `MoERuntimeTable`, even when the logical layer index aliases a main-model
+   layer. Runtime-table keys must be depth-scoped and must not feed decode
+   histograms.
+2. Keep MoE graph buffers arena/workspace owned: routing indices, routing
+   weights, grouped expert metadata, shared-expert scratch, and prefill scratch
+   must have stable graph-facing addresses.
+3. Keep sidecar replay-safety contracts separate from direct live-state
+   publication. Persistent sidecar metadata may be used by captured sidecar
+   graphs, but MoE must not advertise `supportsMTPSpecStatePublication()` until
+   all-position verifier rows are serial-equivalent.
+4. Do not broaden `supportsMTPSidecarPreservesMainState()` or
+   `supportsMTPShiftedRowReuseFromSidecar()` for MoE in this phase. MoE still
+   restores verifier base state and commits accepted shifted rows through the
+   verifier publication path.
+5. Add structural guards proving MoE sidecar runtime tables are depth-scoped and
+   replay preservation is not tied to the dense shifted-row shortcut.
+6. Add real-model integration coverage proving Qwen3.6 MoE MTP creates or
+   reuses depth-scoped sidecar runtime tables, remains token-correct, and stays
+   off the direct all-position publication path while that verifier is red.
+7. Update dashboard evidence only after the focused Phase 9.6 gate passes.
+
+Acceptance gate:
+
+```bash
+cmake --build build_v2_integration --parallel
+ctest --test-dir build_v2_integration \
+  -R '^(V2_Unit_GpuWorkspaceAllocationPolicy|V2_Integration_Parity_Qwen36MoE_(CUDA|ROCm)_SingleDevice_.*MTPBenchmarkStyleUsesPersistentMoESidecarMetadata)$' \
+  --output-on-failure --parallel
+```
+
+Exit criteria:
+
+- MoE MTP sidecar graphs use persistent depth-scoped runtime metadata.
+- MoE does not opt into dense shifted-row reuse or sidecar main-state
+  preservation unless a separate equivalence proof lands.
+- MoE direct all-position state publication is disabled until verifier rows are
+  serial-equivalent; integration tests prove the Phase 9.6 metadata path without
+  exercising that broken publication shortcut.
+- CUDA and ROCm Qwen3.6 MoE integration tests prove output correctness while
+  the sidecar uses persistent metadata.
+
+Current status:
+
+- [x] Planned as a distinct cleanup phase before the next broad gate.
+- [x] Initial code slice gives MTP MoE sidecars depth-scoped runtime tables and
+  keeps sidecar metadata out of main-decode runtime slots.
+- [x] Capability correction keeps MoE direct all-position publication disabled
+  until verifier-row parity proves it.
+- [x] Structural guards updated and passing.
+- [x] Real-model CUDA/ROCm integration tests proving persistent sidecar
+  metadata are added and passing.
+- [x] Dashboard updated with Phase 9.6 evidence.
+
+Expanded guard evidence:
+
+- `V2_Unit_GpuWorkspaceAllocationPolicy` passed.
+- CUDA and ROCm
+  `MTPBenchmarkStyleUsesPersistentMoESidecarMetadata` passed.
+- The broader reference sweep exposed a CUDA MoE depth-1
+  `MTPBenchmarkStyleDepth1EightTokensMatchesReference` failure: live committed
+  continuation matched the committed probe, but full replay diverged and the
+  shifted MTP KV probe reported `596@596` live versus `594@594` after replay.
+  This is not a Phase 9.6 metadata failure; it is the seed blocker for Phase
+  9.7's verifier-row decode-equivalence proofs.
+
+### Phase 9.7: Decode-Equivalent Multi-Row Verifier Proofs
+
+Goal: implement and prove CPU, CUDA, and ROCm verifier-row paths that are
+decode-equivalent to serial decode for every row count used by production MTP.
+No production graph may consume a multi-row verifier state, compact outcome, or
+accepted-row publisher until the corresponding backend/model-class proof is
+green.
+
+Why this phase exists:
+
+- Phase 9.6 deliberately kept MoE direct all-position state publication off.
+  CUDA MoE row publication already showed row-level drift on this fixture, and
+  the expanded Phase 9.6 guard found a depth-1 CUDA replay mismatch in the
+  decode-equivalent path itself.
+- The vLLM-style target architecture is a batched speculative verifier: for
+  each request it runs `num_draft_tokens + 1` target rows, indexes draft-token
+  logits separately from bonus logits, and lets the sampler consume explicit
+  device metadata. Llaminar must prove that each produced verifier row is the
+  same state/logit row serial decode would have produced before wiring it into
+  the hot graph path.
+- Hidden, KV, GDN, MTP shifted KV, positions, sampled logits, router metadata,
+  and stochastic acceptance metadata must move together as one verified row
+  contract. Partial equivalence is a coherence bug waiting to happen.
+
+Implementation plan:
+
+1. Define `MTPVerifierRowEquivalenceSpec` for dense, hybrid, and MoE models.
+   It names backend, model class, draft depth, verifier rows, sampling mode,
+   row-selection policy, and the state families that must compare.
+2. Add dedicated integration tests before graph promotion:
+   - Dense Qwen3.6 CPU/CUDA/ROCm M=1/2/3/4 verifier rows versus serial decode.
+   - MoE Qwen3.6 CPU/CUDA/ROCm M=1/2/3/4 verifier rows versus serial decode.
+   - Greedy and stochastic tests using the same request seeds and sampling
+     params as served inference.
+   - Full-row distribution checks, not just sampled-token, top-k, or raw
+     argmax checks: raw-logit cosine similarity, raw-logit relative L2, and
+     symmetric KL over softmax probabilities must all pass tight thresholds for
+     every verifier row before a backend is considered equivalent.
+   - Stage snapshots may diagnose the first divergent layer, but they are not
+     substitutes for final distribution metrics. A test that only matches the
+     sampled token or a handful of logits is red for Phase 9.7.
+   - Continuation replay tests that restore or publish row `k`, then decode at
+     least four more tokens and compare with a fresh serial runner.
+3. Compare all state needed for production:
+   - Main KV logical metadata and payload hashes.
+   - MTP shifted KV logical metadata and payload hashes.
+   - GDN recurrence and short-conv hashes.
+   - Terminal hidden and logits, including target-logit and bonus-logit rows.
+   - MoE router indices/weights, grouped expert metadata, shared-expert output,
+     and persistent sidecar runtime table generation.
+   - Position, sequence length, accepted-token count, and sampler RNG state.
+4. Keep tests backend-symmetric. If CUDA has a deep proof, ROCm and CPU must
+   have the same proof unless explicitly marked unsupported in the dashboard.
+5. Implement backend paths only behind a narrow capability object:
+   `MTPVerifierRowPublicationCapability`. It reports supported row counts,
+   supported sampling modes, supported model classes, and the exact test gate
+   that promoted the capability.
+6. Wire graph consumers only after proofs pass:
+   - Dense direct row publication first.
+   - Hybrid GDN row publication second.
+   - MoE row publication last, after routed/shared expert rows are serial
+     equivalent on CPU/CUDA/ROCm.
+7. Preserve the fallback policy while the proof is red: use the shared
+   decode-equivalent replay path and fail closed rather than silently enabling
+   an unproven fast path.
+8. Update the dashboard after each slice with backend/model/sampling RAG,
+   failing row count, first mismatch family, and benchmark impact.
+9. Treat all-position verifier rows as unaccepted until they pass the strict
+   distribution proof. If a batched candidate fails cosine, relative L2, or
+   symmetric KL, the accepted implementation for that lane is the row-serial
+   decode-equivalent verifier path until a fused/batched replacement proves the
+   same metrics against the row-serial oracle.
+
+Acceptance gate:
+
+```bash
+cmake --build build_v2_integration --parallel
+ctest --test-dir build_v2_integration \
+  -R '^(V2_Unit_.*MTP.*Verifier|V2_Integration_Parity_Qwen36.*VerifierRowsDecodeEquivalent|V2_Integration_Parity_Qwen36MoE_.*VerifierRowsDecodeEquivalent|V2_Integration_Parity_Qwen36MoE_.*MTPBenchmarkStyleDepth1EightTokensMatchesReference)$' \
+  --output-on-failure --parallel
+```
+
+Promotion gate:
+
+```bash
+ctest --test-dir build_v2_integration \
+  -R '^(V2_Integration_Parity_Qwen36.*(MTPStochasticSamplingVerifierRuns|PrefixCacheMTPRestore)|V2_Integration_Parity_Qwen36MoE_.*(MTPStochasticSamplingVerifierRuns|MTPBenchmarkStyle.*Reference|MainVerifierPublishedStateMatchesSerialContinuation))$' \
+  --output-on-failure --parallel
+```
+
+Exit criteria:
+
+- CPU, CUDA, and ROCm dense verifier rows M=1/2/3/4 are serial-decode
+  equivalent for greedy and stochastic.
+- CPU, CUDA, and ROCm MoE verifier rows M=1/2/3/4 are serial-decode equivalent
+  for greedy and stochastic.
+- The CUDA depth-1 replay mismatch found in Phase 9.6 is fixed and covered by a
+  regression.
+- Production capability flags name the exact proven row counts; unsupported
+  lanes remain fail-closed.
+- Dashboard rows show correctness status and benchmark deltas for every
+  promoted backend/model/sampling lane.
+
+Current status:
+
+- [x] Phase written from the Phase 9.6 CUDA depth-1 replay failure and current
+  vLLM speculative verifier structure.
+- [x] Full-distribution proof requirement added: cosine, relative L2, and
+  symmetric KL must pass for each verifier row; top-token equality is
+  insufficient.
+- [ ] Equivalence spec and capability type added.
+- [x] Dense CPU/CUDA/ROCm verifier-row tests added and passing for the current
+  supported proof paths. CPU grouped all-position covers M=2/3/4; CUDA and
+  ROCm grouped all-position cover M=1/2/3/4.
+- [x] CPU dense grouped all-position verifier rows M=2/3/4 now pass strict
+  full-distribution equivalence against serial decode. The root cause was CPU
+  RoPE using the normal contiguous multi-row prefill math inside tiny MTP
+  verifier graphs; `RoPEStage` now has an explicit CPU decode-equivalent
+  verifier-row mode that row-walks the same one-token RoPE contract as live
+  decode. Focused guards:
+  `ComputeStageTest.RoPEVerifierPrefillMatchesSerialDecodeRows` and
+  `Qwen36CPUSingleDevicePrefixMTPParity.VerifierRowsGroupedDecodeEquivalentM[2-4]`.
+- [x] CUDA/ROCm dense grouped all-position verifier rows M=1/2/3/4 now pass
+  strict model-level parity. ROCm M=3 previously diverged because GPU
+  non-captured verifier rows still used the host row-loop oracle while graph
+  capture used device-derived row params; `AttentionComputeStage` now routes
+  all GPU verifier rows through the same device-owned multi-row path. Focused
+  ROCm attention guards prove raw flash-decode, stage, and captured
+  append+attention M=2/3/4 rows match serial decode.
+- [x] MoE CPU/CUDA/ROCm M=1/2/3/4 verifier-row tests added and passing for
+  the currently supported shared decode-equivalent verifier path. The proof
+  runs `runSharedStepwiseMTPDecodeCatchupGreedy()`, captures every verifier
+  row's full logit distribution, and compares it with serial replay using
+  cosine, relative L2, symmetric KL, sampled-token equality, and four-token
+  continuation equality.
+- [x] MoE direct all-position verifier-row diagnostics are no longer part of
+  the default gate while `supportsMTPSpecStatePublication()` is false for MoE.
+  The previous CUDA M=2 all-position candidate failed strict metrics
+  (`cos=0.9826`, `rel_l2=0.1855` on row 0; row 1 `symmetric_kl=0.129`), so the
+  production lane remains fail-closed on shared decode-equivalent replay.
+- [x] CUDA depth-1 MoE replay regression fixed. CUDA runtime MoE pointer
+  staging now treats direct stream capture the same as Llaminar graph capture,
+  so captured graphs reuse pre-staged scoped pointer slots instead of recording
+  stack-backed H2D pointer copies. ROCm uses the same scoped-slot contract.
+- [ ] Proven capabilities wired into production graph consumers.
+- [x] Dashboard updated with Phase 9.7 correctness and benchmark evidence.
+
+Focused MoE verifier-row evidence:
+
+```bash
+cmake --build build_v2_integration --parallel
+ctest --test-dir build_v2_integration -R '^V2_Integration_Parity_Qwen36MoE_CUDA_SingleDevice_.*VerifierRowsDecodeEquivalentM2$' --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R '^V2_Integration_Parity_Qwen36MoE_CUDA_SingleDevice_.*VerifierRowsDecodeEquivalentM(1|3|4)$' --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R '^V2_Integration_Parity_Qwen36MoE_ROCm_SingleDevice_.*VerifierRowsDecodeEquivalentM[1-4]$' --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R '^V2_Integration_Parity_Qwen36MoE_CPU_SingleDevice_.*VerifierRowsDecodeEquivalentM1$' --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R '^V2_Integration_Parity_Qwen36MoE_CPU_SingleDevice_.*VerifierRowsDecodeEquivalentM(2|3|4)$' --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R '^V2_Integration_CUDAMoEKernel$' --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R '^V2_Integration_ROCmMoEKernel$' --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R '^V2_Integration_Parity_Qwen36MoE_(CUDA|ROCm)_SingleDevice_.*MTPBenchmarkStyleDepth1EightTokensMatchesReference$' --output-on-failure --parallel
+```
+
+Observed focused results:
+
+- CPU dense M=2,3,4 passed after the RoPE decode-equivalence fix. Standalone
+  M3/M4 passed in `117.09s`; the combined M2/M3/M4 proof also passed, but took
+  `642.70s`, so Phase 9.8 still treats the CPU grouped proof path as
+  correctness-green but performance-suspect.
+- CUDA MoE M=1,2,3,4 passed. M=2 passed after the test was corrected to prove
+  the supported shared verifier instead of the rejected all-position candidate.
+- ROCm MoE M=1,2,3,4 passed. M=3 and M=4 were correctness-green but slow
+  (`285.51s` and `291.23s` respectively), so Phase 10 keeps ROCm verifier proof
+  cost as performance debt.
+- CPU MoE M=1,2,3,4 passed. M=1 cold load/proof took `209.98s`; warm M=2..4
+  took about `29s` each.
+
+### Phase 9.8: Economical Decode-Equivalent Verifier Implementation
+
+Goal: turn the Phase 9.7 decode-equivalence proofs into production-economical
+implementations before any Phase 10 default-enablement decision. The verifier
+must stay decode-equivalent, but the hot path should no longer pay row-serial
+replay, full all-position LM-head, or host transfer/sync costs where a compact
+backend-resident path can produce the same state and logits.
+
+Scope:
+
+- CPU, CUDA, and ROCm dense verifier rows M=1/2/3/4.
+- CPU, CUDA, and ROCm MoE verifier rows M=1/2/3/4, including routed experts,
+  shared expert, final hidden publication, LM-head, sampling, correction-token
+  selection, and accepted-state publication.
+- SingleDevice first, then sharded LocalTP, NodeLocalTP/GlobalTP, LocalPP, and
+  ExpertOverlay. SingleDevice-only reducers are a bootstrap lane, not the final
+  Phase 9.8 contract.
+- Greedy and stochastic paths. Stochastic promotion requires the same RNG draw
+  positions and distribution metrics as the serial decode oracle.
+- Fixed d1/d2/d3 paths first. Dynamic-depth policy remains secondary until the
+  fixed-depth verifier economics are green.
+
+Why this phase exists:
+
+- Phase 9.7 intentionally proved correctness first. It allowed row-serial
+  decode-equivalent replay and host bridges while the row contract was still
+  being validated.
+- Current MoE publication code still has a decode-equivalent row replay route
+  for multi-row verifier prefill. That is the right fail-closed correctness
+  posture, but it is not an economical production implementation.
+- GPU verifier/sampling work has already moved toward resident outcomes, but
+  the remaining D2H/H2D and stream-sync boundaries still show up in perfstats
+  and ROCm stage timing. The hot path needs to decide, publish, and continue
+  from backend-owned data.
+- CPU is correctness-capable but should use the same compact row metadata
+  contract and avoid GPU-only optimizations being mirrored as full host-logit
+  scans or all-position target work.
+
+Implementation plan:
+
+1. Capability contract
+   - Add or extend a verifier-economy capability record, alongside the Phase 9.7
+     correctness capability, with explicit fields for:
+     `device_resident_input`, `device_resident_outcome`,
+     `device_resident_publication`, `grouped_decode_equivalent`,
+     `row_indexed_lm_head`, `host_bridge_free_hot_path`, `graph_capturable`,
+     `supported_rows`, `supported_sampling_modes`, and `perf_gate_status`.
+   - Capabilities must distinguish "serial decode-equivalent fallback" from
+     "grouped decode-equivalent implementation". Both can be correct; only the
+     grouped path can satisfy this phase's performance gate.
+   - Dashboard/perfstats rows must print the active verifier path, grouped
+     support, row-indexed LM-head support, host-bridge hot-path status, and the
+     exact row counts proven per backend/model/sampling lane.
+
+2. Fully resident GPU transaction boundary
+   - Keep draft tokens, verifier input rows, accepted counts, correction/bonus
+     token choice, output-token metadata, terminal-hidden selection, and next
+     condition token in backend-owned buffers until the state update is
+     complete.
+   - Remove remaining H2D uploads of compact verifier rows in CUDA/ROCm greedy
+     and stochastic paths. Sidecar sampling should publish draft token rows
+     directly into the verifier mailbox/arena.
+   - Remove hot-path D2H dependencies from stochastic outcome and publication.
+     A host-readable outcome bridge may remain only as an output materialization
+     or diagnostic path after the publication-safe event.
+   - Request-batched stochastic lanes need the same resident boundary as the
+     scalar lane. The compact outcome reducer may already produce a
+     `DeviceSpeculativeOutcomeHandle`, but publication is not complete until
+     recurrent/short-conv state can restore from a batch of device row indices,
+     not only one scalar accepted-row pointer. Until that batch restore contract
+     exists, request-batched lanes must remain marked host-transaction-bound and
+     must not quietly advertise resident publication support.
+   - Perfstats must expose hot-path H2D/D2H byte counts and sync counts. The
+     target value for CUDA/ROCm verifier transaction decisions is zero, excluding
+     explicit final response materialization.
+   - All CUDA/HIP work must use explicit non-null streams, reusable workspace,
+     and graph-capturable operations. No default-stream timing or per-iteration
+     allocation is allowed in a promoted path.
+   - SingleDevice full-vocabulary reducers must not be mistaken for TP support.
+     Vocab-sharded LocalTP and GlobalTP need a collective-aware compact outcome
+     reducer that computes row argmax/top-k/top-p/probability acceptance across
+     shards before publication. Until that reducer exists, TP lanes must
+     fail-closed or use the explicitly labelled serial decode-equivalent path;
+     they must not sample from participant 0 or silently downgrade to a local
+     full-vocab assumption.
+
+3. CPU compact verifier path
+   - Bring CPU up to the same contract shape as GPU: compact verifier metadata,
+     row-indexed hidden selection, row-indexed target/bonus LM-head, sampled
+     output metadata, and accepted-state publication.
+   - Avoid full all-position LM-head and host-logit scans when the verifier only
+     needs draft rows plus the bonus/correction row.
+   - Avoid per-row virtual stage replay for M=2/3/4 once the grouped CPU path is
+     proven. Use cache-friendly row blocks and existing NativeVNNI/top-k CPU
+     fast paths where they apply.
+   - CPU stochastic sampling must keep using shared `SamplingMath` semantics so
+     CPU remains the readable oracle for GPU-focused failures.
+
+4. Performant grouped multi-row verifier
+   - Dense: implement a batched row-indexed verifier path for M=2/3/4 that
+     produces the same logits, sampled tokens, accepted-state rows, and
+     continuation state as serial decode.
+   - MoE: replace promoted uses of `executeDecodeEquivalentVerifierPrefill`
+     row replay with grouped decode-equivalent routed+shared prefill for
+     M=2/3/4. Serial replay remains available only as a guarded fallback.
+   - CUDA: tune grouped verifier prefill with explicit stream capture, reusable
+     descriptor tables/workspace, row-indexed LM-head, and tile/dispatch choices
+     trained or measured for the actual Qwen3.5/3.6 verifier buckets.
+   - ROCm: tune M=2/3/4 grouped verifier buckets with `rocprof` per-dispatch
+     evidence, explicit HIP streams, graph-capturable grouping/prefill, and no
+     producer-drain sync masquerading as a compact D2H cost.
+   - CPU: provide a batched decode-equivalent verifier path with the same
+     strict distribution proof and enough instrumentation to identify row
+     grouping, LM-head, sampler, and publication cost separately.
+   - Trained M=2/3/4 kernels are part of this phase, not a follow-up.  The
+     row-wise M=1 verifier path is the correctness fallback contract; Phase 9.8
+     is not performance-complete until CPU, CUDA, and ROCm have generated or
+     trained dispatch tables for verifier-shaped GEMV/GEMM buckets and the
+     promoted kernels are wired into dense, GDN, LM-head, routed MoE, and shared
+     expert verifier paths where applicable.
+   - The generated-kernel pipeline must be turnkey: perf sweeps emit CSV for
+     the verifier shapes and codebooks, the trainer emits checked-in C++ `.inc`
+     dispatch tables, and backend code consumes those tables without ad hoc
+     per-codebook overrides.  The sweep/trainer must cover the full Q-quant,
+     K-quant, and IQ-quant families used by Qwen3.5/Qwen3.6 dense and MoE
+     weights, not only the codebooks present in one benchmark model.
+   - M=2/3/4 trained kernels must be graph-capturable on CUDA and ROCm, use
+     explicit non-null streams, consume declared workspace, and avoid raw
+     cuda/hip allocations.  CPU kernels must follow the existing scalar/AVX2/
+     AVX512 runtime-dispatch pattern where vectorized paths are introduced.
+   - Promotion requires a focused perf win over the serial fallback for the same
+     row count/backend/model/sampling lane and no full-model regression versus
+     the current guarded path.
+
+5. Strict numeric proof
+   - Reuse the existing Qwen3.6 dense and MoE parity suites wherever possible.
+     Extend the existing `VerifierRowsDecodeEquivalentM[1-4]` coverage or add
+     adjacent `VerifierRowsGroupedDecodeEquivalentM[2-4]` tests for the grouped
+     path.
+   - Every verifier row must compare full logit distributions against the
+     serial decode oracle using cosine similarity, relative L2, and symmetric
+     KL/KLD. Top-token equality alone is not sufficient.
+   - Greedy tests must verify accepted length, correction token, bonus token,
+     final hidden row, KV/cache positions, and continuation tokens.
+   - Stochastic tests must additionally verify RNG draw positions, accepted
+     rows, residual/correction sampling, bonus sampling, and continuation under
+     the same seed.
+   - State publication tests must compare the grouped verifier's published
+     state with a serial continuation, not just verifier-row logits.
+
+6. Cleanup and reconciliation
+   - Reconcile the Phase 10 documentation/status rows with the code capability
+     flags so "grouped verifier green" cannot mean "serial fallback is correct".
+   - Rename comments and metrics where needed to separate
+     `serial_decode_equivalent_fallback` from
+     `grouped_decode_equivalent_verifier`.
+   - Delete or demote retired experimental all-position verifier paths only
+     after the grouped path has passed correctness and perf gates on CPU, CUDA,
+     and ROCm.
+   - Keep dynamic-depth policy tables conservative until fixed d1/d2/d3 grouped
+     evidence is speed-positive.
+
+7. Multi-participant verifier economy
+   - Add a TP-aware compact verifier outcome contract for sharded logits. The
+     contract must cover LocalTP, NodeLocalTP/GlobalTP, and LocalPP final-stage
+     domains, with rank/device participation decided by the same graph-native
+     collective plan used by the main model.
+   - Greedy sharded verification must compute a global row argmax for each
+     verifier row before acceptance/correction. Stochastic sharded verification
+     must compute globally normalized distributions or an equivalent distributed
+     top-k/top-p/rejection sampler with the same RNG draw positions as the
+     serial oracle.
+   - Accepted-state publication remains common-prefix/domain-wide: every
+     participant publishes or none do, using the same accepted count and
+     correction token. A participant-local compact outcome is invalid unless it
+     is accompanied by the domain-wide reduced metadata.
+   - GlobalTP/NodeLocalTP implementations must use a narrow typed collective
+     helper or existing TP collective abstraction, not ad hoc MPI/NCCL/RCCL
+     calls inside MTP-specific runner code.
+   - Dedicated LocalTP and GlobalTP integration tests must prove strict
+     cosine, relative L2, symmetric KL/KLD, sampled-token, accepted-count, and
+     published-continuation equivalence before any sharded verifier lane is
+     promoted out of the serial fallback.
+
+Focused correctness gate:
+
+```bash
+cmake --build build_v2_integration --parallel
+ctest --test-dir build_v2_integration \
+  -R '^(V2_Integration_Parity_Qwen36.*VerifierRows(DecodeEquivalent|GroupedDecodeEquivalent)M[1-4]|V2_Integration_Parity_Qwen36MoE_.*VerifierRows(DecodeEquivalent|GroupedDecodeEquivalent)M[1-4]|V2_Integration_Parity_Qwen36MoE_.*MainVerifierPublishedStateMatchesSerialContinuation|V2_Integration_GPUSamplingKernels|V2_Integration_CUDAMoEKernel|V2_Integration_ROCmMoEKernel)$' \
+  --output-on-failure --parallel
+```
+
+Generated-kernel proof gate:
+
+```bash
+cmake --build build_v2_integration --parallel
+ctest --test-dir build_v2_integration \
+  -R '^(V2_Integration_.*(CUDA|ROCm|CPU).*GEMV.*M(2|3|4)|V2_Integration_.*(CUDA|ROCm|CPU).*QuantisedGemm.*VerifierM(2|3|4)|V2_Integration_Parity_Qwen36.*VerifierRowsGroupedDecodeEquivalentM[2-4]|V2_Integration_Parity_Qwen36MoE_.*VerifierRowsGroupedDecodeEquivalentM[2-4])$' \
+  --output-on-failure --parallel
+```
+
+The generated-kernel proof gate must compare each trained M=2/3/4 kernel
+against serial M=1 GEMV/GEMM for every supported codebook and verifier shape.
+For model-level promotion, dense and MoE grouped verifier rows must pass strict
+full-distribution cosine, relative L2, and symmetric KL/KLD checks against the
+serial decode oracle before the trained table is selected by production code.
+
+Focused performance gate:
+
+```bash
+cmake --build build_v2_release --parallel
+ctest --test-dir build_v2_release \
+  -R '^(V2_Perf_MoEVerifierPrefill|V2_Perf_GPUSpeculativeSummary|V2_Perf_CPUSamplerTopK|V2_Perf_CPUNativeVNNI_GEMV|V2_Perf_.*(CUDA|ROCm|CPU).*GEMV.*M(2|3|4)|V2_Perf_.*QuantisedGemm.*VerifierM(2|3|4))$' \
+  --output-on-failure --parallel
+scripts/run_mtp_iteration_benchmark_matrix.sh \
+  --models dense,moe \
+  --modes greedy,stochastic \
+  --variants baseline,fixed_d1,fixed_d2,fixed_d3 \
+  --decode-tokens 16 --perfstats --gpu-stage-timing
+```
+
+Backend-specific evidence:
+
+- CUDA: `LLAMINAR_PROFILING=1` for attribution only, clean-shell benchmark for
+  throughput, and `nsys`/`ncu` only for targeted kernel diagnosis. Do not quote
+  profiling-enabled decode throughput as the acceptance number because graph
+  capture is intentionally disabled under executor profiling.
+- ROCm: use `rocprof` per-dispatch timing for grouped verifier kernels and treat
+  wallclock-only improvements as insufficient evidence on PCIe-bound systems.
+- CPU: use release-build matrix rows and CPU sampler/LM-head focused timings to
+  show the row-indexed path reduced verifier, sampler, and publication cost
+  without weakening the serial decode oracle.
+
+Exit criteria:
+
+- CUDA and ROCm verifier transaction decisions are host-bridge free: zero
+  hot-path H2D/D2H bytes and zero hot-path transfer-induced syncs in perfstats,
+  excluding explicit final response materialization.
+- LocalTP and GlobalTP/NodeLocalTP have explicit sharded compact verifier
+  reducers for greedy and stochastic, or their Phase 9.8 dashboard rows remain
+  unaccepted and fail-closed behind the labelled serial fallback.
+- CPU uses the same compact verifier metadata contract as GPU and avoids full
+  all-position LM-head work for promoted verifier rows.
+- Dense grouped/batched verifier M=2/3/4 passes strict cosine, relative L2, and
+  symmetric KL/KLD checks on CPU, CUDA, and ROCm for greedy and stochastic.
+- MoE grouped routed+shared verifier M=2/3/4 passes the same strict metrics and
+  `MainVerifierPublishedStateMatchesSerialContinuation` on CPU, CUDA, and ROCm.
+- CPU, CUDA, and ROCm trained/generated M=2/3/4 verifier kernels cover all
+  supported Q/K/IQ codebooks, pass serial M=1 numerical equivalence in focused
+  integration tests, and are wired into production only after dense/MoE grouped
+  verifier parity passes strict cosine, relative L2, and symmetric KL/KLD.
+- Grouped paths are faster than serial fallback in focused verifier harnesses
+  and do not regress same-run full-model MTP benchmark rows. Lanes that fail
+  either condition remain on fail-closed serial fallback and are not eligible
+  for Phase 10 default enablement.
+- Dashboard rows include same-run baseline, verifier time, condition-token time,
+  publication time, sampler/outcome time, graph replay time, grouped-path status,
+  and host-bridge status for every backend/model/sampling lane.
+
+Current status:
+
+- [x] Phase added to close the gap between Phase 9.7 correctness proofs and
+  Phase 10 speed/default-readiness evidence.
+- [x] Verifier-economy capability contract added in
+  `MTPDecodeCatchup`/`IInferenceRunner`, with `DeviceGraphOrchestrator` and
+  `RankOrchestrator` reporting correct serial fallback separately from
+  grouped/promoted verifier support. Focused unit coverage proves
+  `RankOrchestrator` clamps to the weakest participant and current
+  SingleDevice lanes are not accidentally marked economical.
+- [x] Verifier-economy capability printed in perfstats/matrix rows. MTP decode
+  emits tagged dense/MoE `verifier_economy_capability` counters, and
+  `summarize_mtp_perfstats.py`/`run_mtp_iteration_benchmark_matrix.sh` expose
+  compact `verifier_economy_dense` and `verifier_economy_moe` columns for
+  dashboard refreshes.
+- [x] GPU request-batched stochastic depth-1 sidecar tokens can now publish
+  directly into device draft slots. `OrchestrationRunner` skips the legacy
+  draft-token H2D staging for this lane, while the compatibility host shadow is
+  kept only for response/metadata materialization. Focused gate:
+  `V2_Unit_(PrefillDecodeTransition|DeviceGraphOrchestrator|MTPSpecRequestBatchScheduler|MTPSpecDecodeMetadata)`.
+- [x] Request-batched device draft publication now covers depth greater than
+  one. CUDA/ROCm batched argmax supports strided output stores, so sidecar row
+  `request i` writes directly to request-major slot
+  `first_draft_slot + i * draft_depth`; the old per-request host-to-device
+  draft staging hook is no longer used for promoted GPU stochastic request
+  batches. Focused `V2_Unit_PrefillDecodeTransition` depth-1/2/3 regressions
+  pin the slot layout, and `V2_Integration_GPUSamplingKernels` proves strided
+  device-output argmax on CUDA and ROCm.
+- [x] NativeVNNI trainer/generated-table guardrails are green for CUDA and
+  ROCm. Focused gate:
+  `V2_Unit_NativeVNNIDispatchRefreshScript`,
+  `V2_Unit_CUDAGemvDispatchGeneratorAliases`,
+  `V2_Unit_CUDAGemvDispatchBaseMerge`,
+  `V2_Unit_CUDAPrefillDispatchGeneratorAliases`,
+  `V2_Unit_ROCmNativeVNNITrainerGenerator`,
+  `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeVNNIBatchedDecodeTrainerGenerator`,
+  `V2_Unit_ROCmNativeVNNITrainerCsvValidator`, and
+  `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`.
+- [x] Focused M=2/3/4 kernel serial-equivalence proofs are green for the
+  current CPU/CUDA/ROCm NativeVNNI paths. CPU passed
+  `MTP_SmallM_{FusedProjection_AllFormats,AllFormatsMatchSerialDecodeRows,Qwen36ShapesMatchSerialDecodeRows}`.
+  CUDA passed `MTP_SmallM_FusedProjection_AllNativeFormats` and
+  `NativeVNNISpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs`; the CUDA
+  assertion now keeps the strict relative-L2/cosine gates and treats sub-3e-4
+  absolute KPAR reduction-order spikes as outlier diagnostics. ROCm passed
+  `SpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs`,
+  `DispatchNativeSmallMAllCodebooksMatchReference`, and graph-captured Qwen3.6
+  GDN projection samples for M=2/M=4.
+- [x] Focused trainer/perf CSV smoke is green for the generated-dispatch
+  pipeline. CPU `MTP_SmallM_TrainerCsv_AllFormats` now emits machine-readable
+  default-route rows for M=2/3/4; the focused Q4_0/IQ4_XS smoke produced six
+  rows at about 156-177 us. CUDA `GemvSweepPerf.Sweep_GemvDispatchCsv`
+  emitted 48 Qwen3.6 GDN time-projection rows for Q4_0 and IQ4_XS at M=2/3/4,
+  selecting KPAR winners per codebook and row count. ROCm
+  `TrainerCsv_BatchedProjectionCodebookTagged` emitted 12 Qwen3.6 Q4_K
+  batched GDN qkv/z rows, all correctness-pass with cosine 1.0, selecting
+  AUTO/KB4/KB8 winners for M=2/3/4 respectively. This is pipeline smoke only;
+  CPU generated-table consumption and the full all-codebook generated-table
+  acceptance boxes remain open.
+- [x] Greedy GPU all-position verification no longer re-uploads first-token or
+  draft-token shadows when the runner advertises device slots. Main-logits
+  greedy sampling writes the first target token into the runner-owned target
+  arena, fused sidecar sampling writes each draft into the draft arena, the
+  verifier and greedy reducer consume that prepared row, and opted-in failures
+  hard-fail instead of silently falling back to host sampling/upload. Focused gate:
+  `V2_Unit_PrefillDecodeTransition` and
+  `V2_Unit_GpuWorkspaceAllocationPolicy`; real-model graph smoke:
+  `V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsSmoke` and
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsSmoke`.
+- [x] Greedy GPU all-position compact outcomes now use the same
+  `DeviceSpeculativeOutcomeHandle` contract as stochastic verification.
+  `OrchestrationRunner` publishes accepted state from resident compact metadata
+  before materializing the compatibility host response plan, and the static
+  guard prevents the hot path from calling the legacy host-returning verifier.
+  Focused gate: `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, and the CUDA/ROCm Qwen3.6 graph
+  smokes listed above.
+- [x] Resident greedy GPU verifier outcomes no longer have a host token-row H2D
+  compatibility path. A missing materialized device verifier row now hard-fails
+  as a coherence error, and `V2_Unit_GpuWorkspaceAllocationPolicy` guards
+  against reintroducing `hostToDeviceOnStream()` in the resident verifier body.
+  CUDA/ROCm Qwen3.6 graph smokes pass after the removal.
+- [x] Resident publication base cached-token counts now come from a
+  pre-verifier device snapshot, not a post-verifier host upload. DGO copies the
+  KV cache's device sequence-count mirror into the MTP metadata workspace before
+  verifier replay mutates live KV state, keeps the snapshot through scoped-plan
+  teardown, rejects missing snapshots, and the runner no longer attaches a host
+  base-cache shadow to resident publication requests.
+  Focused gate: `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_PrefillDecodeTransition`, and the
+  CUDA/ROCm Qwen3.6 graph smokes.
+- [x] The all-position runner path now calls an explicit host-response
+  materialization boundary after device-resident publication, instead of naming
+  the compatibility D2H as host-plan materialization. `IInferenceRunner` keeps
+  the old host-plan adapter only as a legacy delegate, while structural guards
+  require publication and sidecar prelaunch to occur before response
+  materialization and still forbid the low-level host copy hook in the runner
+  branch. Focused gate: `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_PrefillDecodeTransition`, and the CUDA/ROCm Qwen3.6 graph smokes.
+- [x] Dense grouped/batched verifier M=2/3/4 strict correctness is green on
+  CPU, CUDA, and ROCm. Focused gates:
+  `V2_Integration_Parity_Qwen36_CPU_SingleDevice_Qwen36CPUSingleDevicePrefixMTPParity_VerifierRowsGroupedDecodeEquivalentM[2-4]`,
+  `V2_Integration_Parity_Qwen36_ROCm_SingleDevice_Qwen36ROCmSingleDevicePrefixMTPParity_VerifierRowsGroupedDecodeEquivalentM[1-4]`,
+  `V2_Integration_Parity_Qwen36_CUDA_SingleDevice_Qwen36CUDASingleDevicePrefixMTPParity_VerifierRowsGroupedDecodeEquivalentM[1-4]`,
+  and `V2_Integration_ROCmFlashAttentionParity` raw/stage/captured M=2/3/4
+  Qwen3.6 attention rows.
+- [x] CPU compact row-indexed verifier and LM-head path is wired and proven
+  for dense M=2/3/4. The graph selects compact hidden rows into
+  `lm_head_input_rows`, projects compact logits through the decode-equivalent
+  LM-head row contract, and the focused CPU grouped parity gate compares every
+  row against serial decode with cosine, relative L2, symmetric KL, and sampled
+  token checks.
+- [x] Scalar device-indexed GDN and short-conv publication is device-owned on
+  CUDA and ROCm. `GDNRecurrenceStage` and `ShortConv1dStage` no longer pass
+  host mirror pointers into the device-index restore path, and the CUDA/ROCm
+  tensor wrappers no longer perform D2H refresh or stream synchronization from
+  `restoreVerifierStateCaptureRowFromDeviceIndex()`. Focused gate:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, `V2_Unit_GDNKernels`, and
+  `V2_Unit_MTPSpecStateContract`; real-runner smoke:
+  `V2_Integration_PrefixCacheMTP_Qwen36(CUDA|ROCm)GpuGraphsStochasticSmoke`.
+- [x] Dense request-batched resident publication is not blocked by the hybrid
+  recurrent-state guard. The DGO guard now fails request batches only when the
+  model has GDN/short-conv verifier state that still lacks per-request live
+  storage.
+- [x] Hybrid/GDN request-batched all-position verifier graphs hard-fail at
+  graph construction while capture is `[row,state]` and live state is one
+  buffer per layer. Focused gate: `V2_Unit_GpuWorkspaceAllocationPolicy` plus
+  CUDA/ROCm Qwen3.6 stochastic graph smokes.
+- [x] Request-batched verifier-state restore has a shared stage and
+  tensor-kernel contract with default hard-fail semantics. GDN recurrence and
+  short-conv stages now expose the batch hook and delegate to the backend
+  batch API instead of looping scalar restore. Focused gate:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`.
+- [x] `MTPSpecStatePublisher` has a request-batched device-index publication
+  helper that validates GPU + explicit-stream ownership and calls captured
+  stages through the batch restore hook exactly once. It deliberately remains
+  fail-closed until backends implement request-owned recurrent live-state
+  banks. Focused gate: `V2_Unit_MTPSpecStateContract`.
+- [x] Qwen3.5/Qwen3.6 GDN graph construction now passes request shape
+  (`request_count`, `request_seq_len`) into short-conv and GDN recurrence
+  stages instead of leaving them with only flattened token count. Focused gate:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`.
+- [ ] CUDA hot-path H2D/D2H verifier transaction dependencies removed.
+- [ ] ROCm hot-path H2D/D2H verifier transaction dependencies removed.
+- [ ] Request-batched stochastic resident publication supports CUDA/ROCm
+  recurrent and short-conv batch restore from device row-index arrays, then
+  publishes KV, terminal hidden, logical-state mailbox, and host adoption from
+  one resident handle. Current DGO support is intentionally scalar-only because
+  `HybridGDNLayerState` and backend GDN/short-conv `gpu_state_` are one live
+  state per layer; request-batched publication first needs per-request
+  recurrent live-state storage, batch-aware verifier execution that prevents
+  state carry-over between requests, request-aware capture layout
+  `[request, verifier_row, state]`, then batched device-index restore.
+- [ ] LocalTP and GlobalTP grouped verifier support added for sharded logits:
+  compact outcome reducers perform domain-wide argmax/top-k/top-p/probability
+  acceptance across shards, and TP lanes fail-closed until that reducer is
+  present for dense and MoE.
+- [ ] Dense grouped/batched verifier M=2/3/4 strict metrics green and
+  performance-accepted on CPU, CUDA, and ROCm.
+- [ ] MoE grouped routed+shared verifier M=2/3/4 strict metrics green on CPU,
+  CUDA, and ROCm.
+- [ ] CPU trained/generated M=2/3/4 verifier GEMV/GEMM dispatch tables cover
+  all supported Q/K/IQ codebooks, pass strict serial M=1 equivalence, and are
+  wired into dense/GDN/LM-head/MoE verifier paths.
+- [ ] CUDA trained/generated M=2/3/4 verifier GEMV/GEMM dispatch tables cover
+  all supported Q/K/IQ codebooks, pass strict serial M=1 equivalence, are graph
+  capturable, and are wired into dense/GDN/LM-head/MoE verifier paths.
+- [ ] ROCm trained/generated M=2/3/4 verifier GEMV/GEMM dispatch tables cover
+  all supported Q/K/IQ codebooks, pass strict serial M=1 equivalence, are graph
+  capturable, and are wired into dense/GDN/LM-head/MoE verifier paths.
+- [ ] Focused verifier perf harnesses show grouped path faster than serial
+  fallback per backend.
+- [ ] Greedy temperature-zero requests with repetition/DRY penalties are
+  performance-promoted beyond the safe shared sequential verifier. The current
+  correctness contract allows penalty-greedy MTP only through the
+  decode-equivalent path; Phase 9.8 must add row-local penalty history to the
+  grouped/resident verifier before this lane can count as economical.
+- [ ] Full MTP benchmark matrix refreshed with perfstats and GPU stage timing.
+- [ ] Phase 10 status reconciled so correctness-only serial fallback cannot be
+  mistaken for performant grouped verifier acceptance.
+- [ ] LocalTP sharded compact verifier reducers implemented and proven for
+  greedy/stochastic dense lanes with strict distribution and continuation
+  equivalence.
+- [ ] GlobalTP/NodeLocalTP sharded compact verifier reducers implemented and
+  proven for greedy/stochastic dense lanes with strict distribution and
+  continuation equivalence.
+- [ ] Sharded TP MoE/ExpertOverlay verifier reducers implemented or explicitly
+  left red/amber as serial-fallback-only; no single-device compact reducer is
+  allowed to advertise support for these lanes.
+
 ### Phase 10: Default-Enablement Evidence
 
 Goal: decide rollout from measured correctness and speed, not optimism.
@@ -2442,16 +3286,642 @@ Current status:
   the scalar hot-path D2H boundary; it gives the next publication slice a
   concrete handle to consume for accepted-state publish and next-token staging.
 - The resident-outcome host bridge now queues compact output-token and metadata
-  D2H copies with `deviceToHostOnStream()` on the verifier stream and performs
-  a single `synchronizeStream()` handoff. CUDA and ROCm reject null streams for
-  stream-aware H2D/D2H copies, and
+  D2H copies with `deviceToHostOnStream()` on the verifier stream, uses
+  persistent backend-pinned host scratch for the compatibility copy target, and
+  performs a single `synchronizeStream()` handoff. CUDA and ROCm reject null
+  streams for stream-aware H2D/D2H copies, and
   `V2_Unit_GpuWorkspaceAllocationPolicy` guards against regressing this bridge
-  back to multiple `deviceToHostFast()` synchronizations.
+  back to multiple `deviceToHostFast()` synchronizations. The bridge now also
+  reports `stochastic_batch_d2h_enqueue_ms` and
+  `stochastic_batch_d2h_wait_ms` next to the legacy total sync column so ROCm
+  attribution can distinguish actual compact-copy enqueue cost from deferred
+  GPU work drained at the handoff.
+- A bounded MoE stochastic refresh after that slice,
+  `benchmark_results/mtp_vllm_style/20260613T121236Z-iteration-matrix-a6a69ec8`,
+  remains speed-negative: CUDA best dynamic is 85.1 tok/s versus 115.1
+  baseline, and ROCm best fixed d3 is 58.1 tok/s versus 69.0 baseline. CUDA is
+  primarily verifier/condition limited in this capture. ROCm still drains a
+  large amount of deferred GPU work at the compact outcome host boundary
+  (`stochastic_request_batch_summary_d2h_sync` is 235 ms for d3 and over
+  400 ms for d1/dynamic), so the next ROCm slice should move resident outcome
+  consumption into device-side publication/continuation rather than adding more
+  host copies. Completely removing the D2H boundary requires a device-resident
+  scheduler/output contract that can carry sampled tokens across steps before
+  flushing host-visible responses.
+- A follow-up after persistent pinned host scratch,
+  `benchmark_results/mtp_vllm_style/20260613T123247Z-iteration-matrix-a6a69ec8`,
+  confirms the diagnosis: enqueue is now tiny, but total boundary cost remains
+  speed-negative because the wait drains producer-stream work. CUDA dynamic is
+  83.6 tok/s versus 115.3 baseline with D2H 23.8 ms split into 0.2 ms enqueue
+  plus 23.5 ms wait. ROCm dynamic is 55.2 tok/s versus 69.1 baseline with D2H
+  405 ms split into 0.2 ms enqueue plus 404 ms wait. The next Phase 10
+  implementation target is device-resident accepted-state publication and
+  continuation-token staging from `DeviceSpeculativeOutcomeHandle`, not more
+  host-copy tuning.
+- The scalar all-position stochastic branch now calls the resident verifier
+  APIs directly, keeps the resulting `DeviceSpeculativeOutcomeHandle` visible
+  in `OrchestrationRunner`, and then invokes the host bridge only as an explicit
+  compatibility step. `V2_Unit_GpuWorkspaceAllocationPolicy` guards that the
+  runner branch does not regress to the legacy host-returning verifier API, and
+  `V2_Unit_PrefillDecodeTransition` now serializes/parses compact resident rows
+  in its mock runner. This is a structural step toward device-side publication;
+  it does not remove the host boundary yet.
+- The Phase 10 summary surface now exposes runner-level
+  `resident_outcome_enqueue_ms` and `resident_outcome_host_bridge_ms` in
+  addition to compact D2H enqueue/wait. This keeps future matrices honest about
+  whether a slice moved work onto the device or merely renamed the same
+  synchronization boundary. The next real implementation slice is a
+  device-side publication/token-mailbox contract: compact outcome metadata must
+  drive accepted-state row selection, KV truncation, terminal-hidden restore,
+  and next-token staging without copying the outcome to host first. The
+  existing host bridge should then become an output flush, not the state
+  mutation dependency.
+- Fresh diagnostic evidence with those columns,
+  `benchmark_results/mtp_vllm_style/20260613T125826Z-iteration-matrix-a6a69ec8`,
+  keeps MoE stochastic red: CUDA dynamic is 78.8 tok/s versus 114.6 baseline,
+  with 1.0 ms resident enqueue and 23.9 ms host bridge; ROCm dynamic is
+  55.4 tok/s versus 69.2 baseline, with 1.4 ms resident enqueue and
+  405.1 ms host bridge. This proves the next slice must remove the state
+  dependency on the host bridge instead of further tuning compact copy enqueue.
+- Phase 10 now has the runner/orchestrator contract for that removal:
+  `DeviceSpeculativePublicationRequest` carries the compact
+  `DeviceSpeculativeOutcomeHandle` plus host-known verifier shape invariants;
+  pre-verifier base-cache counts live in device metadata. The only supported
+  direct-publication entry point is
+  `publishAcceptedMTPSpecStateBatchFromDeviceOutcome()`. `OrchestrationRunner`
+  calls it before `copyDeviceSpeculativeOutcomesToHost()` when a backend
+  advertises `supportsDeviceResidentMTPSpecStatePublication()`, then skips the
+  older host-plan publish so the host bridge is only an output flush. Real DGO
+  support remains false until its KV/state/terminal-hidden publication consumes
+  device metadata directly. Focused gate:
+  `V2_Unit_PrefillDecodeTransition` and
+  `V2_Unit_GpuWorkspaceAllocationPolicy`.
+- A follow-up code dive confirmed why DGO cannot safely advertise the new
+  capability yet: `MTPSpecStatePublisher`, `GDNRecurrenceStage`, and
+  `ShortConv1dStage` still restore verifier state from a host integer row, and
+  DGO positions/sequence lengths are host-owned. The next implementation slice
+  is a device-indexed publication primitive: derive accepted restore rows and
+  target cache counts from compact metadata on the verifier stream, restore
+  GDN/short-conv snapshots by device row index, and only later flush host-visible
+  output tokens.
+- Device-indexed verifier-state publication is now implemented as the first
+  piece of that primitive. `IComputeStage`, `GDNRecurrenceStage`, and
+  `ShortConv1dStage` expose
+  `restoreVerifierStateCaptureRowFromDeviceIndex()`, and CUDA/ROCm GDN kernels
+  copy captured recurrence/short-conv rows by reading the row index on the
+  caller's explicit stream. `MTPSpecStatePublisher` can publish graph or vector
+  stage state from a device row pointer and hard-fails CPU devices, null row
+  pointers, or null/default streams. Focused gate passed:
+  `V2_Unit_MTPSpecStateContract` and
+  `V2_Unit_GpuWorkspaceAllocationPolicy`. DGO still does not advertise
+  resident publication until compact metadata also drives cache-count mutation,
+  terminal-hidden row selection, and next-token staging without the host bridge.
+- Compact outcome row/count derivation is now shared in
+  `sampling_math::derive_speculative_publication_metadata()`. The helper uses
+  `kSpecBatchMetaTargetVerifierStateCommitCount`, not
+  `kSpecBatchMetaAcceptedSpeculativePrefix`, so reject-first stochastic steps
+  still publish verifier row zero and advance one cache token. Focused tests in
+  `V2_Unit_MTPSpecDecodeMetadata` cover accept-all, reject-first, and invalid
+  commit-count metadata. CUDA/ROCm now expose
+  `enqueueDeriveSpeculativePublicationMetadata()`, a graph-captured backend
+  kernel that writes derived restore rows, target cached-token counts, accepted
+  state counts, and validity flags from device-resident compact metadata plus
+  device-resident base-cache counts. `V2_Integration_GPUSamplingKernels` covers
+  accept-all, reject-first, invalid metadata, null-stream rejection, and graph
+  capture on both GPU backends. `MTPSpecDecodeMetadataWorkspaceBinding` now
+  declares and binds base cached-token, target cached-token, and
+  publication-validity buffers so DGO can own the handoff through normal
+  workspace allocation instead of ad hoc device allocations. DGO now also has
+  an unpromoted terminal-hidden row-select helper that points
+  `HiddenStateRowsSelectStage` at
+  `MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_SLOT_INDICES` with external
+  device metadata, so accepted terminal rows can be selected without host row
+  uploads once the direct publication path is enabled. The next Phase 10
+  implementation slice is KV count handoff, next-token staging, and DGO
+  consumption without requiring
+  `copyDeviceSpeculativeOutcomesToHost()` before live-state mutation.
+- DGO now has the matching unpromoted publication-metadata preflight. It
+  validates the resident outcome against the last all-position verifier graph,
+  snapshots pre-verifier base cached-token counts from the KV cache's
+  device-owned sequence metadata into the persistent MTP metadata workspace,
+  and launches `enqueueDeriveSpeculativePublicationMetadata()` on that same
+  verifier stream. The old host base-count upload is forbidden; a missing
+  device count pointer is a hard coherence failure. That same shared CUDA/ROCm
+  derivation now writes
+  `NEXT_CONDITION_TOKENS`: it prefers the sampled terminal ready token when the
+  verifier accepted every row, otherwise it uses the last committed compact
+  output token. `V2_Unit_GpuWorkspaceAllocationPolicy` guards that the helper
+  uses the verifier stream, graph workspace allocation, backend derivation,
+  pre-verifier D2D base-cache snapshot, and no compatibility D2H bridge, host
+  base-count H2D, or stream sync. `V2_Unit_MTPSpecDecodeMetadata` and
+  `V2_Integration_GPUSamplingKernels` cover the next-token rule on CPU math,
+  CUDA, and ROCm graph capture. DGO still must not advertise resident
+  publication until KV cache truncation and logical positions/sequence lengths
+  consume those device buffers atomically.
+- The cache-side handoff is now named in `IKVCache` as
+  `DeviceSequenceStatePublicationRequest`. It requires device-resident target
+  cached-token counts, accepted-state counts, publication-ok flags, and an
+  explicit stream. The contract documents the long-context ring-cache hazard:
+  target count alone cannot recover a wrapped ring head, so implementations need
+  a device-visible base head/count mirror. DGO's direct publication endpoint now
+  checks `supportsDeviceResidentSequenceStatePublication()` and hard-fails with
+  that exact reason before any compatibility host bridge can run. The next
+  Phase 10 slice is implementing that GPU cache mirror and teaching attention
+  dynamic params to consume it.
+- The first mirror slice is in place for regular CUDA/ROCm ring KV caches:
+  `deviceCachedTokenCountPtr()` and `deviceRingHeadPtr()` expose backend-neutral
+  device pointers, and graph-captured dynamic append enqueues a tiny
+  stream-ordered state-advance kernel after writing KV rows. This keeps
+  device-side count/head metadata coherent after replay without a D2H sync or a
+  post-replay H2D upload. TQ and hybrid variants remain guarded unless they use
+  the same dynamic append contract.
+- CUDA/ROCm FP32 attention now has the matching unpromoted device-count path.
+  `ITensorAttention::prepareDynamicAttnParamsFromDeviceSequenceState()` defaults
+  false, while the GPU kernels enqueue a tiny count-to-`AttentionDeviceParams`
+  derivation on the explicit stage stream. `AttentionComputeStage` records that
+  derive step after KV append for regular GPU caches and leaves TQ/hybrid caches
+  on their guarded metadata path. Resident publication is still disabled because
+  accepted-state KV mutation, wrapped-ring-safe target heads, graph signatures,
+  and DGO logical positions still need device-owned publication.
+- The mirror path is coherent outside graph replay too: regular CUDA/ROCm
+  append, logical import, and truncate now refresh device head/count mirrors on
+  explicit streams after host-owned mutations. This prevents the new
+  device-count attention path from reading stale metadata during non-captured
+  GPU execution while keeping captured append replay on the device-advance
+  kernel.
+- Regular CUDA/ROCm ring KV caches now have the next unpromoted cache-side
+  publication primitive:
+  `publishSequenceStateFromDeviceMetadata()` validates the device metadata
+  request and enqueues a tiny wrapped-ring-safe head/count publication kernel on
+  the verifier stream. The kernel advances each live device head by
+  `accepted_state_counts[request]` and writes
+  `target_cached_tokens[request]` as the valid-token count, so it never tries
+  to recover a wrapped ring head from target count alone.
+  `V2_Unit_GpuWorkspaceAllocationPolicy` guards the CUDA/ROCm symmetry,
+  explicit-stream requirement, publication-ok gating, and DGO's continued
+  refusal to advertise resident publication until logical positions and
+  sequence lengths are also device-owned.
+- DGO now has a separate
+  `supportsDeviceResidentLogicalSequenceStatePublication()` gate before any
+  cache-side device publication is enqueued. This keeps the Phase 10 handoff
+  atomic: if regular CUDA/ROCm KV caches later advertise device sequence-state
+  publication, direct resident publication still hard-fails before KV mutation
+  until DGO positions, `sequence_lengths()`, and graph-signature inputs are
+  backed by a real device-owned mailbox. `V2_Unit_GpuWorkspaceAllocationPolicy`
+  guards the ordering as cache-support gate, DGO logical-state gate, then KV
+  mutation.
+- The first DGO logical-state mailbox slice is in place. After resident compact
+  outcome metadata is derived, DGO records a
+  `DeviceResidentLogicalSequenceStateMailbox` that wraps device target cached
+  tokens as both next position and sequence length, carries device next-token
+  and publication-ok buffers, preserves the explicit producer stream, records a
+  backend readiness event, and is invalidated on request/session resets. DGO now
+  exposes the mailbox through a typed
+  `DeviceResidentLogicalSequenceStateHandle` and queues an event wait from the
+  forward-graph live-state prelude without synchronizing the host. Reset API
+  comments now distinguish the request-boundary `clear_cache()` contract from
+  destructive graph/workspace teardown. The support gate remains false until
+  `get_position()`, `sequence_lengths()`, and graph signatures consume that
+  mailbox directly.
+- The next mailbox-consumer prerequisite is now in place: generic
+  `ForwardInput`, `MTPForwardInput`, Qwen/Qwen3.5 graph helpers, `RoPEStage`,
+  and CUDA/ROCm RoPE kernels understand device-resident INT32 position rows.
+  Host explicit positions still pre-upload through the workspace before graph
+  capture, but resident position rows bind directly through
+  `setDynamicDevicePositionIds()` and are rejected on null/default streams.
+  `V2_Unit_GpuWorkspaceAllocationPolicy` guards that this path does not hide an
+  H2D copy, while the Phase 10 focused gate
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_MTPPerfStatsSummary`,
+  `V2_Unit_MTPIterationBenchmarkMatrix`,
+  `V2_Unit_MTPSpecStateContract`,
+  `V2_Unit_MTPSpecDecodeMetadata`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, and
+  `V2_Integration_GPUSamplingKernels` passed on this slice. DGO resident
+  publication remains disabled until the mailbox also feeds graph signatures,
+  `get_position()`, and `sequence_lengths()` without host synchronization.
+- DGO graph-session plumbing now has explicit `withDevicePositionIds()` hooks
+  for full-forward and attention subgraph builds, and the attention-session API
+  passes host and device position inputs separately into `buildAttentionGraph`.
+  `V2_Unit_GpuWorkspaceAllocationPolicy` guards this structural handoff so
+  future mailbox consumers do not collapse resident positions back into an
+  implicit host-position path.
+- Cached forward replay now refreshes explicit RoPE position rows through the
+  common `IComputeStage` dynamic-position hook. The forward graph signature
+  distinguishes device-resident position mode, GPU resident position rows count
+  as stable replay inputs, and cache-hit replay refreshes either host explicit
+  rows or the device pointer before graph capture/replay. This closes the
+  position-row replay prerequisite, but Phase 10 direct resident publication
+  still remains disabled until host `sequence_lengths()`/`get_position()`
+  consumers are removed from the accepted-state path.
+- MTP sidecar replay can now consume the resident logical-state mailbox through
+  `forwardMTPFromDeviceResidentLogicalStateForDeviceSampling()`. DGO rejects
+  non-owned or stale handles by checking device, epoch, stream, event, and
+  mailbox pointers, then feeds `next_condition_tokens_device` plus
+  `target_positions_device` into the normal sidecar graph path. The sidecar
+  executor waits on the mailbox readiness event on its explicit stream and
+  refreshes device position rows through `IComputeStage` before replay. Rank
+  delegation is intentionally single-child only until LocalTP/PP have a
+  domain-wide mailbox map. This is still unpromoted because the call retains a
+  host shadow position for scalar metadata and the stochastic planner still
+  copies compact outcomes to host after resident publication.
+- Phase 10 mailbox ownership is now structural instead of open-coded at each
+  consumer. `DeviceResidentLogicalSequenceStateHandle` owns request-bounds and
+  row-pointer helpers, while DGO's mailbox owns the stream/event/pointer/epoch
+  identity check. The sidecar consumer now uses those helpers before deriving
+  request-local token and position rows, which keeps future getter,
+  sequence-length, and scheduler consumers from drifting into partial
+  ownership checks. Focused gate:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_MTPSpecDecodeMetadata`, and
+  `V2_Unit_PrefillDecodeTransition`.
+- The resident sidecar path no longer reads `state_.positions` as a scalar
+  crutch. Dynamic stages now expose
+  `supportsDeviceResidentDynamicPositionReplay()`: RoPE, embedding, KV append,
+  GDN, and short-conv declare that they ignore or consume device position rows,
+  while attention opts in only for regular GPU KV caches with device cached-token
+  mirrors. The sidecar validates that support before binding resident rows and
+  passes a neutral scalar to `updateDynamicParams()` in device-position mode.
+  This keeps unsupported TQ/hybrid attention hard-failed instead of silently
+  falling back to stale host state. Focused gate:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_MTPSpecDecodeMetadata`,
+  `V2_Unit_PrefillDecodeTransition`, and
+  `V2_Integration_GPUSamplingKernels`.
+- Direct device-resident publication now has the matching host-mirror adoption
+  boundary. `IInferenceRunner::adoptDeviceResidentMTPSpecPublishedHostState()`
+  refreshes `get_position()`/`sequence_lengths()` from the already-built
+  `MTPSpecStepPlanBatch` after the compact outcome host bridge, without calling
+  the host KV/state publisher again. DGO ties this adoption to the current
+  logical-state mailbox and refuses to synchronize or mutate KV. The runner's
+  direct-publication branch now calls adoption instead of leaving host getters
+  stale after skipping `publishAcceptedMTPSpecStateBatch()`. Focused gate:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_MTPSpecDecodeMetadata`,
+  `V2_Unit_PrefillDecodeTransition`, and
+  `V2_Integration_GPUSamplingKernels`.
+- MTP sidecar position planning now has a single guarded host-mirror read
+  boundary. `IInferenceRunner::hostLogicalStateMirrorsDeviceResidentState()`
+  lets DGO report whether a current resident logical-state mailbox has been
+  adopted into host-visible `get_position()`/`sequence_lengths()` mirrors.
+  Recording a mailbox marks those mirrors stale, adopting the validated step
+  plan marks the same live-state epoch fresh, and
+  `OrchestrationRunner::currentMTPBaseSidecarPositionForPlanning()` refuses
+  speculative planning if a caller would read stale host logical state. Focused
+  gate:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_MTPSpecDecodeMetadata`,
+  `V2_Unit_PrefillDecodeTransition`, and
+  `V2_Integration_GPUSamplingKernels`.
+- Direct device-resident KV/logical publication is now enabled for GPU ring
+  caches that expose device head/count mirrors. CUDA and ROCm ring bases
+  advertise `supportsDeviceResidentSequenceStatePublication()` only when both
+  mirrors exist, publish device metadata on the verifier stream, and implement
+  `adoptSequenceStateFromHostMetadata()` so wrapped-ring host heads/counts match
+  the already-enqueued device update without extra GPU work. DGO now returns
+  success from `publishAcceptedMTPSpecStateBatchFromDeviceOutcome()` after KV
+  device publication and resident mailbox recording, then the later adoption
+  bridge refreshes both KV host mirrors and DGO positions from the validated
+  step plan. The remaining Phase 10 bridge is compact outcome and transaction
+  output materialization, not KV/position publication.
+- The all-position stochastic runner path now calls
+  `materializeDeviceSpeculativeOutcomesForHostResponse()` instead of the raw
+  `copyDeviceSpeculativeOutcomesToHost()` hook. This is a structural ownership
+  marker: resident state publication happens first from device metadata, while
+  host materialization is only for emitted response tokens and the temporary
+  host adoption/transaction-plan invariant. Focused gate:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_MTPSpecDecodeMetadata`, and
+  `V2_Unit_PrefillDecodeTransition`.
+- Direct resident publication now includes shifted MTP KV caches in the same
+  atomic handoff as the main KV cache. CUDA/ROCm derive per-depth shifted target
+  counts and wrapped-head deltas from compact verifier metadata on the verifier
+  stream, publish each shifted cache through the same
+  `DeviceSequenceStatePublicationRequest` contract, and adopt matching host
+  mirrors from the validated step plan. DGO now records the logical mailbox
+  readiness event only after main and shifted KV publication kernels are
+  enqueued, so sidecar consumers wait for the full state update instead of only
+  metadata derivation. Focused gate passed:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_MTPSpecDecodeMetadata`,
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Integration_GPUSamplingKernels`, and exact Qwen3.6 CUDA/ROCm
+  SingleDevice stochastic Prefix+MTP parity.
+- Rejected-token correction shifted commits now consume the same resident
+  logical-state mailbox. `IInferenceRunner`,
+  `DeviceGraphOrchestrator`, and `RankOrchestrator` expose
+  `commitMTPShiftedRowFromDeviceResidentLogicalState()`, which validates the
+  mailbox owner/epoch, waits on its readiness event on an explicit stream, reads
+  `NEXT_CONDITION_TOKENS` on device, and appends the shifted MTP row without
+  using the host-materialized compact token. Multi-participant TP remains a hard
+  fail until a domain-wide logical mailbox exists. Focused gate passed:
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, exact Qwen3.6 CUDA/ROCm SingleDevice
+  stochastic Prefix+MTP parity, and the bounded CUDA/ROCm MoE stochastic sweep
+  `benchmark_results/mtp_vllm_style/20260613T_phase10_resident_correction_token`.
+  The sweep keeps MoE stochastic speed-negative: CUDA best fixed d2 is
+  75.8 tok/s versus 114.7 baseline and ROCm best fixed d3 is 54.3 tok/s versus
+  68.8 baseline. CUDA's compact bridge is now sub-ms, so CUDA remains
+  verifier/condition limited; ROCm still drains about 261 ms at the outcome
+  boundary in the best lane.
+- The resident logical-state mailbox now carries accepted-state counts as a
+  first-class device pointer alongside target positions, sequence lengths,
+  next-condition tokens, and publication-ok flags. The accepted-state count is
+  the correction replay boundary after a stochastic rejection, so future
+  transaction-output consumers can reason from device metadata rather than
+  rebuilding that boundary from host-materialized compact outcomes. Focused gate
+  passed: `V2_Unit_PrefillDecodeTransition` and
+  `V2_Unit_GpuWorkspaceAllocationPolicy`.
+- Resident stochastic outcomes now carry a response-ready event recorded on the
+  producer stream immediately after compact verifier rows are ready and before
+  any direct state-publication work can enqueue behind them. The compatibility
+  host bridge creates its own explicit response stream, waits on that event,
+  copies compact output tokens/metadata, and synchronizes only that bridge
+  stream; synchronizing the producer stream is now guarded as a regression.
+  Focused gate passed: `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, and exact Qwen3.6 CUDA/ROCm
+  SingleDevice stochastic Prefix+MTP parity. The bounded MoE stochastic sweep
+  `benchmark_results/mtp_vllm_style/20260613T_phase10_response_ready_event`
+  remains speed-negative: CUDA best fixed d2 is 71.9 tok/s versus 113.7
+  baseline, while ROCm best fixed d3 is 51.9 tok/s versus 66.9 baseline. CUDA
+  is verifier/condition limited with sub-ms bridge time. ROCm still reports a
+  large bridge wait, which now reflects waiting for compact summary/verifier
+  work itself rather than extra state publication queued after the response
+  event. The next Phase 10 implementation target remains device-side
+  transaction/output planning and lower verifier/condition cost, not more
+  compact-copy enqueue tuning.
+- A fixed-depth-only MoE stochastic stage-timing pass
+  `benchmark_results/mtp_vllm_style/20260613T_phase10_fixed_depth_stage_timing`
+  confirms that dynamic-controller tuning is not the current floor. CUDA best
+  fixed d1/d2 is about 73.9 tok/s versus 113.5 baseline, with 297-314 ms of
+  verifier time and 220-221 ms of condition-forward time over the short lane.
+  ROCm best fixed d1 is 42.5 tok/s versus 68.1 baseline, with 415-495 ms
+  verifier time, 273-323 ms condition-forward time, and bridge waits that still
+  drain real compact summary/verifier producer work. The next Phase 10 target
+  is vLLM-style pending-condition verifier rows: after a stochastic rejection,
+  carry the correction token as the first input row of the next target verifier
+  transaction and draft from the accepted-prefix state, instead of running that
+  correction token through a standalone one-token main `condition_forward`
+  before sidecar drafting. Controller polishing is explicitly deferred until
+  fixed d1/d2/d3 lanes become speed-positive.
+- vLLM-style pending-condition verifier rows are now implemented for stochastic
+  all-position publication. After a rejection, the correction token is carried
+  as row zero of the next target verifier transaction, sidecar drafting starts
+  from the accepted-prefix state, and only newly generated tokens are emitted
+  or recorded. Focused gates passed:
+  `V2_Unit_PrefillDecodeTransition` plus the adjacent
+  `V2_Unit_(MTPDecodeCatchup|MTPSpecDecodeMetadata|MTPSpecTransactionPlan|MTPRejectionSampler)`
+  cluster. The bounded fixed-depth MoE stochastic refresh
+  `benchmark_results/mtp_vllm_style/20260613T_phase10_pending_condition_rows`
+  shows the standalone condition-forward tax is gone (`condition_ms=0` on
+  CUDA and ROCm), but Phase 10 remains red: CUDA best fixed d2 is
+  77.5 tok/s versus 113.3 baseline, and ROCm best fixed d3 is 47.1 tok/s
+  versus 68.3 baseline. The next fixed-depth target is no longer correction
+  replay. CUDA is verifier, accepted-state publication, and outcome limited;
+  ROCm has the same verifier/publication cost and additionally drains large
+  compact outcome work at the response bridge for d1/d2. Keep dynamic-policy
+  work parked until those fixed-depth lanes are speed-positive.
+- Direct resident publication now mirrors the normal publication contract for
+  the active single-request GPU path: it waits for shifted MTP KV readiness,
+  publishes main and shifted KV from device-derived counts, restores
+  GDN/short-conv verifier capture rows from device `accepted_state_slot_indices`,
+  selects terminal hidden from the same device metadata, advances the live
+  replay epoch, and only then records the resident logical-state mailbox. The
+  direct device-resident stochastic lane now also skips success-path live
+  rollback checkpoint capture and carries only a logical base stamp, matching
+  the intended vLLM-style atomic transaction shape.
+  Focused gates passed:
+  `V2_Unit_(PrefillDecodeTransition|GpuWorkspaceAllocationPolicy)`, the
+  adjacent MTP transaction/state unit cluster, and exact CUDA/ROCm Qwen3.6 MoE
+  SingleDevice `MTPStochasticSamplingVerifierRuns`. The bounded probe
+  `benchmark_results/mtp_vllm_style/20260613T194327Z_phase10_checkpoint_skip_probe`
+  shows checkpoint time is now zero and direct publication remains bounded
+  (CUDA about 12-15 ms, ROCm about 23-27 ms over the short lane), while the
+  remaining hot boundary is still the host-visible stochastic outcome/plan
+  bridge plus verifier work, especially on ROCm.
+  `V2_Unit_GpuWorkspaceAllocationPolicy` now guards that this endpoint cannot
+  regress to KV-only publication before the mailbox.
+  A clean same-run non-profiling check,
+  `benchmark_results/mtp_vllm_style/20260613T194526Z_phase10_checkpoint_skip_same_run`,
+  keeps the lane unaccepted: CUDA fixed d3 is effectively break-even
+  (128.4 tok/s versus 128.3 baseline), while ROCm remains negative
+  (best fixed d3 66.1 tok/s versus 72.1 baseline). The next fixed-depth slice
+  should consume device-resident transaction output directly and reduce the
+  verifier/outcome boundary instead of polishing dynamic-depth policy,
+  reintroducing host-plan dependencies, or restoring success-path checkpoints.
+- The stochastic host response bridge now reuses a persistent explicit GPU
+  stream instead of creating and destroying a CUDA/HIP stream on every decode
+  step. This keeps the no-null-stream contract while removing a ROCm-visible
+  runtime setup cost from fixed-depth MTP. Focused gates passed:
+  `V2_Unit_(GpuWorkspaceAllocationPolicy|PrefillDecodeTransition|MTPPerfStatsSummary|MTPIterationBenchmarkMatrix)`
+  plus exact CUDA/ROCm Qwen3.6 MoE SingleDevice stochastic Prefix+MTP parity.
+  The bounded probe
+  `benchmark_results/mtp_vllm_style/20260613T195903Z_phase10_persistent_bridge_stream_probe`
+  shows measured rows have zero bridge-stream creation time and only stream
+  reuses. The clean same-run check
+  `benchmark_results/mtp_vllm_style/20260613T200052Z_phase10_persistent_bridge_stream_same_run`
+  still leaves Phase 10 red: CUDA fixed d3 is break-even
+  (128.7 tok/s versus 128.8 baseline), and ROCm improves but remains negative
+  (best fixed d2 69.5 tok/s versus 74.1 baseline). The next fixed-depth target
+  is therefore verifier/compact-outcome producer latency and device-resident
+  transaction output, not stream allocation, checkpoint capture, or dynamic
+  controller tuning.
+- The resident stochastic verifier-input path now skips the final sidecar flush
+  before target verification when all verifier inputs are backed by device
+  sample-ready events. This removes a real host-visible sync without changing
+  served inference semantics: `decodeStep()` still returns actual emitted token
+  ids, and benchmark mode still exercises that same contract. Focused gates
+  passed: `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, and release `llaminar2`. The ROCm
+  MoE stochastic d1 probe
+  `benchmark_results/mtp_vllm_style/20260613T203857Z-phase10-skip-sidecar-flush-rocm-moe-d1`
+  shows the skip counter firing for every verifier step and improves fixed d1
+  to 70.4 tok/s versus a 77.3 tok/s baseline, but Phase 10 remains red. The
+  outcome bridge still waits about 2081 ms over the measured lane because it is
+  mostly waiting on queued GPU producer work, not copying compact bytes.
+- Do not add benchmark-only token-count shortcuts. The verifier bonus token is
+  a host-visible output prediction, but live model state has only advanced
+  through the accepted verifier input prefix; the bonus token must still be
+  forwarded as a later condition before it can become published state. The
+  vLLM-aligned next step is therefore a resident next-input/output boundary:
+  served inference may stream compact token ids to the host at real output
+  boundaries, while the next main decode/sidecar input consumes the same token
+  from a device-resident slot instead of round-tripping through a CPU shadow.
+- The served-inference resident input boundary is now active for the scalar GPU
+  stochastic lane. Rejected corrections and bonus-ready verifier tokens both
+  preserve a resident logical-state mailbox, and the next sidecar consumes that
+  mailbox rather than re-uploading the host-visible token shadow. The regression
+  keeps compatibility host-plan publication and direct device-resident
+  publication as separate contracts. Focused gates passed:
+  `V2_Unit_PrefillDecodeTransition` and
+  `V2_Unit_GpuWorkspaceAllocationPolicy`.
+  The narrow ROCm MoE stochastic d1 check
+  `benchmark_results/mtp_vllm_style/20260613T211306Z-phase10-resident-ready-rocm-moe-d1`
+  is near break-even at 76.5 tok/s versus a 77.6 tok/s baseline, with
+  resident-ready handoff used 170 times and resident correction handoff 37
+  times. The remaining hot timer is still the response-bound compact outcome
+  wait: 4378 ms total over 210 verifier steps, while enqueue is only 1.6 ms.
+  That points at verifier/summary producer latency exposed at the host response
+  boundary, not compact-copy byte volume.
+- The compact vLLM recovered-token verifier is now the accepted GPU stochastic
+  one-hot draft primitive. CUDA/ROCm device-token batch verifier kernels can
+  treat `q` as one-hot at the greedy draft token and sample rejected rows with
+  vLLM-style inverse-exponential residual noise, without materializing a draft
+  probability table. Focused
+  `V2_(Unit_MTPRejectionSampler|Unit_PrefillDecodeTransition|Integration_GPUSamplingKernels)`
+  gates pass. The ROCm MoE d1 check
+  `benchmark_results/mtp_vllm_style/20260613T_phase10_rocm_moe_compact_vllm_recovered_d1`
+  restores acceptance versus the rejected compact-CDF shortcut (78.1%
+  acceptance, 78.4 tok/s versus 77.9 baseline) but remains only break-even.
+  vLLM source inspection confirms the next alignment target: keep sampled
+  output tensors and transaction metadata device-owned, copy response tokens
+  asynchronously for the serving layer, and remove the host-materialized
+  transaction/adoption plan from the GPU state-mutation boundary.
+- Resident logical-state metadata now carries device-side transaction
+  predicates: all-drafts-accepted and stopped flags are derived in the same
+  CUDA/ROCm graph-captured metadata pass as accepted counts, target cache
+  counts, next-condition tokens, and validity. The DGO mailbox and typed
+  `DeviceResidentLogicalSequenceStateHandle` expose those predicates with the
+  same stream/event/epoch ownership contract, and the mock runner plus captured
+  GPU sampling integration tests read them back. Focused gate passed:
+  `V2_(Unit_(PrefillDecodeTransition|MTPSpecDecodeMetadata|GpuWorkspaceAllocationPolicy)|Integration_GPUSamplingKernels)`.
+  This is a prerequisite for the next Phase 10 slice: graph-captured
+  continuation/prelaunch must branch from resident predicates instead of
+  materializing compact outcomes on the CPU to discover stop/all-accepted
+  state.
+- The first resident prelaunch overlap slice is implemented for the scalar GPU
+  stochastic lane. Direct resident publication now enqueues the next first MTP
+  sidecar from the resident logical-state mailbox before the compatibility
+  compact-outcome host bridge materializes served tokens, including normal
+  stop-token chat lanes. The following accepted-ready step reuses that sidecar
+  instead of replaying shifted-cache work. Rejected lanes that do not expose a
+  compatible ready/pending resident continuation drop stale prelaunches, and
+  completed requests discard terminal-step prelaunches before they can affect
+  response state. Focused gate passed:
+  `V2_(Unit_(PrefillDecodeTransition|GpuWorkspaceAllocationPolicy|MTPPerfStatsSummary|MTPIterationBenchmarkMatrix)|Integration_GPUSamplingKernels)`.
+  The iteration perfstats summary now exposes prelaunch enqueue time, launches,
+  reuses, drops, and completed-request discards so real-model matrices can prove
+  whether overlap is firing without confusing terminal waste for stale reuse.
+- Seeded device-derived vLLM verifier thresholds were benchmark-rejected for
+  production use. The isolated CUDA/ROCm primitive remains graph-capturable and
+  unit/integration-equivalent, but the full served stochastic stream includes
+  sampler state, bonus-token consumption, and recovered-token inverse sampling.
+  On ROCm MoE d1, omitting explicit accept/residual threshold arrays collapsed
+  default-seed acceptance to 8.6%. Production scalar and request-batched
+  descriptors now always pass value-owned explicit thresholds until a shared
+  end-to-end RNG stream contract is designed and proven. Focused gates passed:
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_MTPPerfStatsSummary`,
+  `V2_Unit_MTPIterationBenchmarkMatrix`, and
+  `V2_Integration_GPUSamplingKernels`. The corrective benchmark
+  `benchmark_results/mtp_vllm_style/20260613T234850Z-phase10-rocm-moe-d1-explicit-thresholds`
+  restored ROCm MoE d1 acceptance to 69.9%; Phase 10 remains red because the
+  compact outcome/producer wait still prevents a speedup. A later recheck,
+  `benchmark_results/mtp_vllm_style/20260614T010724Z-phase10-rocm-moe-d1-seeded-threshold-recheck`,
+  again rejected production seeded derivation: fixed d1 reached only
+  66.7 tok/s with 63.8% acceptance versus a 73.4 tok/s baseline, so explicit
+  thresholds remain the production contract.
+- A later processed-logit bonus wiring experiment was also benchmark-rejected.
+  The primitive stayed useful for instrumentation (`stochastic_processed_rows_build_gpu`),
+  but replacing the production compact target+bonus distribution path collapsed
+  ROCm MoE d1 acceptance to 12.0% and throughput to 45.96 tok/s in
+  `20260614T002748Z-phase10-rocm-moe-d1-lazy-processed-bonus-clean`.
+  Restoring the compact bonus row recovered 70.9% acceptance and 69.53 tok/s in
+  `20260614T003328Z-phase10-rocm-moe-d1-compact-bonus-restore-clean`. Do not
+  reintroduce processed-bonus production sampling until a dedicated
+  sampler-trajectory equivalence gate proves compact and processed paths produce
+  the same served token stream, including bonus-token consumption.
+- The follow-up perfstats row
+  `20260614T003922Z-phase10-rocm-moe-d1-compact-bonus-restore-perfstats`
+  confirms the remaining ROCm d1 wait is producer work, not byte-copy overhead:
+  compact D2H enqueue is 0.36 ms total, while the response bridge waits 949 ms.
+  Visible producers are target+bonus distribution build (142 ms), verifier
+  forward (215 ms), and prelaunch/sidecar overlap work (93 ms over the short
+  lane). The next Phase 10 tuning target should therefore reduce or overlap
+  real GPU producer work and move response flushing outside live-state
+  scheduling; more D2H copy plumbing is unlikely to change throughput.
+- GPU replay attribution now makes that producer work concrete. In
+  `20260614T004817Z-phase10-rocm-moe-d1-gpu-replay-attribution`, ROCm fixed d1
+  is 64.1 tok/s with 75.5% acceptance under instrumentation, compact D2H wait
+  is only 1.1 ms, and `main_verifier_graph_replay_gpu_ms` is 785 ms over 47
+  replays, about 16.7 ms per target-verifier replay. The main verifier replay
+  plan is 405 captured stages per replay; captured plan metadata now surfaces
+  in `stage_summary.tsv` as `graph_replay_plan_stage_types.<TYPE>` rows so
+  future matrices can distinguish whole-verifier graph economics from compact
+  copy plumbing. The immediate tuning target is the full MoE verifier graph,
+  not another host bridge tweak.
+- A focused ROCm grouped-MoE regression now mutates route indices and weights
+  after graph capture and proves replay still matches eager grouping, so the
+  ROCm d3 acceptance collapse is not a low-level routed/shared expert grouping
+  bake-in. `DeviceGraphOrchestrator` now distinguishes
+  `supportsMTPSidecarPreservesMainState()` from the narrower
+  sidecar-replay-after-spec-publication capability. Dense GPU sidecars keep
+  replay warm; MoE sidecars recapture after accepted/rejected publication until
+  their router/expert transaction metadata is vLLM-style persistent and has a
+  full replay equivalence gate.
+- The follow-up Release lane
+  `20260614T035626Z-phase10-rocm-moe-d3-sidecar-replay-contract-summary` confirms the
+  split fixed the normal ROCm d3 acceptance collapse: fixed d3 reaches
+  82.0 tok/s versus a 78.6 baseline with 74.3% acceptance, and the matrix
+  summary records `sidecar_replay_reset_after_spec_publication=139` at the publication
+  boundaries. This moves ROCm MoE stochastic from red correctness/perf collapse
+  to amber small-win status. Phase 10 remains open because the target path is
+  persistent vLLM-style MoE sidecar metadata, not recurring recapture.
+- Phase 10 attribution now promotes verifier stage-type timings into the
+  benchmark matrix summary. The ROCm d3 evidence row
+  `20260614T041420Z-phase10-rocm-moe-d3-sidecar-reset-timer` shows
+  sidecar replay reset is only 10.7 ms total, while main-verifier graph replay
+  is 1503 ms. Sampled verifier stage timing is led by MoE expert FFN
+  (151 ms), then router (21 ms), GDN projection/recurrence, attention, and
+  LM head. This confirms the next vLLM-aligned implementation target is
+  persistent/fused MoE verifier execution and device-resident transaction
+  metadata, not more compact D2H or reset plumbing.
+- ROCm ordinary `seq_len=1` MoE runtime decode now mirrors CUDA's fused
+  runtime grouped-decode hook instead of falling back to stage-owned
+  gate/up TensorBase scratch handoff. The regression
+  `V2_Integration_ROCmMoEKernel` covers fused-vs-two-step equivalence,
+  explicit-stream HIP graph capture, and the rule that runtime-table semantic
+  validation belongs at graph-build/stage setup boundaries rather than as a
+  hot-path D2H check. A bounded real-runner probe,
+  `20260614T043812Z-phase10-rocm-moe-d3-fused-runtime-decode`, confirms this
+  is a backend-symmetry guard rather than the active MTP verifier bottleneck:
+  MoE stochastic verifier rows are `M=3/4` and still use the combined
+  routed+shared grouped prefill pipeline, with producer-side sidecar/verifier
+  graph work dominating bridge cost.
 - The tuning dashboard has been reshaped into an explicit device/topology
   matrix covering SingleDevice, LocalTP CUDA2, LocalTP ROCm2/ROCm4, LocalPP,
   NodeLocalTP, and ExpertOverlay with RAG columns for dense/MoE and
   greedy/stochastic. Missing benchmark lanes must stay amber/red until a fresh
   same-run matrix exists for that exact mode and degree.
+- Qwen3.6 MoE all-position accepted-state publication is green across CPU,
+  CUDA, and ROCm after splitting deferred verifier readiness into two explicit
+  contracts: logits remain a one-shot stream handoff owned by sampling, while
+  publishable verifier KV/GDN/short-conv row state is protected by a separate
+  event-backed dependency that accepted-state publication consumes later. This
+  fixes the CUDA deferred-sync regression where sampling consumed the verifier
+  stream and publication restored the previous verifier row. Focused gates
+  passed:
+  `V2_Unit_DeviceGraphOrchestrator`,
+  `V2_Unit_ForwardGraphTypes`,
+  `V2_Unit_ForwardExecutionEngine`,
+  `V2_Unit_ForwardExecutionEngineAdvanced`,
+  `V2_Integration_Parity_Qwen36MoE_CPU_SingleDevice_Qwen36MoECPUSingleDevicePrefixMTPParity_MainVerifierPublishedStateMatchesSerialContinuation`,
+  `V2_Integration_Parity_Qwen36MoE_CUDA_SingleDevice_Qwen36MoECUDASingleDevicePrefixMTPParity_MainVerifierPublishedStateMatchesSerialContinuation`, and
+  `V2_Integration_Parity_Qwen36MoE_ROCm_SingleDevice_Qwen36MoEROCmSingleDevicePrefixMTPParity_MainVerifierPublishedStateMatchesSerialContinuation`.
+- CUDA/ROCm GDN and short-conv verifier publication now refresh both the
+  backend-owned device state and the hybrid KV cache host mirrors from the
+  accepted verifier row. This fixed the CUDA Qwen3.6 MoE continuation
+  divergence where publication was device-correct but a later graph rebuild
+  resumed from stale host hybrid state. Direct CUDA/ROCm GDN tests assert that
+  the host mirror equals the accepted snapshot row, and the CUDA MoE
+  published-state parity regression passed after the fix.
+- The Phase 10 multi-row grouped verifier guard is green on CUDA and ROCm.
+  CUDA and ROCm depth-3 Qwen3.6 MoE path guards now assert that MTP verifier
+  rows M=2/3/4 use graph-capturable combined routed+shared grouped prefill
+  rather than falling back to serial or split shared-expert lanes. CUDA uses
+  tile-M=4 for M=3/4; ROCm intentionally keeps M=3/4 on the tuned tile-M=2
+  K-part path. Focused kernel tests also prove the combined verifier prefill
+  matches row-wise serial verifier references on both backends.
 - No default-enable proposal is allowed until the active dashboard matrix has
   same-run parity and benchmark evidence for the exact backend/model/sampling
   lanes under consideration.
@@ -2523,6 +3993,52 @@ This must cover, as applicable:
 - MoE CPU/CUDA/ROCm stochastic verifier parity and deterministic reuse after
   `clearCache()`.
 - ROCm MoE ExpertOverlay parity remains separate from SingleDevice acceptance.
+
+### E2E Server Gate
+
+The release E2E server harness must include real served-inference coverage for:
+
+- Existing Qwen2.5/Qwen3.5 CPU, CUDA, ROCm, TP, and PP smoke lanes.
+- Qwen3.6 dense and Qwen3.6 MoE SingleDevice CPU, CUDA, and ROCm baseline
+  lanes. Bare `cpu` is intentional here because the served E2E path should
+  cover the dual-socket NodeLocal CPU configuration, not just `cpu:0`.
+- Qwen3.6 dense and MoE prefix-cache server lanes with RAM storage and terminal
+  state restore policy enabled.
+- Qwen3.6 dense and MoE MTP server lanes with fixed greedy draft-depth coverage.
+- Qwen3.6 MoE LocalTP feature lanes for 2x CUDA, 2x ROCm, and 4x ROCm. Each
+  LocalTP degree must run both RAM prefix-cache and fixed-depth MTP server
+  variants so cache restore, shifted MTP state, and TP collectives are covered
+  by the same HTTP/SSE/shutdown checks as SingleDevice.
+- Qwen3.6 MoE ExpertOverlay feature lanes for the target production tiered
+  residency shapes: 2x ROCm hot plus 2x CPU cold, 2x CUDA hot plus 2x CPU cold,
+  and 2x CUDA hot plus 2x ROCm warm plus 2x CPU cold. These lanes must run
+  prefix-cache and MTP variants with the placement-fingerprint policy so
+  overlay placement remains a first-class restore contract. Overlay E2E domains
+  must declare deterministic ownership with `owner=` or `ranks=`; ambiguous
+  domains are validation failures, not acceptable best-effort launches.
+
+Current ExpertOverlay production status:
+
+- Root-owned local overlay execution is the accepted path today. Existing
+  parity covers ROCm2TP-hot plus CPU2LocalTP-cold where the root rank owns the
+  graph-native sparse dispatch, local expert, and return-reduce work.
+- Remote CPU-cold and warm participant ranks are intentionally fail-closed in
+  production. A failed ROCm2+CPU2 served E2E attempt proved that wiring
+  non-root ranks through a scalar `MoEGraphRoleRunner` creates unmatched MPI
+  ordering against the root graph and can deadlock.
+- The remote ExpertOverlay E2E lanes remain off the default server gate until a
+  real participant graph exists: root and non-root ranks must run matched
+  `MoEOverlayMPISparseCollectiveContext` dispatch, local-expert, and
+  return-reduce stages for every request/decode step. Once that integration
+  gate is green, enable the three target overlay suites in the default E2E
+  harness.
+
+Feature variants run the normal REST request matrix and skip only duplicate
+optional long-context helpers; baseline Qwen3.6 lanes remain eligible for the
+long-context stress path. Prefix-cache probes validate their own shared-prefix
+answers, while generic OpenAI response-format checks use the ordinary
+cache-clear response so feature probes do not become brittle when a thinking
+model exhausts its token budget after already producing the checked answer.
 
 ### Mandatory Benchmark Matrix Gate
 

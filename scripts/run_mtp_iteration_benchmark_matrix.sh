@@ -475,7 +475,7 @@ if [[ ! -x "${perf_summary_script}" ]]; then
   chmod +x "${perf_summary_script}" 2>/dev/null || true
 fi
 
-printf 'topology\tdevice\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\trequest_batch\tdepth_updates\tdepth_promotions\tdepth_demotions\tdepth_windows\tlast_depth_reason\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tstochastic_physical_verify_rows\tstochastic_semantic_verify_rows\tstochastic_post_reject_rows\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tsampling_enqueue_ms\tstochastic_batch_outcome_ms\tstochastic_batch_d2h_sync_ms\tgreedy_summary_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
+printf 'topology\tdevice\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\trequest_batch\tdepth_updates\tdepth_promotions\tdepth_demotions\tdepth_windows\tlast_depth_reason\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tstochastic_physical_verify_rows\tstochastic_semantic_verify_rows\tstochastic_post_reject_rows\tstochastic_seeded_device_threshold_rows\tverifier_economy_dense\tverifier_economy_moe\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcondition_skipped_pending\tpending_condition_rows\tfirst_token_pending_condition_rows\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tsampling_enqueue_ms\tstochastic_distribution_build_gpu_ms\tstochastic_distribution_batch_build_gpu_ms\tstochastic_processed_rows_build_gpu_ms\tstochastic_batch_outcome_ms\tresident_outcome_enqueue_ms\tresident_outcome_host_bridge_ms\tstochastic_batch_gpu_reducer_ms\tfirst_sidecar_prelaunch_ms\tfirst_sidecar_prelaunches\tfirst_sidecar_prelaunch_reuses\tfirst_sidecar_prelaunch_drops\tfirst_sidecar_prelaunch_discarded_complete\tfirst_sidecar_resident_ready_inputs\tfirst_sidecar_resident_condition_inputs\tsidecar_device_token_inputs\tsidecar_device_token_inputs_from_host\tsidecar_device_token_inputs_from_device\toutcome_catchup_plan_ms\ttransaction_plan_ms\thost_state_adoption_ms\ttransaction_output_commit_ms\tstochastic_batch_d2h_sync_ms\tstochastic_batch_d2h_enqueue_ms\tstochastic_batch_d2h_wait_ms\tbridge_stream_create_ms\tbridge_stream_creations\tbridge_stream_reuses\tmain_decode_graph_replay_gpu_ms\tmain_verifier_graph_replay_gpu_ms\tmain_verifier_stage_sample_gpu_ms\tmain_verifier_moe_expert_ffn_gpu_ms\tmain_verifier_moe_router_gpu_ms\tmain_verifier_gdn_projection_gpu_ms\tmain_verifier_gdn_recurrence_gpu_ms\tmain_verifier_attention_gpu_ms\tmain_verifier_lm_head_gpu_ms\tsidecar_graph_replay_gpu_ms\tsidecar_replay_reset_ms\tgreedy_summary_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\tsidecar_replay_reset_after_spec_publication\tsidecar_replay_preserved_for_spec_publication\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
 printf 'topology\tdevice\tmodel\tmode\tvariant\tdomain\tphase\tcontext\tname\ttotal_ms\tcount\tavg_us\tstage_count\tsource\tperfstats\n' > "${stage_summary_path}"
 : > "${commands_path}"
 
@@ -555,14 +555,35 @@ append_stage_summary() {
     --arg variant "${variant}" \
     --arg perfstats "${perf_path}" \
     '
-      (.records // [])
-      | map(select(
-          (.kind // "") == "timer"
-          and ((.domain // "") == "mtp" or (.domain // "") == "stage_gpu")
-          and ((.phase // "") == "decode")
-          and ((.total_ms // 0) > 0)
-        ))
-      | sort_by((.total_ms // 0)) | reverse | .[:40]
+      def timer_rows:
+        (.records // [])
+        | map(select(
+            (.kind // "") == "timer"
+            and ((.domain // "") == "mtp" or (.domain // "") == "stage_gpu")
+            and ((.phase // "") == "decode")
+            and ((.total_ms // 0) > 0)
+          ))
+        | sort_by((.total_ms // 0)) | reverse | .[:40];
+
+      def graph_plan_rows:
+        (.records // [])
+        | map(select(
+            (.kind // "") == "counter"
+            and (.domain // "") == "stage_gpu"
+            and (.phase // "") == "decode"
+            and ((.name // "") | startswith("graph_replay_plan_"))
+            and ((.value // 0) > 0)
+          ))
+        | sort_by(
+            (.tags.context // ""),
+            (.name // ""),
+            (.tags.segment_type // ""),
+            (.tags.stage_type // ""),
+            (.tags.type // "")
+          )
+        | .[:120];
+
+      (timer_rows + graph_plan_rows)
       | .[]
       | [
           $topology,
@@ -573,11 +594,20 @@ append_stage_summary() {
           (.domain // ""),
           (.phase // ""),
           (.tags.context // ""),
-          (.name // ""),
+          (
+            if (.kind // "") == "counter" then
+              (.name // "") +
+              (if (.tags.stage_type // "") != "" then "." + .tags.stage_type
+               elif (.tags.type // "") != "" then "." + .tags.type
+               else "" end)
+            else
+              (.name // "")
+            end
+          ),
           (.total_ms // 0),
-          (.count // 0),
+          (if (.kind // "") == "counter" then (.value // 0) else (.count // 0) end),
           (.avg_us // 0),
-          (.tags.stage_count // ""),
+          (if (.kind // "") == "counter" then (.value // "") else (.tags.stage_count // "") end),
           (.tags.source // ""),
           $perfstats
         ] | @tsv

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <set>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -554,6 +555,7 @@ namespace llaminar2
                 input.batch_size,
                 input.kv_cache,
                 input.position_ids,
+                input.position_ids_device,
                 device,
                 sidecar_stage_prefix,
                 /*layer_idx_is_cache_local=*/true);
@@ -573,11 +575,12 @@ namespace llaminar2
             mtp_buffers,
             /*layer_idx=*/0,
             input.seq_len,
-            input.batch_size,
-            input.kv_cache,
-            input.position_ids,
-            device,
-            input.sequence_lengths,
+                input.batch_size,
+                input.kv_cache,
+                input.position_ids,
+                input.position_ids_device,
+                device,
+                input.sequence_lengths,
             sidecar_stage_prefix,
             /*layer_idx_is_cache_local=*/true);
         if (attention.size() == 0)
@@ -662,10 +665,12 @@ namespace llaminar2
         IKVCache *kv_cache,
         const int *position_ids,
         DeviceId device,
-        const std::vector<int> *sequence_lengths)
+        const std::vector<int> *sequence_lengths,
+        const void *position_ids_device)
     {
         if (isGDNLayer(layer_idx))
         {
+            (void)position_ids_device;
             return buildGDNAttentionGraph(layer, buffers, layer_idx,
                                           seq_len, batch_size, kv_cache, device);
         }
@@ -674,7 +679,7 @@ namespace llaminar2
             // Full attention layers — custom Qwen3.5 FA path with Q gate split
             return buildFAAttentionGraph(
                 layer, buffers, layer_idx, seq_len, batch_size,
-                kv_cache, position_ids, device, sequence_lengths);
+                kv_cache, position_ids, position_ids_device, device, sequence_lengths);
         }
     }
 
@@ -693,6 +698,10 @@ namespace llaminar2
     {
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
+        const std::string workspace_namespace =
+            prefix.empty() || prefix.back() != '_'
+                ? prefix
+                : prefix.substr(0, prefix.size() - 1);
         int total_tokens = batch_size * seq_len;
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
@@ -755,8 +764,27 @@ namespace llaminar2
             config_.compute_all_position_logits &&
             config_.mtp.enabled &&
             (device.is_cpu() || device.is_cuda() || device.is_rocm());
+        if (verifier_state_capture_supported &&
+            batch_size > 1 &&
+            seq_len > 1)
+        {
+            /*
+             * GDN recurrence and short-conv kernels currently expose one live
+             * state per layer and capture snapshots as [row, state]. A batched
+             * all-position verifier needs [request, row, state] plus
+             * request-isolated live state; otherwise the last row of request N
+             * becomes the initial recurrent state for request N+1.
+             */
+            throw std::runtime_error(
+                "Qwen3.5/3.6 GDN all-position verifier request batches require "
+                "request-aware recurrent-state capture and live-state banks");
+        }
         const int verifier_state_capture_rows =
             verifier_state_capture_supported ? resolveMTPMaxTargetQueryRows(config_.mtp) : 0;
+        const bool force_decode_equivalent_gdn_verifier_prefill =
+            verifier_state_capture_supported &&
+            total_tokens > 1 &&
+            total_tokens <= 4;
 
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm
@@ -794,6 +822,8 @@ namespace llaminar2
         proj_params.prepared_ref_b = preparedRefForGraphWeight(layer_bindings.ssm_beta, device);
         proj_params.output_b = buffers.get(BufferId::GDN_BETA);
         proj_params.n_b = n_v_heads; // Beta is per-value-head
+        proj_params.force_decode_equivalent_verifier_prefill =
+            force_decode_equivalent_gdn_verifier_prefill;
 
         proj_params.input_buffer_id = BufferId::NORMALIZED;
         proj_params.output_qkv_buffer_id = BufferId::GDN_QKV;
@@ -817,9 +847,12 @@ namespace llaminar2
         conv_params.bias = nullptr; // Conv bias from ssm_dt.bias if available
         conv_params.conv_state = gdn_state->conv_state.data();
         conv_params.seq_len = total_tokens;
+        conv_params.request_count = batch_size;
+        conv_params.request_seq_len = seq_len;
         conv_params.channels = qkv_dim;
         conv_params.kernel_size = config_.gdn.conv_kernel_size;
         conv_params.layer_idx = layer_idx;
+        conv_params.workspace_namespace = workspace_namespace;
         conv_params.verifier_state_capture_rows = verifier_state_capture_rows;
         conv_params.speculative_state_slot_rows = verifier_state_capture_rows;
 
@@ -844,6 +877,7 @@ namespace llaminar2
         GDNRecurrenceStage::Params rec_params;
         rec_params.device_id = device;
         rec_params.layer_idx = layer_idx;
+        rec_params.workspace_namespace = workspace_namespace;
         rec_params.Q = buffers.get(BufferId::GDN_QKV); // Will be split by kernel
         rec_params.K = buffers.get(BufferId::GDN_QKV); // Same tensor, offset by kernel
         rec_params.V = buffers.get(BufferId::GDN_QKV); // Same tensor, offset by kernel
@@ -854,6 +888,8 @@ namespace llaminar2
         rec_params.output = buffers.attn_output;
         rec_params.recurrence_state = gdn_state->recurrence_state.data();
         rec_params.seq_len = total_tokens;
+        rec_params.request_count = batch_size;
+        rec_params.request_seq_len = seq_len;
         rec_params.n_heads = n_v_heads;   // Recurrence runs with value head count
         rec_params.n_k_heads = n_k_heads; // Key head count for QKV split
         rec_params.d_k = d_k;
@@ -972,6 +1008,7 @@ namespace llaminar2
         int batch_size,
         IKVCache *kv_cache,
         const int *position_ids,
+        const void *position_ids_device,
         DeviceId device,
         const std::string &stage_prefix_override,
         bool layer_idx_is_cache_local)
@@ -1007,6 +1044,12 @@ namespace llaminar2
         const int q_n = static_cast<int>(layer.wq->shape()[0]);
         const int k_n = static_cast<int>(layer.wk->shape()[0]);
         const int v_n = static_cast<int>(layer.wv->shape()[0]);
+        const bool force_decode_equivalent_qkv_verifier_prefill =
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            total_tokens > 1 &&
+            total_tokens <= 4 &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled;
 
         graph.addNode(prefix + "qkv_proj",
                       ComputeStageFactory::createFusedQKVGEMM({
@@ -1030,6 +1073,7 @@ namespace llaminar2
                           .output_q_buffer_id = buffers.idFor(BufferId::FA_Q_RAW),
                           .output_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
                           .output_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
+                          .force_decode_equivalent_verifier_prefill = force_decode_equivalent_qkv_verifier_prefill,
                           .prepared_ref_q = preparedRefForGraphWeight(wq_binding, device),
                           .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
                           .prepared_ref_v = preparedRefForGraphWeight(wv_binding, device),
@@ -1064,7 +1108,7 @@ namespace llaminar2
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, device);
+            position_ids, position_ids_device, device);
 
         if (has_qk_norms)
         {
@@ -1100,6 +1144,7 @@ namespace llaminar2
         int batch_size,
         IKVCache *kv_cache,
         const int *position_ids,
+        const void *position_ids_device,
         DeviceId device,
         const std::vector<int> *sequence_lengths,
         const std::string &stage_prefix_override,
@@ -1149,6 +1194,12 @@ namespace llaminar2
             int q_n = static_cast<int>(layer.wq->shape()[0]); // n_heads * head_dim * 2 = 4096
             int k_n = static_cast<int>(layer.wk->shape()[0]);
             int v_n = static_cast<int>(layer.wv->shape()[0]);
+            const bool force_decode_equivalent_qkv_verifier_prefill =
+                (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+                total_tokens > 1 &&
+                total_tokens <= 4 &&
+                config_.compute_all_position_logits &&
+                config_.mtp.enabled;
 
             LOG_DEBUG("[Qwen35Graph FA] Layer " << layer_idx << " QKV dims: q_n=" << q_n
                                                 << " k_n=" << k_n << " v_n=" << v_n);
@@ -1176,6 +1227,7 @@ namespace llaminar2
                               .output_q_buffer_id = buffers.idFor(BufferId::FA_Q_RAW),
                               .output_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
                               .output_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
+                              .force_decode_equivalent_verifier_prefill = force_decode_equivalent_qkv_verifier_prefill,
                               .prepared_ref_q = preparedRefForGraphWeight(wq_binding, device),
                               .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
                               .prepared_ref_v = preparedRefForGraphWeight(wv_binding, device),
@@ -1224,7 +1276,7 @@ namespace llaminar2
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, device);
+            position_ids, position_ids_device, device);
 
         if (has_qk_norms)
         {
@@ -1244,7 +1296,7 @@ namespace llaminar2
         std::string attn_node = addKVCacheAndAttention(
             graph, prefix, buffers, layer_idx,
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
-            kv_cache, position_ids, device, has_qkv_proj, rope_node,
+            kv_cache, position_ids, position_ids_device, device, has_qkv_proj, rope_node,
             layer_idx_is_cache_local);
 
         // =================================================================

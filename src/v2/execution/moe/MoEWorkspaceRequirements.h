@@ -59,7 +59,10 @@ namespace llaminar2
         constexpr const char *ROCM_DECODE_UP_OUTPUT_PTRS = "rocm_moe_decode_up_output_ptrs";
         constexpr const char *ROCM_DECODE_DOWN_DESCS = "rocm_moe_decode_down_descs";
 
-        constexpr int kRuntimePointerWorkspaceEntries = 1024;
+        constexpr int kRuntimePointerTableSlots = 1024;
+        constexpr int kRuntimePointerWorkspaceScopes = 3;
+        constexpr int kRuntimePointerWorkspaceEntries =
+            kRuntimePointerTableSlots * kRuntimePointerWorkspaceScopes;
         constexpr int kRuntimePointerArrayMaxTopK = 16;
 
         inline int ceilDiv(int value, int divisor)

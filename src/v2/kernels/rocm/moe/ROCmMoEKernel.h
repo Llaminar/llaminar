@@ -201,6 +201,24 @@ namespace llaminar2
             int d_model,
             int intermediate) override;
 
+        /**
+         * @brief Fused runtime-table single-token expert decode.
+         *
+         * ROCm mirrors CUDA's graph-capturable runtime path: route ids and
+         * weights are read from the device-resident runtime table, temporary
+         * gate/up activations live in declared MoE workspace buffers, and no
+         * host routing or tensor scratch ownership is involved on replay.
+         */
+        bool groupedExpertDecodeFromRuntime(
+            DeviceMoELayerRuntime *runtime_layer,
+            const TensorBase *input,
+            int gateup_descriptor_table_id,
+            int down_descriptor_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate) override;
+
         bool groupedExpertDownDecodeFromTable(
             ITensor *const *gate_tensors,
             ITensor *const *up_tensors,
@@ -373,7 +391,26 @@ namespace llaminar2
 
     private:
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
-        static constexpr std::size_t kRuntimePointerArrayWorkspaceEntries = 1024;
+        static constexpr std::size_t kRuntimePointerArrayTableSlots = 1024;
+        static constexpr std::size_t kRuntimePointerArrayWorkspaceScopes = 3;
+        static constexpr std::size_t kRuntimePointerArrayWorkspaceEntries =
+            kRuntimePointerArrayTableSlots * kRuntimePointerArrayWorkspaceScopes;
+
+        /**
+         * @brief Stable graph-capture slot bands for grouped decode pointer arrays.
+         *
+         * Descriptor table ids identify prepared weights, while table decode,
+         * two-step runtime decode, and fused runtime decode can target different
+         * scratch/output buffers for the same table id. HIP graphs capture the
+         * pointer-array device address, so ROCm uses the same scoped-slot
+         * contract as CUDA.
+         */
+        enum class RuntimePointerArrayScope : std::size_t
+        {
+            TableDecode = 0,
+            RuntimeTwoStep = 1,
+            RuntimeFused = 2,
+        };
 
         void syncBlasStream();
         void allocateHistogramBuffers(int num_layers, int num_experts);
@@ -387,6 +424,7 @@ namespace llaminar2
         bool rejectDecodeStagingDuringCapture(const char *context) const;
         bool stageRuntimeGateUpPointerArrays(
             int descriptor_table_id,
+            RuntimePointerArrayScope scope,
             int top_k,
             const std::array<float *, kRuntimePointerArrayMaxTopK> &gate_ptrs,
             const std::array<float *, kRuntimePointerArrayMaxTopK> &up_ptrs,
@@ -394,11 +432,17 @@ namespace llaminar2
             float ***d_up_ptrs);
         bool stageRuntimeDownPointerArrays(
             int descriptor_table_id,
+            RuntimePointerArrayScope scope,
             int top_k,
             const std::array<const float *, kRuntimePointerArrayMaxTopK> &gate_ptrs,
             const std::array<const float *, kRuntimePointerArrayMaxTopK> &up_ptrs,
             const float ***d_gate_ptrs,
             const float ***d_up_ptrs);
+        bool runtimePointerWorkspaceSlot(
+            int descriptor_table_id,
+            RuntimePointerArrayScope scope,
+            std::size_t *workspace_slot,
+            const char *context) const;
         bool ensureSharedGateScratchCapacity(int seq_len);
         bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
         bool ensureRouteLogitsPartialsCapacity(size_t partial_count);
@@ -484,11 +528,11 @@ namespace llaminar2
          * @brief Warmup readiness for graph-owned grouped-decode pointer slots.
          *
          * HIP graph replay captures the device address of the pointer-array slot,
-         * not the host pointer values.  ROCm therefore uses a deterministic slot
-         * per prepared descriptor table and refuses capture until warmup has
-         * staged that slot through the declared MoE workspace.  The booleans are
-         * intentionally just readiness markers; pointer values are not cached on
-         * the kernel object.
+         * not the host pointer values.  ROCm therefore uses deterministic scoped
+         * slots and refuses capture until warmup has staged the requested slot
+         * through the declared MoE workspace.  The booleans are intentionally
+         * just readiness markers; pointer values are not cached on the kernel
+         * object.
          */
         std::array<bool, kRuntimePointerArrayWorkspaceEntries> gateup_pointer_slot_ready_{};
         std::array<bool, kRuntimePointerArrayWorkspaceEntries> down_pointer_slot_ready_{};

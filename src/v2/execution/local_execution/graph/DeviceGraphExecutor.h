@@ -75,6 +75,7 @@ namespace llaminar2
         bool stage_dump = true;           ///< Stage dump framework (input/output snapshots)
         bool snapshot_callback = true;    ///< Invoke snapshot callback after execution
         bool pointer_validation = false;  ///< GPU pointer device validation
+        bool preserve_gpu_streams = false; ///< Keep caller-assigned streams instead of rebinding normal passes to the worker stream
 
         /// Full execution — coherence, validation, profiling, everything.
         static StageRunPolicy full()

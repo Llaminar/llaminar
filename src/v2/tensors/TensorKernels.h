@@ -1519,6 +1519,36 @@ namespace llaminar2
             setDynamicAttnParams(kv_len, position_offset, query_rows);
             return true;
         }
+
+        /**
+         * @brief Prepare attention params from device-owned sequence metadata.
+         *
+         * This graph-capturable path is used when the KV cache owns the live
+         * token count on device. Implementations should enqueue a small kernel
+         * on @p stream that derives AttentionDeviceParams from
+         * @p post_append_cached_tokens_device after the KV append stage has
+         * advanced the cache count. The default returns false so unsupported
+         * backends fail hard instead of silently falling back to host-owned
+         * scalar uploads.
+         *
+         * @param post_append_cached_tokens_device Device pointer to the current
+         *        cached-token count for this layer/sequence after append.
+         * @param seq_len Logical query row count for this attention stage.
+         * @param query_rows Number of row-local dynamic attention params needed.
+         * @param stream Explicit non-null backend stream.
+         */
+        virtual bool prepareDynamicAttnParamsFromDeviceSequenceState(
+            const int *post_append_cached_tokens_device,
+            int seq_len,
+            int query_rows,
+            void *stream)
+        {
+            (void)post_append_cached_tokens_device;
+            (void)seq_len;
+            (void)query_rows;
+            (void)stream;
+            return false;
+        }
     };
 
     // =========================================================================
@@ -2486,6 +2516,25 @@ namespace llaminar2
             (void)position_ids;
             (void)seq_len;
         }
+
+        /**
+         * @brief Bind explicit position IDs that already live on the device.
+         *
+         * This is the no-copy counterpart to setDynamicPositionIds().  Resident
+         * MTP continuation publishes per-request position rows in device
+         * workspace memory; GPU RoPE implementations should read this pointer
+         * directly during graph capture/replay.  Implementations must reject
+         * null/default streams before treating the pointer as valid so the
+         * producer/consumer ordering can be expressed with explicit events.
+         *
+         * @param position_ids_device Device pointer to INT32 position IDs.
+         * @param seq_len Number of valid entries in `position_ids_device`.
+         */
+        virtual void setDynamicDevicePositionIds(const void *position_ids_device, int seq_len)
+        {
+            (void)position_ids_device;
+            (void)seq_len;
+        }
     };
 
     /**
@@ -2891,6 +2940,57 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Restore a captured verifier-row conv state by device row index.
+         *
+         * GPU MTP publication uses compact device metadata to choose the
+         * accepted verifier row. Implementations that support this method must
+         * read @p device_row_index on @p stream and copy the corresponding
+         * snapshot into implementation-owned live state without any host read.
+         * @p dst_state is retained for the scalar restore ABI shape but must
+         * not be refreshed by device-indexed GPU implementations; host mirror
+         * adoption must be a separate explicit operation. The stream is
+         * intentionally mandatory for GPU implementations.
+         */
+        virtual bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            float *dst_state,
+            const int *device_row_index,
+            void *stream)
+        {
+            (void)dst_state;
+            (void)device_row_index;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Restore request-batched conv state from device row indices.
+         *
+         * `device_row_indices` names one accepted verifier row per request.
+         * Implementations must restore into request-owned live-state storage
+         * laid out by the backend, not into one shared `gpu_state_` buffer. A
+         * negative row index means no row was accepted for that request and the
+         * corresponding live-state slot must remain unchanged. The optional
+         * `dst_states` mirror is retained for ABI symmetry but must not be
+         * refreshed by GPU hot-path implementations.
+         */
+        virtual bool restoreVerifierStateCaptureRowsFromDeviceIndices(
+            float *dst_states,
+            int dst_state_stride_floats,
+            const int *device_row_indices,
+            int request_count,
+            int row_index_stride,
+            void *stream)
+        {
+            (void)dst_states;
+            (void)dst_state_stride_floats;
+            (void)device_row_indices;
+            (void)request_count;
+            (void)row_index_stride;
+            (void)stream;
+            return false;
+        }
+
         /// Return true when padded prefill can commit state using a dynamic real length.
         virtual bool supportsPaddedPrefillRealLength() const { return false; }
 
@@ -3128,6 +3228,56 @@ namespace llaminar2
         {
             (void)dst_state;
             (void)row;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Restore a captured verifier-row recurrence state by device row index.
+         *
+         * This is the device-resident companion to restoreVerifierStateCaptureRow().
+         * It exists so MTP accepted-state publication can consume compact GPU
+         * verifier metadata directly instead of synchronizing a row index to
+         * the host. GPU implementations must use @p stream, must not launch
+         * on an implicit/default stream, and must not refresh @p dst_state from
+         * device memory. Host mirror adoption belongs in a separate explicit
+         * non-hot-path operation.
+         */
+        virtual bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            float *dst_state,
+            const int *device_row_index,
+            void *stream)
+        {
+            (void)dst_state;
+            (void)device_row_index;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Restore request-batched recurrence state from device row indices.
+         *
+         * This is the tensor-kernel companion to
+         * IComputeStage::restoreVerifierStateCaptureRowsFromDeviceIndices().
+         * GPU implementations must consume @p device_row_indices on @p stream
+         * and write each request into independent live-state storage. A
+         * negative row index means that request stays at its pre-verifier
+         * state. Returning false is the correct behavior until both the capture
+         * layout and the live-state bank are request-aware.
+         */
+        virtual bool restoreVerifierStateCaptureRowsFromDeviceIndices(
+            float *dst_states,
+            int dst_state_stride_floats,
+            const int *device_row_indices,
+            int request_count,
+            int row_index_stride,
+            void *stream)
+        {
+            (void)dst_states;
+            (void)dst_state_stride_floats;
+            (void)device_row_indices;
+            (void)request_count;
+            (void)row_index_stride;
             (void)stream;
             return false;
         }

@@ -843,7 +843,7 @@ TEST(Test__ForwardGraphCache, ReplayStateEpochClearsOnStateInvalidatingResets)
     EXPECT_FALSE(cache.valid);
 }
 
-TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureOnlyAppliesToReadyOrdinaryDecode)
+TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureAppliesToReadyVersionedDecode)
 {
     ForwardGraphCache cache;
     cache.segment_cache.initialized = true;
@@ -851,26 +851,26 @@ TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureOnlyAppliesToReadyOrdinaryD
     cache.segmented_capture_live_state_epoch = 7;
 
     EXPECT_TRUE(cache.requiresLiveStateEpochRecapture(
-        /*ordinary_decode_context=*/true,
+        /*live_state_versioned_context=*/true,
         /*segmented_capture_allowed=*/true,
         /*live_state_epoch=*/8));
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
-        /*ordinary_decode_context=*/true,
+        /*live_state_versioned_context=*/true,
         /*segmented_capture_allowed=*/true,
         /*live_state_epoch=*/7));
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
-        /*ordinary_decode_context=*/false,
+        /*live_state_versioned_context=*/false,
         /*segmented_capture_allowed=*/true,
         /*live_state_epoch=*/8))
-        << "All-position verifier captures use the verifier publication contract.";
+        << "Single-row decode captures are version-safe and only need fresh dynamic metadata.";
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
-        /*ordinary_decode_context=*/true,
+        /*live_state_versioned_context=*/true,
         /*segmented_capture_allowed=*/false,
         /*live_state_epoch=*/8));
 
     cache.segment_cache.needs_capture = true;
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
-        /*ordinary_decode_context=*/true,
+        /*live_state_versioned_context=*/true,
         /*segmented_capture_allowed=*/true,
         /*live_state_epoch=*/8))
         << "A graph queued for capture does not need an extra recapture reset.";
@@ -878,14 +878,14 @@ TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureOnlyAppliesToReadyOrdinaryD
     cache.segment_cache.needs_capture = false;
     cache.segment_cache.initialized = false;
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
-        /*ordinary_decode_context=*/true,
+        /*live_state_versioned_context=*/true,
         /*segmented_capture_allowed=*/true,
         /*live_state_epoch=*/8));
 
     cache.segment_cache.initialized = true;
     cache.segmented_capture_live_state_epoch = 0;
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
-        /*ordinary_decode_context=*/true,
+        /*live_state_versioned_context=*/true,
         /*segmented_capture_allowed=*/true,
         /*live_state_epoch=*/8))
         << "Unstamped captures are handled by existing reset paths.";
@@ -904,6 +904,8 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
 
     ForwardGraphSignature all_position_verifier = single_token_decode;
     all_position_verifier.all_position_logits = true;
+    ForwardGraphSignature multirow_all_position_verifier = all_position_verifier;
+    multirow_all_position_verifier.seq_len = 3;
 
     ForwardGraphSignature prefill;
     prefill.decode = false;
@@ -914,6 +916,12 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
               ForwardReplayStateCacheClass::OrdinaryDecode);
     EXPECT_EQ(classifyForwardReplayStateCache(all_position_verifier),
               ForwardReplayStateCacheClass::AllPositionVerifier);
+    EXPECT_TRUE(isLiveStateVersionedReplayCache(ordinary_decode));
+    EXPECT_FALSE(isLiveStateVersionedReplayCache(single_token_decode));
+    EXPECT_FALSE(isLiveStateVersionedReplayCache(all_position_verifier));
+    EXPECT_FALSE(isLiveStateVersionedReplayCache(multirow_all_position_verifier))
+        << "All-position verifier replay publishes row-local state through stage-owned capture slots "
+           "and refreshes row metadata before every launch.";
     EXPECT_EQ(classifyForwardReplayStateCache(prefill),
               ForwardReplayStateCacheClass::Other);
 
@@ -924,13 +932,20 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
         << "One-token condition decode updates token/position metadata before replay and reads stable live-state buffers.";
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
-                  classifyForwardReplayStateCache(ordinary_decode)),
+                  ordinary_decode),
               ForwardReplayStateAction::ResetReplayState)
         << "Multi-token ordinary decode remains conservative until a versioned state contract proves it safe.";
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
-                  classifyForwardReplayStateCache(all_position_verifier)),
-              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams);
+                  all_position_verifier),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Single-row verifier captures do not carry row-local multi-token state progression.";
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
+                  multirow_all_position_verifier),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Multi-row verifier captures stay warm across publication; stage capture slots and "
+           "GPU event handoff carry the freshness contract.";
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
                   classifyForwardReplayStateCache(prefill)),

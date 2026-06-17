@@ -5,16 +5,69 @@
 
 #include "GEMMStage.h"
 #include "../ComputeStageUtils.h"
+#include "../../../backends/BackendManager.h"
+#include "../../../backends/IBackend.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../loaders/PreparedWeightStore.h"
+
+#include <algorithm>
+#include <cmath>
 
 namespace llaminar2
 {
     namespace
     {
+        std::shared_ptr<FP32Tensor> makeScratchFP32(size_t rows, size_t cols, DeviceId device, void *stream)
+        {
+            auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{rows, cols});
+            if (device.is_gpu())
+                tensor->allocateOnDevice(device, stream);
+            return tensor;
+        }
+
+        bool ensureScratchFP32(
+            std::shared_ptr<FP32Tensor> &tensor,
+            size_t rows,
+            size_t cols,
+            DeviceId device,
+            void *stream,
+            const char *name)
+        {
+            const std::vector<size_t> expected_shape{rows, cols};
+            if (!tensor || tensor->shape() != expected_shape)
+            {
+                if (device.is_gpu() && isGraphCaptureActive())
+                {
+                    LOG_ERROR("[GEMMStage] Cannot allocate verifier scratch tensor '"
+                              << name << "' during graph capture");
+                    return false;
+                }
+                tensor = makeScratchFP32(rows, cols, device, stream);
+            }
+
+            if (device.is_gpu() && !tensor->gpu_data_ptr())
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[GEMMStage] Verifier scratch tensor '"
+                              << name << "' was not device-resident before graph capture");
+                    return false;
+                }
+                if (!tensor->allocateOnDevice(device, stream))
+                {
+                    LOG_ERROR("[GEMMStage] Failed to allocate verifier scratch tensor '"
+                              << name << "' on " << device.to_string());
+                    return false;
+                }
+            }
+            return true;
+        }
+
         bool validateMatrixExtent(
             const TensorBase *tensor,
             const char *tensor_name,
@@ -79,6 +132,61 @@ namespace llaminar2
             {
                 tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
             }
+        }
+
+        bool copyFP32DeviceRow(
+            TensorBase *dst,
+            int dst_row,
+            int dst_cols,
+            const TensorBase *src,
+            int src_row,
+            int src_cols,
+            int copy_cols,
+            DeviceId device,
+            void *stream,
+            const char *label)
+        {
+            if (!stream)
+            {
+                LOG_ERROR("[GEMMStage] " << label
+                                         << " requires an explicit GPU stream");
+                return false;
+            }
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+            {
+                LOG_ERROR("[GEMMStage] No backend for " << device.to_string()
+                                                        << " while copying " << label);
+                return false;
+            }
+
+            auto *dst_ptr = static_cast<float *>(dst ? dst->gpu_data_ptr() : nullptr);
+            const auto *src_ptr = static_cast<const float *>(src ? src->gpu_data_ptr() : nullptr);
+            if (!dst_ptr || !src_ptr)
+            {
+                LOG_ERROR("[GEMMStage] Null device pointer while copying "
+                          << label << " dst=" << static_cast<void *>(dst_ptr)
+                          << " src=" << static_cast<const void *>(src_ptr));
+                return false;
+            }
+
+            const size_t dst_offset = static_cast<size_t>(dst_row) * static_cast<size_t>(dst_cols);
+            const size_t src_offset = static_cast<size_t>(src_row) * static_cast<size_t>(src_cols);
+            const size_t bytes = static_cast<size_t>(copy_cols) * sizeof(float);
+            const bool ok = backend->deviceCopyAsync(
+                dst_ptr + dst_offset,
+                src_ptr + src_offset,
+                bytes,
+                device.gpu_ordinal(),
+                stream);
+            if (!ok)
+            {
+                LOG_ERROR("[GEMMStage] Device row copy failed for " << label
+                                                                    << " bytes=" << bytes);
+                return false;
+            }
+            return true;
         }
     }
 
@@ -303,6 +411,14 @@ namespace llaminar2
                                                 << " for weight ITensor*=" << static_cast<const void *>(params_.B)
                                                 << " TensorBase*=" << static_cast<const void *>(B_base));
 
+        if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
+        {
+            auto *A_base = requireTensorBase(params_.A, "input A");
+            auto *C_base = asTensorBase(params_.C, "output C");
+            return executeDecodeEquivalentVerifierPrefill(
+                A_base, C_base, gemm, effective_n);
+        }
+
         // Fused SwiGLU + GEMM: output = W @ (silu(gate) * up)
         // Both CPU and GPU kernels implement multiply_tensor_with_fused_swiglu().
         if (params_.gate_input)
@@ -393,6 +509,225 @@ namespace llaminar2
             }
             return success;
         }
+    }
+
+    bool GEMMStage::executeDecodeEquivalentVerifierPrefill(
+        const TensorBase *A_base,
+        TensorBase *C_base,
+        ITensorGemm *gemm,
+        int effective_n)
+    {
+        if (!A_base || !C_base || !gemm)
+            return false;
+        if (params_.m > 4)
+        {
+            LOG_ERROR("[GEMMStage] Decode-equivalent verifier prefill is only supported "
+                      << "for tiny MTP verifier batches, got m=" << params_.m);
+            return false;
+        }
+
+        const bool is_gpu = params_.device_id.is_gpu();
+        void *stream = gpuStream();
+        if (is_gpu && !stream)
+        {
+            LOG_ERROR("[GEMMStage] Decode-equivalent GPU verifier prefill requires an explicit stream");
+            return false;
+        }
+
+        if (!ensureScratchFP32(verifier_input_row_, 1, static_cast<size_t>(params_.k),
+                               params_.device_id, stream, "input_row") ||
+            !ensureScratchFP32(verifier_output_row_, 1, static_cast<size_t>(effective_n),
+                               params_.device_id, stream, "output_row"))
+        {
+            return false;
+        }
+        if (params_.gate_input &&
+            !ensureScratchFP32(verifier_gate_row_, 1, static_cast<size_t>(params_.k),
+                               params_.device_id, stream, "gate_row"))
+        {
+            return false;
+        }
+
+        const float *input_data = is_gpu ? nullptr : A_base->data();
+        const auto *gate_base = params_.gate_input
+                                    ? requireTensorBase(params_.gate_input, "gate input")
+                                    : nullptr;
+        const float *gate_data = (!is_gpu && gate_base) ? gate_base->data() : nullptr;
+        float *output_data = is_gpu ? nullptr : C_base->mutable_data();
+        if (!is_gpu && (!input_data || !output_data))
+        {
+            LOG_ERROR("[GEMMStage] Decode-equivalent verifier prefill requires FP32 host-visible tensors");
+            return false;
+        }
+        if (params_.gate_input && !gate_base)
+            return false;
+        if (!is_gpu && params_.gate_input && !gate_data)
+        {
+            LOG_ERROR("[GEMMStage] Decode-equivalent fused SwiGLU verifier prefill requires host-visible gate tensor");
+            return false;
+        }
+
+        if (is_gpu)
+        {
+            if (!A_base->gpu_data_ptr())
+            {
+                LOG_ERROR("[GEMMStage] Decode-equivalent verifier input is not device-resident on "
+                          << params_.device_id.to_string()
+                          << "; StageBufferContract/BufferArena coherence must prepare graph inputs");
+                return false;
+            }
+            if (params_.gate_input && !gate_base->gpu_data_ptr())
+            {
+                LOG_ERROR("[GEMMStage] Decode-equivalent verifier gate input is not device-resident on "
+                          << params_.device_id.to_string()
+                          << "; StageBufferContract/BufferArena coherence must prepare graph inputs");
+                return false;
+            }
+            if (!C_base->allocateOnDevice(params_.device_id, stream))
+            {
+                LOG_ERROR("[GEMMStage] Failed to prepare verifier output tensor on "
+                          << params_.device_id.to_string());
+                return false;
+            }
+        }
+
+        bool success = true;
+        for (int row = 0; row < params_.m; ++row)
+        {
+            if (is_gpu)
+            {
+                if (!copyFP32DeviceRow(
+                        verifier_input_row_.get(), 0, params_.k,
+                        A_base, row, params_.k,
+                        params_.k, params_.device_id, stream,
+                        "verifier_input_row"))
+                {
+                    success = false;
+                    break;
+                }
+                if (params_.gate_input &&
+                    !copyFP32DeviceRow(
+                        verifier_gate_row_.get(), 0, params_.k,
+                        gate_base, row, params_.k,
+                        params_.k, params_.device_id, stream,
+                        "verifier_gate_row"))
+                {
+                    success = false;
+                    break;
+                }
+                markDeviceOutputWritten(verifier_input_row_.get(), params_.device_id, stream);
+                if (params_.gate_input)
+                    markDeviceOutputWritten(verifier_gate_row_.get(), params_.device_id, stream);
+
+                if (params_.beta != 0.0f &&
+                    !copyFP32DeviceRow(
+                        verifier_output_row_.get(), 0, effective_n,
+                        C_base, row, effective_n,
+                        effective_n, params_.device_id, stream,
+                        "verifier_existing_output_row"))
+                {
+                    success = false;
+                    break;
+                }
+            }
+            else
+            {
+                std::copy(input_data + static_cast<size_t>(row) * params_.k,
+                          input_data + static_cast<size_t>(row + 1) * params_.k,
+                          verifier_input_row_->mutable_data());
+                if (params_.gate_input)
+                {
+                    std::copy(gate_data + static_cast<size_t>(row) * params_.k,
+                              gate_data + static_cast<size_t>(row + 1) * params_.k,
+                              verifier_gate_row_->mutable_data());
+                }
+                if (params_.beta != 0.0f)
+                {
+                    std::copy(output_data + static_cast<size_t>(row) * effective_n,
+                              output_data + static_cast<size_t>(row + 1) * effective_n,
+                              verifier_output_row_->mutable_data());
+                }
+            }
+
+            const bool row_success = params_.gate_input
+                                         ? gemm->multiply_tensor_with_fused_swiglu(
+                                               verifier_gate_row_.get(),
+                                               verifier_input_row_.get(),
+                                               verifier_output_row_.get(),
+                                               1,
+                                               effective_n,
+                                               params_.k,
+                                               params_.alpha,
+                                               params_.beta,
+                                               getWorkspace())
+                                         : gemm->multiply_tensor(
+                                               verifier_input_row_.get(),
+                                               verifier_output_row_.get(),
+                                               1,
+                                               effective_n,
+                                               params_.k,
+                                               params_.transpose_B,
+                                               params_.alpha,
+                                               params_.beta,
+                                               nullptr,
+                                               params_.mpi_ctx,
+                                               params_.device_id.toKernelDeviceIndex(),
+                                               getWorkspace());
+            if (!row_success)
+            {
+                LOG_ERROR("[GEMMStage] Decode-equivalent verifier row "
+                          << row << " failed");
+                success = false;
+                break;
+            }
+
+            /*
+             * The row GEMV writes verifier_output_row_ on the stage stream.
+             * Publish that scratch explicitly before the following device row
+             * copy consumes it. Without this handoff, later coherence-aware
+             * code can legally observe the previous host shadow while the
+             * device bytes are already correct.
+             */
+            if (is_gpu)
+                markDeviceOutputWritten(
+                    verifier_output_row_.get(),
+                    params_.device_id,
+                    stream);
+
+            if (is_gpu)
+            {
+                if (!copyFP32DeviceRow(
+                        C_base, row, effective_n,
+                        verifier_output_row_.get(), 0, effective_n,
+                        effective_n, params_.device_id, stream,
+                        "verifier_output_row"))
+                {
+                    success = false;
+                    break;
+                }
+            }
+            else
+            {
+                std::copy(verifier_output_row_->data(),
+                          verifier_output_row_->data() + effective_n,
+                          output_data + static_cast<size_t>(row) * effective_n);
+            }
+        }
+
+        if (success)
+        {
+            if (is_gpu)
+                markDeviceOutputWritten(C_base, params_.device_id, stream);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "gemm_decode_equivalent_verifier_prefill_rows",
+                static_cast<double>(params_.m),
+                {},
+                params_.device_id.to_string(),
+                {{"stage", "GEMM"}});
+            traceOutput("C", params_.C);
+        }
+        return success;
     }
 
     size_t GEMMStage::estimatedFlops() const

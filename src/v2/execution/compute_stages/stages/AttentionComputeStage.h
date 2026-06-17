@@ -106,6 +106,7 @@ namespace llaminar2
             bool apply_rope_to_k = false;
             float rope_theta = 10000.0f;        ///< RoPE frequency base (only used when apply_rope_to_k=true)
             float partial_rotary_factor = 1.0f; ///< Fraction of head dimensions to rotate (only used when apply_rope_to_k=true)
+
         };
 
         explicit AttentionComputeStage(Params params);
@@ -145,6 +146,7 @@ namespace llaminar2
         /// this step, so get_cached_tokens() returns previous step's count.
         /// We add seq_len to get the count after appending.
         bool hasDynamicParams() const override { return true; }
+        bool supportsDeviceResidentDynamicPositionReplay() const override;
         void updateDynamicParams(int pos_offset, int seq_len) override;
         bool hasPrefillReplayParams() const override { return params_.kv_cache != nullptr; }
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
@@ -214,6 +216,39 @@ namespace llaminar2
          * @return Pointer to cached kernel, or nullptr on failure
          */
         ITensorAttention *getOrCreateKernel();
+
+        /**
+         * @brief Number of row-local dynamic attention params needed.
+         *
+         * Multi-row MTP verifier decode can run as several row-local decode
+         * kernels. The host-prepared and device-derived metadata paths must use
+         * exactly the same row count or graph replay will read mismatched
+         * `AttentionDeviceParams`.
+         */
+        int dynamicAttentionParamRows(int logical_seq_len, int kv_len) const;
+
+        /**
+         * @brief Run small MTP verifier continuations as serial-equivalent rows.
+         *
+         * Verifier publication is only valid when every "all position" row
+         * matches the state that would have been produced by ordinary one-token
+         * decode.  This helper reuses the production M=1 attention kernel while
+         * keeping row copies on the stage's explicit device stream.
+         */
+        bool executeDecodeEquivalentVerifierRows(
+            ITensorAttention *kernel,
+            ITensor *effective_K,
+            ITensor *effective_V,
+            int effective_kv_len,
+            int device_idx,
+            bool kernel_causal,
+            const IMPIContext *mpi_ctx);
+
+        /// One-row Q scratch used by executeDecodeEquivalentVerifierRows().
+        mutable std::shared_ptr<FP32Tensor> verifier_q_row_;
+
+        /// One-row attention output scratch used by executeDecodeEquivalentVerifierRows().
+        mutable std::shared_ptr<FP32Tensor> verifier_output_row_;
     };
 
 } // namespace llaminar2

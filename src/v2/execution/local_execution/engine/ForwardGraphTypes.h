@@ -85,6 +85,7 @@ namespace llaminar2
         bool all_position_logits = false;
         int all_position_logit_rows = 0; ///< Compact verifier logits row count when all-position logits are row-indexed.
         bool uses_device_token_ids = false; ///< True when embedding reads token IDs from a stable device buffer.
+        bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
         bool standard_path = true;
         bool pp_stage_enabled = false;
         int pp_first_layer = -1;
@@ -105,6 +106,7 @@ namespace llaminar2
                    all_position_logits == other.all_position_logits &&
                    all_position_logit_rows == other.all_position_logit_rows &&
                    uses_device_token_ids == other.uses_device_token_ids &&
+                   uses_device_position_ids == other.uses_device_position_ids &&
                    standard_path == other.standard_path &&
                    pp_stage_enabled == other.pp_stage_enabled &&
                    pp_first_layer == other.pp_first_layer &&
@@ -129,6 +131,7 @@ namespace llaminar2
             h ^= (std::hash<bool>{}(sig.all_position_logits) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.all_position_logit_rows) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_token_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.uses_device_position_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.pp_first_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));
@@ -174,6 +177,33 @@ namespace llaminar2
         return ForwardReplayStateCacheClass::OrdinaryDecode;
     }
 
+    /**
+     * @brief True when a segmented decode capture is tied to a specific live
+     *        KV/recurrent-state epoch rather than only to stable buffer names.
+     *
+     * Multi-token ordinary decode encodes live KV/recurrent-state progression
+     * directly in the replayed graph.  After MTP publishes an accepted row,
+     * that capture must be refreshed before it can read the newly published
+     * live state.
+     *
+     * All-position verifier graphs are different: verifier-row GDN/short-conv
+     * state is published through stage-owned capture slots, and verifier row
+     * metadata is refreshed before every launch.  Keeping that graph warm is
+     * the vLLM-style fast path; stream/event handoff and per-launch metadata
+     * updates provide the freshness boundary instead of live-epoch recapture.
+     * Single-token decode is also version-safe because token/position metadata
+     * is updated before replay and it reads stable live-state buffer addresses.
+     */
+    inline bool isLiveStateVersionedReplayCache(
+        const ForwardGraphSignature &signature)
+    {
+        if (!signature.decode)
+            return false;
+        if (signature.all_position_logits)
+            return false;
+        return !(signature.seq_len == 1 && signature.batch_size <= 1);
+    }
+
     inline ForwardReplayStateAction chooseForwardReplayStateAction(
         ForwardReplayStateMutationKind mutation,
         ForwardReplayStateCacheClass cache_class)
@@ -184,6 +214,20 @@ namespace llaminar2
             return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
         }
         return ForwardReplayStateAction::ResetReplayState;
+    }
+
+    inline ForwardReplayStateAction chooseForwardReplayStateAction(
+        ForwardReplayStateMutationKind mutation,
+        const ForwardGraphSignature &signature)
+    {
+        if (mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary &&
+            isLiveStateVersionedReplayCache(signature))
+        {
+            return ForwardReplayStateAction::ResetReplayState;
+        }
+        return chooseForwardReplayStateAction(
+            mutation,
+            classifyForwardReplayStateCache(signature));
     }
 
     /**
@@ -353,19 +397,18 @@ namespace llaminar2
         bool phase3_active = false;
 
         /// Live replay-state epoch that the current segmented capture is safe for.
-        /// Multi-token ordinary decode graphs are invalidated when speculative
-        /// publication advances the live state to a newer epoch. Single-token
-        /// decode, including MTP condition decode, is version-safe: it updates
-        /// token/position metadata before every launch and reads stable live-state
-        /// buffer addresses, so accepted-state publication only requires stream
-        /// rebinding and a fresh epoch stamp.
+        /// Multi-token ordinary decode and multi-row all-position verifier graphs
+        /// are invalidated when speculative publication advances live state to a
+        /// newer epoch. Single-token decode, including MTP condition decode, is
+        /// version-safe: it updates token/position metadata before every launch
+        /// and reads stable live-state buffer addresses.
         uint64_t segmented_capture_live_state_epoch = 0;
 
-        bool requiresLiveStateEpochRecapture(bool ordinary_decode_context,
+        bool requiresLiveStateEpochRecapture(bool live_state_versioned_context,
                                              bool segmented_capture_allowed,
                                              uint64_t live_state_epoch) const
         {
-            return ordinary_decode_context &&
+            return live_state_versioned_context &&
                    segmented_capture_allowed &&
                    segment_cache.initialized &&
                    !segment_cache.needs_capture &&
@@ -471,10 +514,10 @@ namespace llaminar2
          * @brief Stamp a preserved replay capture for the current live state.
          *
          * This is intentionally reserved for replay classes whose state-safety
-         * has been proven separately.  In particular, single-token condition
-         * decode and all-position verifier captures may be preserved across
-         * MTP accepted-state publication; multi-token ordinary decode remains
-         * conservative and recaptures.
+         * has been proven separately. In particular, single-token condition
+         * decode and all-position verifier replay may be preserved across MTP
+         * accepted-state publication; multi-token ordinary decode remains
+         * epoch-versioned and recaptures after publication.
          */
         void markReplayStateSafeForLiveEpoch(uint64_t live_state_epoch)
         {
@@ -486,14 +529,22 @@ namespace llaminar2
          *
          * This is the request-boundary counterpart to invalidate(): it keeps the
          * cached ComputeGraph, stable token buffers, and workspace bindings, but
-         * clears stage/kernels' dynamic metadata and all captured executable
-         * state so the next prompt starts from cleared KV/GDN model state.
+         * clears stage/kernels' dynamic metadata and decode replay captures so
+         * the next prompt starts from cleared KV/GDN model state.
+         *
+         * Monolithic prefill graph captures are dropped here even though the
+         * cached ComputeGraph topology is preserved.  Prefill captures record a
+         * stateful prompt mutation over KV/GDN/short-conv buffers and may embed
+         * backend context/workspace pointers in captured kernel parameters.  A
+         * request clear resets those live buffers, so the next request must warm
+         * or capture prefill against the fresh state instead of replaying the
+         * prior request's executable graph.
          */
         void resetSessionState()
         {
             resetReplayState();
             if (prefill_graph_cache)
-                prefill_graph_cache->invalidateAll(PrefillGraphRejectReason::SessionReset);
+                prefill_graph_cache->invalidateAll(PrefillGraphRejectReason::RequestStateReset);
             last_prefill_graph_observation = {};
 
             if (graph)

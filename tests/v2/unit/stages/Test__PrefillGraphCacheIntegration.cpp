@@ -149,7 +149,7 @@ TEST(Test__PrefillGraphCacheIntegration, InvalidateAllClearsPrefillCache)
     EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Cold);
 }
 
-TEST(Test__PrefillGraphCacheIntegration, SessionResetInvalidatesPrefillCacheEntries)
+TEST(Test__PrefillGraphCacheIntegration, SessionResetInvalidatesPrefillExecutableEntries)
 {
     ForwardGraphCache cache;
 
@@ -169,9 +169,10 @@ TEST(Test__PrefillGraphCacheIntegration, SessionResetInvalidatesPrefillCacheEntr
 
     EXPECT_NE(cache.prefill_graph_cache, nullptr);
     EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Cold)
-        << "Request/session reset clears KV/GDN state, so captured prefill graph entries "
-           "must be rebuilt before the next prompt can replay them";
-    EXPECT_EQ(cache.prefill_graph_cache->lastInvalidationReason(), PrefillGraphRejectReason::SessionReset);
+        << "Request/session reset clears KV/GDN state, so a monolithic prefill "
+           "executable captured against the previous request must not replay "
+           "against freshly cleared live state.";
+    EXPECT_EQ(cache.prefill_graph_cache->lastInvalidationReason(), PrefillGraphRejectReason::RequestStateReset);
 }
 
 TEST(Test__PrefillGraphCacheIntegration, WorkspaceRebindInvalidatesPrefillCache)
@@ -616,4 +617,5 @@ TEST(Test__PrefillGraphCacheIntegration, RejectReasonToString)
     EXPECT_NE(toString(PrefillGraphRejectReason::NoGPUContext), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::InvalidatedByPlacement), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::SessionReset), nullptr);
+    EXPECT_NE(toString(PrefillGraphRejectReason::RequestStateReset), nullptr);
 }

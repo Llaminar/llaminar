@@ -13,6 +13,7 @@
 #include "../../../tensors/FP16Utils.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../backends/BackendManager.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../kernels/cpu/rotation/ActivationRotation.h"
@@ -20,6 +21,7 @@
 #include "../../../kernels/KernelFactory.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <filesystem>
 #include <stdexcept>
@@ -134,6 +136,8 @@ namespace llaminar2
 
         int rocmAttentionRequestedDecodeSplitCap(int kv_len)
         {
+            if (debugEnv().gemm.deterministic)
+                return 1;
             if (kv_len <= 64)
                 return 1;
             if (kv_len < 128)
@@ -143,11 +147,240 @@ namespace llaminar2
             return 8;
         }
 
+        /**
+         * @brief Coarse CUDA small-M decode launch bucket for graph capture.
+         *
+         * CUDA small-M verifier attention launches one row at a time and chooses
+         * the split count from the row KV length.  The split count can only
+         * increase at `MIN_KV_PER_SPLIT` boundaries, so exact token positions
+         * are not structural graph variants.  Keeping the signature bucketed
+         * lets adjacent verifier steps replay the same captured graph while
+         * still recapturing when the launch regime can actually change.
+         */
+        int cudaAttentionDecodeSplitBucket(int kv_len)
+        {
+            constexpr int kMinKVPerSplit = 16;
+            if (debugEnv().gemm.deterministic || kv_len <= 1)
+                return 1;
+            return std::max(1, kv_len / kMinKVPerSplit);
+        }
+
+        int attentionDecodeLaunchBucket(DeviceId device, int kv_len)
+        {
+            if (device.is_cuda())
+                return cudaAttentionDecodeSplitBucket(kv_len);
+            if (device.is_rocm())
+                return rocmAttentionRequestedDecodeSplitCap(kv_len);
+            return 0;
+        }
+
+        /**
+         * @brief True when a verifier Q tensor is laid out as [head][row][dim].
+         *
+         * CPU HybridQ16 RoPE intentionally stores Q in head-major form because
+         * the integer attention kernel consumes one head block at a time.  The
+         * grouped verifier, however, must replay each logical token as an M=1
+         * decode row, whose Q tensor is [row][head * dim].  Treating row `i`
+         * as contiguous in the head-major buffer mixes future verifier rows
+         * into the current row and breaks decode equivalence.
+         */
+        bool isHeadMajorVerifierQ(const TensorBase *q,
+                                  int seq_len,
+                                  int n_heads,
+                                  int head_dim)
+        {
+            if (!q || q->native_type() != TensorType::Q16_1 ||
+                seq_len <= 1 || n_heads <= 0 || head_dim <= 0)
+            {
+                return false;
+            }
+
+            const auto &shape = q->shape();
+            return shape.size() >= 2 &&
+                   shape[0] == static_cast<size_t>(n_heads * seq_len) &&
+                   shape[1] == static_cast<size_t>(head_dim);
+        }
+
+        /**
+         * @brief Copy one logical verifier Q row into a one-token FP32 tensor.
+         *
+         * Most attention Q tensors are row-major and can be copied in one
+         * contiguous slice.  HybridQ16 is the exception: RoPE writes head-major
+         * Q for the CPU integer attention kernel, so the verifier must gather
+         * the requested row across all heads before invoking the serial M=1
+         * attention path.
+         */
+        bool copyHostVerifierQRow(const TensorBase *src,
+                                  int row,
+                                  int seq_len,
+                                  int n_heads,
+                                  int head_dim,
+                                  FP32Tensor *dst)
+        {
+            if (!src || !dst || row < 0 || row >= seq_len)
+            {
+                LOG_ERROR("[AttentionComputeStage] Invalid verifier Q row copy request");
+                return false;
+            }
+
+            const float *src_data = src->data();
+            float *dst_data = dst->mutable_data();
+            if (!src_data || !dst_data)
+            {
+                LOG_ERROR("[AttentionComputeStage] Verifier Q row copy requires host-visible FP32 data");
+                return false;
+            }
+
+            const int q_dim = n_heads * head_dim;
+            if (isHeadMajorVerifierQ(src, seq_len, n_heads, head_dim))
+            {
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const size_t src_offset =
+                        (static_cast<size_t>(h) * static_cast<size_t>(seq_len) +
+                         static_cast<size_t>(row)) *
+                        static_cast<size_t>(head_dim);
+                    const size_t dst_offset =
+                        static_cast<size_t>(h) * static_cast<size_t>(head_dim);
+                    std::copy_n(src_data + src_offset, head_dim, dst_data + dst_offset);
+                }
+                return true;
+            }
+
+            const auto &shape = src->shape();
+            if (shape.size() < 2 ||
+                shape[0] < static_cast<size_t>(seq_len) ||
+                shape[1] < static_cast<size_t>(q_dim))
+            {
+                LOG_ERROR("[AttentionComputeStage] Verifier Q tensor shape ["
+                          << (shape.empty() ? 0 : shape[0]) << ","
+                          << (shape.size() > 1 ? shape[1] : 0)
+                          << "] cannot provide row-major q_dim=" << q_dim);
+                return false;
+            }
+
+            std::copy_n(src_data + static_cast<size_t>(row) * static_cast<size_t>(q_dim),
+                        q_dim,
+                        dst_data);
+            return true;
+        }
+
         void combineAttentionVariant(uint64_t &h, uint64_t value)
         {
             constexpr uint64_t kPrime = 1099511628211ull;
             h ^= value;
             h *= kPrime;
+        }
+
+        std::shared_ptr<FP32Tensor> makeAttentionScratchFP32(
+            size_t rows,
+            size_t cols,
+            DeviceId device,
+            void *stream)
+        {
+            auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{rows, cols});
+            if (device.is_gpu())
+                tensor->allocateOnDevice(device, stream);
+            return tensor;
+        }
+
+        bool ensureAttentionScratchFP32(
+            std::shared_ptr<FP32Tensor> &tensor,
+            size_t rows,
+            size_t cols,
+            DeviceId device,
+            void *stream,
+            const char *name)
+        {
+            const std::vector<size_t> expected_shape{rows, cols};
+            if (!tensor || tensor->shape() != expected_shape)
+            {
+                if (device.is_gpu() && isGraphCaptureActive())
+                {
+                    LOG_ERROR("[AttentionComputeStage] Cannot allocate verifier scratch tensor '"
+                              << name << "' during graph capture");
+                    return false;
+                }
+                tensor = makeAttentionScratchFP32(rows, cols, device, stream);
+            }
+
+            if (device.is_gpu() && !tensor->gpu_data_ptr())
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[AttentionComputeStage] Verifier scratch tensor '"
+                              << name << "' was not device-resident before graph capture");
+                    return false;
+                }
+                if (!tensor->allocateOnDevice(device, stream))
+                {
+                    LOG_ERROR("[AttentionComputeStage] Failed to allocate verifier scratch tensor '"
+                              << name << "' on " << device.to_string());
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        void markAttentionGpuTensorWritten(TensorBase *tensor, DeviceId device, void *stream)
+        {
+            if (tensor && device.is_gpu())
+                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
+        }
+
+        bool copyAttentionFP32DeviceRow(
+            TensorBase *dst,
+            int dst_row,
+            int dst_cols,
+            const TensorBase *src,
+            int src_row,
+            int src_cols,
+            int copy_cols,
+            DeviceId device,
+            void *stream,
+            const char *label)
+        {
+            if (!stream)
+            {
+                LOG_ERROR("[AttentionComputeStage] " << label
+                                                      << " requires an explicit GPU stream");
+                return false;
+            }
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+            {
+                LOG_ERROR("[AttentionComputeStage] No backend for " << device.to_string()
+                                                                     << " while copying " << label);
+                return false;
+            }
+
+            auto *dst_ptr = static_cast<float *>(dst ? dst->gpu_data_ptr() : nullptr);
+            const auto *src_ptr = static_cast<const float *>(src ? src->gpu_data_ptr() : nullptr);
+            if (!dst_ptr || !src_ptr)
+            {
+                LOG_ERROR("[AttentionComputeStage] Null device pointer while copying "
+                          << label << " dst=" << static_cast<void *>(dst_ptr)
+                          << " src=" << static_cast<const void *>(src_ptr));
+                return false;
+            }
+
+            const size_t dst_offset = static_cast<size_t>(dst_row) * static_cast<size_t>(dst_cols);
+            const size_t src_offset = static_cast<size_t>(src_row) * static_cast<size_t>(src_cols);
+            const size_t bytes = static_cast<size_t>(copy_cols) * sizeof(float);
+            const bool ok = backend->deviceCopyAsync(
+                dst_ptr + dst_offset,
+                src_ptr + src_offset,
+                bytes,
+                device.gpu_ordinal(),
+                stream);
+            if (!ok)
+            {
+                LOG_ERROR("[AttentionComputeStage] Device row copy failed for " << label
+                                                                                << " bytes=" << bytes);
+                return false;
+            }
+            return true;
         }
     } // namespace
 
@@ -158,6 +391,225 @@ namespace llaminar2
     AttentionComputeStage::AttentionComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    int AttentionComputeStage::dynamicAttentionParamRows(int logical_seq_len, int kv_len) const
+    {
+        if (!params_.kv_cache)
+            return 1;
+
+        if (params_.device_id.is_rocm())
+        {
+            const auto &rocm_env = debugEnv().rocm;
+            const auto kp = params_.kv_cache->k_precision();
+            const auto vp = params_.kv_cache->v_precision();
+            const bool native_kv =
+                !rocm_env.fa_disable_native_kv &&
+                params_.head_dim >= 64 &&
+                ((kp == ActivationPrecision::FP16 && vp == ActivationPrecision::FP16) ||
+                 (kp == ActivationPrecision::Q8_1 && vp == ActivationPrecision::Q8_1 &&
+                  params_.head_dim % 32 == 0));
+            const bool small_native_decode =
+                native_kv &&
+                params_.batch_size == 1 &&
+                params_.causal &&
+                !rocm_env.fa_decode_via_prefill &&
+                logical_seq_len > 1 &&
+                logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+                kv_len > logical_seq_len;
+            return small_native_decode ? logical_seq_len : 1;
+        }
+
+        const auto kp = params_.kv_cache->k_precision();
+        const auto vp = params_.kv_cache->v_precision();
+        const bool cuda_small_fp16_decode =
+            params_.device_id.is_cuda() &&
+            kp == ActivationPrecision::FP16 &&
+            vp == ActivationPrecision::FP16 &&
+            params_.batch_size == 1 &&
+            params_.causal &&
+            logical_seq_len > 1 &&
+            logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+            kv_len > logical_seq_len;
+        return cuda_small_fp16_decode ? logical_seq_len : 1;
+    }
+
+    bool AttentionComputeStage::executeDecodeEquivalentVerifierRows(
+        ITensorAttention *kernel,
+        ITensor *effective_K,
+        ITensor *effective_V,
+        int effective_kv_len,
+        int device_idx,
+        bool kernel_causal,
+        const IMPIContext *mpi_ctx)
+    {
+        if (!kernel || !params_.Q || !effective_K || !effective_V || !params_.output)
+            return false;
+
+        if (params_.batch_size != 1 ||
+            params_.seq_len <= 1 ||
+            params_.seq_len > kMTPVerifierSmallDecodeMaxRows ||
+            effective_kv_len <= params_.seq_len ||
+            !params_.causal)
+        {
+            return false;
+        }
+
+        const int q_dim = params_.n_heads * params_.head_dim;
+        if (q_dim <= 0)
+        {
+            LOG_ERROR("[AttentionComputeStage] Invalid verifier attention row width: " << q_dim);
+            return false;
+        }
+
+        auto *q_base = dynamic_cast<TensorBase *>(params_.Q);
+        auto *out_base = dynamic_cast<TensorBase *>(params_.output);
+        if (!q_base || !out_base)
+        {
+            LOG_ERROR("[AttentionComputeStage] Decode-equivalent verifier rows require TensorBase Q/output tensors");
+            return false;
+        }
+
+        const bool is_gpu = params_.device_id.is_gpu();
+        void *stream = gpuStream();
+        if (is_gpu && !stream)
+        {
+            LOG_ERROR("[AttentionComputeStage] Decode-equivalent verifier rows require an explicit GPU stream");
+            return false;
+        }
+
+        /*
+         * This path deliberately matches production one-token decode.  Captured
+         * verifier graphs need a future device-side row-param primitive; until
+         * then, recording host scalar uploads inside capture would recreate the
+         * coherence bug this path is meant to remove.
+         */
+        if (is_gpu && isGraphCaptureActive())
+        {
+            LOG_ERROR("[AttentionComputeStage] Decode-equivalent verifier attention row replay is not graph-capturable yet");
+            return false;
+        }
+
+        if (!ensureAttentionScratchFP32(verifier_q_row_, 1, static_cast<size_t>(q_dim),
+                                        params_.device_id, stream, "q_row") ||
+            !ensureAttentionScratchFP32(verifier_output_row_, 1, static_cast<size_t>(q_dim),
+                                        params_.device_id, stream, "output_row"))
+        {
+            return false;
+        }
+
+        if (is_gpu)
+        {
+            if (!q_base->gpu_data_ptr())
+            {
+                LOG_ERROR("[AttentionComputeStage] Verifier Q tensor is not device-resident on "
+                          << params_.device_id.to_string());
+                return false;
+            }
+            if (!out_base->allocateOnDevice(params_.device_id, stream))
+            {
+                LOG_ERROR("[AttentionComputeStage] Failed to allocate verifier attention output on "
+                          << params_.device_id.to_string());
+                return false;
+            }
+        }
+
+        const float *q_host = is_gpu ? nullptr : q_base->data();
+        float *out_host = is_gpu ? nullptr : out_base->mutable_data();
+        if (!is_gpu && (!q_host || !out_host))
+        {
+            LOG_ERROR("[AttentionComputeStage] Decode-equivalent verifier rows require FP32 host-visible Q/output tensors");
+            return false;
+        }
+
+        const int base_kv_len = effective_kv_len - params_.seq_len;
+        for (int row = 0; row < params_.seq_len; ++row)
+        {
+            const int row_kv_len = base_kv_len + row + 1;
+            const int row_position_offset = row_kv_len - 1;
+
+            if (!kernel->prepareDynamicAttnParams(row_kv_len, row_position_offset, 1, stream))
+            {
+                LOG_ERROR("[AttentionComputeStage] Failed to prepare verifier attention row params"
+                          << " row=" << row
+                          << " kv_len=" << row_kv_len
+                          << " position_offset=" << row_position_offset);
+                return false;
+            }
+
+            if (is_gpu)
+            {
+                if (!copyAttentionFP32DeviceRow(
+                        verifier_q_row_.get(), 0, q_dim,
+                        q_base, row, q_dim,
+                        q_dim, params_.device_id, stream,
+                        "verifier_q_row"))
+                {
+                    return false;
+                }
+                markAttentionGpuTensorWritten(verifier_q_row_.get(), params_.device_id, stream);
+            }
+            else
+            {
+                (void)q_host;
+                if (!copyHostVerifierQRow(q_base,
+                                          row,
+                                          params_.seq_len,
+                                          params_.n_heads,
+                                          params_.head_dim,
+                                          verifier_q_row_.get()))
+                {
+                    return false;
+                }
+            }
+
+            const bool success = kernel->compute_tensor(
+                verifier_q_row_.get(), effective_K, effective_V, verifier_output_row_.get(),
+                1,
+                1,
+                row_kv_len,
+                params_.n_heads,
+                params_.n_kv_heads,
+                params_.head_dim,
+                kernel_causal,
+                params_.window_size,
+                params_.workspace_scores,
+                nullptr,
+                mpi_ctx,
+                device_idx,
+                params_.head_start,
+                -1,
+                -1,
+                params_.gqa_n_rep);
+            if (!success)
+            {
+                LOG_ERROR("[AttentionComputeStage] Decode-equivalent verifier attention row "
+                          << row << " failed");
+                return false;
+            }
+
+            if (is_gpu)
+            {
+                if (!copyAttentionFP32DeviceRow(
+                        out_base, row, q_dim,
+                        verifier_output_row_.get(), 0, q_dim,
+                        q_dim, params_.device_id, stream,
+                        "verifier_attention_output_row"))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                std::copy_n(verifier_output_row_->data(),
+                            q_dim,
+                            out_host + static_cast<size_t>(row) * q_dim);
+            }
+        }
+
+        if (is_gpu)
+            markAttentionGpuTensorWritten(out_base, params_.device_id, stream);
+        return true;
     }
 
     void AttentionComputeStage::updateDynamicParams(int pos_offset, int seq_len)
@@ -185,46 +637,30 @@ namespace llaminar2
         int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
         kv_len += logical_seq_len; // This step will append logical_seq_len real tokens.
         const int logical_pos_offset = std::max(0, kv_len - logical_seq_len);
+        const int query_rows_for_params =
+            dynamicAttentionParamRows(logical_seq_len, kv_len);
 
-        int query_rows_for_params = 1;
-        if (params_.device_id.is_rocm())
-        {
-            const auto &rocm_env = debugEnv().rocm;
-            const auto kp = params_.kv_cache->k_precision();
-            const auto vp = params_.kv_cache->v_precision();
-            const bool native_kv =
-                !rocm_env.fa_disable_native_kv &&
-                params_.head_dim >= 64 &&
-                ((kp == ActivationPrecision::FP16 && vp == ActivationPrecision::FP16) ||
-                 (kp == ActivationPrecision::Q8_1 && vp == ActivationPrecision::Q8_1 &&
-                  params_.head_dim % 32 == 0));
-            const bool small_native_decode =
-                native_kv &&
-                params_.batch_size == 1 &&
-                params_.causal &&
-                !rocm_env.fa_decode_via_prefill &&
-                logical_seq_len > 1 &&
-                logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
-                kv_len > logical_seq_len;
-            query_rows_for_params = small_native_decode ? logical_seq_len : 1;
-        }
-        else
-        {
-            const auto kp = params_.kv_cache->k_precision();
-            const auto vp = params_.kv_cache->v_precision();
-            const bool cuda_small_fp16_decode =
-                params_.device_id.is_cuda() &&
-                kp == ActivationPrecision::FP16 &&
-                vp == ActivationPrecision::FP16 &&
-                params_.batch_size == 1 &&
-                params_.causal &&
-                logical_seq_len > 1 &&
-                logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
-                kv_len > logical_seq_len;
-            query_rows_for_params = cuda_small_fp16_decode ? logical_seq_len : 1;
-        }
-
-        if (!cached_kernel_->prepareDynamicAttnParams(
+        const auto kp = params_.kv_cache->k_precision();
+        const auto vp = params_.kv_cache->v_precision();
+        const bool tq_cache =
+            kp == ActivationPrecision::TQ4 || kp == ActivationPrecision::TQ8 ||
+            vp == ActivationPrecision::TQ4 || vp == ActivationPrecision::TQ8;
+        /*
+         * Device-derived attention params are for decode/replay, where the
+         * cache already contains older tokens and the graph body must discover
+         * the post-append KV length without a host scalar upload.  Ordinary
+         * prefill has `kv_len == logical_seq_len`; deriving params from the
+         * live cache counter there adds an unnecessary state owner and can make
+         * CUDA FA2 prefill consume stale/double-advanced cache metadata.
+         */
+        const bool decode_like_step = kv_len > logical_seq_len;
+        const bool will_derive_from_device_count =
+            params_.device_id.is_gpu() &&
+            decode_like_step &&
+            !tq_cache &&
+            params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0) != nullptr;
+        if (!will_derive_from_device_count &&
+            !cached_kernel_->prepareDynamicAttnParams(
                 kv_len, logical_pos_offset, query_rows_for_params, gpuStream()))
         {
             const std::string msg =
@@ -248,6 +684,24 @@ namespace llaminar2
             0, gpuStream());
     }
 
+    bool AttentionComputeStage::supportsDeviceResidentDynamicPositionReplay() const
+    {
+        if (!params_.device_id.is_gpu() ||
+            !params_.kv_cache ||
+            params_.layer_idx < 0)
+        {
+            return false;
+        }
+
+        const auto kp = params_.kv_cache->k_precision();
+        const auto vp = params_.kv_cache->v_precision();
+        const bool tq_cache =
+            kp == ActivationPrecision::TQ4 || kp == ActivationPrecision::TQ8 ||
+            vp == ActivationPrecision::TQ4 || vp == ActivationPrecision::TQ8;
+        return !tq_cache &&
+               params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0) != nullptr;
+    }
+
     void AttentionComputeStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
     {
         prefill_bucket_seq_len_ = replay.bucket_seq_len > 0 ? replay.bucket_seq_len : params_.seq_len;
@@ -258,13 +712,16 @@ namespace llaminar2
 
     uint64_t AttentionComputeStage::graphCaptureVariantSignature() const
     {
-        if (!params_.device_id.is_rocm() ||
+        if (!params_.device_id.is_gpu() ||
             !params_.kv_cache ||
             params_.layer_idx < 0 ||
             params_.batch_size != 1 ||
             params_.seq_len <= 0 ||
-            params_.head_dim <= 0 ||
-            debugEnv().rocm.fa_decode_via_prefill)
+            params_.head_dim <= 0)
+        {
+            return 0;
+        }
+        if (params_.device_id.is_rocm() && debugEnv().rocm.fa_decode_via_prefill)
         {
             return 0;
         }
@@ -295,12 +752,23 @@ namespace llaminar2
         }
 
         /*
-         * ROCm split-K decode launches are used for one-row decode and the
-         * native-KV M=2..4 verifier path.  Fixed-depth-3 MTP verifies four
-         * target rows (`draft_count + 1`), so capture signatures must bucket
-         * all four row-local split caps.  Otherwise HIP graph replay can reuse
-         * a capture whose launch topology was prepared for a different row set.
+         * Multirow MTP verifier graphs append M=2..4 rows and then run the
+         * native-KV M=2..4 verifier path.  The row count is a first-class
+         * replay signature input, but exact token positions are not: dynamic
+         * attention params and device sequence state carry row-local KV lengths
+         * into the captured kernel arguments before every replay.  The graph
+         * signature therefore records only the launch regime bucket that can
+         * change kernel topology or split count.
          */
+        const bool multirow_verifier_decode =
+            params_.seq_len > 1 &&
+            params_.seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+            params_.seq_len < effective_kv_len;
+        if (!multirow_verifier_decode && params_.device_id.is_cuda())
+        {
+            return 0;
+        }
+
         const int decode_rows = std::min(params_.seq_len, kMTPVerifierSmallDecodeMaxRows);
         if (decode_rows <= 0 || params_.seq_len > kMTPVerifierSmallDecodeMaxRows)
         {
@@ -308,30 +776,58 @@ namespace llaminar2
         }
 
         uint64_t signature = 1469598103934665603ull;
-        combineAttentionVariant(signature, 0xA77E0001ull);
+        combineAttentionVariant(signature, 0xA77E0002ull);
+        combineAttentionVariant(signature, params_.device_id.is_cuda() ? 1ull : 2ull);
         combineAttentionVariant(signature, static_cast<uint64_t>(params_.seq_len));
+        /*
+         * MTP verifier rows must be decode-equivalent before they are allowed to
+         * publish live KV/GDN state.  CUDA FA2 prefill currently converts Q to
+         * half for WMMA; that is a good throughput path for ordinary prefill but
+         * can drift enough on real Qwen3.6 MoE verifier rows to change the next
+         * token.  Keep the capture signature tied to the row-local decode bucket
+         * until a fused multi-row verifier kernel proves serial-decode parity.
+         */
+        combineAttentionVariant(signature, multirow_verifier_decode
+                                               ? static_cast<uint64_t>(
+                                                     attentionDecodeLaunchBucket(params_.device_id, effective_kv_len))
+                                               : 0ull);
         combineAttentionVariant(signature, static_cast<uint64_t>(params_.n_heads));
         combineAttentionVariant(signature, static_cast<uint64_t>(params_.n_kv_heads));
         combineAttentionVariant(signature, static_cast<uint64_t>(params_.head_dim));
         combineAttentionVariant(signature, static_cast<uint64_t>(params_.kv_cache->k_precision()));
         combineAttentionVariant(signature, static_cast<uint64_t>(params_.kv_cache->v_precision()));
+        combineAttentionVariant(signature, params_.apply_rope_to_k ? 1ull : 0ull);
+        combineAttentionVariant(signature, static_cast<uint64_t>(
+                                             std::max(0, static_cast<int>(
+                                                             params_.partial_rotary_factor *
+                                                             params_.head_dim))));
 
-        const auto &rocm_env = debugEnv().rocm;
-        combineAttentionVariant(signature, rocm_env.fa_decode_num_splits_present ? 1ull : 0ull);
-        combineAttentionVariant(signature, rocm_env.fa_decode_num_splits
-                                               ? static_cast<uint64_t>(std::max(0, *rocm_env.fa_decode_num_splits))
-                                               : 0ull);
-        combineAttentionVariant(signature, rocm_env.fa_decode_tpb
-                                               ? static_cast<uint64_t>(std::max(0, *rocm_env.fa_decode_tpb))
-                                               : 0ull);
+        if (params_.device_id.is_rocm())
+        {
+            const auto &rocm_env = debugEnv().rocm;
+            combineAttentionVariant(signature, rocm_env.fa_decode_num_splits_present ? 1ull : 0ull);
+            combineAttentionVariant(signature, rocm_env.fa_decode_num_splits
+                                                   ? static_cast<uint64_t>(std::max(0, *rocm_env.fa_decode_num_splits))
+                                                   : 0ull);
+            combineAttentionVariant(signature, rocm_env.fa_decode_tpb
+                                                   ? static_cast<uint64_t>(std::max(0, *rocm_env.fa_decode_tpb))
+                                                   : 0ull);
+        }
 
         for (int row = 0; row < decode_rows; ++row)
         {
             const int row_kv_len =
                 std::max(1, effective_kv_len - (decode_rows - 1 - row));
-            const int requested_split_cap = rocmAttentionRequestedDecodeSplitCap(row_kv_len);
             combineAttentionVariant(signature, static_cast<uint64_t>(row));
-            combineAttentionVariant(signature, static_cast<uint64_t>(requested_split_cap));
+            combineAttentionVariant(signature, multirow_verifier_decode
+                                                   ? static_cast<uint64_t>(
+                                                         attentionDecodeLaunchBucket(params_.device_id, row_kv_len))
+                                                   : 0ull);
+            if (params_.device_id.is_rocm())
+            {
+                const int requested_split_cap = rocmAttentionRequestedDecodeSplitCap(row_kv_len);
+                combineAttentionVariant(signature, static_cast<uint64_t>(requested_split_cap));
+            }
         }
 
         return signature;
@@ -578,6 +1074,13 @@ namespace llaminar2
                         {
                             effective_K = cache_k;
                             effective_V = cache_v;
+                            if (kv_len_out <= 0)
+                            {
+                                LOG_ERROR("[AttentionComputeStage] get_kv_converted returned invalid kv_len="
+                                          << kv_len_out << " for layer " << params_.layer_idx);
+                                return false;
+                            }
+                            effective_kv_len = kv_len_out;
                             LOG_TRACE("[AttentionComputeStage] Using cache get_kv<FP32> ("
                                       << cache_k->dtype_name() << ") for layer " << params_.layer_idx
                                       << " kv_len=" << kv_len_out);
@@ -653,6 +1156,13 @@ namespace llaminar2
                         {
                             effective_K = cache_k;
                             effective_V = cache_v;
+                            if (kv_len_out <= 0)
+                            {
+                                LOG_ERROR("[AttentionComputeStage] GPU get_kv_converted returned invalid kv_len="
+                                          << kv_len_out << " for layer " << params_.layer_idx);
+                                return false;
+                            }
+                            effective_kv_len = kv_len_out;
                             LOG_TRACE("[AttentionComputeStage] GPU: Using cache get_kv_converted<FP16> ("
                                       << cache_k->dtype_name() << ") for layer " << params_.layer_idx
                                       << " kv_len=" << kv_len_out);
@@ -742,6 +1252,42 @@ namespace llaminar2
             return false;
         }
         bindStageStream(kernel);
+
+        if (gpu_stage && params_.kv_cache && params_.layer_idx >= 0)
+        {
+            const auto kp = params_.kv_cache->k_precision();
+            const auto vp = params_.kv_cache->v_precision();
+            const bool tq_cache =
+                kp == ActivationPrecision::TQ4 || kp == ActivationPrecision::TQ8 ||
+                vp == ActivationPrecision::TQ4 || vp == ActivationPrecision::TQ8;
+            const int *device_cached_tokens =
+                tq_cache ? nullptr : params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0);
+            const bool padded_prefill_replay =
+                prefill_replay_params_set_ &&
+                prefill_effective_seq_len_ > 0 &&
+                prefill_bucket_seq_len_ > 0 &&
+                prefill_bucket_seq_len_ == params_.seq_len &&
+                prefill_effective_seq_len_ < params_.seq_len;
+            const int logical_seq_len = padded_prefill_replay
+                                            ? prefill_effective_seq_len_
+                                            : params_.seq_len;
+            const bool decode_like_step = effective_kv_len > logical_seq_len;
+            if (device_cached_tokens && decode_like_step)
+            {
+                const int query_rows_for_params =
+                    dynamicAttentionParamRows(logical_seq_len, effective_kv_len);
+                if (!kernel->prepareDynamicAttnParamsFromDeviceSequenceState(
+                        device_cached_tokens,
+                        logical_seq_len,
+                        query_rows_for_params,
+                        gpuStream()))
+                {
+                    LOG_ERROR("[AttentionComputeStage] Failed to derive dynamic attention params from device KV state for layer "
+                              << params_.layer_idx << " on " << params_.device_id.toString());
+                    return false;
+                }
+            }
+        }
 
         // Get device index using proper ordinal for GPU devices (0-based), not legacy index
         int device_idx = params_.device_id.toKernelDeviceIndex();
@@ -1000,24 +1546,65 @@ namespace llaminar2
             invalidateDumpInfoCache();
         }
 
-        bool success = kernel->compute_tensor(
-            params_.Q, effective_K, effective_V, params_.output,
-            params_.batch_size,
-            params_.seq_len,
-            effective_kv_len,
-            params_.n_heads,
-            params_.n_kv_heads,
-            params_.head_dim,
-            kernel_causal, // Pass false for decode (we built the mask explicitly)
-            params_.window_size,
-            params_.workspace_scores,
-            mask_to_use, // Use our decode mask if we built one
-            params_.mpi_ctx,
-            device_idx,
-            params_.head_start,
-            -1, // local_n_heads (n_heads is already local)
-            -1, // local_n_kv_heads (n_kv_heads is already local)
-            params_.gqa_n_rep);
+        const bool small_verifier_decode =
+            is_decode_mode &&
+            params_.batch_size == 1 &&
+            params_.causal &&
+            params_.seq_len > 1 &&
+            params_.seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+            effective_kv_len > params_.seq_len;
+        /*
+         * The row-loop helper below is the CPU/reference oracle: it runs M
+         * verifier rows as M ordinary one-token decode calls.  GPU execution
+         * must always use the backend's device-owned multi-row path, even when
+         * the caller is not recording a graph.  That keeps CUDA and ROCm on the
+         * same contract as production capture: fixed M=2..4 launch shapes,
+         * per-row AttentionDeviceParams, and dynamic lengths derived from the
+         * cache's device sequence state.  Reintroducing the host row-loop for
+         * GPU would split sequence-state ownership and can hide coherence bugs.
+         */
+        const bool use_decode_equivalence_oracle =
+            small_verifier_decode &&
+            !params_.device_id.is_gpu();
+
+        bool success = false;
+        if (use_decode_equivalence_oracle)
+        {
+            LOG_DEBUG("[AttentionComputeStage] Using decode-equivalent verifier attention rows"
+                      << " layer=" << params_.layer_idx
+                      << " rows=" << params_.seq_len
+                      << " effective_kv_len=" << effective_kv_len
+                      << " q_type=" << (params_.Q ? params_.Q->dtype_name() : "null"));
+            success = executeDecodeEquivalentVerifierRows(
+                kernel,
+                effective_K,
+                effective_V,
+                effective_kv_len,
+                device_idx,
+                kernel_causal,
+                params_.mpi_ctx);
+        }
+        else
+        {
+            success = kernel->compute_tensor(
+                params_.Q, effective_K, effective_V, params_.output,
+                params_.batch_size,
+                params_.seq_len,
+                effective_kv_len,
+                params_.n_heads,
+                params_.n_kv_heads,
+                params_.head_dim,
+                kernel_causal, // Pass false for decode (we built the mask explicitly)
+                params_.window_size,
+                params_.workspace_scores,
+                mask_to_use, // Use our decode mask if we built one
+                params_.mpi_ctx,
+                device_idx,
+                params_.head_start,
+                -1, // local_n_heads (n_heads is already local)
+                -1, // local_n_kv_heads (n_kv_heads is already local)
+                params_.gqa_n_rep);
+        }
 
         if (!success)
         {
@@ -1182,6 +1769,7 @@ namespace llaminar2
         info.addScalarInt("batch_size", params_.batch_size);
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("kv_len", params_.kv_len);
+        info.addScalarInt("layer_idx", params_.layer_idx);
         info.addScalarInt("n_heads", params_.n_heads);
         info.addScalarInt("n_kv_heads", params_.n_kv_heads);
         info.addScalarInt("head_dim", params_.head_dim);

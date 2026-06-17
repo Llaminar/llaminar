@@ -257,7 +257,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             header = lines[0].split("\t")
             row = lines[1].split("\t")
             self.assertEqual(len(header), len(row))
-            self.assertEqual(len(header), 78)
+            self.assertEqual(len(header), 122)
             self.assertIn("topology", header)
             self.assertEqual(row[header.index("topology")], "single")
             self.assertEqual(row[header.index("device")], "cpu:0")
@@ -274,6 +274,51 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
                 "stochastic_physical_verify_rows",
                 "stochastic_semantic_verify_rows",
                 "stochastic_post_reject_rows",
+                "stochastic_seeded_device_threshold_rows",
+                "verifier_economy_dense",
+                "verifier_economy_moe",
+                "condition_skipped_pending",
+                "pending_condition_rows",
+                "first_token_pending_condition_rows",
+                "stochastic_distribution_build_gpu_ms",
+                "stochastic_distribution_batch_build_gpu_ms",
+                "stochastic_processed_rows_build_gpu_ms",
+                "resident_outcome_enqueue_ms",
+                "resident_outcome_host_bridge_ms",
+                "stochastic_batch_gpu_reducer_ms",
+                "first_sidecar_prelaunch_ms",
+                "first_sidecar_prelaunches",
+                "first_sidecar_prelaunch_reuses",
+                "first_sidecar_prelaunch_drops",
+                "first_sidecar_prelaunch_discarded_complete",
+                "first_sidecar_resident_ready_inputs",
+                "first_sidecar_resident_condition_inputs",
+                "sidecar_device_token_inputs",
+                "sidecar_device_token_inputs_from_host",
+                "sidecar_device_token_inputs_from_device",
+                "outcome_catchup_plan_ms",
+                "transaction_plan_ms",
+                "host_state_adoption_ms",
+                "transaction_output_commit_ms",
+                "stochastic_batch_d2h_sync_ms",
+                "stochastic_batch_d2h_enqueue_ms",
+                "stochastic_batch_d2h_wait_ms",
+                "bridge_stream_create_ms",
+                "bridge_stream_creations",
+                "bridge_stream_reuses",
+                "main_decode_graph_replay_gpu_ms",
+                "main_verifier_graph_replay_gpu_ms",
+                "main_verifier_stage_sample_gpu_ms",
+                "main_verifier_moe_expert_ffn_gpu_ms",
+                "main_verifier_moe_router_gpu_ms",
+                "main_verifier_gdn_projection_gpu_ms",
+                "main_verifier_gdn_recurrence_gpu_ms",
+                "main_verifier_attention_gpu_ms",
+                "main_verifier_lm_head_gpu_ms",
+                "sidecar_graph_replay_gpu_ms",
+                "sidecar_replay_reset_ms",
+                "sidecar_replay_reset_after_spec_publication",
+                "sidecar_replay_preserved_for_spec_publication",
             ):
                 self.assertIn(required_column, header)
             self.assertEqual(row[header.index("depth_updates")], "0")
@@ -340,6 +385,19 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
                           "phase": "prefill",
                           "count": 99,
                           "total_ms": 99.0
+                        },
+                        {
+                          "kind": "counter",
+                          "domain": "stage_gpu",
+                          "name": "graph_replay_plan_stage_types",
+                          "phase": "decode",
+                          "value": 120,
+                          "tags": {
+                            "context": "main_verifier",
+                            "source": "segmented_graph_capture",
+                            "segment_type": "capturable",
+                            "stage_type": "MOE_EXPERT_FFN"
+                          }
                         }
                       ]
                     }
@@ -380,10 +438,11 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = (output_dir / "stage_summary.tsv").read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(lines), 3)
+            self.assertEqual(len(lines), 4)
             header = lines[0].split("\t")
             first = lines[1].split("\t")
             second = lines[2].split("\t")
+            third = lines[3].split("\t")
             self.assertEqual(header[:5], ["topology", "device", "model", "mode", "variant"])
             self.assertEqual(first[header.index("name")], "type.MOE_EXPERT_FFN")
             self.assertEqual(first[header.index("context")], "main_verifier")
@@ -392,6 +451,11 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             self.assertEqual(first[header.index("source")], "stage_timeline")
             self.assertEqual(second[header.index("name")], "condition_forward")
             self.assertEqual(second[header.index("total_ms")], "7.25")
+            self.assertEqual(third[header.index("name")], "graph_replay_plan_stage_types.MOE_EXPERT_FFN")
+            self.assertEqual(third[header.index("context")], "main_verifier")
+            self.assertEqual(third[header.index("count")], "120")
+            self.assertEqual(third[header.index("stage_count")], "120")
+            self.assertEqual(third[header.index("source")], "segmented_graph_capture")
             self.assertNotIn("type.MOE_ROUTER", "\n".join(lines))
 
 

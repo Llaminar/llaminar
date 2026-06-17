@@ -162,6 +162,7 @@ namespace llaminar2
         bool prefillBatch(
             const std::vector<std::vector<int32_t>> &token_batches) override;
         GenerationResult decodeStep() override;
+        GenerationResult forceDecodeToken(int32_t token) override;
         bool supportsDecodeStepBatch(int request_batch) const override;
         GenerationBatchResult decodeStepBatch(int request_batch) override;
         GenerationResult generate(
@@ -288,6 +289,7 @@ namespace llaminar2
             DECODE_STEP = 4,         ///< Run one decode step
             SKIP_LOGITS_DECODE = 5,  ///< Set skip-logits-gather for decode
             APPLY_MOE_REBALANCE = 6, ///< Apply dynamic MoE rebalance/hot replicas
+            FORCE_DECODE_TOKEN = 7,  ///< Commit a forced token (followed by token id)
             SHUTDOWN = 99            ///< Exit the worker loop
         };
 
@@ -445,9 +447,30 @@ namespace llaminar2
         std::string mtpDecodeHardFailureReason() const;
         std::string mtpDecodeBypassReason() const;
         void recordMTPBypass(const std::string &reason);
+        /**
+         * @brief Emit one structured Phase 9.8 verifier-economy snapshot.
+         *
+         * The snapshot is intentionally separate from decode timers. It lets
+         * dashboards distinguish a correct serial fallback from an economical
+         * grouped/resident verifier path without adding per-token hot-path
+         * logging overhead when perfstats are disabled.
+         */
+        void recordMTPVerifierEconomyPerfStatsIfNeeded();
         bool ensureMTPDepthController(const MTPRuntimeConfig &mtp);
         int effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const;
         int currentMTPDraftDepth(const MTPRuntimeConfig &mtp);
+        /**
+         * @brief Read the host-visible sidecar base position for MTP planning.
+         *
+         * vLLM-style resident publication can advance logical positions on the
+         * device before the compatibility bridge refreshes host mirrors.  This
+         * helper is the only MTP planning path that may read `get_position()`;
+         * it hard-fails when a current resident mailbox exists but host mirrors
+         * have not been adopted yet.
+         */
+        std::optional<int> currentMTPBaseSidecarPositionForPlanning(
+            const char *context,
+            std::string *error = nullptr) const;
         void recordMTPDepthZeroBypass();
         void recordMTPDepthObservation(
             int requested_depth,
@@ -509,6 +532,62 @@ namespace llaminar2
         std::optional<int32_t> ready_sampled_token_;                    // Token already sampled from ready terminal logits
         std::optional<SamplingParams> ready_sampled_params_;            // Sampling params used to produce ready_sampled_token_
         /**
+         * @brief Device-resident source for @ref ready_sampled_token_.
+         *
+         * A ready token is sampled one step early from the verifier's bonus
+         * terminal row, then emitted at the beginning of the next decode step.
+         * The host token remains necessary for the served response, but the
+         * next MTP sidecar should consume the token and logical position from
+         * the device mailbox when one is available.  This keeps the real
+         * inference path aligned with vLLM-style resident state publication
+         * instead of re-uploading the same token from a CPU shadow.
+         */
+        std::optional<DeviceResidentLogicalSequenceStateHandle>
+            ready_sampled_resident_state_;
+        /**
+         * @brief Already-emitted correction token that still needs a main verifier row.
+         *
+         * vLLM-style MTP rejection publishes accepted state only through the
+         * accepted verifier prefix.  When stochastic verification rejects a
+         * draft, the sampled correction is emitted to the caller immediately,
+         * but the next speculative transaction can consume that correction as
+         * verifier input row zero instead of running a standalone one-token
+         * condition forward.  This field owns that handoff.  The token is
+         * already in `sampler_` history and must not be emitted or recorded
+         * again when the next transaction commits.
+         */
+        std::optional<int32_t> pending_mtp_condition_token_;
+        std::optional<SamplingParams> pending_mtp_condition_params_;
+        /**
+         * @brief Device-resident source for @ref pending_mtp_condition_token_.
+         *
+         * The host token above is still required because `decodeStep()` returns
+         * concrete token ids to the caller.  It must not, however, become the
+         * source of truth for the next GPU sidecar.  When direct MTP
+         * publication exposes a logical-state mailbox, this handle lets the
+         * next fixed-depth stochastic transaction consume the correction token
+         * and logical position from GPU metadata, matching vLLM's
+         * device-resident transaction shape.
+         */
+        std::optional<DeviceResidentLogicalSequenceStateHandle>
+            pending_mtp_condition_resident_state_;
+        /**
+         * @brief First MTP sidecar already queued for the next decode step.
+         *
+         * vLLM overlaps response copies with target-state postprocessing and
+         * the following draft proposal.  In Llaminar's synchronous
+         * `decodeStep()` API we still return concrete host tokens, but when a
+         * direct GPU publication has a resident continuation token and no stop
+         * token can invalidate it, we can enqueue the next first sidecar before
+         * waiting for the host response bridge.  The next decode step consumes
+         * this handle only if it still matches the pending/ready resident
+         * mailbox exactly.
+         */
+        std::optional<DeviceResidentLogicalSequenceStateHandle>
+            prelaunched_mtp_first_sidecar_resident_state_;
+        std::optional<SamplingParams>
+            prelaunched_mtp_first_sidecar_params_;
+        /**
          * @brief Per-request state initialized by prefillBatch().
          *
          * Phase 8 request batching must never reuse the scalar last-token or
@@ -542,6 +621,7 @@ namespace llaminar2
         std::shared_ptr<ITokenizer> tokenizer_;
         MTPStats mtp_stats_;
         std::unique_ptr<MTPDepthController> mtp_depth_controller_;
+        bool mtp_verifier_economy_perfstats_emitted_{false};
         PrefillChunkStats prefill_chunk_stats_;
         PrefixCacheRequestSummary prefix_request_summary_;
         bool mtp_bypassed_{false};

@@ -1385,6 +1385,8 @@ TEST(Test__PrefillGraphCache, ToString_RejectReasons)
     EXPECT_STREQ(toString(PrefillGraphRejectReason::StageNotCapturable), "StageNotCapturable");
     EXPECT_STREQ(toString(PrefillGraphRejectReason::NoGPUContext), "NoGPUContext");
     EXPECT_STREQ(toString(PrefillGraphRejectReason::InvalidatedByPlacement), "InvalidatedByPlacement");
+    EXPECT_STREQ(toString(PrefillGraphRejectReason::SessionReset), "SessionReset");
+    EXPECT_STREQ(toString(PrefillGraphRejectReason::RequestStateReset), "RequestStateReset");
 }
 
 // =============================================================================

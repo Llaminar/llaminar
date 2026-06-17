@@ -2724,9 +2724,13 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_InjectsStopSequ
         .WillByDefault(Return("stop thinking now"));
     ON_CALL(*tokenizer_, encode("stop thinking now", _, _))
         .WillByDefault(Return(std::vector<int>{90, 91, 92}));
+    EXPECT_CALL(*tokenizer_, encode("stop thinking now", false, false))
+        .Times(1);
 
-    // Decode: 2 thinking tokens, then budget exhausted → inject [90, 91, 92]
-    // For injected tokens, the runner still gets called (KV cache consistency)
+    // Decode 2 thinking tokens, then budget exhaustion schedules the stop
+    // sequence for subsequent forced positions. The forced-token calls are the
+    // important regression guard: text injection without runner-state commits
+    // leaves later decode on the wrong KV/GDN state.
     ON_CALL(*tokenizer_, decode_token(10))
         .WillByDefault(Return("thinking1"));
     ON_CALL(*tokenizer_, decode_token(11))
@@ -2741,18 +2745,16 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_InjectsStopSequ
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
 
-    // Decode sequence:
-    // Token 10 (thinking1) -> thinking_tokens=1
-    // Token 11 (thinking2) -> thinking_tokens=2, budget exhausted → inject 90
-    // Then inject 91 (runner decodeStep called for KV cache)
-    // Then inject 92 (runner decodeStep called for KV cache)
-    // Then normal decode returns complete
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(10)))       // Thinking token 1
-        .WillOnce(Return(makeToken(11)))       // Thinking token 2 → budget exhausted, inject 90
-        .WillOnce(Return(makeToken(99)))       // KV cache forward for 91 (result discarded)
-        .WillOnce(Return(makeToken(99)))       // KV cache forward for 92 (result discarded)
+        .WillOnce(Return(makeToken(11)))       // Thinking token 2, then budget exhausted
         .WillOnce(Return(makeToken(0, true))); // Normal completion
+    EXPECT_CALL(*runner_, forceDecodeToken(90))
+        .WillOnce(Return(makeToken(90)));
+    EXPECT_CALL(*runner_, forceDecodeToken(91))
+        .WillOnce(Return(makeToken(91)));
+    EXPECT_CALL(*runner_, forceDecodeToken(92))
+        .WillOnce(Return(makeToken(92)));
 
     ChatCompletionRequest request;
     request.messages = {ChatMessage("user", "think about this")};

@@ -711,6 +711,15 @@ namespace llaminar2
         TensorBase *terminal_hidden = nullptr;
         IKVCache *kv_cache = nullptr;
         const int *position_ids = nullptr;
+        /**
+         * @brief Optional device-resident INT32 position IDs for GPU sidecars.
+         *
+         * When set, MTP RoPE stages consume row positions directly from device
+         * memory.  This keeps request-batched verifier/sidecar replay graph
+         * capturable and avoids the per-step host position upload that Phase 10
+         * is removing.
+         */
+        const void *position_ids_device = nullptr;
         const std::vector<int> *sequence_lengths = nullptr;
         int batch_size = 1;
         int seq_len = 1;

@@ -9,6 +9,7 @@
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/Tensors.h"
+#include <algorithm>
 #include <cmath>
 #include <vector>
 #include <numeric>
@@ -714,6 +715,84 @@ TEST_F(ComputeStageTest, FactoryCreateRoPE)
     auto stage = ComputeStageFactory::createRoPE(params);
     ASSERT_NE(stage, nullptr);
     EXPECT_EQ(stage->type(), ComputeStageType::ROPE);
+}
+
+TEST_F(ComputeStageTest, RoPEVerifierPrefillMatchesSerialDecodeRows)
+{
+    const int seq_len = 3;
+    const int n_heads = 4;
+    const int n_kv_heads = 2;
+    const int head_dim = 16;
+    const int q_cols = n_heads * head_dim;
+    const int k_cols = n_kv_heads * head_dim;
+    const int pos_offset = 17;
+
+    std::vector<float> q_input(static_cast<size_t>(seq_len) * q_cols);
+    std::vector<float> k_input(static_cast<size_t>(seq_len) * k_cols);
+    for (size_t i = 0; i < q_input.size(); ++i)
+        q_input[i] = std::sin(0.031f * static_cast<float>(i + 1));
+    for (size_t i = 0; i < k_input.size(); ++i)
+        k_input[i] = std::cos(0.017f * static_cast<float>(i + 3));
+
+    auto grouped_q = makeTensor(seq_len, q_cols, q_input);
+    auto grouped_k = makeTensor(seq_len, k_cols, k_input);
+    RoPEStage::Params grouped_params{
+        .device_id = DeviceId::cpu(),
+        .Q = grouped_q.get(),
+        .K = grouped_k.get(),
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .pos_offset = pos_offset,
+        .theta_base = 1000000.0f,
+        .seq_len = seq_len,
+        .force_decode_equivalent_verifier_prefill = true};
+
+    RoPEStage grouped_stage(grouped_params);
+    ASSERT_TRUE(grouped_stage.execute(ctx_.get()));
+
+    std::vector<float> serial_q(q_input.size(), 0.0f);
+    std::vector<float> serial_k(k_input.size(), 0.0f);
+    for (int row = 0; row < seq_len; ++row)
+    {
+        auto row_q = makeTensor(1, q_cols);
+        auto row_k = makeTensor(1, k_cols);
+        std::copy_n(q_input.data() + static_cast<size_t>(row) * q_cols,
+                    q_cols,
+                    row_q->mutable_data());
+        std::copy_n(k_input.data() + static_cast<size_t>(row) * k_cols,
+                    k_cols,
+                    row_k->mutable_data());
+
+        RoPEStage::Params row_params{
+            .device_id = DeviceId::cpu(),
+            .Q = row_q.get(),
+            .K = row_k.get(),
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim,
+            .pos_offset = pos_offset + row,
+            .theta_base = 1000000.0f,
+            .seq_len = 1};
+        RoPEStage row_stage(row_params);
+        ASSERT_TRUE(row_stage.execute(ctx_.get())) << "row=" << row;
+
+        std::copy_n(row_q->data(), q_cols,
+                    serial_q.data() + static_cast<size_t>(row) * q_cols);
+        std::copy_n(row_k->data(), k_cols,
+                    serial_k.data() + static_cast<size_t>(row) * k_cols);
+    }
+
+    for (size_t i = 0; i < serial_q.size(); ++i)
+    {
+        EXPECT_NEAR(grouped_q->data()[i], serial_q[i], 1e-6f)
+            << "Q index=" << i;
+    }
+    for (size_t i = 0; i < serial_k.size(); ++i)
+    {
+        EXPECT_NEAR(grouped_k->data()[i], serial_k[i], 1e-6f)
+            << "K index=" << i;
+    }
 }
 
 // =============================================================================

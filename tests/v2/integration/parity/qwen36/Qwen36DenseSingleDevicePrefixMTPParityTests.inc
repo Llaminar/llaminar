@@ -111,6 +111,62 @@ QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, MTPStochasticSamplin
     runDenseStochasticMTPVerifierParity(QWEN36_DENSE_PREFIX_MTP_CASE());
 }
 
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, VerifierRowsDecodeEquivalentM1)
+{
+    runDenseMainVerifierDecodeEquivalentRowsMatchSerialDecode(
+        QWEN36_DENSE_PREFIX_MTP_CASE(),
+        1);
+}
+
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, VerifierRowsDecodeEquivalentM2)
+{
+    runDenseMainVerifierDecodeEquivalentRowsMatchSerialDecode(
+        QWEN36_DENSE_PREFIX_MTP_CASE(),
+        2);
+}
+
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, VerifierRowsDecodeEquivalentM3)
+{
+    runDenseMainVerifierDecodeEquivalentRowsMatchSerialDecode(
+        QWEN36_DENSE_PREFIX_MTP_CASE(),
+        3);
+}
+
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, VerifierRowsDecodeEquivalentM4)
+{
+    runDenseMainVerifierDecodeEquivalentRowsMatchSerialDecode(
+        QWEN36_DENSE_PREFIX_MTP_CASE(),
+        4);
+}
+
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, VerifierRowsGroupedDecodeEquivalentM1)
+{
+    runDenseMainVerifierGroupedRowsMatchSerialDecode(
+        QWEN36_DENSE_PREFIX_MTP_CASE(),
+        1);
+}
+
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, VerifierRowsGroupedDecodeEquivalentM2)
+{
+    runDenseMainVerifierGroupedRowsMatchSerialDecode(
+        QWEN36_DENSE_PREFIX_MTP_CASE(),
+        2);
+}
+
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, VerifierRowsGroupedDecodeEquivalentM3)
+{
+    runDenseMainVerifierGroupedRowsMatchSerialDecode(
+        QWEN36_DENSE_PREFIX_MTP_CASE(),
+        3);
+}
+
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, VerifierRowsGroupedDecodeEquivalentM4)
+{
+    runDenseMainVerifierGroupedRowsMatchSerialDecode(
+        QWEN36_DENSE_PREFIX_MTP_CASE(),
+        4);
+}
+
 #undef QWEN36_DENSE_PREFIX_MTP_TEST
 #undef QWEN36_DENSE_PREFIX_MTP_TEST_IMPL
 #undef QWEN36_DENSE_PREFIX_MTP_CASE

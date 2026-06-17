@@ -32,6 +32,8 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
+#include "kernels/attention/AttentionDeviceParams.h"
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #endif
 
@@ -52,6 +54,31 @@ using namespace llaminar2::test;
 
 namespace
 {
+#ifdef HAVE_CUDA
+    extern "C"
+    {
+        int cudaFlashAttn_decode_fp16kv(
+            const float *Q,
+            const void *K_cache_fp16,
+            const void *V_cache_fp16,
+            float *O,
+            float *O_partial,
+            float *m_partial,
+            float *l_partial,
+            int batch_size,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            int num_splits,
+            const llaminar2::attention::AttentionDeviceParams *device_params,
+            void *stream,
+            int device_idx,
+            int head_start,
+            int gqa_n_rep);
+    }
+#endif
+
     double cosineSimilarity(const float *a, const float *b, size_t count)
     {
         double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
@@ -78,6 +105,81 @@ namespace
         }
         return max_err;
     }
+
+#ifdef HAVE_CUDA
+    std::vector<__half> toHalfVector(const std::vector<float> &src)
+    {
+        std::vector<__half> dst(src.size());
+        for (size_t i = 0; i < src.size(); ++i)
+            dst[i] = __float2half(src[i]);
+        return dst;
+    }
+
+    void computeReferenceFP16KVDecode(
+        const std::vector<float> &Q,
+        const std::vector<__half> &K,
+        const std::vector<__half> &V,
+        std::vector<float> &output,
+        int query_row,
+        int kv_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim)
+    {
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        const int gqa = n_heads / n_kv_heads;
+        const size_t q_row_stride =
+            static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
+
+        for (int h = 0; h < n_heads; ++h)
+        {
+            const int kv_h = h / gqa;
+            const float *q_h =
+                Q.data() + static_cast<size_t>(query_row) * q_row_stride +
+                static_cast<size_t>(h) * static_cast<size_t>(head_dim);
+
+            std::vector<float> scores(static_cast<size_t>(kv_len));
+            for (int t = 0; t < kv_len; ++t)
+            {
+                float dot = 0.0f;
+                const size_t kv_base =
+                    (static_cast<size_t>(t) * static_cast<size_t>(n_kv_heads) +
+                     static_cast<size_t>(kv_h)) *
+                    static_cast<size_t>(head_dim);
+                for (int d = 0; d < head_dim; ++d)
+                    dot += q_h[d] * __half2float(K[kv_base + static_cast<size_t>(d)]);
+                scores[static_cast<size_t>(t)] = dot * scale;
+            }
+
+            const float max_score =
+                *std::max_element(scores.begin(), scores.end());
+            float denom = 0.0f;
+            for (float &score : scores)
+            {
+                score = std::exp(score - max_score);
+                denom += score;
+            }
+
+            float *out_h =
+                output.data() + static_cast<size_t>(query_row) * q_row_stride +
+                static_cast<size_t>(h) * static_cast<size_t>(head_dim);
+            for (int d = 0; d < head_dim; ++d)
+            {
+                float acc = 0.0f;
+                for (int t = 0; t < kv_len; ++t)
+                {
+                    const size_t kv_base =
+                        (static_cast<size_t>(t) * static_cast<size_t>(n_kv_heads) +
+                         static_cast<size_t>(kv_h)) *
+                        static_cast<size_t>(head_dim);
+                    acc += (scores[static_cast<size_t>(t)] / denom) *
+                           __half2float(V[kv_base + static_cast<size_t>(d)]);
+                }
+                out_h[d] = acc;
+            }
+        }
+    }
+#endif
 } // namespace
 
 // ============================================================================
@@ -425,6 +527,163 @@ TEST_F(Test__CUDAFlashAttention_DecodeKVLen, MultipleDecodeSteps_GrowingKVCache)
     cudaFree(d_K);
     cudaFree(d_V);
     cudaFree(d_output);
+}
+
+/**
+ * @brief Qwen3.6 all-position verifier shape for FP16-KV tiny decode.
+ *
+ * The MTP verifier publishes recurrent state from a small multi-row decode
+ * graph. Attention must therefore be equivalent to serial single-row decode:
+ * row 0 attends through base+1 KV rows and row 1 attends through base+2 rows.
+ * This regression locks down the low-level CUDA FP16-KV primitive before the
+ * full graph publication path consumes its hidden rows.
+ */
+TEST_F(Test__CUDAFlashAttention_DecodeKVLen, SmallMFP16KVRowsMatchSerialReference)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int seq_len = 2;
+    constexpr int post_append_kv_len = 599;
+    constexpr int n_heads = 16;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 128;
+    constexpr int num_splits = 8;
+
+    const size_t q_row_stride =
+        static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
+    const size_t q_size = static_cast<size_t>(seq_len) * q_row_stride;
+    const size_t kv_size =
+        static_cast<size_t>(post_append_kv_len) *
+        static_cast<size_t>(n_kv_heads) *
+        static_cast<size_t>(head_dim);
+
+    auto Q_data = randomFP32(q_size);
+    auto K_fp32 = randomFP32(kv_size);
+    auto V_fp32 = randomFP32(kv_size);
+
+    // Mildly stress the softmax while keeping the random reference stable.
+    for (float &v : Q_data)
+        v *= 3.0f;
+    for (float &v : K_fp32)
+        v *= 2.0f;
+
+    const auto K_half = toHalfVector(K_fp32);
+    const auto V_half = toHalfVector(V_fp32);
+
+    std::vector<float> reference(q_size, 0.0f);
+    computeReferenceFP16KVDecode(
+        Q_data, K_half, V_half, reference,
+        /*query_row=*/0, post_append_kv_len - 1,
+        n_heads, n_kv_heads, head_dim);
+    computeReferenceFP16KVDecode(
+        Q_data, K_half, V_half, reference,
+        /*query_row=*/1, post_append_kv_len,
+        n_heads, n_kv_heads, head_dim);
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    float *d_Q = nullptr;
+    __half *d_K = nullptr;
+    __half *d_V = nullptr;
+    float *d_output = nullptr;
+    float *d_partial_output = nullptr;
+    float *d_partial_m = nullptr;
+    float *d_partial_l = nullptr;
+    attention::AttentionDeviceParams *d_params = nullptr;
+
+    ASSERT_EQ(cudaMalloc(&d_Q, q_size * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_K, kv_size * sizeof(__half)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_V, kv_size * sizeof(__half)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_output, q_size * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_partial_output,
+                         static_cast<size_t>(n_heads) *
+                             static_cast<size_t>(num_splits) *
+                             static_cast<size_t>(head_dim) *
+                             sizeof(float)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_partial_m,
+                         static_cast<size_t>(n_heads) *
+                             static_cast<size_t>(num_splits) *
+                             sizeof(float)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_partial_l,
+                         static_cast<size_t>(n_heads) *
+                             static_cast<size_t>(num_splits) *
+                             sizeof(float)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_params,
+                         static_cast<size_t>(seq_len) *
+                             sizeof(attention::AttentionDeviceParams)),
+              cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpyAsync(
+                  d_Q, Q_data.data(), q_size * sizeof(float),
+                  cudaMemcpyHostToDevice, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  d_K, K_half.data(), kv_size * sizeof(__half),
+                  cudaMemcpyHostToDevice, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  d_V, V_half.data(), kv_size * sizeof(__half),
+                  cudaMemcpyHostToDevice, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_output, 0, q_size * sizeof(float), stream),
+              cudaSuccess);
+
+    const attention::AttentionDeviceParams params[seq_len] = {
+        {post_append_kv_len - 1, post_append_kv_len - seq_len, post_append_kv_len},
+        {post_append_kv_len, post_append_kv_len - seq_len + 1, post_append_kv_len},
+    };
+    ASSERT_EQ(cudaMemcpyAsync(
+                  d_params, params, sizeof(params),
+                  cudaMemcpyHostToDevice, stream),
+              cudaSuccess);
+
+    for (int row = 0; row < seq_len; ++row)
+    {
+        const int row_kv_len = post_append_kv_len - (seq_len - 1 - row);
+        const int rc = cudaFlashAttn_decode_fp16kv(
+            d_Q + static_cast<size_t>(row) * q_row_stride,
+            d_K, d_V,
+            d_output + static_cast<size_t>(row) * q_row_stride,
+            d_partial_output, d_partial_m, d_partial_l,
+            1, row_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            num_splits,
+            d_params + row,
+            stream,
+            cuda_ordinal_,
+            0,
+            0);
+        ASSERT_EQ(rc, 0) << "row " << row << " FP16-KV decode launch failed";
+    }
+
+    std::vector<float> actual(q_size, 0.0f);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  actual.data(), d_output, q_size * sizeof(float),
+                  cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    const double cosine = cosineSimilarity(actual.data(), reference.data(), q_size);
+    const double max_err = maxAbsError(actual.data(), reference.data(), q_size);
+
+    EXPECT_GE(cosine, 0.9995)
+        << "small-M FP16-KV decode should match serial row reference";
+    EXPECT_LT(max_err, 0.03)
+        << "small-M FP16-KV decode max error too high";
+
+    cudaFree(d_params);
+    cudaFree(d_partial_l);
+    cudaFree(d_partial_m);
+    cudaFree(d_partial_output);
+    cudaFree(d_output);
+    cudaFree(d_V);
+    cudaFree(d_K);
+    cudaFree(d_Q);
+    cudaStreamDestroy(stream);
 }
 
 #endif // HAVE_CUDA

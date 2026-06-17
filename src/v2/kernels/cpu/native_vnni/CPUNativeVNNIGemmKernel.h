@@ -485,9 +485,6 @@ namespace llaminar2::cpu::native_vnni
                 {
                     // Fused path: quantize once, single OMP region for all projections
 
-                    // Apply activation rotation (if configured on this kernel)
-                    input_data = maybe_rotate_activation(input_data, 1, k);
-
                     // Set up workspace for deferred-packing kernels.
                     // Multiple deferred kernels need simultaneous workspace slots
                     // since the fused GEMV reads all weights in parallel.

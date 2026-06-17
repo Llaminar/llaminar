@@ -370,11 +370,19 @@ namespace llaminar2
         const int entry_idx = layer * batch_size_ + seq_idx;
         if (h_head_params_)
             h_head_params_[entry_idx] = 0;
+        if (h_count_params_)
+            h_count_params_[entry_idx] = 0;
         if (d_head_params_)
         {
             hipError_t err = hipMemsetAsync(&d_head_params_[entry_idx], 0, sizeof(int), stream);
             if (err != hipSuccess)
                 LOG_WARN("[ROCmRingKVCacheTQ::clear] head param memset failed: " << hipGetErrorString(err));
+        }
+        if (d_count_params_)
+        {
+            hipError_t err = hipMemsetAsync(&d_count_params_[entry_idx], 0, sizeof(int), stream);
+            if (err != hipSuccess)
+                LOG_WARN("[ROCmRingKVCacheTQ::clear] count param memset failed: " << hipGetErrorString(err));
         }
 
         if (h_dequant_params_)

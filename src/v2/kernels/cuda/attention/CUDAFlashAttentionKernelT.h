@@ -284,6 +284,11 @@ namespace llaminar2
             void setDynamicAttnParams(int kv_len, int position_offset, int query_rows) override;
             bool prepareDynamicAttnParams(
                 int kv_len, int position_offset, int query_rows, void *stream) override;
+            bool prepareDynamicAttnParamsFromDeviceSequenceState(
+                const int *post_append_cached_tokens_device,
+                int seq_len,
+                int query_rows,
+                void *stream) override;
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
@@ -467,6 +472,7 @@ namespace llaminar2
             int dynamic_attn_param_rows_ = 1;
             bool dynamic_attn_host_valid_ = false;
             bool dynamic_attn_device_valid_ = false;
+            bool dynamic_attn_device_derived_ = false;
 
             bool ensureHostAttnParamsCapacity(int capacity);
             bool uploadDynamicAttnParams(void *stream);

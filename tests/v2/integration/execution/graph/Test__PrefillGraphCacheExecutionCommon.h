@@ -853,7 +853,7 @@ namespace
             << "Capture launch and Ready replay both run post-graph callbacks.";
     }
 
-    TEST_F(PrefillGraphCacheExecutionTest, SessionResetKeepsCapturedPrefillReadyForReplay)
+    TEST_F(PrefillGraphCacheExecutionTest, SessionResetDropsCapturedPrefillExecutable)
     {
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -900,23 +900,24 @@ namespace
         auto after_reset = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(after_reset.has_value());
         ASSERT_TRUE(after_reset->prefill_cache_initialized);
-        EXPECT_EQ(after_reset->phase, PrefillGraphPhase::Ready)
-            << "Request/session reset must preserve captured prefill graphs; "
-               "otherwise benchmark steady-state iterations repeatedly re-enter "
-               "cold/warmup/capture instead of replaying the warmed graph.";
-        EXPECT_EQ(after_reset->replay_count, replay_count_before_reset);
+        EXPECT_EQ(after_reset->phase, PrefillGraphPhase::Cold)
+            << "Request/session reset clears live KV/GDN/short-conv state, so "
+               "the previous request's monolithic prefill executable must be "
+               "dropped before the next request begins.";
+        EXPECT_EQ(after_reset->replay_count, 0);
         EXPECT_EQ(after_reset->capture_count, ready->capture_count);
 
         ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
         expectProbeOutputMatches(*host_, kExactBucketSeqLen);
 
-        auto after_replay = engine_->prefillGraphCacheSnapshot(signature, key);
-        ASSERT_TRUE(after_replay.has_value());
-        EXPECT_EQ(after_replay->phase, PrefillGraphPhase::Ready);
-        EXPECT_EQ(after_replay->capture_count, ready->capture_count);
-        EXPECT_EQ(after_replay->replay_count, replay_count_before_reset + 1)
-            << "The first request after session reset should be a Ready replay, "
-               "not a fresh warmup or capture.";
+        auto after_warmup = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_warmup.has_value());
+        EXPECT_EQ(after_warmup->phase, PrefillGraphPhase::Warmup)
+            << "The first request after session reset executes normally and "
+               "arms a fresh capture against the newly cleared live state.";
+        EXPECT_EQ(after_warmup->capture_count, ready->capture_count);
+        EXPECT_EQ(after_warmup->replay_count, 0);
+        EXPECT_EQ(after_warmup->warmup_count, ready->warmup_count + 1);
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, ChunkScheduleFixedPlacementReachesCapturedReplay)

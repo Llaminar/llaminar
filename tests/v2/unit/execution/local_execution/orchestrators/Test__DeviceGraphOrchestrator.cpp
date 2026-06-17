@@ -369,8 +369,11 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
     ASSERT_TRUE(moe_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     EXPECT_FALSE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
-        << "CPU MoE keeps the conservative restore path; the skip exists to let "
-           "GPU verifier graphs mature to replay.";
+        << "MoE all-position verifier row parity is not enough to prove that the "
+           "preceding sidecar left every routed live-state surface untouched.";
+    EXPECT_FALSE(moe_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
+        << "MoE must publish the first shifted MTP row from the target verifier "
+           "accepted row, not reuse sidecar-local routed expert state.";
 
     DeviceId gpu_device = DeviceId::invalid();
     if (DeviceManager::instance().cuda_device_count() > 0)
@@ -389,10 +392,25 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
             std::make_shared<Qwen35MoEGraph>(gpu_moe_config, nullptr),
             nullptr);
         ASSERT_TRUE(gpu_moe_orchestrator.initializeInferenceStateFromArena(1, 16, gpu_device));
-        EXPECT_TRUE(gpu_moe_orchestrator.supportsMTPSidecarPreservesMainState())
-            << "SingleDevice GPU MoE with full expert ownership has real-model "
-               "CUDA/ROCm verifier-row preservation coverage and can skip the "
-               "verifier-base restore.";
+        EXPECT_FALSE(gpu_moe_orchestrator.supportsMTPSidecarPreservesMainState())
+            << "GPU MoE sidecar preservation must stay disabled until a dedicated "
+               "preservation test covers KV, GDN/conv, routed scratch, and overlay state.";
+        EXPECT_FALSE(gpu_moe_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
+            << "MoE shifted-row reuse requires the stronger sidecar-preservation capability.";
+        const auto gpu_moe_capability =
+            gpu_moe_orchestrator.mtpVerifierRowCapability();
+        EXPECT_TRUE(gpu_moe_capability.supportsMoEDecodeEquivalentRows(4, true))
+            << "Phase 9.7 proves MoE shared decode-equivalent verifier rows "
+               "for M=1..4 on every backend.";
+        EXPECT_FALSE(gpu_moe_capability.supportsMoEDirectAllPositionRows(1, false))
+            << "MoE direct all-position publication remains fail-closed.";
+        const auto gpu_moe_economy =
+            gpu_moe_orchestrator.mtpVerifierEconomyCapability();
+        EXPECT_TRUE(gpu_moe_economy.supportsMoERows(4, true));
+        EXPECT_TRUE(gpu_moe_economy.moe.serial_decode_equivalent_fallback);
+        EXPECT_FALSE(gpu_moe_economy.hasEconomicalMoEPath(4, true))
+            << "Phase 9.8 must not treat the correct serial fallback as a "
+               "grouped verifier fast path.";
     }
 
     auto dense_config = config_;
@@ -413,6 +431,53 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
     EXPECT_TRUE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
         << "Initialized dense MTP runners can skip the full verifier-base restore; "
            "speculative MTP KV rows are discarded by the shifted-row commit path.";
+    EXPECT_TRUE(dense_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
+        << "Dense sidecars append a first shifted row that is equivalent to the "
+           "accepted target-row commit.";
+    EXPECT_FALSE(dense_orchestrator.supportsMTPSpecStatePublication())
+        << "CPU dense MTP must stay on the decode-equivalent verifier until "
+           "CPU all-position GDN/KV publication has a continuation-equivalence "
+           "proof.";
+    const auto cpu_dense_capability =
+        dense_orchestrator.mtpVerifierRowCapability();
+    EXPECT_TRUE(cpu_dense_capability.supportsDenseDecodeEquivalentRows(4, true))
+        << "CPU dense has a proven shared decode-equivalent verifier row "
+           "contract for M=1..4.";
+    EXPECT_FALSE(cpu_dense_capability.supportsDenseDirectAllPositionRows(1, false))
+        << "CPU dense direct publication is intentionally not promoted.";
+    const auto cpu_dense_economy =
+        dense_orchestrator.mtpVerifierEconomyCapability();
+    EXPECT_TRUE(cpu_dense_economy.supportsDenseRows(4, true));
+    EXPECT_TRUE(cpu_dense_economy.dense.serial_decode_equivalent_fallback);
+    EXPECT_FALSE(cpu_dense_economy.hasEconomicalDensePath(4, false));
+
+    if (gpu_device.is_valid())
+    {
+        auto gpu_dense_config = dense_config;
+        gpu_dense_config.default_device = gpu_device;
+        DeviceGraphOrchestrator gpu_dense_orchestrator(
+            std::make_shared<QwenStandardGraph>(gpu_dense_config, nullptr),
+            nullptr);
+        ASSERT_TRUE(gpu_dense_orchestrator.initializeInferenceStateFromArena(1, 16, gpu_device));
+        EXPECT_FALSE(gpu_dense_orchestrator.supportsMTPSpecStatePublication())
+            << "GPU dense direct all-position publication must stay disabled "
+               "until it has a continuation-equivalence proof for recurrent "
+               "GDN/short-conv state, not just matching verifier row logits.";
+        const auto gpu_dense_capability =
+            gpu_dense_orchestrator.mtpVerifierRowCapability();
+        EXPECT_TRUE(gpu_dense_capability.supportsDenseDecodeEquivalentRows(4, true));
+        EXPECT_FALSE(gpu_dense_capability.supportsDenseDirectAllPositionRows(1, false))
+            << "The proven M=1..4 contract is the shared decode-equivalent "
+               "path; direct publication remains fail-closed.";
+        EXPECT_FALSE(gpu_dense_capability.supportsDenseDirectAllPositionRows(4, true))
+            << "Stochastic direct publication also requires its own proof.";
+        const auto gpu_dense_economy =
+            gpu_dense_orchestrator.mtpVerifierEconomyCapability();
+        EXPECT_TRUE(gpu_dense_economy.supportsDenseRows(4, true));
+        EXPECT_FALSE(gpu_dense_economy.hasEconomicalDensePath(4, true))
+            << "Grouped/resident verifier promotion is Phase 9.8 work, even "
+               "when Phase 9.7 row correctness is green.";
+    }
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeLazyCallback)
@@ -1739,6 +1804,7 @@ namespace
             last_m_ = m;
             last_n_ = n;
             last_k_ = k;
+            saw_decode_m1_ = saw_decode_m1_ || (m == 1);
             getRequirements_called_++;
             WorkspaceRequirements reqs;
             reqs.buffers.push_back(WorkspaceDescriptor{
@@ -1780,6 +1846,7 @@ namespace
         int getLastM() const { return last_m_; }
         int getLastN() const { return last_n_; }
         int getLastK() const { return last_k_; }
+        bool sawDecodeM1() const { return saw_decode_m1_; }
 
     private:
         std::string name_;
@@ -1790,6 +1857,7 @@ namespace
         mutable int last_m_ = -1;
         mutable int last_n_ = -1;
         mutable int last_k_ = -1;
+        mutable bool saw_decode_m1_ = false;
     };
 
     /**
@@ -2107,6 +2175,8 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualMaxSeqLen)
 
     // Verify that max_seq_len was passed as m (first argument)
     EXPECT_EQ(gpu_ptr->getLastM(), 2048) << "max_seq_len should be passed as m dimension";
+    EXPECT_TRUE(gpu_ptr->sawDecodeM1())
+        << "Prefill-sized graph workspaces should also include decode-only scratch";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesExplicitRequestWhenProvided)
@@ -2143,6 +2213,8 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesExplicitRequestWhenPro
     // ForwardExecutionEngine handles later workspace growth by rebinding cached
     // graphs and invalidating captured replay state.
     EXPECT_EQ(gpu_ptr->getLastM(), 768);
+    EXPECT_TRUE(gpu_ptr->sawDecodeM1())
+        << "Bucketed graph workspaces should also include decode-only scratch";
     EXPECT_TRUE(gpu_ptr->wasBound());
 }
 
@@ -2309,6 +2381,8 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_FallbackWhenMaxSeqLenZero)
 
     // Verify fallback to default (4096)
     EXPECT_EQ(gpu_ptr->getLastM(), 4096) << "max_seq_len=0 should fallback to 4096";
+    EXPECT_TRUE(gpu_ptr->sawDecodeM1())
+        << "Fallback graph workspaces should also include decode-only scratch";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenNHeadsZero)

@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -90,6 +91,283 @@ namespace llaminar2
     };
 
     using MTPDecodeCatchupGreedySampler = std::function<int32_t()>;
+
+    /**
+     * @brief Numeric proof contract for one verifier-row implementation.
+     *
+     * Phase 9.7 promotes verifier implementations only by model family, row
+     * count, and sampling mode.  Keeping those facts in a plain value type
+     * makes capability reporting precise: a runner can advertise that shared
+     * stepwise replay is proven for M=1..4 while direct all-position
+     * publication remains disabled for MoE, for example.
+     */
+    struct MTPVerifierRowEquivalenceSpec
+    {
+        bool enabled = false;
+        int max_rows = 0;
+        bool greedy = false;
+        bool stochastic = false;
+        double min_cosine = 0.99995;
+        double max_rel_l2 = 0.005;
+        double max_symmetric_kl = 1.0e-4;
+
+        static MTPVerifierRowEquivalenceSpec proven(
+            int rows,
+            bool supports_stochastic = true)
+        {
+            MTPVerifierRowEquivalenceSpec spec;
+            spec.enabled = rows > 0;
+            spec.max_rows = rows > 0 ? rows : 0;
+            spec.greedy = rows > 0;
+            spec.stochastic = rows > 0 && supports_stochastic;
+            return spec;
+        }
+
+        bool supportsRows(int rows, bool stochastic_requested = false) const
+        {
+            if (!enabled || rows <= 0 || rows > max_rows)
+            {
+                return false;
+            }
+            return stochastic_requested ? stochastic : greedy;
+        }
+
+        void intersectWith(const MTPVerifierRowEquivalenceSpec &other)
+        {
+            enabled = enabled && other.enabled;
+            max_rows = enabled ? std::min(max_rows, other.max_rows) : 0;
+            greedy = greedy && other.greedy;
+            stochastic = stochastic && other.stochastic;
+            min_cosine = std::max(min_cosine, other.min_cosine);
+            max_rel_l2 = std::min(max_rel_l2, other.max_rel_l2);
+            max_symmetric_kl = std::min(max_symmetric_kl, other.max_symmetric_kl);
+        }
+    };
+
+    /**
+     * @brief Runner-level verifier-row capability matrix.
+     *
+     * The dense and MoE fields are intentionally separate because their fast
+     * paths advance different mutable state surfaces.  Direct all-position
+     * publication is stronger than decode-equivalent replay; callers should
+     * require the direct field before publishing state from a batched verifier
+     * graph, and fall back to the decode-equivalent field only for the shared
+     * one-row replay contract.
+     */
+    struct MTPVerifierRowCapability
+    {
+        MTPVerifierRowEquivalenceSpec dense_decode_equivalent;
+        MTPVerifierRowEquivalenceSpec moe_decode_equivalent;
+        MTPVerifierRowEquivalenceSpec dense_direct_all_position;
+        MTPVerifierRowEquivalenceSpec moe_direct_all_position;
+        bool device_resident_direct_publication = false;
+
+        bool supportsDenseDecodeEquivalentRows(
+            int rows,
+            bool stochastic_requested = false) const
+        {
+            return dense_decode_equivalent.supportsRows(
+                rows,
+                stochastic_requested);
+        }
+
+        bool supportsMoEDecodeEquivalentRows(
+            int rows,
+            bool stochastic_requested = false) const
+        {
+            return moe_decode_equivalent.supportsRows(
+                rows,
+                stochastic_requested);
+        }
+
+        bool supportsDenseDirectAllPositionRows(
+            int rows,
+            bool stochastic_requested = false) const
+        {
+            return dense_direct_all_position.supportsRows(
+                rows,
+                stochastic_requested);
+        }
+
+        bool supportsMoEDirectAllPositionRows(
+            int rows,
+            bool stochastic_requested = false) const
+        {
+            return moe_direct_all_position.supportsRows(
+                rows,
+                stochastic_requested);
+        }
+
+        void intersectWith(const MTPVerifierRowCapability &other)
+        {
+            dense_decode_equivalent.intersectWith(other.dense_decode_equivalent);
+            moe_decode_equivalent.intersectWith(other.moe_decode_equivalent);
+            dense_direct_all_position.intersectWith(other.dense_direct_all_position);
+            moe_direct_all_position.intersectWith(other.moe_direct_all_position);
+            device_resident_direct_publication =
+                device_resident_direct_publication &&
+                other.device_resident_direct_publication;
+        }
+    };
+
+    /**
+     * @brief Phase 9.8 performance capability for one verifier lane.
+     *
+     * MTPVerifierRowCapability answers "is this verifier row numerically
+     * decode-equivalent?".  This object answers the separate production
+     * question: "is the proven implementation economical enough to promote?".
+     * A serial replay fallback may be correct and still fail this capability.
+     * Keeping those states separate prevents dashboards and rollout logic from
+     * treating correctness-only paths as vLLM-style fast paths.
+     */
+    struct MTPVerifierEconomyLane
+    {
+        bool correct = false;
+        bool serial_decode_equivalent_fallback = false;
+        bool grouped_decode_equivalent = false;
+        bool row_indexed_lm_head = false;
+        bool device_resident_input = false;
+        bool device_resident_outcome = false;
+        bool device_resident_publication = false;
+        bool host_bridge_free_hot_path = false;
+        bool graph_capturable = false;
+        bool greedy = false;
+        bool stochastic = false;
+        int max_rows = 0;
+        std::string perf_gate_status = "unproven";
+
+        static MTPVerifierEconomyLane serialFallbackCorrect(int rows)
+        {
+            MTPVerifierEconomyLane lane;
+            lane.correct = rows > 0;
+            lane.serial_decode_equivalent_fallback = lane.correct;
+            lane.greedy = lane.correct;
+            lane.stochastic = lane.correct;
+            lane.max_rows = lane.correct ? rows : 0;
+            lane.perf_gate_status = lane.correct
+                                        ? "correct_serial_fallback_not_economical"
+                                        : "unproven";
+            return lane;
+        }
+
+        static MTPVerifierEconomyLane groupedPromoted(int rows)
+        {
+            MTPVerifierEconomyLane lane;
+            lane.correct = rows > 0;
+            lane.grouped_decode_equivalent = lane.correct;
+            lane.row_indexed_lm_head = lane.correct;
+            lane.device_resident_input = lane.correct;
+            lane.device_resident_outcome = lane.correct;
+            lane.device_resident_publication = lane.correct;
+            lane.host_bridge_free_hot_path = lane.correct;
+            lane.graph_capturable = lane.correct;
+            lane.greedy = lane.correct;
+            lane.stochastic = lane.correct;
+            lane.max_rows = lane.correct ? rows : 0;
+            lane.perf_gate_status = lane.correct
+                                        ? "grouped_promoted"
+                                        : "unproven";
+            return lane;
+        }
+
+        bool supportsRows(
+            int rows,
+            bool stochastic_requested = false) const
+        {
+            if (!correct || rows <= 0 || rows > max_rows)
+                return false;
+            return stochastic_requested ? stochastic : greedy;
+        }
+
+        bool isEconomicalForRows(
+            int rows,
+            bool stochastic_requested = false) const
+        {
+            return supportsRows(rows, stochastic_requested) &&
+                   grouped_decode_equivalent &&
+                   row_indexed_lm_head &&
+                   device_resident_input &&
+                   device_resident_outcome &&
+                   device_resident_publication &&
+                   host_bridge_free_hot_path &&
+                   graph_capturable;
+        }
+
+        void intersectWith(const MTPVerifierEconomyLane &other)
+        {
+            correct = correct && other.correct;
+            max_rows = correct ? std::min(max_rows, other.max_rows) : 0;
+            serial_decode_equivalent_fallback =
+                serial_decode_equivalent_fallback &&
+                other.serial_decode_equivalent_fallback;
+            grouped_decode_equivalent =
+                grouped_decode_equivalent &&
+                other.grouped_decode_equivalent;
+            row_indexed_lm_head = row_indexed_lm_head && other.row_indexed_lm_head;
+            device_resident_input =
+                device_resident_input && other.device_resident_input;
+            device_resident_outcome =
+                device_resident_outcome && other.device_resident_outcome;
+            device_resident_publication =
+                device_resident_publication && other.device_resident_publication;
+            host_bridge_free_hot_path =
+                host_bridge_free_hot_path && other.host_bridge_free_hot_path;
+            graph_capturable = graph_capturable && other.graph_capturable;
+            greedy = greedy && other.greedy;
+            stochastic = stochastic && other.stochastic;
+            if (!correct)
+            {
+                perf_gate_status = "unproven";
+            }
+            else if (perf_gate_status != other.perf_gate_status)
+            {
+                perf_gate_status = "mixed_capability";
+            }
+        }
+    };
+
+    /**
+     * @brief Phase 9.8 verifier economy matrix by model family.
+     */
+    struct MTPVerifierEconomyCapability
+    {
+        MTPVerifierEconomyLane dense;
+        MTPVerifierEconomyLane moe;
+
+        bool supportsDenseRows(
+            int rows,
+            bool stochastic_requested = false) const
+        {
+            return dense.supportsRows(rows, stochastic_requested);
+        }
+
+        bool supportsMoERows(
+            int rows,
+            bool stochastic_requested = false) const
+        {
+            return moe.supportsRows(rows, stochastic_requested);
+        }
+
+        bool hasEconomicalDensePath(
+            int rows,
+            bool stochastic_requested = false) const
+        {
+            return dense.isEconomicalForRows(rows, stochastic_requested);
+        }
+
+        bool hasEconomicalMoEPath(
+            int rows,
+            bool stochastic_requested = false) const
+        {
+            return moe.isEconomicalForRows(rows, stochastic_requested);
+        }
+
+        void intersectWith(const MTPVerifierEconomyCapability &other)
+        {
+            dense.intersectWith(other.dense);
+            moe.intersectWith(other.moe);
+        }
+    };
 
     MTPDecodeCatchupGreedyEquivalence compareMTPDecodeCatchupGreedyResults(
         const MTPDecodeCatchupGreedyResult &oracle,

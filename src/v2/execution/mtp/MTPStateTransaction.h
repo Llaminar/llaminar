@@ -49,6 +49,26 @@ namespace llaminar2
         static MTPStateValidationResult failure(std::string reason);
     };
 
+    struct MTPRuntimeSnapshotComparisonOptions
+    {
+        /**
+         * @brief Compare main KV payload hashes in addition to logical cache metadata.
+         *
+         * Leave this true for production replay checks.  Serial-oracle parity
+         * tests may disable it when they compare a row-grouped verifier path
+         * against row-by-row decode: the logical KV position must still match,
+         * but quantized payload bytes can differ slightly while continuation
+         * remains decode-equivalent.
+         */
+        bool compare_main_kv_payload_hashes = true;
+        bool compare_shifted_mtp_kv = true;
+        bool compare_gdn_hashes = true;
+        bool compare_gdn_values_if_available = false;
+        double gdn_relative_l2_tolerance = 1e-4;
+        double gdn_max_abs_tolerance = 1e-4;
+        double gdn_min_cosine = 0.999999;
+    };
+
     int expectedShiftedMTPTokens(int logical_tokens);
 
     /**
@@ -77,6 +97,7 @@ namespace llaminar2
 
     MTPStateValidationResult compareMTPRuntimeStateSnapshots(
         const PrefixRuntimeStateSnapshot &oracle,
-        const PrefixRuntimeStateSnapshot &candidate);
+        const PrefixRuntimeStateSnapshot &candidate,
+        const MTPRuntimeSnapshotComparisonOptions &options = {});
 
 } // namespace llaminar2

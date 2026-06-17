@@ -48,6 +48,7 @@ namespace
 #define QWEN36_MOE_PREFIX_MTP_CASE cpuSingleDeviceCase
 #define QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE cpuSingleDeviceBenchmarkPromptCase
 #define QWEN36_MOE_PREFIX_MTP_DEPTH3_CASE cpuSingleDeviceDepth3Case
+#define QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION 0
 #include "Qwen36MoESingleDevicePrefixMTPParityTests.inc"
 
 int main(int argc, char **argv)

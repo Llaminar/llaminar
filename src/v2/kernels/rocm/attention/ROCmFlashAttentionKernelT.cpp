@@ -93,6 +93,13 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep);
 
+    int hipFlashAttn_prepare_device_params_from_count(
+        void *device_params,
+        const int *post_append_cached_tokens,
+        int seq_len,
+        int query_rows,
+        void *stream);
+
     int hipFlashAttn_allocWorkspace(
         void **partial_output, void **partial_m, void **partial_l,
         int batch_size, int n_heads, int head_dim, int num_splits);
@@ -213,7 +220,14 @@ namespace llaminar2
               device_ctx_(other.device_ctx_),
               h_attn_params_(other.h_attn_params_),
               h_attn_params_capacity_(other.h_attn_params_capacity_),
-              small_decode_rows_(other.small_decode_rows_)
+              small_decode_rows_(other.small_decode_rows_),
+              dynamic_attn_kv_len_(other.dynamic_attn_kv_len_),
+              dynamic_attn_position_offset_(other.dynamic_attn_position_offset_),
+              dynamic_attn_query_rows_(other.dynamic_attn_query_rows_),
+              dynamic_attn_param_rows_(other.dynamic_attn_param_rows_),
+              dynamic_attn_host_valid_(other.dynamic_attn_host_valid_),
+              dynamic_attn_device_valid_(other.dynamic_attn_device_valid_),
+              dynamic_attn_device_derived_(other.dynamic_attn_device_derived_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -226,6 +240,9 @@ namespace llaminar2
             other.h_attn_params_ = nullptr;
             other.h_attn_params_capacity_ = 0;
             other.small_decode_rows_ = 0;
+            other.dynamic_attn_host_valid_ = false;
+            other.dynamic_attn_device_valid_ = false;
+            other.dynamic_attn_device_derived_ = false;
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32> &
@@ -253,6 +270,13 @@ namespace llaminar2
                 h_attn_params_ = other.h_attn_params_;
                 h_attn_params_capacity_ = other.h_attn_params_capacity_;
                 small_decode_rows_ = other.small_decode_rows_;
+                dynamic_attn_kv_len_ = other.dynamic_attn_kv_len_;
+                dynamic_attn_position_offset_ = other.dynamic_attn_position_offset_;
+                dynamic_attn_query_rows_ = other.dynamic_attn_query_rows_;
+                dynamic_attn_param_rows_ = other.dynamic_attn_param_rows_;
+                dynamic_attn_host_valid_ = other.dynamic_attn_host_valid_;
+                dynamic_attn_device_valid_ = other.dynamic_attn_device_valid_;
+                dynamic_attn_device_derived_ = other.dynamic_attn_device_derived_;
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
@@ -265,6 +289,9 @@ namespace llaminar2
                 other.h_attn_params_ = nullptr;
                 other.h_attn_params_capacity_ = 0;
                 other.small_decode_rows_ = 0;
+                other.dynamic_attn_host_valid_ = false;
+                other.dynamic_attn_device_valid_ = false;
+                other.dynamic_attn_device_derived_ = false;
             }
             return *this;
         }
@@ -680,6 +707,7 @@ namespace llaminar2
             {
                 dynamic_attn_device_valid_ = false;
             }
+            dynamic_attn_device_derived_ = false;
 
             if (small_decode_rows_ > 1)
             {
@@ -776,6 +804,66 @@ namespace llaminar2
             return ready;
         }
 
+        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParamsFromDeviceSequenceState(
+            const int *post_append_cached_tokens_device,
+            int seq_len,
+            int query_rows,
+            void *stream)
+        {
+            const int sanitized_query_rows =
+                (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
+            if (!post_append_cached_tokens_device || seq_len <= 0 || !stream)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, positive seq_len, and explicit stream");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+            if (!workspace_)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Device-derived attention params require a bound workspace");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+
+            void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+            if (!d_buf)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Missing workspace buffer "
+                          << AttentionWorkspaceBuffers::DEVICE_PARAMS
+                          << " for device-derived attention params");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+
+            setGPUStream(stream);
+            const int rc = hipFlashAttn_prepare_device_params_from_count(
+                d_buf,
+                post_append_cached_tokens_device,
+                seq_len,
+                sanitized_query_rows,
+                stream);
+            if (rc != 0)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Failed to derive attention params from device KV count");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+
+            small_decode_rows_ = (sanitized_query_rows > 1) ? sanitized_query_rows : 0;
+            dynamic_attn_kv_len_ = 0;
+            dynamic_attn_position_offset_ = 0;
+            dynamic_attn_query_rows_ = sanitized_query_rows;
+            dynamic_attn_param_rows_ = sanitized_query_rows;
+            dynamic_attn_host_valid_ = true;
+            dynamic_attn_device_valid_ = true;
+            dynamic_attn_device_derived_ = true;
+            return true;
+        }
+
         void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::resetDynamicState()
         {
             small_decode_rows_ = 0;
@@ -785,6 +873,7 @@ namespace llaminar2
             dynamic_attn_param_rows_ = 1;
             dynamic_attn_host_valid_ = false;
             dynamic_attn_device_valid_ = false;
+            dynamic_attn_device_derived_ = false;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::compute_tensor(
@@ -958,7 +1047,22 @@ namespace llaminar2
                     return false;
                 }
 
-                if (cap_status == hipStreamCaptureStatusActive)
+                if (dynamic_attn_device_derived_)
+                {
+                    if (!dynamic_attn_device_valid_ ||
+                        dynamic_attn_param_rows_ < query_rows_for_params ||
+                        dynamic_attn_query_rows_ != query_rows_for_params)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
+                                  "Device-derived attention params were not ready"
+                                  << " rows=" << query_rows_for_params
+                                  << " prepared_rows=" << dynamic_attn_query_rows_
+                                  << " param_rows=" << dynamic_attn_param_rows_
+                                  << " device_valid=" << dynamic_attn_device_valid_);
+                        return false;
+                    }
+                }
+                else if (cap_status == hipStreamCaptureStatusActive)
                 {
                     if (!dynamic_attn_host_valid_ ||
                         !dynamic_attn_device_valid_ ||

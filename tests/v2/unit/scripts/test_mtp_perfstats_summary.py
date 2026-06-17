@@ -64,6 +64,59 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "stochastic_seeded_device_threshold_rows",
+                    "phase": "decode",
+                    "count": 2,
+                    "value": 5,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "verifier_economy_capability",
+                    "phase": "decode",
+                    "device": "cuda:0",
+                    "count": 1,
+                    "value": 4,
+                    "tags": {
+                        "lane": "dense",
+                        "perf_gate_status": "correct_serial_fallback_not_economical",
+                        "max_rows": "4",
+                        "serial_decode_equivalent_fallback": "true",
+                        "grouped_decode_equivalent": "false",
+                        "row_indexed_lm_head": "false",
+                        "device_resident_input": "false",
+                        "device_resident_outcome": "false",
+                        "device_resident_publication": "false",
+                        "host_bridge_free_hot_path": "false",
+                        "graph_capturable": "false",
+                        "greedy": "true",
+                        "stochastic": "true",
+                    },
+                },
+                {
+                    "domain": "mtp",
+                    "name": "verifier_economy_capability",
+                    "phase": "decode",
+                    "device": "cuda:0",
+                    "count": 1,
+                    "value": 3,
+                    "tags": {
+                        "lane": "moe",
+                        "perf_gate_status": "grouped_promoted",
+                        "max_rows": "3",
+                        "serial_decode_equivalent_fallback": "false",
+                        "grouped_decode_equivalent": "true",
+                        "row_indexed_lm_head": "true",
+                        "device_resident_input": "true",
+                        "device_resident_outcome": "true",
+                        "device_resident_publication": "true",
+                        "host_bridge_free_hot_path": "true",
+                        "graph_capturable": "true",
+                        "greedy": "true",
+                        "stochastic": "true",
+                    },
+                },
+                {
+                    "domain": "mtp",
                     "name": "condition_forward",
                     "phase": "decode",
                     "count": 2,
@@ -74,6 +127,26 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                     "name": "condition_forward_skipped_ready_logits",
                     "phase": "decode",
                     "count": 5,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "condition_forward_skipped_pending_condition",
+                    "phase": "decode",
+                    "count": 6,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "pending_condition_verifier_rows",
+                    "phase": "decode",
+                    "count": 2,
+                    "value": 4,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "first_token_pending_condition_rows",
+                    "phase": "decode",
+                    "count": 3,
+                    "value": 3,
                 },
                 {
                     "domain": "mtp",
@@ -226,6 +299,133 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "stochastic_distribution_build_gpu",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 8.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_distribution_batch_build_gpu",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 9.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_processed_rows_build_gpu",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 9.5,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "all_position_stochastic_device_resident_outcome_enqueue",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 11.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "all_position_stochastic_device_outcome_host_bridge",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 12.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_request_batch_summary_gpu_reducer",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 13.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_first_sidecar_prelaunch_enqueue",
+                    "phase": "decode",
+                    "count": 2,
+                    "total_ms": 1.5,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_first_sidecar_prelaunches",
+                    "phase": "decode",
+                    "count": 3,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_first_sidecar_prelaunch_reuses",
+                    "phase": "decode",
+                    "count": 2,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_prelaunched_first_sidecar_dropped",
+                    "phase": "decode",
+                    "count": 1,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_first_sidecar_prelaunch_discarded_complete",
+                    "phase": "decode",
+                    "count": 2,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_first_sidecar_resident_ready_inputs",
+                    "phase": "decode",
+                    "count": 4,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_first_sidecar_resident_condition_inputs",
+                    "phase": "decode",
+                    "count": 5,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "mtp_sidecar_device_token_inputs",
+                    "phase": "decode",
+                    "count": 3,
+                    "tags": {"source": "host"},
+                },
+                {
+                    "domain": "mtp",
+                    "name": "mtp_sidecar_device_token_inputs",
+                    "phase": "decode",
+                    "count": 7,
+                    "tags": {"source": "device"},
+                },
+                {
+                    "domain": "mtp",
+                    "name": "all_position_stochastic_device_outcome_catchup_plan",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 0.75,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "all_position_transaction_plan_build",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 0.5,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "device_resident_publication_host_adoption",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 0.25,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "transaction_output_commit",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 0.125,
+                },
+                {
+                    "domain": "mtp",
                     "name": "stochastic_batch_summary_d2h_sync",
                     "phase": "decode",
                     "count": 1,
@@ -233,10 +433,166 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "stochastic_batch_summary_d2h_enqueue",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 0.25,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_batch_summary_d2h_wait",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 19.75,
+                },
+                {
+                    "domain": "mtp",
                     "name": "stochastic_request_batch_summary_d2h_sync",
                     "phase": "decode",
                     "count": 1,
                     "total_ms": 3.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_request_batch_summary_d2h_enqueue",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 0.5,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_request_batch_summary_d2h_wait",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 2.5,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_request_batch_summary_bridge_stream_create",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 1.5,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_request_batch_summary_bridge_stream_creations",
+                    "phase": "decode",
+                    "count": 1,
+                    "value": 1.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "stochastic_request_batch_summary_bridge_stream_reuses",
+                    "phase": "decode",
+                    "count": 1,
+                    "value": 4.0,
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "graph_replay.total",
+                    "phase": "decode",
+                    "count": 2,
+                    "total_ms": 14.0,
+                    "tags": {"context": "main_decode"},
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "graph_replay.total",
+                    "phase": "decode",
+                    "count": 5,
+                    "total_ms": 35.0,
+                    "tags": {"context": "main_verifier"},
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "total",
+                    "phase": "decode",
+                    "count": 5,
+                    "total_ms": 31.0,
+                    "tags": {"context": "main_verifier"},
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "type.MOE_EXPERT_FFN",
+                    "phase": "decode",
+                    "count": 5,
+                    "total_ms": 21.0,
+                    "tags": {"context": "main_verifier"},
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "type.MOE_ROUTER",
+                    "phase": "decode",
+                    "count": 5,
+                    "total_ms": 4.0,
+                    "tags": {"context": "main_verifier"},
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "type.GDN_PROJECTION",
+                    "phase": "decode",
+                    "count": 5,
+                    "total_ms": 3.0,
+                    "tags": {"context": "main_verifier"},
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "type.GDN_RECURRENCE",
+                    "phase": "decode",
+                    "count": 5,
+                    "total_ms": 2.0,
+                    "tags": {"context": "main_verifier"},
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "type.ATTENTION",
+                    "phase": "decode",
+                    "count": 5,
+                    "total_ms": 1.5,
+                    "tags": {"context": "main_verifier"},
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "type.LM_HEAD",
+                    "phase": "decode",
+                    "count": 5,
+                    "total_ms": 1.25,
+                    "tags": {"context": "main_verifier"},
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "type.MOE_EXPERT_FFN",
+                    "phase": "prefill",
+                    "count": 99,
+                    "total_ms": 999.0,
+                    "tags": {"context": "main_verifier"},
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "graph_replay.total",
+                    "phase": "decode",
+                    "count": 4,
+                    "total_ms": 6.0,
+                    "tags": {"context": "mtp_decode_sidecar_resident_logical_state"},
+                },
+                {
+                    "domain": "mtp",
+                    "name": "sidecar_replay_reset",
+                    "phase": "decode",
+                    "count": 4,
+                    "total_ms": 44.0,
+                    "tags": {
+                        "reset_scope": "after_spec_publication",
+                        "mutation_reason": "accepted_spec_publication",
+                    },
+                },
+                {
+                    "domain": "stage_gpu",
+                    "name": "graph_replay.total",
+                    "phase": "decode",
+                    "count": 10,
+                    "total_ms": 99.0,
+                    "tags": {"context": "mtp_shifted_prefill"},
                 },
                 {
                     "domain": "mtp",
@@ -361,6 +717,20 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                     "count": 6,
                     "tags": {"replay_state": "preserved"},
                 },
+                {
+                    "domain": "mtp",
+                    "name": "live_prefix_replay_state_after_mutation",
+                    "phase": "decode",
+                    "count": 4,
+                    "tags": {"sidecar_replay_state": "reset_after_spec_publication"},
+                },
+                {
+                    "domain": "mtp",
+                    "name": "live_prefix_replay_state_after_mutation",
+                    "phase": "decode",
+                    "count": 3,
+                    "tags": {"sidecar_replay_state": "preserved_for_spec_publication"},
+                },
             ],
         }
 
@@ -384,9 +754,21 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["stochastic_physical_verify_rows"], 9.0)
         self.assertEqual(summary["stochastic_semantic_verify_rows"], 7.0)
         self.assertEqual(summary["stochastic_post_reject_rows"], 2.0)
+        self.assertEqual(summary["stochastic_seeded_device_threshold_rows"], 5.0)
+        self.assertEqual(
+            summary["verifier_economy_dense"],
+            "status=correct_serial_fallback_not_economical;rows=4;serial=true;grouped=false;row_lm=false;resident=false/false/false;bridge_free=false;graph=false;greedy=true;stochastic=true",
+        )
+        self.assertEqual(
+            summary["verifier_economy_moe"],
+            "status=grouped_promoted;rows=3;serial=false;grouped=true;row_lm=true;resident=true/true/true;bridge_free=true;graph=true;greedy=true;stochastic=true",
+        )
         self.assertEqual(summary["condition_ms"], 9.75)
         self.assertEqual(summary["condition_count"], 2)
         self.assertEqual(summary["condition_skipped_ready"], 5)
+        self.assertEqual(summary["condition_skipped_pending"], 6)
+        self.assertEqual(summary["pending_condition_rows"], 4.0)
+        self.assertEqual(summary["first_token_pending_condition_rows"], 3.0)
         self.assertEqual(summary["correction_ms"], 7.5)
         self.assertEqual(summary["correction_count"], 2)
         self.assertEqual(summary["deferred_corrections"], 3)
@@ -407,8 +789,44 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["shifted_kv_syncs_deferred"], 6)
         self.assertEqual(summary["sampling_ms"], 41.5)
         self.assertEqual(summary["sampling_enqueue_ms"], 0.5)
+        self.assertEqual(summary["stochastic_distribution_build_gpu_ms"], 8.0)
+        self.assertEqual(summary["stochastic_distribution_batch_build_gpu_ms"], 9.0)
+        self.assertEqual(summary["stochastic_processed_rows_build_gpu_ms"], 9.5)
         self.assertEqual(summary["stochastic_batch_outcome_ms"], 10.0)
+        self.assertEqual(summary["resident_outcome_enqueue_ms"], 11.0)
+        self.assertEqual(summary["resident_outcome_host_bridge_ms"], 12.0)
+        self.assertEqual(summary["stochastic_batch_gpu_reducer_ms"], 13.0)
+        self.assertEqual(summary["first_sidecar_prelaunch_ms"], 1.5)
+        self.assertEqual(summary["first_sidecar_prelaunches"], 3)
+        self.assertEqual(summary["first_sidecar_prelaunch_reuses"], 2)
+        self.assertEqual(summary["first_sidecar_prelaunch_drops"], 1)
+        self.assertEqual(summary["first_sidecar_prelaunch_discarded_complete"], 2)
+        self.assertEqual(summary["first_sidecar_resident_ready_inputs"], 4)
+        self.assertEqual(summary["first_sidecar_resident_condition_inputs"], 5)
+        self.assertEqual(summary["sidecar_device_token_inputs"], 10)
+        self.assertEqual(summary["sidecar_device_token_inputs_from_host"], 3)
+        self.assertEqual(summary["sidecar_device_token_inputs_from_device"], 7)
+        self.assertEqual(summary["outcome_catchup_plan_ms"], 0.75)
+        self.assertEqual(summary["transaction_plan_ms"], 0.5)
+        self.assertEqual(summary["host_state_adoption_ms"], 0.25)
+        self.assertEqual(summary["transaction_output_commit_ms"], 0.125)
         self.assertEqual(summary["stochastic_batch_d2h_sync_ms"], 23.0)
+        self.assertEqual(summary["stochastic_batch_d2h_enqueue_ms"], 0.75)
+        self.assertEqual(summary["stochastic_batch_d2h_wait_ms"], 22.25)
+        self.assertEqual(summary["bridge_stream_create_ms"], 1.5)
+        self.assertEqual(summary["bridge_stream_creations"], 1.0)
+        self.assertEqual(summary["bridge_stream_reuses"], 4.0)
+        self.assertEqual(summary["main_decode_graph_replay_gpu_ms"], 14.0)
+        self.assertEqual(summary["main_verifier_graph_replay_gpu_ms"], 35.0)
+        self.assertEqual(summary["main_verifier_stage_sample_gpu_ms"], 31.0)
+        self.assertEqual(summary["main_verifier_moe_expert_ffn_gpu_ms"], 21.0)
+        self.assertEqual(summary["main_verifier_moe_router_gpu_ms"], 4.0)
+        self.assertEqual(summary["main_verifier_gdn_projection_gpu_ms"], 3.0)
+        self.assertEqual(summary["main_verifier_gdn_recurrence_gpu_ms"], 2.0)
+        self.assertEqual(summary["main_verifier_attention_gpu_ms"], 1.5)
+        self.assertEqual(summary["main_verifier_lm_head_gpu_ms"], 1.25)
+        self.assertEqual(summary["sidecar_graph_replay_gpu_ms"], 6.0)
+        self.assertEqual(summary["sidecar_replay_reset_ms"], 44.0)
         self.assertEqual(summary["greedy_summary_ms"], 30.0)
         self.assertEqual(summary["checkpoint_ms"], 6.0)
         self.assertEqual(summary["sidecar_graph_hits"], 7)
@@ -421,6 +839,8 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["main_verifier_replay"], 5)
         self.assertEqual(summary["replay_resets"], 2)
         self.assertEqual(summary["replay_preserves"], 6)
+        self.assertEqual(summary["sidecar_replay_reset_after_spec_publication"], 4)
+        self.assertEqual(summary["sidecar_replay_preserved_for_spec_publication"], 3)
         self.assertEqual(summary["replay_reset_caches"], 0)
         self.assertEqual(summary["replay_rebind_caches"], 6)
         self.assertEqual(summary["replay_ordinary_decode_resets"], 0)
@@ -435,7 +855,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
             capture_output=True,
         )
         values = result.stdout.strip().split("\t")
-        self.assertEqual(len(values), 47)
+        self.assertEqual(len(values), 91)
         self.assertTrue(all(value in ("0", "0.0") for value in values))
 
     def test_multiple_paths_emit_table_for_matrix_comparison(self) -> None:

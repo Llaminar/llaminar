@@ -60,9 +60,19 @@ namespace llaminar2
 
             float *conv_state = nullptr; ///< Conv state buffer [channels, kernel_size-1] (from GDNLayerState)
             int seq_len = 0;             ///< Sequence length
+            int request_count = 1;       ///< Number of independent requests in the flattened verifier tensor.
+            int request_seq_len = 0;     ///< Per-request rows before flattening; 0 means seq_len for legacy graphs.
             int channels = 0;            ///< Number of channels (= QKV dim)
             int kernel_size = 4;         ///< Convolution kernel width
             int layer_idx = -1;          ///< Logical model layer for stable graph workspace naming.
+            /**
+             * @brief Stable graph/workspace namespace for capture-sensitive buffers.
+             *
+             * All-position verifier rows and MTP sidecar rows may be built for the
+             * same logical layer.  The namespace keeps short-conv verifier-state
+             * snapshots graph-role local instead of sharing one layer-only key.
+             */
+            std::string workspace_namespace;
             int verifier_state_capture_rows = 0; ///< Compatibility spelling for speculative state slots.
             int speculative_state_slot_rows = 0; ///< Phase 13.8 temporary state slots for MTP verifier rows.
 
@@ -100,6 +110,10 @@ namespace llaminar2
             params_.seq_len = seq_len;
         }
         bool hasDynamicParams() const override { return true; }
+        bool supportsDeviceResidentDynamicPositionReplay() const override
+        {
+            return true;
+        }
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
@@ -117,7 +131,27 @@ namespace llaminar2
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
         bool supportsPaddedPrefillRealLengthContract() const override;
         bool hasVerifierStateCapture() const override;
+        bool requiresVerifierStateCaptureForPublication() const override
+        {
+            return verifierStateCaptureWorkspaceRequired();
+        }
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            const int *device_row_index,
+            void *stream) override;
+        /**
+         * @brief Restore one captured short-conv state row per request.
+         *
+         * Batched publication is only correct when the backend owns a separate
+         * live conv-state slot per request.  This hook exists so CUDA, ROCm,
+         * and CPU can share the same publication contract once those state
+         * banks are implemented; it must not be replaced by a scalar loop.
+         */
+        bool restoreVerifierStateCaptureRowsFromDeviceIndices(
+            const int *device_row_indices,
+            int request_count,
+            int row_index_stride,
+            void *stream) override;
         void onGraphReplayed() override;
         bool needsOnGraphReplayed() const override { return params_.kernel != nullptr; }
         // Short conv1d operates fully on-device when GPU is active — graph-capturable
@@ -156,6 +190,8 @@ namespace llaminar2
         void releaseGpuEffectiveSeqLenState();
         void bindKernelWorkspace();
         void clearKernelVerifierStateWorkspace();
+        const float *cpuVerifierStateCaptureSource() const;
+        bool restoreCPUVerifierStateCaptureRowDirect(int row);
     };
 
 } // namespace llaminar2

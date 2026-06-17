@@ -299,6 +299,38 @@ namespace
         return {max_abs, rel_l2};
     }
 
+    /**
+     * @brief Verifies that verifier publication refreshed the host state mirror.
+     *
+     * CUDA GDN kernels keep the live decode state in device memory, while the
+     * hybrid KV cache also owns a host mirror used when graph rebuilds happen
+     * after an MTP publication boundary.  The mirror must be the same accepted
+     * verifier row as the device state restore; otherwise a rebuild can resume
+     * from stale recurrent/conv state even though captured replay is correct.
+     */
+    void expectHostMirrorMatchesSnapshotRow(
+        const std::vector<float> &host_mirror,
+        const CudaFloatBuffer &snapshots,
+        int row,
+        int state_floats)
+    {
+        ASSERT_GE(row, 0);
+        ASSERT_GT(state_floats, 0);
+        ASSERT_EQ(host_mirror.size(), static_cast<size_t>(state_floats));
+        const std::vector<float> snapshot_host = snapshots.toHost();
+        const size_t offset =
+            static_cast<size_t>(row) * static_cast<size_t>(state_floats);
+        ASSERT_LE(offset + static_cast<size_t>(state_floats),
+                  snapshot_host.size());
+        for (int i = 0; i < state_floats; ++i)
+        {
+            EXPECT_FLOAT_EQ(
+                host_mirror[static_cast<size_t>(i)],
+                snapshot_host[offset + static_cast<size_t>(i)])
+                << "state_float=" << i << " row=" << row;
+        }
+    }
+
     /// @brief Returns the largest absolute value in a contiguous output span.
     float maxAbsSpan(const std::vector<float> &values, size_t offset, size_t count)
     {
@@ -749,8 +781,16 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAcc
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(verifier recurrence capture)");
     std::vector<float> live_state_before_publish(static_cast<size_t>(state_floats));
     ASSERT_TRUE(verifier_kernel.exportState(live_state_before_publish.data(), nullptr, nullptr));
+    std::vector<float> restored_host_mirror(
+        static_cast<size_t>(state_floats),
+        -123.0f);
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        nullptr, accepted_rows - 1, stream.stream));
+        restored_host_mirror.data(), accepted_rows - 1, stream.stream));
+    expectHostMirrorMatchesSnapshotRow(
+        restored_host_mirror,
+        d_snapshots,
+        accepted_rows - 1,
+        state_floats);
     verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     ASSERT_TRUE(verifier_kernel.recurrent_step(
@@ -1202,8 +1242,16 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceTwoRowVerifierRowZeroRestoreMatc
         d_verifier_out.ptr, nullptr,
         verifier_len, n_heads, d_k, d_v,
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    std::vector<float> restored_host_mirror(
+        static_cast<size_t>(state_floats),
+        -456.0f);
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        nullptr, accepted_rows - 1, stream.stream));
+        restored_host_mirror.data(), accepted_rows - 1, stream.stream));
+    expectHostMirrorMatchesSnapshotRow(
+        restored_host_mirror,
+        d_snapshots,
+        accepted_rows - 1,
+        state_floats);
     verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     ASSERT_TRUE(verifier_kernel.recurrent_step(
@@ -1312,8 +1360,16 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiSt
         d_verifier_out.ptr, nullptr,
         verifier_len, n_heads, d_k, d_v,
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    std::vector<float> restored_host_mirror(
+        static_cast<size_t>(state_floats),
+        -789.0f);
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        nullptr, accepted_rows - 1, stream.stream));
+        restored_host_mirror.data(), accepted_rows - 1, stream.stream));
+    expectHostMirrorMatchesSnapshotRow(
+        restored_host_mirror,
+        d_snapshots,
+        accepted_rows - 1,
+        state_floats);
     verifier_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
     for (int row = 0; row < continuation_rows; ++row)

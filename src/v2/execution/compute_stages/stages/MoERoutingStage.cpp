@@ -7,11 +7,14 @@
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "../../../tensors/Tensors.h"
 #include "../../../utils/Assertions.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace llaminar2
@@ -43,6 +46,24 @@ namespace llaminar2
             }
 
             return true;
+        }
+
+        /**
+         * Mark a routing tensor after a backend kernel writes it on an explicit
+         * GPU stream.  Decode-equivalent verifier routing scatters per-row
+         * route IDs and weights directly into the full all-position tensors.
+         * If we leave the host mirror authoritative after that D2D scatter, the
+         * following expert stage can re-upload stale host routing and break the
+         * serial-decode equivalence contract.
+         */
+        void markRoutingOutputGpuWritten(TensorBase *tensor, DeviceId device, void *stream)
+        {
+            if (!tensor || !device.is_gpu())
+                return;
+            tensor->transitionToWithEvent(
+                TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                device,
+                stream);
         }
 
         bool supportsGroupedPrefillExecutionBackend(DeviceId device)
@@ -141,6 +162,271 @@ namespace llaminar2
             params_.decode_histogram->recordTokenBoundary(params_.layer_idx);
     }
 
+    bool MoERoutingStage::executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx)
+    {
+        const int seq_len = params_.seq_len;
+        const int d_model = params_.d_model;
+        const int num_experts = params_.num_experts;
+        const int top_k = params_.top_k;
+        const bool is_gpu = params_.device_id.is_gpu();
+
+        if (seq_len <= 1)
+            return false;
+        if (!params_.input || !params_.gate_weights ||
+            !params_.output_indices || !params_.output_weights)
+        {
+            LOG_ERROR("[MoERoutingStage] Decode-equivalent verifier routing missing tensors");
+            return false;
+        }
+        if (is_gpu && isGraphCaptureActive())
+        {
+            LOG_ERROR("[MoERoutingStage] Decode-equivalent verifier routing uses row-index staging "
+                      "and must not run inside GPU graph capture");
+            return false;
+        }
+
+        /*
+         * Keep this helper deliberately literal: route each verifier row exactly
+         * as a one-token decode row, then scatter it back into the all-position
+         * batch.  This avoids backend-specific M=2..4 router math moving expert
+         * near-ties before the expert FFN even begins.
+         */
+        IMoEKernel *kernel = ensureMoEKernel();
+        TensorBase *full_input = params_.input;
+        TensorBase *full_indices = params_.output_indices;
+        TensorBase *full_output_weights = params_.output_weights;
+
+        if (is_gpu)
+        {
+            kernel->zeroBuffer(full_indices,
+                               static_cast<size_t>(seq_len) *
+                                   static_cast<size_t>(top_k) *
+                                   sizeof(float));
+            kernel->zeroBuffer(full_output_weights,
+                               static_cast<size_t>(seq_len) *
+                                   static_cast<size_t>(top_k) *
+                                   sizeof(float));
+
+            const std::vector<size_t> input_shape{1u, static_cast<size_t>(d_model)};
+            const std::vector<size_t> route_shape{1u, static_cast<size_t>(top_k)};
+            if (!verifier_row_input_ || verifier_row_input_->shape() != input_shape)
+                verifier_row_input_ = std::make_shared<FP32Tensor>(input_shape);
+            if (!verifier_row_indices_ || verifier_row_indices_->shape() != route_shape)
+                verifier_row_indices_ = std::make_shared<FP32Tensor>(route_shape);
+            if (!verifier_row_weights_ || verifier_row_weights_->shape() != route_shape)
+                verifier_row_weights_ = std::make_shared<FP32Tensor>(route_shape);
+        }
+
+        FP32Tensor cpu_row_input({1u, static_cast<size_t>(d_model)});
+        FP32Tensor cpu_row_indices({1u, static_cast<size_t>(top_k)});
+        FP32Tensor cpu_row_weights({1u, static_cast<size_t>(top_k)});
+        const float *input_data = is_gpu ? nullptr : full_input->data();
+        float *indices_data = is_gpu ? nullptr : full_indices->mutable_data();
+        float *weights_data = is_gpu ? nullptr : full_output_weights->mutable_data();
+        if (!is_gpu && (!input_data || !indices_data || !weights_data))
+        {
+            LOG_ERROR("[MoERoutingStage] Decode-equivalent CPU verifier routing could not access tensors");
+            return false;
+        }
+
+        struct ScopedRowParams
+        {
+            Params &params;
+            TensorBase *input;
+            TensorBase *output_indices;
+            TensorBase *output_weights;
+            DecodeExpertHistogram *decode_histogram;
+            IMoERuntimeTable *moe_runtime_table;
+            bool force_grouped_verifier_prefill_for_decode;
+            bool force_decode_equivalent_verifier_prefill;
+            int seq_len;
+
+            ~ScopedRowParams()
+            {
+                params.input = input;
+                params.output_indices = output_indices;
+                params.output_weights = output_weights;
+                params.decode_histogram = decode_histogram;
+                params.moe_runtime_table = moe_runtime_table;
+                params.force_grouped_verifier_prefill_for_decode = force_grouped_verifier_prefill_for_decode;
+                params.force_decode_equivalent_verifier_prefill = force_decode_equivalent_verifier_prefill;
+                params.seq_len = seq_len;
+            }
+        } restore{
+            params_,
+            params_.input,
+            params_.output_indices,
+            params_.output_weights,
+            params_.decode_histogram,
+            params_.moe_runtime_table,
+            params_.force_grouped_verifier_prefill_for_decode,
+            params_.force_decode_equivalent_verifier_prefill,
+            params_.seq_len};
+
+        std::vector<float> full_router_logits;
+        std::vector<float> full_indices_f32(static_cast<size_t>(seq_len) * static_cast<size_t>(top_k));
+        std::vector<float> full_weights(static_cast<size_t>(seq_len) * static_cast<size_t>(top_k));
+        if (!is_gpu && num_experts > 0)
+            full_router_logits.resize(static_cast<size_t>(seq_len) * static_cast<size_t>(num_experts));
+
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const int row_index = row;
+            if (is_gpu)
+            {
+                kernel->gatherTokenBatchFromTensors(
+                    full_input, verifier_row_input_.get(),
+                    &row_index, 1, d_model);
+
+                if (!moe_runtime_layer_)
+                {
+                    LOG_ERROR("[MoERoutingStage] Decode-equivalent GPU verifier routing requires "
+                              "the runtime-table decode router for layer "
+                              << params_.layer_idx);
+                    return false;
+                }
+
+                /*
+                 * Serial decode routes through DeviceMoELayerRuntime so the
+                 * expert path can consume device-resident top-k metadata.  The
+                 * verifier proof must use that exact router, not the older
+                 * routeWithTensors() prefill path, otherwise tiny top-k weight
+                 * differences can cascade into attention/KV divergence a few
+                 * layers later.  Histogram updates are disabled because this is
+                 * speculative verifier work, not an accepted decode token.
+                 */
+                if (!kernel->decodeRouteSelect(
+                        moe_runtime_layer_,
+                        verifier_row_input_.get(),
+                        params_.gate_weights,
+                        d_model,
+                        num_experts,
+                        top_k,
+                        params_.norm_topk_prob,
+                        verifier_row_indices_.get(),
+                        verifier_row_weights_.get(),
+                        /*write_legacy_outputs=*/true,
+                        /*update_runtime_histogram=*/false))
+                {
+                    LOG_ERROR("[MoERoutingStage] Runtime-table decode-equivalent verifier routing failed at row "
+                              << row << " for layer " << params_.layer_idx);
+                    return false;
+                }
+            }
+            else
+            {
+                std::copy_n(input_data + static_cast<size_t>(row) * d_model,
+                            d_model,
+                            cpu_row_input.mutable_data());
+                params_.input = &cpu_row_input;
+                params_.output_indices = &cpu_row_indices;
+                params_.output_weights = &cpu_row_weights;
+            }
+
+            if (!is_gpu)
+            {
+                params_.decode_histogram = nullptr;
+                params_.moe_runtime_table = nullptr;
+                params_.seq_len = 1;
+                params_.force_decode_equivalent_verifier_prefill = false;
+                params_.force_grouped_verifier_prefill_for_decode = false;
+
+                if (!execute(ctx))
+                {
+                    LOG_ERROR("[MoERoutingStage] Decode-equivalent verifier routing failed at row "
+                              << row << " for layer " << params_.layer_idx);
+                    return false;
+                }
+            }
+
+            const float *row_indices = is_gpu
+                                           ? verifier_row_indices_->data()
+                                           : routing_indices_f32_.data();
+            const float *row_weights = is_gpu
+                                           ? verifier_row_weights_->data()
+                                           : routing_weights_.data();
+            const size_t row_route_count = is_gpu
+                                               ? static_cast<size_t>(top_k)
+                                               : routing_indices_f32_.size();
+            const size_t row_weight_count = is_gpu
+                                                ? static_cast<size_t>(top_k)
+                                                : routing_weights_.size();
+
+            if (row_indices && row_weights &&
+                row_route_count >= static_cast<size_t>(top_k) &&
+                row_weight_count >= static_cast<size_t>(top_k))
+            {
+                std::copy_n(row_indices,
+                            top_k,
+                            full_indices_f32.data() + static_cast<size_t>(row) * top_k);
+                std::copy_n(row_weights,
+                            top_k,
+                            full_weights.data() + static_cast<size_t>(row) * top_k);
+            }
+            else if (!is_gpu && (!routing_indices_f32_.empty() || !routing_weights_.empty()))
+            {
+                LOG_ERROR("[MoERoutingStage] Decode-equivalent verifier routing produced incomplete "
+                          "snapshot top-k vectors at row " << row);
+                return false;
+            }
+            else
+            {
+                LOG_ERROR("[MoERoutingStage] Decode-equivalent verifier routing produced no readable "
+                          "top-k vectors at row " << row);
+                return false;
+            }
+
+            if (!is_gpu && !router_logits_.empty())
+            {
+                if (router_logits_.size() < static_cast<size_t>(num_experts))
+                {
+                    LOG_ERROR("[MoERoutingStage] Decode-equivalent verifier routing produced incomplete "
+                              "router logits at row " << row);
+                    return false;
+                }
+                std::copy_n(router_logits_.data(),
+                            num_experts,
+                            full_router_logits.data() + static_cast<size_t>(row) * num_experts);
+            }
+
+            if (is_gpu)
+            {
+                const float one = 1.0f;
+                kernel->scatterAddWeightedFromTensors(
+                    full_indices,
+                    verifier_row_indices_.get(),
+                    &row_index,
+                    &one,
+                    1,
+                    top_k);
+                kernel->scatterAddWeightedFromTensors(
+                    full_output_weights,
+                    verifier_row_weights_.get(),
+                    &row_index,
+                    &one,
+                    1,
+                    top_k);
+                markRoutingOutputGpuWritten(full_indices, params_.device_id, gpuStream());
+                markRoutingOutputGpuWritten(full_output_weights, params_.device_id, gpuStream());
+            }
+            else
+            {
+                std::copy_n(cpu_row_indices.data(),
+                            top_k,
+                            indices_data + static_cast<size_t>(row) * top_k);
+                std::copy_n(cpu_row_weights.data(),
+                            top_k,
+                            weights_data + static_cast<size_t>(row) * top_k);
+            }
+        }
+
+        routing_indices_f32_ = std::move(full_indices_f32);
+        routing_weights_ = std::move(full_weights);
+        router_logits_ = std::move(full_router_logits);
+        invalidateDumpInfoCache();
+        return true;
+    }
+
     bool MoERoutingStage::execute(IDeviceContext *ctx)
     {
         if (!ctx)
@@ -165,6 +451,9 @@ namespace llaminar2
         const int d_model = params_.d_model;
         const int num_experts = params_.num_experts;
         const int top_k = params_.top_k;
+
+        if (params_.force_decode_equivalent_verifier_prefill && seq_len > 1)
+            return executeDecodeEquivalentVerifierPrefill(ctx);
 
         // Delegate entirely to the kernel's tensor-aware API.
         // CPU: uses data()/mutable_data() — no device involvement.
@@ -280,6 +569,9 @@ namespace llaminar2
 
     bool MoERoutingStage::isGraphCapturable() const
     {
+        if (params_.force_decode_equivalent_verifier_prefill)
+            return false;
+
         if (params_.force_grouped_verifier_prefill_for_decode)
             return isDeviceRoutedPrefillGraphCapturable();
 
@@ -292,6 +584,9 @@ namespace llaminar2
 #if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
 #else
+        if (params_.force_decode_equivalent_verifier_prefill)
+            return false;
+
         const bool decode_supported =
             !params_.force_grouped_verifier_prefill_for_decode &&
             supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
@@ -333,6 +628,9 @@ namespace llaminar2
 #if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
 #else
+        if (params_.force_decode_equivalent_verifier_prefill)
+            return false;
+
         // Runtime-table decode routing is capture-safe when the GPU backend
         // keeps top-k routing tensors device-resident. Snapshot builds still
         // require host top-k/logit materialization, but decode histograms are
@@ -356,6 +654,9 @@ namespace llaminar2
 
     bool MoERoutingStage::isDeviceRoutedPrefillExecutionSupported() const
     {
+        if (params_.force_decode_equivalent_verifier_prefill)
+            return false;
+
         const bool forced_decode_replay =
             params_.force_grouped_verifier_prefill_for_decode && params_.seq_len == 1;
         return supportsGroupedPrefillExecutionBackend(params_.device_id) &&

@@ -423,6 +423,17 @@ namespace llaminar2
         return inner_->decodeStep();
     }
 
+    GenerationResult NamedDomainGlobalRunner::forceDecodeToken(int32_t token)
+    {
+        if (!initialized_ || !inner_)
+        {
+            GenerationResult r;
+            r.error = "Not initialized";
+            return r;
+        }
+        return inner_->forceDecodeToken(token);
+    }
+
     GenerationResult NamedDomainGlobalRunner::generate(
         const std::vector<int32_t> &prompt_tokens,
         int max_new_tokens,

@@ -11,6 +11,9 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <exception>
 #include <random>
@@ -118,6 +121,73 @@ namespace llaminar2
                    snapshot.mtp_request.stochastic_accept_tests != 0 ||
                    snapshot.mtp_request.stochastic_residual_samples != 0 ||
                    snapshot.mtp_request.stochastic_terminal_samples != 0;
+        }
+
+        bool traceGeneratedTokensEnabled()
+        {
+            const char *value = std::getenv("LLAMINAR_TRACE_GENERATED_TOKENS");
+            if (!value || value[0] == '\0')
+                return false;
+            std::string flag(value);
+            std::transform(flag.begin(), flag.end(), flag.begin(),
+                           [](unsigned char c)
+                           { return static_cast<char>(std::tolower(c)); });
+            return flag != "0" && flag != "false" && flag != "off" && flag != "no";
+        }
+
+        std::string previewTokenText(std::string text)
+        {
+            for (char &ch : text)
+            {
+                if (ch == '\n')
+                    ch = ' ';
+                else if (ch == '\r' || ch == '\t')
+                    ch = ' ';
+            }
+            constexpr size_t kMaxPreviewChars = 96;
+            if (text.size() > kMaxPreviewChars)
+                text = text.substr(0, kMaxPreviewChars - 3) + "...";
+            return text;
+        }
+
+        void traceGeneratedToken(const char *path,
+                                 int completion_index,
+                                 int32_t token,
+                                 const std::string &text,
+                                 bool forced)
+        {
+            if (!traceGeneratedTokensEnabled())
+                return;
+            LOG_INFO("[ChatCompletion/token] path="
+                     << path
+                     << " index=" << completion_index
+                     << " token=" << token
+                     << " forced=" << boolString(forced)
+                     << " text=\"" << previewTokenText(text) << "\"");
+        }
+
+        using SteadyClock = std::chrono::steady_clock;
+
+        double elapsedMs(SteadyClock::time_point start)
+        {
+            return std::chrono::duration<double, std::milli>(
+                       SteadyClock::now() - start)
+                .count();
+        }
+
+        std::string tokenIdPreview(const std::vector<int32_t> &tokens)
+        {
+            std::ostringstream oss;
+            const size_t preview_count = std::min<size_t>(tokens.size(), 48);
+            for (size_t i = 0; i < preview_count; ++i)
+            {
+                if (i)
+                    oss << ',';
+                oss << tokens[i];
+            }
+            if (tokens.size() > preview_count)
+                oss << ",...";
+            return oss.str();
         }
 
         void logRuntimeStateSummary(IOrchestrationRunner &runner, const char *mode)
@@ -677,12 +747,32 @@ namespace llaminar2
 
         input_ids.assign(token_ids.begin(), token_ids.end());
 
+        if (traceGeneratedTokensEnabled())
+        {
+            const auto [min_it, max_it] =
+                std::minmax_element(input_ids.begin(), input_ids.end());
+            LOG_INFO("[ChatCompletion/trace] setup prompt_tokens="
+                     << input_ids.size()
+                     << " enable_thinking=" << boolString(request.enable_thinking)
+                     << " thinking_budget_tokens=" << request.thinking_budget_tokens
+                     << " token_min=" << (min_it != input_ids.end() ? *min_it : -1)
+                     << " token_max=" << (max_it != input_ids.end() ? *max_it : -1)
+                     << " token_ids=[" << tokenIdPreview(input_ids) << "]");
+        }
+
+        const auto prefill_start = SteadyClock::now();
         if (!runner_.prefill(input_ids))
         {
             error_out.http_status = 500;
             json err = {{"error", {{"message", std::string("Prefill failed: ") + runner_.lastError()}, {"type", "server_error"}}}};
             error_out.json_body = dumpJsonForHttp(err);
             return -1;
+        }
+        if (traceGeneratedTokensEnabled())
+        {
+            LOG_INFO("[ChatCompletion/trace] prefill_ms="
+                     << std::fixed << std::setprecision(3)
+                     << elapsedMs(prefill_start));
         }
 
         return prompt_tokens;
@@ -723,6 +813,7 @@ namespace llaminar2
         bool thinking_budget_active = (request.thinking_budget_tokens >= 0 && request.enable_thinking);
         std::vector<int32_t> stop_thinking_tokens; // Injected token sequence
         int stop_thinking_idx = 0;                 // Current position in injection
+        bool injecting_stop_thinking = false;      // True while forcing stop prompt tokens
 
         // Pre-tokenize stop-thinking prompt if budget is active
         if (thinking_budget_active)
@@ -730,9 +821,29 @@ namespace llaminar2
             std::string stop_prompt = runner_.getStopThinkingPrompt();
             if (!stop_prompt.empty())
             {
-                auto encoded = tokenizer_.encode(stop_prompt);
+                /*
+                 * The stop-thinking text is injected into an already-active
+                 * assistant generation.  It must be encoded as continuation
+                 * text, not as a new sequence, or we would force BOS/EOS
+                 * instead of the model-author-recommended phrase.
+                 */
+                auto encoded = tokenizer_.encode(
+                    stop_prompt,
+                    /*add_bos=*/false,
+                    /*add_eos=*/false);
                 stop_thinking_tokens.assign(encoded.begin(), encoded.end());
             }
+            if (traceGeneratedTokensEnabled())
+            {
+                LOG_INFO("[ChatCompletion/trace] stop_thinking_prompt_tokens="
+                         << stop_thinking_tokens.size()
+                         << " token_ids=[" << tokenIdPreview(stop_thinking_tokens)
+                         << "]");
+            }
+            injecting_stop_thinking =
+                request.thinking_budget_tokens == 0 && !stop_thinking_tokens.empty();
+            if (injecting_stop_thinking)
+                in_thinking = false;
         }
 
         auto rebalance_error = [&]() -> ChatCompletionResponse
@@ -748,27 +859,51 @@ namespace llaminar2
         {
             std::vector<int32_t> step_tokens;
             bool step_complete = false;
+            bool step_forced = false;
 
-            // Check if we're injecting stop-thinking tokens
-            if (stop_thinking_idx > 0 && stop_thinking_idx < static_cast<int>(stop_thinking_tokens.size()))
+            // Check if we're injecting stop-thinking tokens.
+            if (injecting_stop_thinking &&
+                stop_thinking_idx < static_cast<int>(stop_thinking_tokens.size()))
             {
-                // Inject next token from stop-thinking sequence
-                step_tokens.push_back(stop_thinking_tokens[stop_thinking_idx++]);
-                // Feed the injected token through the model (for KV cache consistency)
-                GenerationResult result = decodeStepWithBudget(runner_, 1); // Run forward pass but discard the sampled token
+                step_forced = true;
+                const int32_t forced_token = stop_thinking_tokens[stop_thinking_idx++];
+                const auto forced_start = SteadyClock::now();
+                GenerationResult result = runner_.forceDecodeToken(forced_token);
+                if (traceGeneratedTokensEnabled())
+                {
+                    LOG_INFO("[ChatCompletion/trace] forceDecodeToken token="
+                             << forced_token
+                             << " ms=" << std::fixed << std::setprecision(3)
+                             << elapsedMs(forced_start)
+                             << " success=" << boolString(result.success()));
+                }
                 if (!result.success())
                 {
                     response.http_status = 500;
-                    json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
+                    json err = {{"error", {{"message", std::string("Forced decode failed: ") + result.error}, {"type", "server_error"}}}};
                     response.json_body = dumpJsonForHttp(err);
                     return response;
                 }
+                step_tokens = result.tokens;
+                step_complete = result.is_complete;
+                if (stop_thinking_idx >= static_cast<int>(stop_thinking_tokens.size()))
+                    injecting_stop_thinking = false;
             }
             else
             {
                 const int remaining = effective_max_tokens - completion_tokens;
                 const int step_budget = thinking_budget_active ? 1 : remaining;
+                const auto decode_start = SteadyClock::now();
                 GenerationResult result = decodeStepWithBudget(runner_, step_budget);
+                if (traceGeneratedTokensEnabled())
+                {
+                    LOG_INFO("[ChatCompletion/trace] decodeStep budget="
+                             << step_budget
+                             << " ms=" << std::fixed << std::setprecision(3)
+                             << elapsedMs(decode_start)
+                             << " tokens=" << result.tokens.size()
+                             << " success=" << boolString(result.success()));
+                }
 
                 if (!result.success())
                 {
@@ -803,10 +938,11 @@ namespace llaminar2
                     break;
                 }
 
+                std::string token_text = tokenizer_.decode_token(next_token);
+
                 // Check thinking budget
                 if (thinking_budget_active && in_thinking)
                 {
-                    std::string token_text = tokenizer_.decode_token(next_token);
                     if (token_text.find("</think>") != std::string::npos)
                     {
                         in_thinking = false;
@@ -817,18 +953,27 @@ namespace llaminar2
                         if (thinking_tokens >= request.thinking_budget_tokens &&
                             !stop_thinking_tokens.empty())
                         {
-                            // Budget exhausted — start injecting stop-thinking sequence
+                            // Budget exhausted. Keep the token we just sampled
+                            // because decodeStep() has already made it the
+                            // authoritative last token. The stop prompt begins
+                            // at the next decode position through
+                            // forceDecodeToken(), which preserves KV/GDN state.
                             LOG_DEBUG("[ChatCompletion] Thinking budget exhausted ("
                                       << thinking_tokens << " tokens), injecting stop-thinking prompt");
-                            next_token = stop_thinking_tokens[0];
-                            stop_thinking_idx = 1;
+                            injecting_stop_thinking = true;
+                            stop_thinking_idx = 0;
                             in_thinking = false;
                         }
                     }
                 }
 
+                traceGeneratedToken("nonstream",
+                                    completion_tokens,
+                                    next_token,
+                                    token_text,
+                                    step_forced);
                 completion_tokens++;
-                generated_text += tokenizer_.decode_token(next_token);
+                generated_text += token_text;
             }
 
             if (!stop_generation && !runner_.maybeApplyMoERebalance())
@@ -1005,15 +1150,34 @@ namespace llaminar2
         bool thinking_budget_active = (request.thinking_budget_tokens >= 0 && request.enable_thinking);
         std::vector<int32_t> stop_thinking_tokens;
         int stop_thinking_idx = 0;
+        bool injecting_stop_thinking = false;
 
         if (thinking_budget_active)
         {
             std::string stop_prompt = runner_.getStopThinkingPrompt();
             if (!stop_prompt.empty())
             {
-                auto encoded = tokenizer_.encode(stop_prompt);
+                /*
+                 * The stop-thinking text is injected into an already-active
+                 * assistant generation.  Encode it as continuation text so the
+                 * whole author-recommended phrase, and only that phrase, is
+                 * forced into the live decode state.
+                 */
+                auto encoded = tokenizer_.encode(
+                    stop_prompt,
+                    /*add_bos=*/false,
+                    /*add_eos=*/false);
                 stop_thinking_tokens.assign(encoded.begin(), encoded.end());
             }
+            if (traceGeneratedTokensEnabled())
+            {
+                LOG_INFO("[ChatCompletion/trace] stream stop_thinking_prompt_tokens="
+                         << stop_thinking_tokens.size()
+                         << " token_ids=[" << tokenIdPreview(stop_thinking_tokens)
+                         << "]");
+            }
+            injecting_stop_thinking =
+                request.thinking_budget_tokens == 0 && !stop_thinking_tokens.empty();
         }
 
         auto emit_rebalance_error = [&]() -> ChatCompletionResponse
@@ -1033,12 +1197,24 @@ namespace llaminar2
         {
             std::vector<int32_t> step_tokens;
             bool step_complete = false;
+            bool step_forced = false;
 
-            // Check if we're injecting stop-thinking tokens
-            if (stop_thinking_idx > 0 && stop_thinking_idx < static_cast<int>(stop_thinking_tokens.size()))
+            // Check if we're injecting stop-thinking tokens.
+            if (injecting_stop_thinking &&
+                stop_thinking_idx < static_cast<int>(stop_thinking_tokens.size()))
             {
-                step_tokens.push_back(stop_thinking_tokens[stop_thinking_idx++]);
-                GenerationResult result = decodeStepWithBudget(runner_, 1); // Keep model state consistent
+                step_forced = true;
+                const int32_t forced_token = stop_thinking_tokens[stop_thinking_idx++];
+                const auto forced_start = SteadyClock::now();
+                GenerationResult result = runner_.forceDecodeToken(forced_token);
+                if (traceGeneratedTokensEnabled())
+                {
+                    LOG_INFO("[ChatCompletion/trace] stream forceDecodeToken token="
+                             << forced_token
+                             << " ms=" << std::fixed << std::setprecision(3)
+                             << elapsedMs(forced_start)
+                             << " success=" << boolString(result.success()));
+                }
                 if (!result.success())
                 {
                     json error_data = {{"error", result.error}};
@@ -1050,12 +1226,26 @@ namespace llaminar2
                     response.json_body = dumpJsonForHttp(err);
                     return response;
                 }
+                step_tokens = result.tokens;
+                step_complete = result.is_complete;
+                if (stop_thinking_idx >= static_cast<int>(stop_thinking_tokens.size()))
+                    injecting_stop_thinking = false;
             }
             else
             {
                 const int remaining = effective_max_tokens - completion_tokens;
                 const int step_budget = thinking_budget_active ? 1 : remaining;
+                const auto decode_start = SteadyClock::now();
                 GenerationResult result = decodeStepWithBudget(runner_, step_budget);
+                if (traceGeneratedTokensEnabled())
+                {
+                    LOG_INFO("[ChatCompletion/trace] stream decodeStep budget="
+                             << step_budget
+                             << " ms=" << std::fixed << std::setprecision(3)
+                             << elapsedMs(decode_start)
+                             << " tokens=" << result.tokens.size()
+                             << " success=" << boolString(result.success()));
+                }
 
                 if (!result.success())
                 {
@@ -1105,10 +1295,15 @@ namespace llaminar2
                 }
 
                 std::string token_text = tokenizer_.decode_token(next_token);
+                traceGeneratedToken("stream",
+                                    completion_tokens - 1,
+                                    next_token,
+                                    token_text,
+                                    step_forced);
 
                 // Check thinking budget (before emitting)
                 if (thinking_budget_active && use_think_split && splitter.inThinking() &&
-                    stop_thinking_idx == 0)
+                    !injecting_stop_thinking)
                 {
                     thinking_tokens++;
                     if (thinking_tokens >= request.thinking_budget_tokens &&
@@ -1116,9 +1311,8 @@ namespace llaminar2
                     {
                         LOG_DEBUG("[ChatCompletion/stream] Thinking budget exhausted ("
                                   << thinking_tokens << " tokens), injecting stop-thinking prompt");
-                        next_token = stop_thinking_tokens[0];
-                        stop_thinking_idx = 1;
-                        token_text = tokenizer_.decode_token(next_token);
+                        injecting_stop_thinking = true;
+                        stop_thinking_idx = 0;
                     }
                 }
 

@@ -172,7 +172,7 @@ TEST(Test__OrchestrationRunnerMoEOverlayPlan, KeepsExplicitPlacementsFrozen)
               (std::vector<int>{0, 1, 0, 1, 0, 1}));
 }
 
-TEST(Test__OrchestrationRunnerMoEOverlayPlan, CpuFallbackParticipantStillHardFailsWithoutSidecarEndpoints)
+TEST(Test__OrchestrationRunnerMoEOverlayPlan, CpuFallbackParticipantHardFailsUntilRemoteGraphExecutionExists)
 {
     const auto execution_plan = resolveMoEExpertOverlayExecutionPlan(
         makeHeterogeneousOverlayPlan(),
@@ -189,7 +189,10 @@ TEST(Test__OrchestrationRunnerMoEOverlayPlan, CpuFallbackParticipantStillHardFai
 
     const auto blocker = graphNativeMoEOverlayBuildBlocker(execution_plan);
     ASSERT_TRUE(blocker.has_value());
-    EXPECT_NE(blocker->find("MoE overlay rank 1"), std::string::npos) << *blocker;
-    EXPECT_NE(blocker->find("CpuFallbackParticipant"), std::string::npos) << *blocker;
-    EXPECT_NE(blocker->find("sidecar endpoint ranks were removed"), std::string::npos) << *blocker;
+    EXPECT_NE(blocker->find("root-owned local sparse execution path"),
+              std::string::npos)
+        << *blocker;
+    EXPECT_NE(blocker->find("MPI sparse dispatch/local-expert/return-reduce"),
+              std::string::npos)
+        << *blocker;
 }

@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <numeric>
 #include <set>
+#include <sstream>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -197,6 +199,7 @@ namespace llaminar2
 
             // Find ranks for each device
             std::set<int> rank_set;
+            std::vector<std::string> missing_devices;
             for (const auto &device : domain.devices)
             {
                 int rank = findRankForDevice(device, cluster_inventory);
@@ -208,7 +211,26 @@ namespace llaminar2
                 {
                     LOG_WARN("Device " << device.toString()
                                        << " not found in cluster inventory");
+                    missing_devices.push_back(device.toString());
                 }
+            }
+            if (!missing_devices.empty())
+            {
+                std::ostringstream oss;
+                oss << "Execution domain '" << domain.name
+                    << "' references device(s) not found in cluster inventory: ";
+                for (size_t idx = 0; idx < missing_devices.size(); ++idx)
+                {
+                    if (idx > 0)
+                        oss << ", ";
+                    oss << missing_devices[idx];
+                }
+                oss << ". Check that GPU domains use visible local device "
+                       "ordinals (for example cuda:0,cuda:1) and CPU domains "
+                       "use rank/NUMA-qualified addresses when spanning MPI "
+                       "ranks (for example 0:cpu:0,1:cpu:0 with "
+                       "scope=node_local).";
+                throw std::invalid_argument(oss.str());
             }
             domain.ranks.assign(rank_set.begin(), rank_set.end());
 

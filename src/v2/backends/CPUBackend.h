@@ -231,6 +231,13 @@ namespace llaminar2
         void *createEvent(int device_id) override;
 
         /**
+         * @brief Create timing event (same dummy pointer as createEvent())
+         * @param device_id Must be 0
+         * @return Non-null dummy pointer (CPU is always synchronous)
+         */
+        void *createTimingEvent(int device_id) override;
+
+        /**
          * @brief Destroy event (no-op for CPU)
          * @param event Event handle (ignored)
          * @param device_id Must be 0
@@ -252,6 +259,15 @@ namespace llaminar2
          * @return true
          */
         bool waitForEvent(void *event, int device_id) override;
+
+        /**
+         * @brief CPU elapsed event timing is always zero.
+         */
+        bool eventElapsedTimeMs(
+            void *start_event,
+            void *stop_event,
+            int device_id,
+            float *out_ms) override;
 
         // ====================================================================
         // Capability Queries

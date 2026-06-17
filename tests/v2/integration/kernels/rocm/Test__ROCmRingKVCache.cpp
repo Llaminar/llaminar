@@ -180,6 +180,137 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP32)
     LOG_INFO("[BasicAppendRetrieve_FP32] PASSED");
 }
 
+/**
+ * @brief Device publication advances GPU KV metadata while host mirrors stay stale.
+ *
+ * The vLLM-style MTP path publishes accepted KV sequence state from GPU
+ * metadata and only later adopts host mirrors for diagnostics and graph
+ * signatures.  This regression locks down that ordering for ROCm: device
+ * count/head pointers change first, and get_cached_tokens()/ring_head() do not
+ * catch up until adoptSequenceStateFromHostMetadata() is called.
+ */
+TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirrorStaleUntilAdoption)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int n_layers = 1;
+    constexpr int batch_size = 1;
+    constexpr int max_seq_len = 8;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 16;
+    constexpr int kv_dim = n_kv_heads * head_dim;
+    constexpr int initial_tokens = 6;
+    constexpr int target_cached_tokens = 5;
+    constexpr int accepted_state_count = 1;
+
+    auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
+    ASSERT_NE(cache, nullptr);
+    ASSERT_TRUE(cache->supportsDeviceResidentSequenceStatePublication());
+    ScopedHipStream stream;
+
+    auto h_K = generateRandomFP32(initial_tokens * kv_dim, 20260615);
+    auto h_V = generateRandomFP32(initial_tokens * kv_dim, 20260616);
+
+    float *d_K = nullptr;
+    float *d_V = nullptr;
+    ASSERT_EQ(hipMalloc(&d_K, initial_tokens * kv_dim * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_V, initial_tokens * kv_dim * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  d_K,
+                  h_K.data(),
+                  initial_tokens * kv_dim * sizeof(float),
+                  hipMemcpyHostToDevice,
+                  stream.stream()),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  d_V,
+                  h_V.data(),
+                  initial_tokens * kv_dim * sizeof(float),
+                  hipMemcpyHostToDevice,
+                  stream.stream()),
+              hipSuccess);
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, initial_tokens, stream.stream()));
+    stream.synchronize();
+
+    const int host_count_before = cache->get_cached_tokens(0, 0);
+    const int host_head_before = cache->ring_head(0, 0);
+    ASSERT_EQ(host_count_before, initial_tokens);
+
+    int32_t *d_target = nullptr;
+    int32_t *d_accepted = nullptr;
+    int32_t *d_ok = nullptr;
+    const int32_t h_target = target_cached_tokens;
+    const int32_t h_accepted = accepted_state_count;
+    const int32_t h_ok = 1;
+    ASSERT_EQ(hipMalloc(&d_target, sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_accepted, sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_ok, sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(d_target, &h_target, sizeof(int32_t), hipMemcpyHostToDevice, stream.stream()), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(d_accepted, &h_accepted, sizeof(int32_t), hipMemcpyHostToDevice, stream.stream()), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(d_ok, &h_ok, sizeof(int32_t), hipMemcpyHostToDevice, stream.stream()), hipSuccess);
+
+    IKVCache::DeviceSequenceStatePublicationRequest device_request;
+    device_request.request_count = 1;
+    device_request.first_seq_idx = 0;
+    device_request.target_cached_tokens_device = d_target;
+    device_request.accepted_state_counts_device = d_accepted;
+    device_request.publication_ok_flags_device = d_ok;
+    device_request.stream = stream.opaque();
+    std::string device_error;
+    ASSERT_TRUE(cache->publishSequenceStateFromDeviceMetadata(device_request, &device_error))
+        << device_error;
+    stream.synchronize();
+
+    const int expected_device_head =
+        (host_head_before + accepted_state_count) % max_seq_len;
+    int device_count = -1;
+    int device_head = -1;
+    ASSERT_NE(cache->deviceCachedTokenCountPtr(0, 0), nullptr);
+    ASSERT_NE(cache->deviceRingHeadPtr(0, 0), nullptr);
+    ASSERT_EQ(hipMemcpyAsync(&device_count,
+                             cache->deviceCachedTokenCountPtr(0, 0),
+                             sizeof(int),
+                             hipMemcpyDeviceToHost,
+                             stream.stream()),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(&device_head,
+                             cache->deviceRingHeadPtr(0, 0),
+                             sizeof(int),
+                             hipMemcpyDeviceToHost,
+                             stream.stream()),
+              hipSuccess);
+    stream.synchronize();
+
+    EXPECT_EQ(device_count, target_cached_tokens);
+    EXPECT_EQ(device_head, expected_device_head);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), host_count_before)
+        << "Device publication must not silently adopt host KV mirrors.";
+    EXPECT_EQ(cache->ring_head(0, 0), host_head_before)
+        << "Host ring-head mirrors are stale until adoption is explicit.";
+
+    IKVCache::HostSequenceStatePublicationRequest host_request;
+    host_request.request_count = 1;
+    host_request.first_seq_idx = 0;
+    host_request.target_cached_tokens = {target_cached_tokens};
+    host_request.accepted_state_counts = {accepted_state_count};
+    host_request.publication_ok_flags = {1};
+    std::string host_error;
+    ASSERT_TRUE(cache->adoptSequenceStateFromHostMetadata(host_request, &host_error))
+        << host_error;
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), target_cached_tokens);
+    EXPECT_EQ(cache->ring_head(0, 0), expected_device_head);
+
+    hipFree(d_ok);
+    hipFree(d_accepted);
+    hipFree(d_target);
+    hipFree(d_V);
+    hipFree(d_K);
+}
+
 // =============================================================================
 // Test: Ring Buffer Wrap-Around
 // =============================================================================

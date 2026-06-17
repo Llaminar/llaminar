@@ -47,9 +47,15 @@ namespace llaminar2
 
         // Event operations (fine-grained synchronization)
         void *createEvent(int device_id) override;
+        void *createTimingEvent(int device_id) override;
         void destroyEvent(void *event, int device_id) override;
         bool recordEvent(void *event, int device_id, void *stream = nullptr) override;
         bool waitForEvent(void *event, int device_id) override;
+        bool eventElapsedTimeMs(
+            void *start_event,
+            void *stop_event,
+            int device_id,
+            float *out_ms) override;
 
         // Memory allocation operations
         void *allocate(size_t bytes, int device_id) override;
@@ -95,7 +101,8 @@ namespace llaminar2
             void *out_indices_device,
             void *partial_vals = nullptr,
             void *partial_idxs = nullptr,
-            int partial_capacity = 0) override;
+            int partial_capacity = 0,
+            int output_stride = 1) override;
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,
@@ -291,7 +298,10 @@ namespace llaminar2
             void *out_accepted_device,
             void *out_accept_probability_device = nullptr,
             void *out_accept_threshold_device = nullptr,
-            const void *draft_token_probabilities_device = nullptr) override;
+            const void *draft_token_probabilities_device = nullptr,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            int inverse_sample_vocab_size = 0) override;
         bool enqueueSpeculativeVerifyProcessedLogitsF32DeviceThresholdsBatchDeviceTokens(
             const void *target_logits_device,
             const void *draft_logits_device,
@@ -400,6 +410,37 @@ namespace llaminar2
             void *stream,
             void *out_tokens_device,
             void *out_meta_device) override;
+        bool enqueueDeriveSpeculativePublicationMetadata(
+            const void *meta_device,
+            int meta_stride,
+            const void *base_cached_tokens_device,
+            int request_count,
+            int padded_state_rows_per_request,
+            int max_state_commit_rows,
+            int device_id,
+            void *stream,
+            void *out_restore_rows_device,
+            void *out_target_cached_tokens_device,
+            void *out_accepted_state_counts_device,
+            void *out_ok_device,
+            void *out_next_condition_tokens_device = nullptr,
+            const void *output_tokens_device = nullptr,
+            int output_token_stride = 0,
+            void *out_all_drafts_accepted_flags_device = nullptr,
+            void *out_stopped_flags_device = nullptr) override;
+        bool enqueueDeriveShiftedSpeculativePublicationMetadata(
+            const void *meta_device,
+            int meta_stride,
+            const void *base_cached_tokens_device,
+            int request_count,
+            int padded_state_rows_per_request,
+            int max_state_commit_rows,
+            int mtp_depth,
+            int device_id,
+            void *stream,
+            void *out_target_cached_tokens_device,
+            void *out_accepted_state_counts_device,
+            void *out_ok_device) override;
 
         // GPU-side sparse logit penalty application
         bool applyLogitPenaltiesF32(void *logits_device,

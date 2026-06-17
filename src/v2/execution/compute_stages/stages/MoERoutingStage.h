@@ -17,6 +17,7 @@
 #include "../../moe/DecodeExpertHistogram.h"
 #include "../../moe/MoERuntimeTable.h"
 
+#include <memory>
 #include <vector>
 namespace llaminar2
 {
@@ -55,6 +56,18 @@ namespace llaminar2
             DecodeExpertHistogram *decode_histogram = nullptr;
             IMoERuntimeTable *moe_runtime_table = nullptr;
             bool force_grouped_verifier_prefill_for_decode = false;
+
+            /**
+             * @brief Replay verifier rows through the normal one-token route path.
+             *
+             * MTP all-position verifier batches produce several candidate rows at
+             * once.  The row we later publish must behave exactly as if decode
+             * had processed that token by itself.  Some backend router kernels
+             * choose different math for tiny prefill batches than for M=1 decode,
+             * so this flag asks the stage to split the batch internally and route
+             * each row with seq_len=1 before scattering the rows back.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
 
             // Outputs (written by this stage)
             TensorBase *output_indices = nullptr; ///< FP32 [seq_len * top_k] expert IDs as float
@@ -128,11 +141,17 @@ namespace llaminar2
         bool isDeviceRoutedPrefillGraphCaptureSupported() const;
         bool isDeviceRoutedPrefillGraphCapturable() const;
         bool hasInitializedRuntimeTableIfProvided() const;
+        bool executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
         void recordRuntimeHistogramTokenBoundary() const;
         void stashRoutingResults(
             const std::vector<int> &expert_indices,
             const std::vector<float> &expert_weights,
             int seq_len, int top_k) const;
+
+        /// Device-row scratch for decode-equivalent verifier routing.
+        mutable std::shared_ptr<TensorBase> verifier_row_input_;
+        mutable std::shared_ptr<TensorBase> verifier_row_indices_;
+        mutable std::shared_ptr<TensorBase> verifier_row_weights_;
     };
 
 } // namespace llaminar2

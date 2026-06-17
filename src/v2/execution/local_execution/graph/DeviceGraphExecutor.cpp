@@ -147,6 +147,108 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Ensure GPU stages have explicit streams for normal eager passes.
+         *
+         * Null stage streams are dangerous because CUDA/HIP will otherwise fall
+         * back to the backend's implicit default stream.  This helper fills
+         * missing streams with the owning worker stream while preserving any
+         * stream a caller already bound deliberately, such as a graph-capture
+         * stream.  Preserving explicit ownership is what keeps handoff rules
+         * understandable: callers that bind a stream remain responsible for
+         * ordering it, while unbound stages get the executor-owned stream.
+         */
+        bool bindScheduleToWorkerStreams(
+            const std::vector<ComputeGraph::FastScheduleEntry> &schedule,
+            IDeviceContext *ctx)
+        {
+            if (!ctx || !ctx->isGPU())
+            {
+                return true;
+            }
+
+            struct PendingDependency
+            {
+                IWorkerGPUContext *gpu_ctx = nullptr;
+                void *worker_stream = nullptr;
+                void *old_stream = nullptr;
+            };
+
+            std::vector<PendingDependency> pending_dependencies;
+
+            auto rememberDependency = [&](IWorkerGPUContext *gpu_ctx, void *worker_stream, void *old_stream)
+            {
+                if (!gpu_ctx || !worker_stream || !old_stream || old_stream == worker_stream)
+                {
+                    return;
+                }
+                const auto already_present = std::any_of(
+                    pending_dependencies.begin(),
+                    pending_dependencies.end(),
+                    [&](const PendingDependency &dep)
+                    {
+                        return dep.gpu_ctx == gpu_ctx &&
+                               dep.worker_stream == worker_stream &&
+                               dep.old_stream == old_stream;
+                    });
+                if (!already_present)
+                {
+                    pending_dependencies.push_back({gpu_ctx, worker_stream, old_stream});
+                }
+            };
+
+            for (const auto &entry : schedule)
+            {
+                auto *node = entry.node;
+                if (!node || !node->stage)
+                {
+                    continue;
+                }
+
+                DeviceId device = node->device.is_valid() ? node->device : node->stage->device();
+                if (!device.is_valid() && ctx)
+                {
+                    device = ctx->deviceId();
+                }
+                if (!device.is_gpu())
+                {
+                    continue;
+                }
+
+                auto *gpu_ctx = tryGetWorkerContext(device);
+                if (!gpu_ctx)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Could not resolve GPU context while binding stage '"
+                              << node->name << "' to " << device.to_string());
+                    return false;
+                }
+
+                void *worker_stream = gpu_ctx->defaultStream();
+                if (!worker_stream)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] GPU context for " << device.to_string()
+                                                                       << " has no explicit worker stream");
+                    return false;
+                }
+
+                void *stage_stream = node->stage->gpuStream();
+                if (stage_stream)
+                {
+                    continue;
+                }
+
+                rememberDependency(gpu_ctx, worker_stream, stage_stream);
+                node->stage->setGPUStream(worker_stream);
+            }
+
+            for (const auto &dep : pending_dependencies)
+            {
+                dep.gpu_ctx->insertStreamDependency(dep.worker_stream, dep.old_stream);
+            }
+
+            return true;
+        }
+
         bool contractReadsNeedTransfer(
             BufferArena *arena,
             const StageBufferContract &contract,
@@ -603,6 +705,12 @@ namespace llaminar2
         const auto &schedule = graph.fastSchedule();
         if (schedule.empty())
             return true;
+
+        if (!policy.preserve_gpu_streams &&
+            !bindScheduleToWorkerStreams(schedule, ctx))
+        {
+            return false;
+        }
 
         // Ensure last stage is marked for event-based dirty marking
         schedule.back().node->is_final_output = true;

@@ -68,14 +68,14 @@ TESTS=(
   # Qwen3.5 MoE NodeLocalTP CPU (2)
   "Qwen35MoENodeLocalTPParityTest_PrefillParity_NodeLocalTP_2xMPI_CPU_35B_MoE$"
   "Qwen35MoENodeLocalTPParityTest_DecodeParity_NodeLocalTP_2xMPI_CPU_35B_MoE$"
-  # Qwen3.5 MoE HybridPPTP (2)
-  "Qwen35MoEHybridPPTPParityTest_PrefillParityWithGpuExpertCache"
-  "Qwen35MoEHybridPPTPParityTest_DecodeParityWithGpuExpertCache"
-  # Qwen3.5 MoE ExpertOverlay (4)
+  # Qwen3.5 MoE HybridPPTP named-domain topology coverage (2)
+  "Qwen35MoEHybridPPTPNamedDomainTopology_Rank0OwnsRocmLocalTPStage$"
+  "Qwen35MoEHybridPPTPNamedDomainTopology_Rank1OwnsMirroredRocmLocalTPStage$"
+  # Qwen3.5 MoE ExpertOverlay topology plus implemented ROCm-rooted parity (4)
+  "Qwen35MoEExpertOverlayTopology_OverlayPlanTopology_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold$"
+  "Qwen35MoEExpertOverlayTopology_OverlayPlanTopology_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold$"
   "Qwen35MoEExpertOverlay_PrefillParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold$"
   "Qwen35MoEExpertOverlay_DecodeParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold$"
-  "Qwen35MoEExpertOverlay_PrefillParity_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold$"
-  "Qwen35MoEExpertOverlay_DecodeParity_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold$"
 )
 
 TOTAL=${#TESTS[@]}
