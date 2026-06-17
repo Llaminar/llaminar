@@ -3164,20 +3164,22 @@ Current status:
 - [ ] ROCm hot-path H2D/D2H verifier transaction dependencies removed.
 - [x] Request-batched stochastic resident publication supports CUDA/ROCm
   recurrent and short-conv batch restore from device row-index arrays, then
-  publishes KV, terminal hidden, logical-state mailbox, and host adoption from
-  one resident handle. `OrchestrationRunner` now drives the GPU stochastic
-  request-batch publish callback through `DeviceSpeculativePublicationRequest`
-  and then adopts host mirrors from the validated transaction plan instead of
-  invoking the host-plan state publisher. Focused gate:
+  publishes KV, terminal hidden, and the logical-state mailbox from one
+  resident handle before compact host outcomes are materialized.
+  `OrchestrationRunner` now drives GPU stochastic request-batch publication
+  through `DeviceSpeculativePublicationRequest`, bridges host outcomes only for
+  response/adoption planning, and then adopts host mirrors from the validated
+  transaction plan instead of invoking the host-plan state publisher. Focused
+  gate:
   `V2_Unit_PrefillDecodeTransition`,
   `V2_Unit_MTPVerifierForwardExecutor`, `V2_Unit_MTPSpecStateContract`,
   `V2_Unit_MTPGraphConstruction`, `V2_Unit_GpuWorkspaceAllocationPolicy`, and
   `V2_Integration_PrefixCacheMTP_Qwen36(CUDA|ROCm)GpuGraphsStochasticSmoke`.
 - [ ] Compact stochastic outcome host bridge removed from request-batch
-  planning/state decisions. It is still required today to build the shared host
-  transaction plan before resident publication; the next slice must make the
-  transaction planner consume resident device metadata so the bridge becomes
-  a response-output flush only.
+  planning/adoption decisions. It is no longer required before resident
+  publication, but it still builds the shared host transaction plan and host
+  mirror adoption. The next slice must make the transaction planner consume
+  resident device metadata so the bridge becomes a response-output flush only.
 - [ ] LocalTP and GlobalTP grouped verifier support added for sharded logits:
   compact outcome reducers perform domain-wide argmax/top-k/top-p/probability
   acceptance across shards, and TP lanes fail-closed until that reducer is

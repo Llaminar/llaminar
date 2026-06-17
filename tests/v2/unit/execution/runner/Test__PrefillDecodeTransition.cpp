@@ -4768,8 +4768,8 @@ namespace
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
         EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_THAT(mock->publicationEvents(),
-                    ElementsAre("host_outcome_bridge",
-                                "device_outcome_publish",
+                    ElementsAre("device_outcome_publish",
+                                "host_outcome_bridge",
                                 "host_state_adopt"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 2);
@@ -4856,8 +4856,8 @@ namespace
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
         EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_THAT(mock->publicationEvents(),
-                    ElementsAre("host_outcome_bridge",
-                                "device_outcome_publish",
+                    ElementsAre("device_outcome_publish",
+                                "host_outcome_bridge",
                                 "host_state_adopt"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);

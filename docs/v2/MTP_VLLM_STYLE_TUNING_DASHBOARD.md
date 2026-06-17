@@ -33,7 +33,8 @@ snapshots base-cache counts D2D, keeps scalar GDN/short-conv device-index
 publication device-only, lets dense request batches pass the hybrid guard, and
 names remaining D2H as response materialization. GDN/short-conv request-batch
 restore now has a hard-fail API plus CUDA/ROCm request-owned live-state banks.
-GPU request-batch runner smoke is green; compact host bridge still feeds planning.
+GPU request-batch resident publication now precedes compact host response
+bridging; the bridge still feeds host transaction/adoption planning.
 
 | Lane | Baseline | Best MTP | RAG | Evidence |
 |---|---:|---:|:---:|---|
