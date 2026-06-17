@@ -4721,6 +4721,7 @@ namespace
         mock->setPrimaryDevice(DeviceId::cuda(0));
         mock->enableMainLogitsBatchRowsOnDevice();
         mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
 
         SamplingParams sampling;
         sampling.temperature = 0.1f;
@@ -4761,7 +4762,17 @@ namespace
         EXPECT_FALSE(mock->batchOutcomeUsedHostDraftTokens())
             << "The compact verifier reducer must consume draft tokens from "
                "device slots even while metadata still keeps a host shadow.";
-        EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 1);
+        EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
+            << "GPU stochastic request batches must not mutate live state "
+               "through the host-plan publisher.";
+        EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
+        EXPECT_THAT(mock->publicationEvents(),
+                    ElementsAre("host_outcome_bridge",
+                                "device_outcome_publish",
+                                "host_state_adopt"));
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 2);
     }
 
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticContinuationPublishesDeviceOutcomes)
@@ -4774,6 +4785,7 @@ namespace
         mock->setPrimaryDevice(DeviceId::cuda(0));
         mock->enableMainLogitsBatchRowsOnDevice();
         mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
 
         SamplingParams sampling;
         sampling.temperature = 0.1f;
@@ -4838,7 +4850,17 @@ namespace
             << "Request-batched stochastic verification must consume the "
                "runner-owned draft sample slots";
         EXPECT_EQ(mock->lastBatchOutcomeInverseSampleSeed(), sampling.seed);
-        EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 1);
+        EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
+            << "The compatibility host-plan publisher must not run after "
+               "resident request-batch publication succeeds.";
+        EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
+        EXPECT_THAT(mock->publicationEvents(),
+                    ElementsAre("host_outcome_bridge",
+                                "device_outcome_publish",
+                                "host_state_adopt"));
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
         EXPECT_THAT(mock->sequence_lengths(), ElementsAre(6, 5));
 
         GenerationBatchResult third = runner->decodeStepBatch(2);
@@ -4872,6 +4894,7 @@ namespace
         mock->setPrimaryDevice(DeviceId::cuda(0));
         mock->enableMainLogitsBatchRowsOnDevice();
         mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
         mock->forceStochasticRequestBatchReject(/*request_id=*/1,
                                                 /*correction_token=*/4);
 
@@ -5003,6 +5026,11 @@ namespace
             << "Only request 1 rejects at row zero; its two later verifier "
                "rows are physical work that the next Phase 10 optimization "
                "should try to avoid.";
+        EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
+        EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 4);
         PerfStatsCollector::reset();
     }
 

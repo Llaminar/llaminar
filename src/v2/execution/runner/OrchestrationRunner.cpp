@@ -1434,6 +1434,10 @@ namespace llaminar2
             !active_sampling_params_.is_greedy() &&
             !active_sampling_params_.has_penalties() &&
             runner_->supportsDeviceStochasticMTPVerification();
+        const bool stochastic_publication_ok =
+            !stochastic_batch_verify ||
+            !runner_->primaryDeviceId().is_gpu() ||
+            runner_->supportsDeviceResidentMTPSpecStatePublication();
         const bool chained_ok =
             draft_depth <= 1 || runner_->supportsChainedMTPDrafts();
         return has_verifier_continuation &&
@@ -1443,6 +1447,7 @@ namespace llaminar2
                draft_depth >= 1 &&
                draft_depth <= 3 &&
                chained_ok &&
+               stochastic_publication_ok &&
                runner_->supportsMTPSpecStatePublication();
     }
 
@@ -2008,12 +2013,91 @@ namespace llaminar2
                             ? MTPSpecRequestBatchMode::STOCHASTIC
                             : MTPSpecRequestBatchMode::GREEDY});
 
+        const bool use_device_resident_request_batch_publication =
+            stochastic_batch_verify && runner_->primaryDeviceId().is_gpu();
+        if (use_device_resident_request_batch_publication &&
+            !runner_->supportsDeviceResidentMTPSpecStatePublication())
+        {
+            return fail_after_checkpoint(
+                "decodeStepBatch() GPU stochastic request batching requires "
+                "device-resident MTP state publication");
+        }
+
+        DeviceSpeculativeOutcomeHandle resident_request_batch_outcome;
+        bool resident_request_batch_outcome_ready = false;
+        int resident_request_batch_verifier_rows = 0;
+
         auto publish = [&](const MTPSpecTransactionBatchPlan &plan,
                            std::string *error) -> bool
         {
-            return runner_->publishAcceptedMTPSpecStateBatch(
-                plan.step_plans,
-                error);
+            if (!use_device_resident_request_batch_publication)
+            {
+                return runner_->publishAcceptedMTPSpecStateBatch(
+                    plan.step_plans,
+                    error);
+            }
+
+            auto fail_publish = [&](std::string message) -> bool
+            {
+                if (error)
+                    *error = std::move(message);
+                return false;
+            };
+
+            if (!plan.ok)
+                return fail_publish("resident request-batch publication received an invalid transaction plan");
+            if (!resident_request_batch_outcome_ready)
+                return fail_publish("resident request-batch publication has no device outcome handle");
+            if (!resident_request_batch_outcome.valid())
+                return fail_publish("resident request-batch publication outcome handle is invalid");
+            if (resident_request_batch_verifier_rows <= 0)
+                return fail_publish("resident request-batch publication verifier row count is invalid");
+
+            DeviceSpeculativePublicationRequest publication_request;
+            publication_request.outcome = resident_request_batch_outcome;
+            publication_request.request_count = plan.step_plans.request_count;
+            publication_request.max_draft_tokens =
+                resident_request_batch_verifier_rows;
+            publication_request.base_sidecar_position = 0;
+            publication_request.publish_mtp_shifted_kv =
+                std::any_of(plan.step_plans.steps.begin(),
+                            plan.step_plans.steps.end(),
+                            [](const MTPSpecStepPlan &step)
+                            {
+                                return step.publish_mtp_shifted_kv;
+                            });
+
+            std::string publication_error;
+            if (!runner_->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
+                    publication_request,
+                    &publication_error))
+            {
+                return fail_publish(
+                    std::string("resident request-batch device publication failed: ") +
+                    publication_error);
+            }
+
+            std::string adoption_error;
+            if (!runner_->adoptDeviceResidentMTPSpecPublishedHostState(
+                    plan.step_plans,
+                    &adoption_error))
+            {
+                return fail_publish(
+                    std::string("resident request-batch host-state adoption failed: ") +
+                    adoption_error);
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "request_batch_device_resident_state_publications",
+                1.0,
+                "decode",
+                {},
+                {{"request_count",
+                  std::to_string(publication_request.request_count)},
+                 {"max_draft_tokens",
+                  std::to_string(publication_request.max_draft_tokens)}});
+            return true;
         };
 
         std::vector<int> scheduled_request_ids;
@@ -2060,6 +2144,10 @@ namespace llaminar2
                     return set_producer_error("scheduled stochastic batch is invalid");
                 if (scheduled_batch.request_count <= 0)
                     return set_producer_error("scheduled stochastic batch is empty");
+
+                resident_request_batch_outcome = {};
+                resident_request_batch_outcome_ready = false;
+                resident_request_batch_verifier_rows = 0;
 
                 std::vector<MTPSpecDecodeVerifierDraftRequest> verifier_requests;
                 verifier_requests.reserve(scheduled_batch.greedy_requests.size());
@@ -2301,10 +2389,34 @@ namespace llaminar2
                 outcomes->assign(
                     outcome_requests.size(),
                     MTPDeviceRejectionBatchOutcome{});
-                if (!runner_->verifyStochasticDistributionsRequestBatchOutcomesOnDevice(
-                        outcome_requests.data(),
-                        static_cast<int>(outcome_requests.size()),
-                        outcomes->data()))
+                if (use_device_resident_request_batch_publication)
+                {
+                    DeviceSpeculativeOutcomeHandle resident_handle;
+                    if (!runner_->verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+                            outcome_requests.data(),
+                            static_cast<int>(outcome_requests.size()),
+                            &resident_handle))
+                    {
+                        return set_producer_error(
+                            "stochastic request-batch resident device outcome verifier failed");
+                    }
+                    if (!runner_->materializeDeviceSpeculativeOutcomesForHostResponse(
+                            resident_handle,
+                            outcomes->data()))
+                    {
+                        return set_producer_error(
+                            "stochastic request-batch resident outcome host-response materialization failed");
+                    }
+
+                    resident_request_batch_outcome = resident_handle;
+                    resident_request_batch_outcome_ready = true;
+                    resident_request_batch_verifier_rows =
+                        scheduled_batch.shape.max_draft_tokens;
+                }
+                else if (!runner_->verifyStochasticDistributionsRequestBatchOutcomesOnDevice(
+                             outcome_requests.data(),
+                             static_cast<int>(outcome_requests.size()),
+                             outcomes->data()))
                 {
                     return set_producer_error(
                         "stochastic request-batch device outcome verifier failed");

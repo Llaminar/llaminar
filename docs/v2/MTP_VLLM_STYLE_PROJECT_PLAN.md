@@ -3146,9 +3146,8 @@ Current status:
   `V2_Unit_GpuWorkspaceAllocationPolicy`.
 - [x] `MTPSpecStatePublisher` has a request-batched device-index publication
   helper that validates GPU + explicit-stream ownership and calls captured
-  stages through the batch restore hook exactly once. It remains fail-closed
-  for production promotion until CUDA/ROCm request-batched runner smokes prove
-  the full resident transaction. Focused gate: `V2_Unit_MTPSpecStateContract`.
+  stages through the batch restore hook exactly once. Focused gate:
+  `V2_Unit_MTPSpecStateContract`.
 - [x] Qwen3.5/Qwen3.6 GDN graph construction now passes request shape
   (`request_count`, `request_seq_len`) into short-conv and GDN recurrence
   stages instead of leaving them with only flattened token count. Focused gate:
@@ -3163,14 +3162,22 @@ Current status:
   `V2_Unit_GDNKernels`, and `V2_Unit_GpuWorkspaceAllocationPolicy`.
 - [ ] CUDA hot-path H2D/D2H verifier transaction dependencies removed.
 - [ ] ROCm hot-path H2D/D2H verifier transaction dependencies removed.
-- [ ] Request-batched stochastic resident publication supports CUDA/ROCm
+- [x] Request-batched stochastic resident publication supports CUDA/ROCm
   recurrent and short-conv batch restore from device row-index arrays, then
   publishes KV, terminal hidden, logical-state mailbox, and host adoption from
-  one resident handle. The CUDA/ROCm GDN/short-conv state-bank hooks and DGO
-  resident batch-restore branch now exist; this item remains open until the
-  request-batched runner path consumes `DeviceSpeculativePublicationRequest`
-  end-to-end and focused CUDA/ROCm runner smokes prove KV, terminal hidden,
-  logical-state mailbox, and host adoption all move from one accepted handle.
+  one resident handle. `OrchestrationRunner` now drives the GPU stochastic
+  request-batch publish callback through `DeviceSpeculativePublicationRequest`
+  and then adopts host mirrors from the validated transaction plan instead of
+  invoking the host-plan state publisher. Focused gate:
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_MTPVerifierForwardExecutor`, `V2_Unit_MTPSpecStateContract`,
+  `V2_Unit_MTPGraphConstruction`, `V2_Unit_GpuWorkspaceAllocationPolicy`, and
+  `V2_Integration_PrefixCacheMTP_Qwen36(CUDA|ROCm)GpuGraphsStochasticSmoke`.
+- [ ] Compact stochastic outcome host bridge removed from request-batch
+  planning/state decisions. It is still required today to build the shared host
+  transaction plan before resident publication; the next slice must make the
+  transaction planner consume resident device metadata so the bridge becomes
+  a response-output flush only.
 - [ ] LocalTP and GlobalTP grouped verifier support added for sharded logits:
   compact outcome reducers perform domain-wide argmax/top-k/top-p/probability
   acceptance across shards, and TP lanes fail-closed until that reducer is
@@ -3357,12 +3364,13 @@ Current status:
   `DeviceSpeculativeOutcomeHandle` plus host-known verifier shape invariants;
   pre-verifier base-cache counts live in device metadata. The only supported
   direct-publication entry point is
-  `publishAcceptedMTPSpecStateBatchFromDeviceOutcome()`. `OrchestrationRunner`
-  calls it before `copyDeviceSpeculativeOutcomesToHost()` when a backend
-  advertises `supportsDeviceResidentMTPSpecStatePublication()`, then skips the
-  older host-plan publish so the host bridge is only an output flush. Real DGO
-  support remains false until its KV/state/terminal-hidden publication consumes
-  device metadata directly. Focused gate:
+  `publishAcceptedMTPSpecStateBatchFromDeviceOutcome()`. Scalar
+  `OrchestrationRunner` calls it before `copyDeviceSpeculativeOutcomesToHost()`;
+  request-batched stochastic now calls it after the compatibility bridge has
+  produced a validated host transaction plan, then skips the older host-plan
+  state publisher and only adopts host mirrors. The remaining gap is removing
+  that request-batch host bridge from planning, not live-state mutation.
+  Focused gate:
   `V2_Unit_PrefillDecodeTransition` and
   `V2_Unit_GpuWorkspaceAllocationPolicy`.
 - A follow-up code dive confirmed why DGO cannot safely advertise the new
@@ -3382,9 +3390,9 @@ Current status:
   stage state from a device row pointer and hard-fails CPU devices, null row
   pointers, or null/default streams. Focused gate passed:
   `V2_Unit_MTPSpecStateContract` and
-  `V2_Unit_GpuWorkspaceAllocationPolicy`. DGO still does not advertise
-  resident publication until compact metadata also drives cache-count mutation,
-  terminal-hidden row selection, and next-token staging without the host bridge.
+  `V2_Unit_GpuWorkspaceAllocationPolicy`. This unblocked later DGO resident
+  publication once compact metadata also drove cache-count mutation,
+  terminal-hidden row selection, and next-token staging.
 - Compact outcome row/count derivation is now shared in
   `sampling_math::derive_speculative_publication_metadata()`. The helper uses
   `kSpecBatchMetaTargetVerifierStateCommitCount`, not
