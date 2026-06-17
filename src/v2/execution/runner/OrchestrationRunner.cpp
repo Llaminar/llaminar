@@ -2544,69 +2544,45 @@ namespace llaminar2
                     return release_and_fail(std::move(message));
                 }
 
-                std::vector<int> resident_outcome_meta(
-                    static_cast<size_t>(tx.scheduled_batch.request_count) *
-                        static_cast<size_t>(
-                            sampling_math::kSpeculativeBatchMetaCount),
-                    0);
+                DeviceResidentHostStateAdoptionRequest adoption_request;
+                adoption_request.logical_state =
+                    runner_->deviceResidentLogicalSequenceState();
+                adoption_request.base_cached_tokens =
+                    tx.scheduled_batch.base_cached_tokens;
+                adoption_request.publish_mtp_shifted_kv =
+                    tx.scheduled_batch.requires_shifted_kv_publication;
+
+                std::string adoption_error;
                 {
-                    PerfStatsCollector::ScopedTimer planning_bridge_timer(
+                    PerfStatsCollector::ScopedTimer adoption_timer(
                         "mtp",
-                        "request_batch_stochastic_device_outcome_meta_bridge",
+                        "request_batch_device_resident_host_metadata_adoption",
                         "decode",
                         {},
                         {{"request_count",
                           std::to_string(tx.scheduled_batch.request_count)}});
-                    if (!runner_->materializeDeviceSpeculativeOutcomeMetadataForHostPlanning(
-                            resident_request_batch_outcome,
-                            resident_outcome_meta.data(),
-                            sampling_math::kSpeculativeBatchMetaCount))
+                    if (!runner_->adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(
+                            adoption_request,
+                            &adoption_error))
                     {
-                        return release_and_fail(
+                        std::string message =
                             "decodeStepBatch() request-batched stochastic "
-                            "resident outcome host-planning metadata materialization failed");
+                            "resident host-state metadata adoption failed";
+                        if (!adoption_error.empty())
+                        {
+                            message += ": ";
+                            message += adoption_error;
+                        }
+                        return release_and_fail(std::move(message));
                     }
-                }
-
-                tx.transaction_plan =
-                    buildMTPSpecTransactionBatchPlanFromDeviceRejectionMetadata(
-                        tx.scheduled_batch.shape,
-                        tx.scheduled_batch.request_ids,
-                        tx.scheduled_batch.vocab_size,
-                        tx.scheduled_batch.greedy_requests,
-                        resident_outcome_meta,
-                        sampling_math::kSpeculativeBatchMetaCount,
-                        tx.scheduled_batch.base_cached_tokens);
-                if (!tx.transaction_plan.ok)
-                {
-                    return release_and_fail(
-                        std::string("decodeStepBatch() request-batched stochastic "
-                                    "resident metadata transaction planning failed: ") +
-                        tx.transaction_plan.error);
-                }
-
-                std::string adoption_error;
-                if (!runner_->adoptDeviceResidentMTPSpecPublishedHostState(
-                        tx.transaction_plan.step_plans,
-                        &adoption_error))
-                {
-                    std::string message =
-                        "decodeStepBatch() request-batched stochastic "
-                        "resident host-state adoption failed";
-                    if (!adoption_error.empty())
-                    {
-                        message += ": ";
-                        message += adoption_error;
-                    }
-                    return release_and_fail(std::move(message));
                 }
 
                 /*
                  * Full compact outcome materialization is deliberately after
                  * live-state publication and host-mirror adoption.  It now
                  * exists only so decodeStepBatch() can return response tokens
-                 * and update sampler bookkeeping; state planning above consumes
-                 * metadata only.
+                 * and update sampler bookkeeping; state planning and adoption
+                 * above consume the resident logical-state mailbox only.
                  */
                 tx.device_outcomes.assign(
                     static_cast<size_t>(tx.scheduled_batch.request_count),

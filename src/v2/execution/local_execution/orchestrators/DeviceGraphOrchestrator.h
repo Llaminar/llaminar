@@ -1799,6 +1799,9 @@ namespace llaminar2
         bool adoptDeviceResidentMTPSpecPublishedHostState(
             const MTPSpecStepPlanBatch &plans,
             std::string *error = nullptr) override;
+        bool adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(
+            const DeviceResidentHostStateAdoptionRequest &request,
+            std::string *error = nullptr) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -2362,11 +2365,6 @@ namespace llaminar2
         bool copyDeviceSpeculativeOutcomesToHost(
             const DeviceSpeculativeOutcomeHandle &handle,
             DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
-        bool materializeDeviceSpeculativeOutcomeMetadataForHostPlanning(
-            const DeviceSpeculativeOutcomeHandle &handle,
-            int *meta_out,
-            int meta_stride) override;
-
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)
          */

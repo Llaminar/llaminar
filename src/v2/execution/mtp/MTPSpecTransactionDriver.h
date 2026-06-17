@@ -78,26 +78,6 @@ namespace llaminar2
         const std::vector<int32_t> &base_cached_tokens);
 
     /**
-     * @brief Build a transaction plan from compact resident outcome metadata.
-     *
-     * GPU-resident stochastic verification can publish live state before the
-     * response-token bridge.  For host mirror adoption we only need the compact
-     * metadata row plus the original scheduled draft tokens: accepted draft
-     * tokens are already known from @p requests and a rejected correction token
-     * is carried in the metadata.  This helper reconstructs the same compact
-     * outcome struct used by the legacy planner, then delegates to the shared
-     * validation path so resident and host-bridged planning cannot drift.
-     */
-    MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromDeviceRejectionMetadata(
-        const MTPSpecDecodeMetadataShape &shape,
-        const std::vector<int> &request_ids,
-        int vocab_size,
-        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
-        const std::vector<int> &outcome_meta,
-        int meta_stride,
-        const std::vector<int32_t> &base_cached_tokens);
-
-    /**
      * @brief Build a publication-ready transaction plan from greedy catch-up.
      *
      * This path is used when the host knows the draft tokens and target verifier

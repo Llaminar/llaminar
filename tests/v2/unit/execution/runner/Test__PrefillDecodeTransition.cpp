@@ -521,6 +521,23 @@ namespace
             last_mtp_spec_verifier_plan_ = plan;
             last_mtp_spec_verifier_rows_ = plan.verifier_logit_rows;
             last_mtp_spec_verifier_tokens_ = plan.verifier_input_tokens;
+            /*
+             * The real GPU runner snapshots pre-verifier base cache counts
+             * into device metadata before verifier graph replay mutates live
+             * KV/GDN state.  Mirror that timing in the mock: verifier
+             * forward_batch() rewrites sequence_lengths_ to verifier-row
+             * lengths, so publication must not read it after replay.
+             */
+            for (int request_index = 0;
+                 request_index < plan.request_count &&
+                 request_index < kMockResidentOutcomeRequestCapacity;
+                 ++request_index)
+            {
+                resident_base_cached_tokens_[static_cast<size_t>(request_index)] =
+                    request_index < static_cast<int>(sequence_lengths_.size())
+                        ? sequence_lengths_[static_cast<size_t>(request_index)]
+                        : position_;
+            }
             mtp_spec_verifier_plan_installed_ = true;
             return true;
         }
@@ -737,19 +754,14 @@ namespace
                 const int base_cached_tokens =
                     !request.base_cached_tokens.empty()
                         ? request.base_cached_tokens[static_cast<size_t>(request_index)]
-                        : (request_index < static_cast<int>(sequence_lengths_.size())
-                               ? sequence_lengths_[static_cast<size_t>(request_index)]
-                               : position_);
+                        : (resident_base_cached_tokens_[static_cast<size_t>(request_index)] >= 0
+                               ? resident_base_cached_tokens_[static_cast<size_t>(request_index)]
+                               : (request_index < static_cast<int>(sequence_lengths_.size())
+                                      ? sequence_lengths_[static_cast<size_t>(request_index)]
+                                      : position_));
                 const int target_cached_tokens =
                     base_cached_tokens +
                     row_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
-                if (request_index == 0)
-                    position_ = target_cached_tokens;
-                if (request_index < static_cast<int>(sequence_lengths_.size()))
-                {
-                    sequence_lengths_[static_cast<size_t>(request_index)] =
-                        target_cached_tokens;
-                }
                 resident_target_positions_[static_cast<size_t>(request_index)] =
                     target_cached_tokens;
                 resident_target_sequence_lengths_[static_cast<size_t>(request_index)] =
@@ -839,6 +851,69 @@ namespace
                     step.target_cached_tokens;
                 if (step.request_index == 0)
                     position_ = step.target_cached_tokens;
+            }
+            return true;
+        }
+
+        bool adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(
+            const DeviceResidentHostStateAdoptionRequest &request,
+            std::string *error = nullptr) override
+        {
+            ++adopt_device_resident_host_state_count_;
+            publication_events_.push_back("host_state_adopt");
+            if (!supports_device_resident_mtp_spec_state_publication_)
+            {
+                if (error)
+                    *error = "mock device-resident metadata host-state adoption is disabled";
+                return false;
+            }
+            if (!request.valid() ||
+                !request.logical_state.sameMailboxAs(deviceResidentLogicalSequenceState()))
+            {
+                if (error)
+                    *error = "mock device-resident metadata host-state adoption request is invalid";
+                return false;
+            }
+            if (sequence_lengths_.size() <
+                static_cast<size_t>(std::max(1, batch_capacity_)))
+            {
+                sequence_lengths_.resize(
+                    static_cast<size_t>(std::max(1, batch_capacity_)),
+                    position_);
+            }
+            for (int request_index = 0;
+                 request_index < request.logical_state.request_count;
+                 ++request_index)
+            {
+                const int32_t base =
+                    request.base_cached_tokens[static_cast<size_t>(request_index)];
+                const int32_t target =
+                    request.logical_state
+                        .targetSequenceLengthDeviceForRequest(request_index)[0];
+                const int32_t accepted =
+                    request.logical_state
+                        .acceptedStateCountDeviceForRequest(request_index)[0];
+                const int32_t ok =
+                    request.logical_state
+                        .publicationOkFlagDeviceForRequest(request_index)[0];
+                if (ok == 0 || target != base + accepted)
+                {
+                    if (error)
+                    {
+                        std::ostringstream msg;
+                        msg << "mock device-resident metadata host-state adoption saw invalid counts"
+                            << " request=" << request_index
+                            << " base=" << base
+                            << " accepted=" << accepted
+                            << " target=" << target
+                            << " ok=" << ok;
+                        *error = msg.str();
+                    }
+                    return false;
+                }
+                sequence_lengths_[static_cast<size_t>(request_index)] = target;
+                if (request_index == 0)
+                    position_ = target;
             }
             return true;
         }
@@ -2292,7 +2367,6 @@ namespace
                     request.inverse_sample_first_logical_position);
                 last_request_batch_outcome_derived_thresholds_.push_back(
                     request.derive_thresholds_from_seed);
-
                 std::vector<int32_t> draft_tokens;
                 std::vector<float> accept_thresholds;
                 std::vector<float> residual_thresholds;
@@ -2806,40 +2880,6 @@ namespace
                     row_meta[kSpecBatchMetaConsumedVerifierRows];
                 out.sampled_terminal =
                     row_meta[kSpecBatchMetaSampledTerminal] != 0;
-            }
-            return true;
-        }
-
-        bool materializeDeviceSpeculativeOutcomeMetadataForHostPlanning(
-            const DeviceSpeculativeOutcomeHandle &handle,
-            int *meta_out,
-            int meta_stride) override
-        {
-            using namespace sampling_math;
-            publication_events_.push_back("host_planning_meta_bridge");
-            if (!handle.valid() ||
-                !meta_out ||
-                handle.device != primary_device_ ||
-                handle.meta_stride != kSpeculativeBatchMetaCount ||
-                meta_stride < handle.meta_stride ||
-                handle.request_count <= 0 ||
-                handle.request_count > kMockResidentOutcomeRequestCapacity)
-            {
-                return false;
-            }
-
-            const auto *meta = static_cast<const int *>(handle.meta_device);
-            for (int request = 0; request < handle.request_count; ++request)
-            {
-                const size_t src_base =
-                    static_cast<size_t>(request) *
-                    static_cast<size_t>(handle.meta_stride);
-                const size_t dst_base =
-                    static_cast<size_t>(request) *
-                    static_cast<size_t>(meta_stride);
-                for (int i = 0; i < handle.meta_stride; ++i)
-                    meta_out[dst_base + static_cast<size_t>(i)] =
-                        meta[src_base + static_cast<size_t>(i)];
             }
             return true;
         }
@@ -4059,6 +4099,8 @@ namespace
         std::array<int32_t, kMockResidentOutcomeRequestCapacity>
             resident_accepted_state_counts_{};
         std::array<int32_t, kMockResidentOutcomeRequestCapacity>
+            resident_base_cached_tokens_ = {-1, -1, -1, -1};
+        std::array<int32_t, kMockResidentOutcomeRequestCapacity>
             resident_next_condition_tokens_{};
         std::array<int32_t, kMockResidentOutcomeRequestCapacity>
             resident_all_drafts_accepted_flags_{};
@@ -4803,7 +4845,6 @@ namespace
         EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
-                                "host_planning_meta_bridge",
                                 "host_state_adopt",
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
@@ -4892,7 +4933,6 @@ namespace
         EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
-                                "host_planning_meta_bridge",
                                 "host_state_adopt",
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);

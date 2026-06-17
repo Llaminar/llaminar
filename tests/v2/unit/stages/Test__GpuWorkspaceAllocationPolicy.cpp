@@ -2488,12 +2488,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxWrapsReside
         removeAsciiWhitespace(stripCommentsAndStringLiterals(prepare_body));
     const auto compact_direct_publish =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(direct_publish_body));
-    const auto adopt_body = sliceBetween(
+    const auto host_adopt_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::adoptDeviceResidentMTPSpecPublishedHostState(",
+        "bool DeviceGraphOrchestrator::adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(");
+    const auto metadata_adopt_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(",
         "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(");
-    const auto compact_adopt =
-        removeAsciiWhitespace(stripCommentsAndStringLiterals(adopt_body));
+    const auto compact_host_adopt =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(host_adopt_body));
+    const auto compact_metadata_adopt =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(metadata_adopt_body));
     const auto clear_mailbox_body = sliceBetween(
         source,
         "void DeviceGraphOrchestrator::clearDeviceResidentLogicalSequenceStateMailbox()",
@@ -2796,40 +2802,54 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxWrapsReside
         << "The mailbox readiness event must cover resident KV publication, not just metadata derivation.";
     EXPECT_NE(compact_header.find("adoptDeviceResidentMTPSpecPublishedHostState("),
               std::string::npos);
-    EXPECT_NE(compact_adopt.find("device_resident_logical_sequence_state_mailbox_"),
+    EXPECT_NE(compact_header.find("adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata("),
+              std::string::npos);
+    EXPECT_NE(compact_host_adopt.find("device_resident_logical_sequence_state_mailbox_"),
               std::string::npos)
         << "Host mirror adoption must be tied to the current resident mailbox.";
-    EXPECT_NE(compact_adopt.find("state_.positions[static_cast<size_t>(step.request_index)]=step.target_cached_tokens"),
+    EXPECT_NE(compact_host_adopt.find("state_.positions[static_cast<size_t>(step.request_index)]=step.target_cached_tokens"),
               std::string::npos);
-    EXPECT_NE(compact_adopt.find("state_.sequence_lengths[static_cast<size_t>(step.request_index)]=step.target_cached_tokens"),
+    EXPECT_NE(compact_host_adopt.find("state_.sequence_lengths[static_cast<size_t>(step.request_index)]=step.target_cached_tokens"),
               std::string::npos);
-    EXPECT_NE(compact_adopt.find("HostSequenceStatePublicationRequestkv_host_request"),
+    EXPECT_NE(compact_host_adopt.find("HostSequenceStatePublicationRequestkv_host_request"),
               std::string::npos);
-    EXPECT_NE(compact_adopt.find("adoptSequenceStateFromHostMetadata("),
+    EXPECT_NE(compact_host_adopt.find("adoptSequenceStateFromHostMetadata("),
               std::string::npos)
         << "DGO host adoption must refresh KV cache mirrors before positions are trusted.";
-    EXPECT_NE(compact_adopt.find("state_.mtp_kv_caches"),
+    EXPECT_NE(compact_host_adopt.find("state_.mtp_kv_caches"),
               std::string::npos)
         << "Host adoption must refresh shifted MTP KV cache mirrors too.";
-    EXPECT_NE(compact_adopt.find("shifted_target_cached_tokens"),
+    EXPECT_NE(compact_host_adopt.find("shifted_target_cached_tokens"),
               std::string::npos);
-    EXPECT_NE(compact_adopt.find("shifted_accepted_state_counts"),
+    EXPECT_NE(compact_host_adopt.find("shifted_accepted_state_counts"),
               std::string::npos);
-    EXPECT_LT(compact_adopt.find("adoptSequenceStateFromHostMetadata("),
-              compact_adopt.find("state_.positions[static_cast<size_t>(step.request_index)]=step.target_cached_tokens"))
+    EXPECT_LT(compact_host_adopt.find("adoptSequenceStateFromHostMetadata("),
+              compact_host_adopt.find("state_.positions[static_cast<size_t>(step.request_index)]=step.target_cached_tokens"))
         << "KV host mirrors must be adopted before DGO exposes the new host position.";
-    EXPECT_NE(compact_adopt.find("device_resident_logical_sequence_host_adopted_epoch_=mailbox.live_state_epoch"),
+    EXPECT_NE(compact_host_adopt.find("device_resident_logical_sequence_host_adopted_epoch_=mailbox.live_state_epoch"),
               std::string::npos)
         << "Host mirror adoption must mark the current mailbox epoch as fresh.";
-    EXPECT_EQ(compact_adopt.find("publishSequenceStateFromDeviceMetadata("),
+    EXPECT_EQ(compact_host_adopt.find("publishSequenceStateFromDeviceMetadata("),
               std::string::npos)
         << "Host mirror adoption must not republish KV/cache state.";
-    EXPECT_EQ(compact_adopt.find("publishAcceptedMTPSpecKVState("),
+    EXPECT_EQ(compact_host_adopt.find("publishAcceptedMTPSpecKVState("),
               std::string::npos)
         << "Host mirror adoption must not call the host KV publication path.";
-    EXPECT_EQ(compact_adopt.find("synchronizeStream("),
+    EXPECT_NE(compact_metadata_adopt.find("mailbox.ownsHandle(request.logical_state,live_replay_state_epoch_)"),
               std::string::npos)
-        << "Host mirror adoption must use the existing host bridge plan, not add a sync.";
+        << "Metadata adoption must validate the typed resident mailbox handle.";
+    EXPECT_NE(compact_metadata_adopt.find("request.logical_state.target_sequence_lengths_device"),
+              std::string::npos)
+        << "Metadata adoption must read target sequence lengths from the resident mailbox.";
+    EXPECT_NE(metadata_adopt_body.find("device_resident_host_state_metadata_d2h_wait"),
+              std::string::npos)
+        << "Mailbox host mirror adoption must expose its tiny D2H wait as a named perf scope.";
+    EXPECT_NE(compact_metadata_adopt.find("synchronizeStream("),
+              std::string::npos)
+        << "Mailbox host mirror adoption has one explicit bridge-stream sync until graph signatures stop needing host mirrors.";
+    EXPECT_NE(compact_metadata_adopt.find("device_resident_logical_sequence_host_adopted_epoch_=mailbox.live_state_epoch"),
+              std::string::npos)
+        << "Metadata adoption must mark the current mailbox epoch as fresh.";
 
     const auto clear_cache_body = sliceBetween(
         header,

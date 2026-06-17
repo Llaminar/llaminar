@@ -3167,9 +3167,9 @@ Current status:
   publishes KV, terminal hidden, and the logical-state mailbox from one
   resident handle before compact host outcomes are materialized.
   `OrchestrationRunner` now drives GPU stochastic request-batch publication
-  through `DeviceSpeculativePublicationRequest`, bridges compact host metadata
-  only for planning/adoption, and then adopts host mirrors from the validated
-  transaction plan instead of invoking the host-plan state publisher. Full
+  through `DeviceSpeculativePublicationRequest`, adopts host mirrors from the
+  resident logical-state mailbox metadata, and never invokes the host-plan
+  state publisher on the resident path. Full
   compact host outcome materialization happens only after resident publication
   and host mirror adoption so it can feed response tokens and sampler
   bookkeeping. Focused
@@ -3187,11 +3187,17 @@ Current status:
   `V2_Unit_MTPVerifierForwardExecutor`, `V2_Unit_MTPSpecStateContract`,
   `V2_Unit_MTPGraphConstruction`, `V2_Unit_GpuWorkspaceAllocationPolicy`, and
   `V2_Integration_PrefixCacheMTP_Qwen36(CUDA|ROCm)GpuGraphsStochasticSmoke`.
-- [ ] Compact stochastic planning metadata bridge removed from
-  request-batch planning/adoption decisions. The remaining D2H boundary is now
-  metadata-only (`host_planning_meta_bridge`), but Phase 9.8 should make
-  transaction/adoption consume resident device metadata directly before
-  declaring the request-batched GPU stochastic hot path host-free.
+- [x] Compact stochastic planning metadata bridge removed from
+  request-batch planning/adoption decisions. `DeviceResidentHostStateAdoptionRequest`
+  carries the resident logical-state mailbox plus scheduled base-cache counts;
+  DGO validates the mailbox, copies only target sequence lengths, accepted
+  counts, and publication flags through a named tiny adoption bridge, and
+  refreshes host KV/position mirrors from that device metadata. The remaining
+  full compact outcome bridge is response/sampler-only. Focused gate:
+  `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_MTPVerifierForwardExecutor`, `V2_Unit_MTPSpecStateContract`,
+  `V2_Unit_MTPGraphConstruction`, `V2_Unit_GpuWorkspaceAllocationPolicy`, and
+  `V2_Integration_PrefixCacheMTP_Qwen36(CUDA|ROCm)GpuGraphsStochasticSmoke`.
 - [ ] LocalTP and GlobalTP grouped verifier support added for sharded logits:
   compact outcome reducers perform domain-wide argmax/top-k/top-p/probability
   acceptance across shards, and TP lanes fail-closed until that reducer is
@@ -3380,10 +3386,11 @@ Current status:
   direct-publication entry point is
   `publishAcceptedMTPSpecStateBatchFromDeviceOutcome()`. Scalar
   `OrchestrationRunner` calls it before `copyDeviceSpeculativeOutcomesToHost()`;
-  request-batched stochastic now calls it after the compatibility bridge has
-  produced a validated host transaction plan, then skips the older host-plan
-  state publisher and only adopts host mirrors. The remaining gap is removing
-  that request-batch host bridge from planning, not live-state mutation.
+  request-batched stochastic calls it before host response materialization, then
+  adopts host mirrors from `DeviceResidentLogicalSequenceStateHandle` metadata
+  through `DeviceResidentHostStateAdoptionRequest`. The compatibility host
+  bridge is now only a served-token and sampler-bookkeeping flush, not a
+  planning or live-state mutation dependency.
   Focused gate:
   `V2_Unit_PrefillDecodeTransition` and
   `V2_Unit_GpuWorkspaceAllocationPolicy`.

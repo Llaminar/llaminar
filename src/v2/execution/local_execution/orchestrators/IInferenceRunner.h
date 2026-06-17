@@ -335,6 +335,31 @@ namespace llaminar2
     };
 
     /**
+     * @brief Host-mirror adoption request for a resident speculative publish.
+     *
+     * Device-resident publication makes accelerator metadata authoritative for
+     * the next live logical position and sequence length.  The host still owns
+     * legacy mirrors used by graph signatures and API diagnostics, so it needs
+     * one explicit adoption handoff.  This request carries the resident mailbox
+     * plus the pre-verifier base cache lengths that remain host-known from
+     * scheduling; it does not carry compact verifier outcome rows.
+     */
+    struct DeviceResidentHostStateAdoptionRequest
+    {
+        DeviceResidentLogicalSequenceStateHandle logical_state;
+        std::vector<int32_t> base_cached_tokens;
+        bool publish_mtp_shifted_kv = true;
+
+        bool valid() const
+        {
+            return logical_state.valid() &&
+                   logical_state.request_count > 0 &&
+                   static_cast<int>(base_cached_tokens.size()) ==
+                       logical_state.request_count;
+        }
+    };
+
+    /**
      * @brief One logical request inside a device-side stochastic MTP batch.
      *
      * The descriptor is intentionally value-owned: thresholds and stop tokens
@@ -827,6 +852,29 @@ namespace llaminar2
             {
                 *error =
                     "runner does not support adopting device-resident MTP host state";
+            }
+            return false;
+        }
+
+        /**
+         * @brief Refresh host mirrors directly from resident device metadata.
+         *
+         * This is the request-batched GPU hot-path counterpart to
+         * adoptDeviceResidentMTPSpecPublishedHostState().  Implementations
+         * should wait on @p request.logical_state.ready_event using an explicit
+         * bridge stream, copy only the small logical-state arrays needed for
+         * host mirrors, and update host-side positions/cache heads without
+         * reconstructing an MTPSpecStepPlanBatch from compact verifier outcomes.
+         */
+        virtual bool adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(
+            const DeviceResidentHostStateAdoptionRequest &request,
+            std::string *error = nullptr)
+        {
+            (void)request;
+            if (error)
+            {
+                *error =
+                    "runner does not support adopting device-resident MTP host state from device metadata";
             }
             return false;
         }
@@ -2670,28 +2718,6 @@ namespace llaminar2
             DeviceSpeculativeVerifyBatchOutcome *outcomes)
         {
             return copyDeviceSpeculativeOutcomesToHost(handle, outcomes);
-        }
-
-        /**
-         * @brief Materialize only compact outcome metadata for host planning.
-         *
-         * Resident request-batch publication should not need the response-token
-         * bridge before live state and host mirrors are adopted.  This method is
-         * the smaller planning boundary: implementations may copy only
-         * `handle.meta_device` into @p meta_out so the runner can build an
-         * adoption plan from compact counts and scheduled draft tokens.  The
-         * default hard-fails; unsupported runners must not silently fall back to
-         * full response materialization.
-         */
-        virtual bool materializeDeviceSpeculativeOutcomeMetadataForHostPlanning(
-            const DeviceSpeculativeOutcomeHandle &handle,
-            int *meta_out,
-            int meta_stride)
-        {
-            (void)handle;
-            (void)meta_out;
-            (void)meta_stride;
-            return false;
         }
 
         /**

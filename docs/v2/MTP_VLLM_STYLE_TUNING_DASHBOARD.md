@@ -33,8 +33,8 @@ snapshots base-cache counts D2D, keeps scalar GDN/short-conv device-index
 publication device-only, lets dense request batches pass the hybrid guard, and
 names remaining D2H as response materialization. GDN/short-conv request-batch
 restore now has a hard-fail API plus CUDA/ROCm request-owned live-state banks.
-GPU request-batch resident publication/adoption now uses a compact meta-only
-planning bridge; full host outcome bridging is response/sampler-only.
+GPU request-batch resident publication/adoption now consumes the logical-state
+mailbox directly; host outcome bridging is response/sampler-only.
 
 | Lane | Baseline | Best MTP | RAG | Evidence |
 |---|---:|---:|:---:|---|
@@ -72,7 +72,7 @@ MoE metadata and fused verifier work, not more D2H/reset plumbing.
 | CUDA | Dense 27B | greedy | base 44.0; d1/d2/d3/dyn 63.9/76.1/91.4/87.8 | G | dynamic trails fixed d3 |
 | CUDA | Dense 27B | stochastic | base 44.7; 52.6/52.6/47.7/47.7 | G | d3 short-lane regression |
 | ROCm | Dense 27B | greedy | base 30.3; 42.3/48.1/65.0/52.9 | G | absolute CUDA gap |
-| ROCm | Dense 27B | stochastic | base 31.3; 37.0/28.7/27.0/36.9 | G | d2/d3 cost |
+| ROCm | Dense 27B | stochastic | base 31.3; 37.0/28.7/27.0/36.9 | G | d2/d3 |
 | CPU | Dense 27B | greedy | base 4.7; 5.9/6.0/9.3/6.1 | G | dynamic shallow |
 | CPU | Dense 27B | stochastic | base 4.46; 5.06/5.78/4.85/5.41 | G | verifier/condition |
 | CUDA | MoE 35B | greedy | base 139.2; 129.6/136.6/139.1/146.1 | A | weak win, repeat needed |
@@ -87,8 +87,8 @@ Target anchors from `ggml-org/llama.cpp@6ddc943`: CUDA dense no-MTP 41.83, d1
 
 ## Next Phase 10 Moves
 
-1. Close Phase 9.8 dense economy: remove the remaining meta-only planning
-   bridge and prove grouped verifier perf beats serial on CPU/CUDA/ROCm.
+1. Close Phase 9.8 dense economy: prove grouped verifier perf beats serial on
+   CPU/CUDA/ROCm.
 2. Reduce full MoE verifier graph replay cost; align routed/shared expert work
    with vLLM fused-MoE runner semantics before polishing controller policy.
 3. Move transaction-output adoption behind resident device metadata so response
