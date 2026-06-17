@@ -2673,6 +2673,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief Materialize only compact outcome metadata for host planning.
+         *
+         * Resident request-batch publication should not need the response-token
+         * bridge before live state and host mirrors are adopted.  This method is
+         * the smaller planning boundary: implementations may copy only
+         * `handle.meta_device` into @p meta_out so the runner can build an
+         * adoption plan from compact counts and scheduled draft tokens.  The
+         * default hard-fails; unsupported runners must not silently fall back to
+         * full response materialization.
+         */
+        virtual bool materializeDeviceSpeculativeOutcomeMetadataForHostPlanning(
+            const DeviceSpeculativeOutcomeHandle &handle,
+            int *meta_out,
+            int meta_stride)
+        {
+            (void)handle;
+            (void)meta_out;
+            (void)meta_stride;
+            return false;
+        }
+
+        /**
          * @brief Materialize resident outcomes only for host-visible response data.
          *
          * Device-resident publication must already have consumed @p handle

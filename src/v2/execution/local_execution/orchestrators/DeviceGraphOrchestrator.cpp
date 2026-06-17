@@ -18809,6 +18809,135 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::materializeDeviceSpeculativeOutcomeMetadataForHostPlanning(
+        const DeviceSpeculativeOutcomeHandle &handle,
+        int *meta_out,
+        int meta_stride)
+    {
+        if (!handle.valid() ||
+            !meta_out ||
+            handle.device != state_.device_id ||
+            handle.request_count > stochastic_batch_output_request_capacity_ ||
+            meta_stride < handle.meta_stride)
+        {
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const int request_count = handle.request_count;
+        const size_t meta_elements =
+            static_cast<size_t>(request_count) *
+            static_cast<size_t>(handle.meta_stride);
+        int *copy_meta = meta_out;
+        std::vector<int> fallback_meta;
+
+        if (handle.device.is_gpu())
+        {
+            if (!stochastic_batch_output_host_scratch_ ||
+                !stochastic_batch_output_host_scratch_->canServe(
+                    request_count,
+                    handle.output_token_stride,
+                    handle.meta_stride))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Missing pinned stochastic metadata host scratch for "
+                          << request_count << " requests on "
+                          << state_.device_id.toString());
+                return false;
+            }
+            copy_meta = stochastic_batch_output_host_scratch_->meta;
+        }
+        else
+        {
+            fallback_meta.assign(meta_elements, 0);
+            copy_meta = fallback_meta.data();
+        }
+
+        if (handle.device.is_gpu())
+        {
+            void *copy_stream = stochastic_outcome_response_bridge_stream_.get();
+            if (!copy_stream)
+            {
+                void *raw_copy_stream =
+                    backend->createStream(state_.device_id.gpu_ordinal());
+                if (!raw_copy_stream)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to create explicit stochastic metadata bridge stream");
+                    return false;
+                }
+                const int device_ordinal = state_.device_id.gpu_ordinal();
+                stochastic_outcome_response_bridge_stream_.reset(
+                    raw_copy_stream,
+                    [backend, device_ordinal](void *stream)
+                    {
+                        if (stream)
+                            backend->destroyStream(stream, device_ordinal);
+                    });
+                copy_stream = stochastic_outcome_response_bridge_stream_.get();
+            }
+
+            if (!backend->streamWaitEvent(
+                    copy_stream,
+                    handle.response_ready_event.get(),
+                    state_.device_id.gpu_ordinal()))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue stochastic metadata bridge wait");
+                return false;
+            }
+
+            {
+                PerfStatsCollector::ScopedTimer enqueue_timer(
+                    "mtp",
+                    "stochastic_request_batch_planning_meta_d2h_enqueue",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"requests", std::to_string(request_count)}});
+                if (!backend->deviceToHostOnStream(
+                        copy_meta,
+                        handle.meta_device,
+                        sizeof(int) * meta_elements,
+                        state_.device_id.gpu_ordinal(),
+                        copy_stream))
+                {
+                    return false;
+                }
+            }
+            {
+                PerfStatsCollector::ScopedTimer wait_timer(
+                    "mtp",
+                    "stochastic_request_batch_planning_meta_d2h_wait",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"requests", std::to_string(request_count)}});
+                if (!backend->synchronizeStream(
+                        copy_stream,
+                        state_.device_id.gpu_ordinal()))
+                {
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            const int *meta = static_cast<const int *>(handle.meta_device);
+            std::copy(meta, meta + meta_elements, copy_meta);
+        }
+
+        for (int request = 0; request < request_count; ++request)
+        {
+            const int *src =
+                copy_meta + static_cast<size_t>(request) *
+                                static_cast<size_t>(handle.meta_stride);
+            int *dst =
+                meta_out + static_cast<size_t>(request) *
+                               static_cast<size_t>(meta_stride);
+            std::copy(src, src + handle.meta_stride, dst);
+        }
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(
         int first_target_slot,
         int first_draft_slot,

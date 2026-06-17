@@ -2362,6 +2362,10 @@ namespace llaminar2
         bool copyDeviceSpeculativeOutcomesToHost(
             const DeviceSpeculativeOutcomeHandle &handle,
             DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
+        bool materializeDeviceSpeculativeOutcomeMetadataForHostPlanning(
+            const DeviceSpeculativeOutcomeHandle &handle,
+            int *meta_out,
+            int meta_stride) override;
 
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)

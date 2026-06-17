@@ -33,8 +33,8 @@ snapshots base-cache counts D2D, keeps scalar GDN/short-conv device-index
 publication device-only, lets dense request batches pass the hybrid guard, and
 names remaining D2H as response materialization. GDN/short-conv request-batch
 restore now has a hard-fail API plus CUDA/ROCm request-owned live-state banks.
-GPU request-batch resident publication now precedes compact host response
-bridging; the bridge still feeds host transaction/adoption planning.
+GPU request-batch resident publication/adoption now uses a compact meta-only
+planning bridge; full host outcome bridging is response/sampler-only.
 
 | Lane | Baseline | Best MTP | RAG | Evidence |
 |---|---:|---:|:---:|---|
@@ -87,8 +87,8 @@ Target anchors from `ggml-org/llama.cpp@6ddc943`: CUDA dense no-MTP 41.83, d1
 
 ## Next Phase 10 Moves
 
-1. Close Phase 9.8 dense economy: remove remaining row-plan/control host
-   bridges and prove grouped verifier perf beats serial on CPU/CUDA/ROCm.
+1. Close Phase 9.8 dense economy: remove the remaining meta-only planning
+   bridge and prove grouped verifier perf beats serial on CPU/CUDA/ROCm.
 2. Reduce full MoE verifier graph replay cost; align routed/shared expert work
    with vLLM fused-MoE runner semantics before polishing controller policy.
 3. Move transaction-output adoption behind resident device metadata so response

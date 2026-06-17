@@ -565,6 +565,68 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedDeviceRejectionOu
     EXPECT_TRUE(second.requiresCorrectionReplay());
 }
 
+TEST(Test__MTPSpecStateContract, TransactionDriverBuildsDeviceRejectionPlanFromMetadata)
+{
+    using namespace sampling_math;
+
+    MTPDecodeCatchupGreedyRequest accept_all_request;
+    accept_all_request.draft_tokens = {5, 6, 8};
+
+    MTPDecodeCatchupGreedyRequest reject_after_first_request;
+    reject_after_first_request.draft_tokens = {11, 12, 13};
+
+    std::vector<int> meta(
+        2 * kSpeculativeBatchMetaCount,
+        0);
+    int *first = meta.data();
+    first[kSpecBatchMetaOk] = 1;
+    first[kSpecBatchMetaOutputCount] = 3;
+    first[kSpecBatchMetaAcceptedSpeculativePrefix] = 2;
+    first[kSpecBatchMetaTargetVerifierStateCommitCount] = 3;
+    first[kSpecBatchMetaReadyToken] = 4;
+    first[kSpecBatchMetaRejectedVerifiedToken] = -1;
+    first[kSpecBatchMetaStoppedOnOutput] = 0;
+    first[kSpecBatchMetaAllSpeculativeAccepted] = 1;
+    first[kSpecBatchMetaConsumedVerifierRows] = 2;
+    first[kSpecBatchMetaSampledTerminal] = 1;
+
+    int *second = meta.data() + kSpeculativeBatchMetaCount;
+    second[kSpecBatchMetaOk] = 1;
+    second[kSpecBatchMetaOutputCount] = 2;
+    second[kSpecBatchMetaAcceptedSpeculativePrefix] = 0;
+    second[kSpecBatchMetaTargetVerifierStateCommitCount] = 1;
+    second[kSpecBatchMetaReadyToken] = -1;
+    second[kSpecBatchMetaRejectedVerifiedToken] = 77;
+    second[kSpecBatchMetaStoppedOnOutput] = 0;
+    second[kSpecBatchMetaAllSpeculativeAccepted] = 0;
+    second[kSpecBatchMetaConsumedVerifierRows] = 1;
+    second[kSpecBatchMetaSampledTerminal] = 0;
+
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 2;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromDeviceRejectionMetadata(
+            shape,
+            /*request_ids=*/{10, 11},
+            /*vocab_size=*/100,
+            {accept_all_request, reject_after_first_request},
+            meta,
+            kSpeculativeBatchMetaCount,
+            /*base_cached_tokens=*/{100, 200});
+
+    ASSERT_TRUE(plan.ok) << plan.error;
+    EXPECT_THAT(plan.metadata.committed_output_counts, ElementsAre(3, 2));
+    EXPECT_THAT(plan.metadata.next_condition_tokens, ElementsAre(4, 77));
+    EXPECT_THAT(plan.publication_plan.target_cached_tokens,
+                ElementsAre(103, 201));
+    ASSERT_THAT(plan.step_plans.steps, SizeIs(2));
+    EXPECT_EQ(plan.step_plans.steps[0].bonus_ready_state_slot_index, 3);
+    EXPECT_EQ(plan.step_plans.steps[1].correction_replay_start_index, 1);
+    EXPECT_EQ(plan.step_plans.steps[1].correction_replay_count, 1);
+}
+
 TEST(Test__MTPSpecStateContract, TransactionDriverRejectsInvalidDeviceRejectionOutcome)
 {
     MTPDecodeCatchupGreedyRequest request;

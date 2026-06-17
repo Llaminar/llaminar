@@ -2810,6 +2810,40 @@ namespace
             return true;
         }
 
+        bool materializeDeviceSpeculativeOutcomeMetadataForHostPlanning(
+            const DeviceSpeculativeOutcomeHandle &handle,
+            int *meta_out,
+            int meta_stride) override
+        {
+            using namespace sampling_math;
+            publication_events_.push_back("host_planning_meta_bridge");
+            if (!handle.valid() ||
+                !meta_out ||
+                handle.device != primary_device_ ||
+                handle.meta_stride != kSpeculativeBatchMetaCount ||
+                meta_stride < handle.meta_stride ||
+                handle.request_count <= 0 ||
+                handle.request_count > kMockResidentOutcomeRequestCapacity)
+            {
+                return false;
+            }
+
+            const auto *meta = static_cast<const int *>(handle.meta_device);
+            for (int request = 0; request < handle.request_count; ++request)
+            {
+                const size_t src_base =
+                    static_cast<size_t>(request) *
+                    static_cast<size_t>(handle.meta_stride);
+                const size_t dst_base =
+                    static_cast<size_t>(request) *
+                    static_cast<size_t>(meta_stride);
+                for (int i = 0; i < handle.meta_stride; ++i)
+                    meta_out[dst_base + static_cast<size_t>(i)] =
+                        meta[src_base + static_cast<size_t>(i)];
+            }
+            return true;
+        }
+
         // =====================================================================
         // Test inspection methods
         // =====================================================================
@@ -4769,8 +4803,9 @@ namespace
         EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
-                                "host_outcome_bridge",
-                                "host_state_adopt"));
+                                "host_planning_meta_bridge",
+                                "host_state_adopt",
+                                "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 2);
     }
@@ -4857,8 +4892,9 @@ namespace
         EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
-                                "host_outcome_bridge",
-                                "host_state_adopt"));
+                                "host_planning_meta_bridge",
+                                "host_state_adopt",
+                                "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
         EXPECT_THAT(mock->sequence_lengths(), ElementsAre(6, 5));

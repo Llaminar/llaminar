@@ -2544,11 +2544,69 @@ namespace llaminar2
                     return release_and_fail(std::move(message));
                 }
 
+                std::vector<int> resident_outcome_meta(
+                    static_cast<size_t>(tx.scheduled_batch.request_count) *
+                        static_cast<size_t>(
+                            sampling_math::kSpeculativeBatchMetaCount),
+                    0);
+                {
+                    PerfStatsCollector::ScopedTimer planning_bridge_timer(
+                        "mtp",
+                        "request_batch_stochastic_device_outcome_meta_bridge",
+                        "decode",
+                        {},
+                        {{"request_count",
+                          std::to_string(tx.scheduled_batch.request_count)}});
+                    if (!runner_->materializeDeviceSpeculativeOutcomeMetadataForHostPlanning(
+                            resident_request_batch_outcome,
+                            resident_outcome_meta.data(),
+                            sampling_math::kSpeculativeBatchMetaCount))
+                    {
+                        return release_and_fail(
+                            "decodeStepBatch() request-batched stochastic "
+                            "resident outcome host-planning metadata materialization failed");
+                    }
+                }
+
+                tx.transaction_plan =
+                    buildMTPSpecTransactionBatchPlanFromDeviceRejectionMetadata(
+                        tx.scheduled_batch.shape,
+                        tx.scheduled_batch.request_ids,
+                        tx.scheduled_batch.vocab_size,
+                        tx.scheduled_batch.greedy_requests,
+                        resident_outcome_meta,
+                        sampling_math::kSpeculativeBatchMetaCount,
+                        tx.scheduled_batch.base_cached_tokens);
+                if (!tx.transaction_plan.ok)
+                {
+                    return release_and_fail(
+                        std::string("decodeStepBatch() request-batched stochastic "
+                                    "resident metadata transaction planning failed: ") +
+                        tx.transaction_plan.error);
+                }
+
+                std::string adoption_error;
+                if (!runner_->adoptDeviceResidentMTPSpecPublishedHostState(
+                        tx.transaction_plan.step_plans,
+                        &adoption_error))
+                {
+                    std::string message =
+                        "decodeStepBatch() request-batched stochastic "
+                        "resident host-state adoption failed";
+                    if (!adoption_error.empty())
+                    {
+                        message += ": ";
+                        message += adoption_error;
+                    }
+                    return release_and_fail(std::move(message));
+                }
+
                 /*
-                 * The compact host bridge is deliberately after live-state
-                 * publication.  It exists only so response construction,
-                 * sampler bookkeeping, and host mirrors can observe the same
-                 * reduced outcomes; it must not be required to mutate KV/GDN.
+                 * Full compact outcome materialization is deliberately after
+                 * live-state publication and host-mirror adoption.  It now
+                 * exists only so decodeStepBatch() can return response tokens
+                 * and update sampler bookkeeping; state planning above consumes
+                 * metadata only.
                  */
                 tx.device_outcomes.assign(
                     static_cast<size_t>(tx.scheduled_batch.request_count),
@@ -2585,35 +2643,6 @@ namespace llaminar2
                     {
                         message += ": ";
                         message += process_error;
-                    }
-                    return release_and_fail(std::move(message));
-                }
-
-                MTPDeviceOutcomeBatchTransactionResult planned =
-                    executeMTPDeviceOutcomeScheduledBatchTransaction(
-                        tx.scheduled_batch,
-                        tx.device_outcomes);
-                tx.transaction_plan = planned.transaction_plan;
-                if (!planned.ok)
-                {
-                    return release_and_fail(
-                        std::string("decodeStepBatch() request-batched stochastic "
-                                    "resident transaction planning failed: ") +
-                        planned.error);
-                }
-
-                std::string adoption_error;
-                if (!runner_->adoptDeviceResidentMTPSpecPublishedHostState(
-                        tx.transaction_plan.step_plans,
-                        &adoption_error))
-                {
-                    std::string message =
-                        "decodeStepBatch() request-batched stochastic "
-                        "resident host-state adoption failed";
-                    if (!adoption_error.empty())
-                    {
-                        message += ": ";
-                        message += adoption_error;
                     }
                     return release_and_fail(std::move(message));
                 }

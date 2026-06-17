@@ -194,6 +194,133 @@ namespace llaminar2
             base_cached_tokens);
     }
 
+    MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromDeviceRejectionMetadata(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<int> &request_ids,
+        int vocab_size,
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<int> &outcome_meta,
+        int meta_stride,
+        const std::vector<int32_t> &base_cached_tokens)
+    {
+        using namespace sampling_math;
+
+        if (meta_stride < kSpeculativeBatchMetaCount)
+        {
+            return transactionPlanFailure(
+                "MTP device rejection metadata transaction has an invalid meta stride");
+        }
+        if (requests.empty())
+        {
+            return transactionPlanFailure(
+                "MTP device rejection metadata transaction has no requests");
+        }
+        if (outcome_meta.size() <
+            requests.size() * static_cast<size_t>(meta_stride))
+        {
+            return transactionPlanFailure(
+                "MTP device rejection metadata transaction meta vector is undersized");
+        }
+
+        std::vector<MTPDeviceRejectionBatchOutcome> outcomes;
+        outcomes.reserve(requests.size());
+        for (size_t i = 0; i < requests.size(); ++i)
+        {
+            const MTPDecodeCatchupGreedyRequest &request = requests[i];
+            if (request.draft_tokens.empty())
+            {
+                return transactionPlanFailure(
+                    "MTP device rejection metadata request has no draft tokens");
+            }
+
+            const int *meta =
+                outcome_meta.data() + i * static_cast<size_t>(meta_stride);
+            if (meta[kSpecBatchMetaOk] == 0)
+            {
+                return transactionPlanFailure(
+                    "MTP device rejection metadata row is marked invalid");
+            }
+
+            const int output_count = meta[kSpecBatchMetaOutputCount];
+            const int accepted_prefix =
+                meta[kSpecBatchMetaAcceptedSpeculativePrefix];
+            const int rejected_token =
+                meta[kSpecBatchMetaRejectedVerifiedToken];
+            if (output_count < 1 ||
+                output_count > kSpeculativeBatchMaxOutputTokens)
+            {
+                return transactionPlanFailure(
+                    "MTP device rejection metadata output count is invalid");
+            }
+            if (accepted_prefix < 0 ||
+                accepted_prefix >
+                    static_cast<int>(request.draft_tokens.size()) - 1)
+            {
+                return transactionPlanFailure(
+                    "MTP device rejection metadata accepted prefix is invalid");
+            }
+
+            MTPDeviceRejectionBatchOutcome outcome;
+            outcome.ok = true;
+            outcome.output_token_count = output_count;
+
+            int emitted = 0;
+            outcome.output_tokens[static_cast<size_t>(emitted++)] =
+                request.draft_tokens.front();
+            for (int row = 0;
+                 emitted < output_count && row < accepted_prefix;
+                 ++row)
+            {
+                const size_t draft_index = static_cast<size_t>(row + 1);
+                if (draft_index >= request.draft_tokens.size())
+                {
+                    return transactionPlanFailure(
+                        "MTP device rejection metadata accepted draft index is out of range");
+                }
+                outcome.output_tokens[static_cast<size_t>(emitted++)] =
+                    request.draft_tokens[draft_index];
+            }
+            if (emitted < output_count)
+            {
+                if (rejected_token < 0)
+                {
+                    return transactionPlanFailure(
+                        "MTP device rejection metadata needs an unrecoverable output token");
+                }
+                outcome.output_tokens[static_cast<size_t>(emitted++)] =
+                    rejected_token;
+            }
+            if (emitted != output_count)
+            {
+                return transactionPlanFailure(
+                    "MTP device rejection metadata reconstructed token count mismatch");
+            }
+
+            outcome.accepted_speculative_prefix = accepted_prefix;
+            outcome.target_verifier_state_commit_count =
+                meta[kSpecBatchMetaTargetVerifierStateCommitCount];
+            outcome.ready_token = meta[kSpecBatchMetaReadyToken];
+            outcome.rejected_verified_token = rejected_token;
+            outcome.stopped_on_output =
+                meta[kSpecBatchMetaStoppedOnOutput] != 0;
+            outcome.all_speculative_accepted =
+                meta[kSpecBatchMetaAllSpeculativeAccepted] != 0;
+            outcome.consumed_verifier_rows =
+                meta[kSpecBatchMetaConsumedVerifierRows];
+            outcome.sampled_terminal =
+                meta[kSpecBatchMetaSampledTerminal] != 0;
+            outcomes.push_back(std::move(outcome));
+        }
+
+        return buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+            shape,
+            request_ids,
+            vocab_size,
+            requests,
+            outcomes,
+            base_cached_tokens);
+    }
+
     MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromGreedyCatchup(
         const MTPSpecDecodeMetadataShape &shape,
         int request_id,
