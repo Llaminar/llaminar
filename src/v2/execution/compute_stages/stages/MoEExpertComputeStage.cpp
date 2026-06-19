@@ -4204,9 +4204,26 @@ namespace llaminar2
 
     bool SharedExpertGateStage::gateInputReadyForGraphCapture() const
     {
-        return params_.gate_inp &&
-               (params_.gate_inp->native_type() == TensorType::FP32 ||
-                (fp32_gate_inp_ && fp32_gate_source_ == params_.gate_inp));
+        if (!params_.gate_inp)
+            return false;
+
+        const TensorBase *gate_input =
+            (params_.gate_inp->native_type() == TensorType::FP32)
+                ? params_.gate_inp
+                : ((fp32_gate_inp_ && fp32_gate_source_ == params_.gate_inp)
+                       ? fp32_gate_inp_.get()
+                       : nullptr);
+
+        if (!gate_input)
+            return false;
+
+        /**
+         * Graph replay may not perform a hidden H2D for model weights. Warmup is
+         * responsible for materializing the FP32 gate vector and making the
+         * selected tensor resident on the exact backend device used by this
+         * stage; capture readiness is only true after that device-side handoff.
+         */
+        return !params_.device_id.is_gpu() || gate_input->is_on_device(params_.device_id);
     }
 
     bool SharedExpertGateStage::execute(IDeviceContext *ctx)

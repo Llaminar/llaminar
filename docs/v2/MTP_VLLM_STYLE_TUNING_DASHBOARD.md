@@ -16,11 +16,11 @@ The accepted MoE verifier route is split branch-local math: routed experts use
 the grouped verifier pipeline; the shared expert uses standalone
 decode-equivalent GEMV-many plus the normal shared-gate combine.
 
-Latest MoE stochastic fixed-d3 regression fix:
-`benchmark_results/mtp_vllm_style/20260619T231915Z-moe-stochastic-split-verifier-regression-fix`.
-Acceptance recovered to `30/39` (`76.92%`) on both CUDA and ROCm after the
-combined verifier owner was hard-disabled in the graph and path guards were
-updated to reject its counter.
+Latest MoE stochastic fixed-d3 refresh:
+`benchmark_results/mtp_vllm_style/20260619T233454Z-moe-stochastic-gate-residency-reset-guard`.
+Acceptance stayed at `30/39` (`76.92%`) on both CUDA and ROCm. This slice
+added a semantic runtime-table reset regression and made shared-gate graph
+capture require a device-resident gate tensor after warmup.
 
 ## Device And Topology Matrix
 
@@ -41,8 +41,8 @@ updated to reject its counter.
 
 | Device | Baseline | Stoch fixed d3 | Acceptance | Main blocker | RAG |
 |---|---:|---:|---:|---|:---:|
-| CUDA | `138.87 tok/s` | `75.15 tok/s` (`0.54x`) | `30/39` | verifier forward `539.7 ms`; sidecar `43.3 ms`; distribution build `21.7 ms` | R |
-| ROCm | `84.81 tok/s` | `73.32 tok/s` (`0.86x`) | `30/39` | verifier forward `307.2 ms`; first-sidecar prelaunch `110.1 ms`; response wait `166.8 ms` | A/R |
+| CUDA | `138.70 tok/s` | `75.61 tok/s` (`0.55x`) | `30/39` | verifier forward `537.2 ms`; sidecar `43.0 ms`; distribution build `19.7 ms` | R |
+| ROCm | `83.43 tok/s` | `74.69 tok/s` (`0.90x`) | `30/39` | verifier forward `295.3 ms`; first-sidecar prelaunch `109.9 ms`; response wait `167.0 ms` | A/R |
 
 Regression note: the bad run
 `20260619T230340Z-moe-verifier-stage-refresh` collapsed acceptance to `2/45`
@@ -72,6 +72,10 @@ the active bottleneck is verifier producer time.
   `MTPBenchmarkStyleDepth3LongPromptGreedyMatchesReference`.
 - CUDA/ROCm path guards passed and now reject the combined verifier counter.
 - CUDA/ROCm `MTPStochasticSamplingVerifierRuns` passed after the fix.
+- `V2_Unit_MoERuntimeTable` now proves histogram reset preserves placement
+  banks and captured runtime-table pointers.
+- `V2_Unit_PrefillGraphCapturability` now rejects shared-gate graph capture
+  until the effective gate tensor is device-resident on the stage device.
 - Shared-expert `SharedExpertFFNStage` M=2/3/4 all-codebook gates pass on
   CUDA/ROCm with cosine, relative L2, KLD, and max_abs checks.
 - Token equality alone is not an accepted verifier parity proof.

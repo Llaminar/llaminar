@@ -181,6 +181,51 @@ namespace llaminar2::test
         EXPECT_EQ(active_mask(), (std::vector<uint8_t>{0, 1, 0, 1}));
     }
 
+    TEST(Test__MoERuntimeTable, ResetDecodeHistogramCountsPreservesPlacementBanks)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto *captured_runtime_ptr = table.deviceLayerState(0);
+
+        auto update = updateForEpoch(1, 4);
+        update.local_compute_mask = {1, 0, 1, 0};
+        update.experts[2].owner_participant = 5;
+        update.experts[2].local_slot = 9;
+        update.replica_role[2] = static_cast<uint8_t>(DeviceMoEReplicaRole::PreferredReplica);
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        table.hostLayerState(0).decode_histogram[0] = 7;
+        table.hostLayerState(0).decode_histogram[2] = 3;
+
+        /**
+         * Request/session boundaries clear runtime counters but must not clear
+         * the placement bank observed by graph-captured MoE stages.  Destroying
+         * that bank leaves captured verifier graphs pointing at a table whose
+         * active descriptors no longer describe the resident expert weights.
+         */
+        table.resetDecodeHistogramCounts();
+
+        const auto *after_reset = table.deviceLayerState(0);
+        ASSERT_EQ(captured_runtime_ptr, after_reset)
+            << "Histogram reset must preserve the graph-facing layer pointer.";
+        ASSERT_EQ(after_reset->active_bank, 1u);
+        ASSERT_EQ(after_reset->active_epoch, 1u);
+
+        const auto &active = after_reset->banks[after_reset->active_bank];
+        EXPECT_EQ(active.epoch, 1u);
+        EXPECT_EQ(active.experts[2].owner_participant, 5);
+        EXPECT_EQ(active.experts[2].local_slot, 9);
+        EXPECT_EQ(active.local_compute_mask[0], 1u);
+        EXPECT_EQ(active.local_compute_mask[1], 0u);
+        EXPECT_EQ(active.local_compute_mask[2], 1u);
+        EXPECT_EQ(active.local_compute_mask[3], 0u);
+        EXPECT_EQ(active.replica_role[2],
+                  static_cast<uint8_t>(DeviceMoEReplicaRole::PreferredReplica));
+
+        for (int expert = 0; expert < 4; ++expert)
+            EXPECT_EQ(after_reset->decode_histogram[expert], 0u);
+    }
+
     TEST(Test__MoERuntimeTable, InvalidLayerBoundsAndUpdatesThrowConsistently)
     {
         MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);

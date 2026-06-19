@@ -112,6 +112,40 @@ namespace
     // Minimal stub IMoEKernel (no actual compute, just satisfies the interface)
     // =========================================================================
 
+    class DeviceResidentFP32Tensor final : public FP32Tensor
+    {
+    public:
+        explicit DeviceResidentFP32Tensor(std::vector<size_t> shape)
+            : FP32Tensor(std::move(shape))
+        {
+        }
+
+        ~DeviceResidentFP32Tensor() override
+        {
+            // The pointer below is a predicate-test sentinel, not backend-owned
+            // memory. Clear it before TensorBase destruction can try to free it.
+            gpu_data_ptr_ = nullptr;
+            gpu_device_.reset();
+            setCoherenceState_(TensorCoherenceState::HOST_ONLY);
+        }
+
+        /**
+         * @brief Mark the tensor as already resident on a device without
+         * allocating GPU memory.
+         *
+         * SharedExpertGateStage::isGraphCapturable() only needs to verify the
+         * stage's readiness predicate. The unit must not perform real H2D work
+         * or use a default stream, so this helper supplies a non-null sentinel
+         * pointer and matching coherence state.
+         */
+        void markResidentForGraphCaptureTest(DeviceId device)
+        {
+            gpu_data_ptr_ = reinterpret_cast<void *>(uintptr_t{0x1000});
+            gpu_device_ = device;
+            setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        }
+    };
+
     class StubMoEKernel : public IMoEKernel
     {
     public:
@@ -1301,19 +1335,20 @@ protected:
     static constexpr int SEQ_LEN = 16;
 
     std::unique_ptr<FP32Tensor> input_;
-    std::unique_ptr<FP32Tensor> gate_inp_;
+    std::unique_ptr<DeviceResidentFP32Tensor> gate_inp_;
     std::unique_ptr<FP32Tensor> shared_output_;
     StubMoEKernel stub_kernel_;
 
     void SetUp() override
     {
         input_ = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
-        gate_inp_ = TestTensorFactory::createFP32({1, D_MODEL});
+        gate_inp_ = std::make_unique<DeviceResidentFP32Tensor>(
+            std::vector<size_t>{1, D_MODEL});
         shared_output_ = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
     }
 };
 
-TEST_F(SharedExpertGatePrefillGraphCapture, PrefillCapturableWithKernel)
+TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRequiresDeviceResidentGateWithKernel)
 {
     ScopedRocmMoEFlags flags(true, true, true);
 
@@ -1329,8 +1364,14 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillCapturableWithKernel)
     stage.setMoEKernelForTesting(&stub_kernel_);
 
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "A host-only shared-expert gate vector would force an H2D during "
+        << "graph capture; warmup must make the effective gate tensor resident first.";
+
+    gate_inp_->markResidentForGraphCaptureTest(params.device_id);
     EXPECT_TRUE(stage.isGraphCapturable())
-        << "SharedExpertGate should be capturable for prefill on ROCm with kernel";
+        << "SharedExpertGate should be capturable after warmup has made the "
+        << "gate vector resident on the stage device.";
 #else
     EXPECT_FALSE(stage.isGraphCapturable());
 #endif

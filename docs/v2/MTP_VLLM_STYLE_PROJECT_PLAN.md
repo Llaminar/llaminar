@@ -4565,6 +4565,19 @@ Current status:
   symmetric-KL `0.0153`, max_abs `1.1958`. Production graph promotion is
   therefore hard-disabled with `can_combine_shared_verifier=false` until a
   future full-model cosine/L2/KL/max-abs proof turns green.
+- The split-route follow-up tightened two correctness contracts before more
+  MoE speed work: `V2_Unit_MoERuntimeTable` now proves decode-histogram reset
+  preserves active placement banks and graph-facing runtime-table pointers, and
+  `V2_Unit_PrefillGraphCapturability` now rejects `SharedExpertGateStage`
+  graph capture until the effective gate tensor is device-resident on the stage
+  device. Focused CUDA/ROCm MoE path guards and stochastic verifier parity are
+  green after the change. Fresh bounded stochastic fixed-d3 refresh
+  `benchmark_results/mtp_vllm_style/20260619T233454Z-moe-stochastic-gate-residency-reset-guard`
+  shows CUDA `138.70 -> 75.61 tok/s` and ROCm `83.43 -> 74.69 tok/s` at
+  `30/39` accepted tokens. The perfstats still report `49 KB` of
+  `MTP0_shared_expert_gate` H2D prep, so the next speed slice should separate
+  warmup-only weight staging from replay hot-path accounting and then attack
+  verifier producer kernels.
 - Fresh `V2_Perf_DenseVerifierRows_{CPU,CUDA,ROCm}` shows full dense verifier
   economics are not CPU-dominant: CPU M2/M3/M4 is `1.56/1.76/2.17x`, CUDA is
   `1.50/1.98/2.40x`, and ROCm is `1.28/1.57/1.73x`, all with strict
