@@ -69,15 +69,16 @@ namespace llaminar2
             std::optional<BufferId> output_v_buffer_id;
 
             /**
-             * @brief Execute tiny verifier batches as serial one-row decode projections.
+             * @brief Execute tiny verifier batches with grouped decode-equivalent Q/K/V projections.
              *
              * MTP publication compares the state produced by an all-position verifier
              * pass against the state that would have been produced by accepting the
              * same rows through normal decode. Quantized GEMM kernels can choose
-             * different small-M routes for m=2..4 than they do for m=1, which is fine
-             * for logits tolerance but not for byte-stable KV publication. When this
+             * different small-M routes for m=2..4 than they do for m=1. When this
              * flag is set the stage preserves the single graph node contract while
-             * invoking the existing one-row decode path for each verifier row.
+             * requiring a grouped M=2..4 path whose numerical contract has been
+             * proven equivalent to serial decode with cosine, L2, KLD, max-abs, and
+             * token gates.
              */
             bool force_decode_equivalent_verifier_prefill = false;
 

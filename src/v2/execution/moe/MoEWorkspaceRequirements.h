@@ -23,7 +23,6 @@ namespace llaminar2
         constexpr const char *GROUP_TOKEN_INDICES = "moe_group_token_indices";
         constexpr const char *GROUP_ORIGINAL_TO_GROUPED = "moe_group_original_to_grouped";
         constexpr const char *GROUP_ORIGINAL_EXPERT_IDS = "moe_group_original_expert_ids";
-        constexpr const char *GROUP_SINGLE_EXPERT_IDS = "moe_group_single_expert_ids";
         constexpr const char *GROUP_WRITE_HEADS = "moe_group_write_heads";
         constexpr const char *GROUP_WEIGHTS = "moe_group_weights";
         constexpr const char *GROUP_ACTIVE_EXPERT_IDS = "moe_group_active_expert_ids";
@@ -125,7 +124,6 @@ namespace llaminar2
             add(reqs, GROUP_TOKEN_INDICES, total_slots * sizeof(int));
             add(reqs, GROUP_ORIGINAL_TO_GROUPED, total_slots * sizeof(int));
             add(reqs, GROUP_ORIGINAL_EXPERT_IDS, total_slots * sizeof(int));
-            add(reqs, GROUP_SINGLE_EXPERT_IDS, sizeof(int));
             add(reqs, GROUP_WEIGHTS, total_slots * sizeof(float));
             add(reqs, GROUP_ACTIVE_EXPERT_IDS, active_expert_id_slots * sizeof(int));
             add(reqs, GROUP_OFFSETS, static_cast<std::size_t>(num_experts) * sizeof(int));

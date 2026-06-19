@@ -2446,6 +2446,12 @@ namespace llaminar2
             std::fill(stochastic_draft_row_formats_.begin(),
                       stochastic_draft_row_formats_.end(),
                       StochasticRowFormat::Empty);
+            std::fill(stochastic_target_top_k_.begin(),
+                      stochastic_target_top_k_.end(),
+                      0);
+            std::fill(stochastic_draft_top_k_.begin(),
+                      stochastic_draft_top_k_.end(),
+                      0);
             clearStochasticTargetSampleReadySlots(StochasticSampleReadyClearMode::Force);
             clearStochasticDraftSampleReadySlots(StochasticSampleReadyClearMode::Force);
             pending_mtp_verifier_device_token_plan_.reset();

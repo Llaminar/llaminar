@@ -349,6 +349,38 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief RAII token for verifier-only kernel dispatch modes.
+         *
+         * Some backends have multiple mathematically valid GEMV/GEMM dispatch
+         * policies.  Normal inference can choose the fastest policy, but MTP
+         * verifier publication needs rows to be reproducible against the
+         * accepted serial-decode contract.  Backends that need a temporary
+         * kernel mode override return a token from
+         * beginVerifierDecodeEquivalentScope(); callers keep it alive while
+         * running verifier row work and then let destruction restore the
+         * previous backend mode.  CPU and backends without such a mode may
+         * return nullptr.
+         */
+        struct VerifierKernelModeScope
+        {
+            virtual ~VerifierKernelModeScope() = default;
+        };
+
+        /**
+         * @brief Enter a verifier dispatch mode that preserves rowwise decode equivalence.
+         *
+         * Use this around serial verifier replay and grouped verifier kernels
+         * whose outputs may be published into live MTP/KV/GDN state.  The method
+         * is intentionally tensor-GEMM specific so stages do not need to know
+         * whether CUDA, ROCm, or CPU implements the mode with generated policy
+         * switches, deterministic reductions, or no-op scalar code.
+         */
+        virtual std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope()
+        {
+            return nullptr;
+        }
+
+        /**
          * @brief Tensor-based matrix multiplication: C = alpha * A @ B + beta * C
          *
          * This interface accepts tensors directly, enabling:

@@ -1291,7 +1291,7 @@ namespace llaminar2
          * policy for the same projection shape. That keeps the path economical
          * and graph-capturable while preserving serial-decode equivalence.
          */
-        class ScopedNativeVNNIDecodeEquivalentDispatch
+        class ScopedNativeVNNIDecodeEquivalentDispatch final : public ITensorGemm::VerifierKernelModeScope
         {
         public:
             ScopedNativeVNNIDecodeEquivalentDispatch()
@@ -1313,6 +1313,12 @@ namespace llaminar2
         private:
             bool previous_ = false;
         };
+
+        std::unique_ptr<ITensorGemm::VerifierKernelModeScope>
+        ROCmQuantisedGemmKernel::beginVerifierDecodeEquivalentScope()
+        {
+            return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>();
+        }
 
         bool ROCmQuantisedGemmKernel::weights_converted() const
         {
@@ -4279,22 +4285,32 @@ namespace llaminar2
                         {
                             int policy_kb = -1;
                             int policy_target_waves = -1;
-                            if (!rocmGemv_native_vnni_query_generated_config(
+                            /*
+                             * Decode-equivalent verifier publication is a
+                             * state-commit path, not a generic M-aware GEMV
+                             * throughput path.  Grouping projections by the
+                             * M=2..4 table can choose a different split-K
+                             * policy than the row-by-row decode oracle, which
+                             * changes FP32 reduction order and breaks strict
+                             * row equivalence.  Use the explicit serial-M1
+                             * policy here; the launcher will enforce the same
+                             * policy again before it touches device state.
+                             */
+                            if (!rocmGemv_native_vnni_query_serial_m1_config(
                                     codebooks[i],
-                                    m,
                                     Ns[i],
                                     k,
                                     &policy_kb,
                                     &policy_target_waves))
                             {
-                                LOG_WARN("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection "
-                                         << i
-                                         << " has no generated M-aware NativeVNNI policy for decode-equivalent grouped verifier;"
-                                         << " using serial-M1 grouping for this unsupported shape"
-                                         << " codebook=" << static_cast<int>(codebooks[i])
-                                         << " m=" << m
-                                         << " n=" << Ns[i]
-                                         << " k=" << k);
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection "
+                                          << i
+                                          << " has no serial-M1 NativeVNNI policy for decode-equivalent grouped verifier"
+                                          << " codebook=" << static_cast<int>(codebooks[i])
+                                          << " m=" << m
+                                          << " n=" << Ns[i]
+                                          << " k=" << k
+                                          << "; refusing serial-M1 fallback. Refresh the ROCm NativeVNNI decode dispatch table.");
                                 PerfStatsCollector::addCounter(
                                     "kernel",
                                     "rocm_native_vnni_small_m_generated_policy_miss",
@@ -4333,47 +4349,7 @@ namespace llaminar2
 
                         if (!generated_grouping_available)
                         {
-                            groups.clear();
-                            group_policies.clear();
-                            for (size_t i = 0; i < projections.size(); ++i)
-                            {
-                                int serial_kb = -1;
-                                int serial_target_waves = -1;
-                                if (!rocmGemv_native_vnni_query_serial_m1_config(
-                                        codebooks[i],
-                                        Ns[i],
-                                        k,
-                                        &serial_kb,
-                                        &serial_target_waves))
-                                {
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection "
-                                              << i
-                                              << " has no serial M=1 NativeVNNI policy for decode-equivalent grouped verifier"
-                                              << " codebook=" << static_cast<int>(codebooks[i])
-                                              << " n=" << Ns[i]
-                                              << " k=" << k);
-                                    return false;
-                                }
-
-                                int group_index = -1;
-                                for (size_t group = 0; group < group_policies.size(); ++group)
-                                {
-                                    if (group_policies[group].kb == serial_kb)
-                                    {
-                                        group_index = static_cast<int>(group);
-                                        break;
-                                    }
-                                }
-                                if (group_index < 0)
-                                {
-                                    group_policies.push_back(GeneratedGroupPolicy{
-                                        serial_kb,
-                                        serial_target_waves});
-                                    groups.emplace_back();
-                                    group_index = static_cast<int>(groups.size() - 1);
-                                }
-                                groups[static_cast<size_t>(group_index)].push_back(static_cast<int>(i));
-                            }
+                            return false;
                         }
 
                         for (size_t group_index = 0; group_index < groups.size(); ++group_index)
@@ -5033,7 +5009,7 @@ namespace llaminar2
                           << m);
                 return false;
             }
-            ScopedNativeVNNIDecodeEquivalentDispatch decode_equivalent_dispatch;
+            auto decode_equivalent_dispatch = beginVerifierDecodeEquivalentScope();
             return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
         }
 
@@ -6173,7 +6149,7 @@ namespace llaminar2
                           << m);
                 return false;
             }
-            ScopedNativeVNNIDecodeEquivalentDispatch decode_equivalent_dispatch;
+            auto decode_equivalent_dispatch = beginVerifierDecodeEquivalentScope();
             return multiply_tensor_with_fused_swiglu(
                 gate, up, output, m, n, k, alpha, beta, workspace);
         }

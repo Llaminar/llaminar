@@ -406,6 +406,8 @@ namespace llaminar2
             // ITensorGemm interface - Primary entry points
             // =========================================================================
 
+            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope() override;
+
             /**
              * @brief Tensor-based GEMM with type introspection (PRIMARY ENTRY POINT)
              *

@@ -64,6 +64,7 @@ namespace llaminar2
         // These functions are implemented in CUDAQuantisedGemmKernel_CUTLASS.cu
         extern "C"
         {
+            void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
             bool cudaNativeVNNIPrefill_getDeterministicMode();
 
             // Upload work buffers for activation quantization
@@ -202,6 +203,9 @@ namespace llaminar2
                 CUDAGemvContext *gemv_ctx,
                 CUDARowMajorWeights **rm_slot);
 
+            void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled);
+            int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
+
             bool cudaNativeVNNIInitIQGridTables_tuned();
 
             // Unified prefill dispatch for all formats
@@ -278,6 +282,50 @@ namespace llaminar2
         // Only this many stream slots can be active at once; later projections
         // reuse a slot after that slot's completion event is observed.
         constexpr int kCudaConcurrentDecodeWorkspaceSlots = 8;
+
+        /**
+         * @brief Select serial-decode-shaped CUDA NativeVNNI dispatch inside verifier hooks.
+         *
+         * The normal CUDA generated table optimizes M=2..4 grouped GEMV rows
+         * independently from the M=1 decode route.  That is fine for throughput
+         * microbenchmarks, but MTP verifier rows can be published into live KV
+         * and GDN state.  While this scope is active, small-M grouped kernels
+         * keep batching rows but choose the generated M=1 dispatch policy.  The
+         * scope also disables CUDA prefill/concurrent decode paths that would
+         * otherwise need extra verifier-only workspace and reorder reductions.
+         * Together these choices give each codebook the same reduction contract
+         * as serial decode without turning on process-wide deterministic mode.
+         */
+        class ScopedNativeVNNIDecodeEquivalentDispatch final : public ITensorGemm::VerifierKernelModeScope
+        {
+        public:
+            ScopedNativeVNNIDecodeEquivalentDispatch()
+                : previous_gemv_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config()),
+                  previous_prefill_(cudaNativeVNNIPrefill_getDeterministicMode())
+            {
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
+                cudaNativeVNNIPrefill_setDeterministicMode(true);
+            }
+
+            ~ScopedNativeVNNIDecodeEquivalentDispatch()
+            {
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_gemv_);
+                cudaNativeVNNIPrefill_setDeterministicMode(previous_prefill_);
+            }
+
+            ScopedNativeVNNIDecodeEquivalentDispatch(const ScopedNativeVNNIDecodeEquivalentDispatch &) = delete;
+            ScopedNativeVNNIDecodeEquivalentDispatch &operator=(const ScopedNativeVNNIDecodeEquivalentDispatch &) = delete;
+
+        private:
+            int previous_gemv_ = 0;
+            bool previous_prefill_ = false;
+        };
+
+        bool useCanonicalM1SmallMDecode()
+        {
+            return debugEnv().gemm.deterministic ||
+                   cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config() != 0;
+        }
 
         struct CUDAConcurrentPrefillPool
         {
@@ -984,6 +1032,12 @@ namespace llaminar2
             return *this;
         }
 
+        std::unique_ptr<ITensorGemm::VerifierKernelModeScope>
+        CUDAQuantisedGemmKernel::beginVerifierDecodeEquivalentScope()
+        {
+            return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>();
+        }
+
         // =====================================================================
         // Weight conversion: Any quantized format → INT8 + scales
         // =====================================================================
@@ -1678,6 +1732,7 @@ namespace llaminar2
                           << m);
                 return false;
             }
+            auto decode_equivalent_dispatch = beginVerifierDecodeEquivalentScope();
             return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
         }
 
@@ -2313,7 +2368,7 @@ namespace llaminar2
                         }
                     }
 
-                    if (m == 1 && debugEnv().gemm.deterministic)
+                    if (m == 1 && useCanonicalM1SmallMDecode())
                     {
                         const bool canonical_ok = cuda_kernel->multiply_quantized_m1_via_small_m_gemv(
                             d_A_int8,
@@ -2625,6 +2680,7 @@ namespace llaminar2
                           << m);
                 return false;
             }
+            auto decode_equivalent_dispatch = beginVerifierDecodeEquivalentScope();
             return multiply_tensor_with_fused_swiglu(
                 gate, up, output, m, n, k, alpha, beta, workspace);
         }
@@ -2849,7 +2905,7 @@ namespace llaminar2
             int n, int k,
             float alpha, float beta)
         {
-            if (!debugEnv().gemm.deterministic)
+            if (!useCanonicalM1SmallMDecode())
                 return false;
             if (!d_A_int8 || !d_scales_A_blockwise || !d_C || n <= 0 || k <= 0 || (k % 32) != 0)
                 return false;
@@ -3057,7 +3113,7 @@ namespace llaminar2
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                if (m == 1 && debugEnv().gemm.deterministic)
+                if (m == 1 && useCanonicalM1SmallMDecode())
                 {
                     if (multiply_quantized_m1_via_small_m_gemv(
                             d_A_int8,
@@ -3159,7 +3215,7 @@ namespace llaminar2
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                if (m == 1 && debugEnv().gemm.deterministic)
+                if (m == 1 && useCanonicalM1SmallMDecode())
                 {
                     if (multiply_quantized_m1_via_small_m_gemv(
                             d_A_int8,
@@ -3303,7 +3359,7 @@ namespace llaminar2
             // the same buffers as full tiles. Size by tile-padded M so a short
             // prompt cannot leave the CUDA workspace under-provisioned while
             // keeping active/bucket sizing for the rest of the graph.
-            const bool deterministic_m1 = (m == 1 && debugEnv().gemm.deterministic);
+            const bool deterministic_m1 = (m == 1 && useCanonicalM1SmallMDecode());
             const int workspace_m = deterministic_m1 ? 2 : ((m > 1) ? ((m + 127) & ~127) : m);
 
             // INT8 path needs quantization + accumulator buffers
@@ -3406,7 +3462,7 @@ namespace llaminar2
             // GEMV KPAR partials for decode/verifier reductions. The caller's
             // declared graph shape owns the bound; dynamic-depth graph users
             // must request their max verifier M explicitly.
-            const int gemv_workspace_m = (m == 1 && debugEnv().gemm.deterministic) ? 2 : m;
+            const int gemv_workspace_m = (m == 1 && useCanonicalM1SmallMDecode()) ? 2 : m;
             if (gemv_workspace_m > 0 && gemv_workspace_m <= 4)
             {
                 const int k_groups = (k + 31) / 32;

@@ -163,17 +163,6 @@ namespace llaminar2
         /// @brief Prepare grouped prefill metadata for the always-active shared expert.
         bool prepareSharedExpertPrefillGroup(int seq_len) override;
 
-        /// @brief Prepare verifier grouping with shared expert appended as logical expert num_experts.
-        bool prepareExpertGroupsWithSharedGateAsync(
-            ITensor *routing_indices,
-            ITensor *routing_weights,
-            ITensor *hidden,
-            ITensor *shared_gate_inp,
-            int seq_len,
-            int d_model,
-            int num_experts,
-            int top_k) override;
-
         /// @brief Execute fixed-topology grouped MoE prefill without host synchronization.
         bool executeGroupedPrefillPipeline(
             ITensor *hidden, ITensor *output,
@@ -435,12 +424,10 @@ namespace llaminar2
         int *d_group_token_indices_ = nullptr;
         int *d_group_original_to_grouped_ = nullptr;
         int *d_group_original_expert_ids_ = nullptr;
-        int *d_group_single_expert_ids_ = nullptr;
         int *d_group_write_heads_ = nullptr;
         float *d_group_weights_ = nullptr;
         int *d_group_active_expert_ids_ = nullptr;
         int group_active_expert_slots_ = 0;
-        bool group_has_appended_single_expert_ = false;
         int group_slots_cap_ = 0;
         int group_experts_cap_ = 0;
 

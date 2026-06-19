@@ -76,6 +76,7 @@ FIELDS = (
     "host_state_adoption_ms",
     "transaction_output_commit_ms",
     "stochastic_batch_d2h_sync_ms",
+    "stochastic_batch_response_ready_wait_ms",
     "stochastic_batch_d2h_enqueue_ms",
     "stochastic_batch_d2h_wait_ms",
     "bridge_stream_create_ms",
@@ -473,6 +474,15 @@ def summarize(path: Path | None) -> dict[str, float | int | str]:
         ),
         phase="decode",
     )
+    stochastic_batch_response_ready_wait_ms = _sum_total_ms_many(
+        records,
+        "mtp",
+        (
+            "stochastic_batch_summary_response_ready_wait",
+            "stochastic_request_batch_summary_response_ready_wait",
+        ),
+        phase="decode",
+    )
     stochastic_batch_d2h_enqueue_ms = _sum_total_ms_many(
         records,
         "mtp",
@@ -807,6 +817,7 @@ def summarize(path: Path | None) -> dict[str, float | int | str]:
         "host_state_adoption_ms": host_state_adoption_ms,
         "transaction_output_commit_ms": transaction_output_commit_ms,
         "stochastic_batch_d2h_sync_ms": stochastic_batch_d2h_sync_ms,
+        "stochastic_batch_response_ready_wait_ms": stochastic_batch_response_ready_wait_ms,
         "stochastic_batch_d2h_enqueue_ms": stochastic_batch_d2h_enqueue_ms,
         "stochastic_batch_d2h_wait_ms": stochastic_batch_d2h_wait_ms,
         "bridge_stream_create_ms": bridge_stream_create_ms,

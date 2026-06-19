@@ -218,6 +218,7 @@ unless the user explicitly asks for a temporary experiment. The durable path is:
    `all`, then model-level parity and benchmark gates, before `--install`.
    The wrapper intentionally uses proxy hit-rate thresholds for `family-smoke`;
    production fallback-family/exact thresholds apply only to `qwen36` and `all`.
+
 4. Generate prefill tables with
    `tests/v2/performance/kernels/cuda/gemm/analyze_cuda_tc_gemm_dispatch.py`.
    This reads `TileSweep_AllStrategies` CSVs, validates codebook ids through the
@@ -232,6 +233,10 @@ unless the user explicitly asks for a temporary experiment. The durable path is:
    `(M,N,K)` known-shape winners. Both the fallback tree and overlay fallback
    must stay M-aware; Qwen3.6 LM-head can legitimately prefer WIDE/DIRECT at
    M=1 and KPAR at M=2..4 for the same `(N,K)`.
+   The trained fallback is the real policy: it must generalize by aspect ratio
+   and work-size/log-shape features. Exact `(M,N,K)` rows are overlays only.
+   Do not replace the broad fallback with a table that only recognizes today’s
+   model dimensions.
    The overlay must score the runtime dispatch surface, not raw source-format
    rows. CUDA NativeVNNI GEMV dispatch is keyed by `(codebook,M,N,K)`, and
    aliases such as `Q4_1/Q4_K`, `Q5_1/Q5_K`, and `IQ4_NL/IQ4_XS` cannot receive
@@ -269,6 +274,17 @@ python3 tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids
 
 After updating a checked-in generated include, rerun the focused CUDA GEMM route
 regression for the affected shape and the relevant Qwen3.6 CUDA parity cells.
+
+### MTP verifier dispatch mode
+
+Grouped MTP verifier rows are stricter than ordinary fast decode: rows may be
+published to live state, so they must be reproducible against rowwise serial
+decode under strict L2/cos/KLD/max-abs gates. CUDA exposes this through
+`ITensorGemm::beginVerifierDecodeEquivalentScope()`, which selects the canonical
+small-M NativeVNNI dispatch/reduction policy and disables prefill/concurrent
+decode reordering without enabling global `LLAMINAR_DETERMINISTIC`. Stage code
+must use that shared RAII interface, never call CUDA `extern "C"` mode toggles
+or set environment variables directly.
 
 > **Build gotcha:** the MoE expert kernel `#include`s the decode header
 > `src/v2/kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh`. After editing that header you

@@ -1269,14 +1269,24 @@ namespace llaminar2
             };
 
             /*
-             * Phase 9.8 rejected the single-table routed+shared verifier
-             * shortcut for production graph promotion.  The isolated CUDA/ROCm
-             * kernel microbench is economical, but full Qwen3.6 continuation
-             * parity still drifts when the graph skips the standalone shared
-             * branch.  Keep the explicit routed-plus-shared branch structure
-             * until a future strict full-model proof re-enables this flag.
+             * The old combined verifier represented the shared expert as one
+             * extra routed expert in the backend MoE prefill table; strict
+             * full-continuation parity rejected that math.  The current combined
+             * verifier is a safe composite owner instead: routed grouped prefill
+             * stays routed, shared expert uses decode-equivalent GEMV-many, and
+             * the normal shared gate-add kernel joins the branches.  Limit this
+             * promotion to the proven single-device GPU verifier shape.
              */
-            const bool can_combine_shared_verifier = false;
+            const bool can_combine_shared_verifier =
+                !use_expert_overlay &&
+                !mtp_sidecar_context &&
+                config_.compute_all_position_logits &&
+                forceGroupedSharedMoEVerifierPrefill(device) &&
+                layer.shared_expert_gate &&
+                layer.shared_expert_up &&
+                layer.shared_expert_down &&
+                layer.shared_expert_gate_inp &&
+                buffers.attn_proj;
 
             if (overlay_requested && !use_expert_overlay)
             {
@@ -1799,11 +1809,12 @@ namespace llaminar2
             shared_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
             /*
              * Shared-expert verifier rows are independent of top-k routing.
-             * Main-verifier rows still use the decode-equivalent path because
-             * full-model M=2..4 parity is the authority here; isolated grouped
-             * shared-expert kernels were not enough to prevent integrated row
-             * drift.  The grouped shared route remains available to sidecar
-             * prefill and is tracked as Phase 9.8 performance debt.
+             * The routed+shared single-table shortcut remains disabled, but
+             * the standalone shared expert now has a strict all-codebook
+             * M=2..4 verifier proof on CUDA and ROCm.  Keep it wired through
+             * the grouped verifier route whenever the backend grouped-prefill
+             * capability is enabled, and let routing conservatism stay with
+             * the router/routed-expert stages.
              */
             const bool shared_grouped_verifier_prefill =
                 forceGroupedSharedMoEVerifierPrefill(shared_device);
@@ -1824,20 +1835,32 @@ namespace llaminar2
                           ComputeStageFactory::createSharedExpertFFN(shared_params),
                           shared_device);
             graph.addDependency(prefix + "shared_expert_ffn", prefix + "ffn_norm");
-            if (!mtp_sidecar_context &&
+            const bool main_verifier_rows =
+                !mtp_sidecar_context &&
                 config_.compute_all_position_logits &&
                 total_tokens > 1 &&
-                total_tokens <= 4 &&
+                total_tokens <= 4;
+            /*
+             * The accepted GPU shared-verifier route is the standalone
+             * GEMV-many path inside SharedExpertFFNStage.  It does not touch
+             * IMoEKernel grouped-prefill scratch, so it can remain a true graph
+             * sibling of the routed expert branch.  Any route that still uses
+             * row-serial replay or the backend MoE helper keeps the conservative
+             * dependency until it has its own branch-scoped workspace proof.
+             */
+            const bool shared_verifier_owns_branch_local_math =
+                main_verifier_rows && shared_grouped_verifier_prefill;
+            if (main_verifier_rows &&
+                !shared_verifier_owns_branch_local_math &&
                 !ffn_terminal.empty())
             {
                 /*
-                 * Phase 9.8 correctness guard: CUDA/ROCm MoE grouped decode
-                 * kernels still own singleton scratch buffers inside the MoE
-                 * kernel bridge.  Running routed and shared expert verifier
-                 * rows concurrently can race those decode scratch buffers and
-                 * produce strict cosine/L2/KL drift.  Serialize the two MoE
-                 * branches for decode-equivalent verifier rows until the final
-                 * branch-scoped workspace design lands.
+                 * Phase 9.8 correctness guard: only the standalone grouped
+                 * shared-verifier route has strict branch-local ownership.  If
+                 * this graph ever falls back to the row-serial verifier helper,
+                 * the shared branch temporarily re-enters normal decode and can
+                 * touch backend MoE bridge state.  Keep that path serialized
+                 * until a dedicated branch-scoped workspace proof exists.
                  */
                 graph.addDependency(prefix + "shared_expert_ffn", ffn_terminal);
             }

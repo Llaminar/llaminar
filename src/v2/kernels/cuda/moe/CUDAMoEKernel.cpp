@@ -611,27 +611,6 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool cudaMoE_group_tokens_small_float_with_shared_gate(
-        const float *routing_indices,
-        const float *routing_weights,
-        const float *hidden,
-        const float *shared_gate_inp,
-        int *expert_counts,
-        int *expert_offsets,
-        int *grouped_token_indices,
-        int *original_to_grouped,
-        int *original_expert_ids,
-        int *single_expert_ids,
-        int *active_expert_ids,
-        float *grouped_weights,
-        int seq_len,
-        int d_model,
-        int num_routed_experts,
-        int routed_top_k,
-        int max_active_experts,
-        int device_idx,
-        void *stream);
-
     bool cudaMoE_gather_expert_fixed(
         const float *hidden, float *batch_buffer,
         const int *expert_offsets, const int *expert_counts,
@@ -728,7 +707,6 @@ extern "C"
         const int *d_group_token_indices,
         const int *d_original_to_grouped,
         const int *d_active_expert_ids,
-        const int *d_single_expert_ids,
         const float *d_group_weights,
         int8_t *d_scratch_A_int8,
         float *d_scratch_scales,
@@ -751,8 +729,6 @@ extern "C"
         uint8_t down_codebook_id,
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
-        uint8_t single_gateup_codebook_id,
-        uint8_t single_down_codebook_id,
         int gateup_k_partitions,
         int device_idx,
         void *stream);
@@ -847,12 +823,10 @@ namespace llaminar2
         d_group_token_indices_ = nullptr;
         d_group_original_to_grouped_ = nullptr;
         d_group_original_expert_ids_ = nullptr;
-        d_group_single_expert_ids_ = nullptr;
         d_group_write_heads_ = nullptr;
         d_group_weights_ = nullptr;
         d_group_active_expert_ids_ = nullptr;
         group_active_expert_slots_ = 0;
-        group_has_appended_single_expert_ = false;
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
         d_prefill_A_int8_ = nullptr;
@@ -901,7 +875,6 @@ namespace llaminar2
         host_grouped_weights_.clear();
         prepared_num_experts_ = 0;
         group_active_expert_slots_ = 0;
-        group_has_appended_single_expert_ = false;
         /*
          * Runtime pointer slots are staged during graph warmup.  A dynamic
          * reset means the next captured graph must restage its deterministic
@@ -941,7 +914,6 @@ namespace llaminar2
             release(d_group_token_indices_);
             release(d_group_original_to_grouped_);
             release(d_group_original_expert_ids_);
-            release(d_group_single_expert_ids_);
             release(d_group_active_expert_ids_);
             release(d_group_write_heads_);
             release(d_group_weights_);
@@ -1146,7 +1118,6 @@ namespace llaminar2
         void *group_token_indices = nullptr;
         void *group_original_to_grouped = nullptr;
         void *group_original_expert_ids = nullptr;
-        void *group_single_expert_ids = nullptr;
         void *group_weights = nullptr;
         void *group_offsets = nullptr;
         void *group_counts = nullptr;
@@ -1162,8 +1133,6 @@ namespace llaminar2
                                 static_cast<size_t>(total_slots) * sizeof(int), "group original-to-grouped") &&
             bindWorkspaceBuffer(&group_original_expert_ids, MoEWorkspaceBuffers::GROUP_ORIGINAL_EXPERT_IDS,
                                 static_cast<size_t>(total_slots) * sizeof(int), "group original expert ids") &&
-            bindWorkspaceBuffer(&group_single_expert_ids, MoEWorkspaceBuffers::GROUP_SINGLE_EXPERT_IDS,
-                                sizeof(int), "group single expert ids") &&
             bindWorkspaceBuffer(&group_weights, MoEWorkspaceBuffers::GROUP_WEIGHTS,
                                 static_cast<size_t>(total_slots) * sizeof(float), "group weights") &&
             bindWorkspaceBuffer(&group_offsets, MoEWorkspaceBuffers::GROUP_OFFSETS,
@@ -1180,7 +1149,6 @@ namespace llaminar2
             d_group_token_indices_ = nullptr;
             d_group_original_to_grouped_ = nullptr;
             d_group_original_expert_ids_ = nullptr;
-            d_group_single_expert_ids_ = nullptr;
             d_group_weights_ = nullptr;
             d_group_offsets_ = nullptr;
             d_group_counts_ = nullptr;
@@ -1195,7 +1163,6 @@ namespace llaminar2
         d_group_token_indices_ = static_cast<int *>(group_token_indices);
         d_group_original_to_grouped_ = static_cast<int *>(group_original_to_grouped);
         d_group_original_expert_ids_ = static_cast<int *>(group_original_expert_ids);
-        d_group_single_expert_ids_ = static_cast<int *>(group_single_expert_ids);
         d_group_weights_ = static_cast<float *>(group_weights);
         d_group_offsets_ = static_cast<int *>(group_offsets);
         d_group_counts_ = static_cast<int *>(group_counts);
@@ -2735,7 +2702,6 @@ namespace llaminar2
             return false;
 
         group_active_expert_slots_ = 0;
-        group_has_appended_single_expert_ = false;
         const bool verifier_sized_group =
             total_slots <= 64 &&
             seq_len <= 4 &&
@@ -2766,7 +2732,6 @@ namespace llaminar2
 
             group_active_expert_slots_ = active_expert_slots;
             prepared_num_experts_ = num_experts;
-            group_has_appended_single_expert_ = false;
             PerfStatsCollector::addCounter(
                 "kernel", "cuda_moe_small_prefill_grouping_calls", 1.0, {}, {},
                 {{"seq_len", std::to_string(seq_len)},
@@ -2785,7 +2750,6 @@ namespace llaminar2
             return false;
 
         prepared_num_experts_ = num_experts;
-        group_has_appended_single_expert_ = false;
         return true;
     }
 
@@ -2810,95 +2774,11 @@ namespace llaminar2
         }
         prepared_num_experts_ = 1;
         group_active_expert_slots_ = 1;
-        group_has_appended_single_expert_ = false;
         PerfStatsCollector::addCounter(
             "kernel", "cuda_moe_shared_expert_prefill_group_calls", 1.0, {}, {},
             {{"seq_len", std::to_string(seq_len)},
              {"top_k", "1"},
              {"active_expert_slots", "1"}});
-        return true;
-    }
-
-    bool CUDAMoEKernel::prepareExpertGroupsWithSharedGateAsync(
-        ITensor *routing_indices,
-        ITensor *routing_weights,
-        ITensor *hidden,
-        ITensor *shared_gate_inp,
-        int seq_len,
-        int d_model,
-        int num_experts,
-        int top_k)
-    {
-        if (seq_len <= 0 || seq_len > 4 || d_model <= 0 ||
-            num_experts <= 0 || top_k <= 0 ||
-            top_k >= static_cast<int>(kRuntimePointerArrayMaxTopK))
-        {
-            return false;
-        }
-
-        void *stream = requireStream("CUDAMoEKernel::prepareExpertGroupsWithSharedGateAsync");
-        const DeviceId device = deviceId();
-        const int combined_experts = num_experts + 1;
-        const int combined_top_k = top_k + 1;
-        const int combined_slots = seq_len * combined_top_k;
-        const int routed_slots = seq_len * top_k;
-        /*
-         * group_active_expert_slots_ counts routed experts only.  The appended
-         * shared expert is dispatched via d_group_single_expert_ids_ so mixed
-         * routed/shared codebooks never share one active-expert launch.
-         */
-        const int active_expert_slots = std::min(routed_slots, num_experts);
-        if (!ensureTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
-            !ensureTensorOnDevice(routing_weights, device, stream, "routing_weights") ||
-            !ensureTensorOnDevice(hidden, device, stream, "hidden") ||
-            !ensureTensorOnDevice(shared_gate_inp, device, stream, "shared_gate_inp") ||
-            !ensureGroupingBufferCapacity(combined_slots, combined_experts))
-        {
-            return false;
-        }
-
-        const auto *d_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
-        const auto *d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
-        const auto *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        const auto *d_shared_gate = static_cast<const float *>(shared_gate_inp->gpu_data_ptr());
-        if (!d_indices || !d_weights || !d_hidden || !d_shared_gate)
-            return false;
-
-        if (!cudaMoE_group_tokens_small_float_with_shared_gate(
-                d_indices,
-                d_weights,
-                d_hidden,
-                d_shared_gate,
-                d_group_counts_,
-                d_group_offsets_,
-                d_group_token_indices_,
-                d_group_original_to_grouped_,
-                d_group_original_expert_ids_,
-                d_group_single_expert_ids_,
-                d_group_active_expert_ids_,
-                d_group_weights_,
-                seq_len,
-                d_model,
-                num_experts,
-                top_k,
-                active_expert_slots,
-                device_ordinal_,
-                stream))
-        {
-            return false;
-        }
-
-        prepared_num_experts_ = combined_experts;
-        group_active_expert_slots_ = active_expert_slots;
-        group_has_appended_single_expert_ = true;
-        PerfStatsCollector::addCounter(
-            "kernel", "cuda_moe_combined_shared_prefill_group_calls", 1.0, {}, {},
-            {{"seq_len", std::to_string(seq_len)},
-             {"routed_top_k", std::to_string(top_k)},
-             {"combined_top_k", std::to_string(combined_top_k)},
-             {"routed_slots", std::to_string(routed_slots)},
-             {"active_expert_slots", std::to_string(active_expert_slots)},
-             {"combined_experts", std::to_string(combined_experts)}});
         return true;
     }
 
@@ -2971,49 +2851,6 @@ namespace llaminar2
         }
 
         const bool shared_expert_group = prepared_num_experts_ == 1 && num_experts == 1 && top_k == 1;
-        const bool appended_single_expert =
-            group_has_appended_single_expert_ &&
-            num_experts > 1 &&
-            top_k > 1 &&
-            d_group_original_expert_ids_ &&
-            d_group_single_expert_ids_ &&
-            gateup_table.host_gate_descs.size() == static_cast<size_t>(num_experts) &&
-            down_table.host_descs.size() == static_cast<size_t>(num_experts);
-        const int *d_single_expert_ids =
-            appended_single_expert ? d_group_single_expert_ids_ : nullptr;
-        auto singleton_codebook = [](const auto &descs) -> uint8_t
-        {
-            if (descs.empty())
-                return 0xffu;
-            return descs.back().codebook_id;
-        };
-        auto routed_codebook_mask = [](const auto &descs) -> uint32_t
-        {
-            uint32_t mask = 0;
-            for (size_t i = 0; i + 1 < descs.size(); ++i)
-            {
-                const uint8_t codebook = descs[i].codebook_id;
-                if (codebook < 32)
-                    mask |= uint32_t{1} << codebook;
-            }
-            return mask;
-        };
-        const uint8_t single_gateup_codebook_id =
-            appended_single_expert
-                ? singleton_codebook(gateup_table.host_gate_descs)
-                : 0xffu;
-        const uint8_t single_down_codebook_id =
-            appended_single_expert
-                ? singleton_codebook(down_table.host_descs)
-                : 0xffu;
-        const uint32_t gateup_codebook_mask =
-            appended_single_expert
-                ? routed_codebook_mask(gateup_table.host_gate_descs)
-                : gateup_table.codebook_mask;
-        const uint32_t down_codebook_mask =
-            appended_single_expert
-                ? routed_codebook_mask(down_table.host_descs)
-                : down_table.codebook_mask;
 
         const bool ok = cudaMoE_grouped_prefill_pipeline(
             d_hidden,
@@ -3025,7 +2862,6 @@ namespace llaminar2
             d_group_token_indices_,
             shared_expert_group ? nullptr : d_group_original_to_grouped_,
             d_active_expert_ids,
-            d_single_expert_ids,
             d_group_weights_,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
@@ -3046,10 +2882,8 @@ namespace llaminar2
             active_expert_slots,
             gateup_table.codebook_id,
             down_table.codebook_id,
-            gateup_codebook_mask,
-            down_codebook_mask,
-            single_gateup_codebook_id,
-            single_down_codebook_id,
+            gateup_table.codebook_mask,
+            down_table.codebook_mask,
             use_gateup_kpart ? debugEnv().gemm.cuda_moe_gateup_kparts : 0,
             device_ordinal_,
             stream);

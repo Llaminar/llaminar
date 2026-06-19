@@ -121,14 +121,14 @@ namespace llaminar2
             std::optional<BufferId> c_buffer_id;
 
             /**
-             * @brief Execute tiny verifier batches through repeated M=1 GEMMs.
+             * @brief Execute tiny verifier batches with decode-equivalent grouped GEMV.
              *
              * MTP all-position publication restores state from individual verifier
              * rows. Quantized kernels may choose different M=2..4 dispatches than
              * serial decode's M=1 route, and even tiny output-projection drift can
              * flip later MoE routes. When enabled, this stage preserves the same
-             * graph-level output tensor but computes each row through the exact
-             * one-token GEMM contract used by serial decode.
+             * graph-level output tensor but requires the kernel layer to prove and
+             * use a grouped M=2..4 path with the serial-decode numerical contract.
              */
             bool force_decode_equivalent_verifier_prefill = false;
 

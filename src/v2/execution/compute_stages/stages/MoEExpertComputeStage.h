@@ -149,13 +149,15 @@ namespace llaminar2
             bool require_device_routing_tensor_decode = false;
 
             /**
-             * @brief Append the shared expert to the routed verifier pipeline.
+             * @brief Own both routed and shared verifier branches in one stage.
              *
-             * This GPU verifier fast path represents the shared expert as
-             * logical expert `num_experts` with one extra route per row.  The
-             * grouped pipeline writes the final MoE FFN output directly, so the
-             * graph must not add separate shared-expert FFN/gate/combine stages
-             * for the same layer.
+             * The promoted verifier fast path is a safe composite, not the old
+             * single-table routed+shared shortcut.  It runs the routed experts
+             * through the proven grouped verifier-prefill path, runs the shared
+             * expert through decode-equivalent M=2..4 GEMV hooks, then applies
+             * the normal shared sigmoid gate plus routed residual add.  The graph
+             * must not add separate shared-expert FFN/gate nodes for the same
+             * layer when this is enabled.
              */
             bool combine_shared_expert_in_verifier = false;
             TensorBase *shared_gate_w = nullptr;
@@ -334,7 +336,7 @@ namespace llaminar2
         }
         TensorBase *combinedSharedGateInputForTesting() const
         {
-            return effectiveCombinedSharedGateInput();
+            return effectiveSafeCompositeSharedGateInput();
         }
 
     private:
@@ -426,16 +428,25 @@ namespace llaminar2
         bool ensureGemmEnginesForExperts(const std::vector<int> &expert_ids);
         bool ensureGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         bool ensureGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
-        bool ensureCombinedSharedGroupedDescriptorTables(IMoEKernel *kernel, int d_model, int intermediate);
+        bool ensureCombinedSharedVerifierResources(IMoEKernel *kernel, int d_model, int intermediate);
         bool initializeMoERuntimeTableForGroupedDecode();
         bool initializeMoERuntimeTableForGroupedPrefill();
         bool initializeFixedTopologyGroupedPrefill();
         bool runtimeTableHasActiveGroupedDecodeBank() const;
         bool canUseRuntimePrefillGrouping() const;
         bool canUseFixedTopologyGroupedPrefill() const;
-        bool canUseCombinedSharedVerifierPrefill() const;
-        TensorBase *effectiveCombinedSharedGateInput() const;
-        bool executeCombinedSharedVerifierPrefill(IMoEKernel *kernel) const;
+        /**
+         * @brief True when verifier rows can use the safe routed+shared composite path.
+         *
+         * The rejected shortcut treated the shared expert as an extra routed expert
+         * in one MoE prefill table.  This predicate guards the replacement design:
+         * routed experts use the proven grouped verifier pipeline, shared expert
+         * rows use decode-equivalent GEMV-many projections, and the stage combines
+         * those two branch outputs with the normal shared-gate add kernel.
+         */
+        bool canUseSafeCombinedSharedVerifierComposite() const;
+        TensorBase *effectiveSafeCompositeSharedGateInput() const;
+        bool executeSafeCombinedSharedVerifierComposite(IMoEKernel *kernel) const;
         bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
         bool supportsFixedTopologyPrefillGraphCapturePreflight() const;
@@ -459,13 +470,17 @@ namespace llaminar2
         mutable int grouped_down_desc_table_d_model_ = 0;
         mutable int grouped_down_desc_table_intermediate_ = 0;
 
-        mutable int combined_shared_gateup_desc_table_id_ = -1;
-        mutable int combined_shared_down_desc_table_id_ = -1;
-        mutable int combined_shared_desc_table_num_experts_ = 0;
         mutable int combined_shared_desc_table_d_model_ = 0;
         mutable int combined_shared_desc_table_intermediate_ = 0;
         mutable std::shared_ptr<FP32Tensor> combined_shared_gate_inp_fp32_;
         mutable TensorBase *combined_shared_gate_inp_source_ = nullptr;
+        mutable ITensorGemm *combined_shared_gate_gemm_ = nullptr;
+        mutable ITensorGemm *combined_shared_up_gemm_ = nullptr;
+        mutable ITensorGemm *combined_shared_down_gemm_ = nullptr;
+        mutable std::shared_ptr<FP32Tensor> combined_routed_output_;
+        mutable std::shared_ptr<FP32Tensor> combined_shared_output_;
+        mutable std::shared_ptr<FP32Tensor> combined_shared_gate_scratch_;
+        mutable std::shared_ptr<FP32Tensor> combined_shared_up_scratch_;
 
         DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
         bool moe_runtime_table_initialized_ = false;
@@ -499,6 +514,15 @@ namespace llaminar2
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
             bool force_grouped_verifier_prefill_for_decode = false;
             bool force_decode_equivalent_verifier_prefill = false;
+            /**
+             * @brief Bypass normal grouped decode shortcuts for verifier replay.
+             *
+             * Decode-equivalent verifier publication needs a stable one-row
+             * source of truth.  GPU grouped shared-expert decode may use
+             * split-K/concurrent kernels that are valid for normal inference but
+             * are not the canonical rowwise verifier oracle.
+             */
+            bool disable_grouped_decode_shortcut = false;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution
@@ -598,8 +622,8 @@ namespace llaminar2
          *
          * The shared expert has no routing state, but its quantized GEMM kernels
          * can still choose different M=2..4 math than M=1 decode.  State
-         * publication needs the M=1 path so the next accepted token continues
-         * exactly like serial decode.
+         * publication needs the canonical M=1 GEMM/SwiGLU/down path so the next
+         * accepted token continues exactly like serial decode.
          */
         bool executeDecodeEquivalentVerifierPrefill(
             IDeviceContext *ctx, IMoEKernel *kernel,

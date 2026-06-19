@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
@@ -8,6 +9,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 
+#include "../../../mocks/MockComputeStage.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/TestTensorFactory.h"
 
@@ -17,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -27,6 +30,7 @@
 #include <memory>
 #include <numeric>
 #include <string>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -56,6 +60,10 @@ namespace
         double min_row_cosine = 1.0;
         double max_row_relative_l2 = 0.0;
         double max_row_kl = 0.0;
+        size_t nonfinite_count = 0;
+        size_t nonfinite_actual_count = 0;
+        size_t nonfinite_expected_count = 0;
+        size_t first_nonfinite_index = 0;
         size_t worst_row = 0;
     };
 
@@ -73,6 +81,72 @@ namespace
         double rowwise_ms = 0.0;
         CloseMetrics metrics;
     };
+
+    struct QuantFormatCase
+    {
+        const char *name = "";
+        std::function<std::unique_ptr<llaminar2::TensorBase>(
+            const std::vector<size_t> &, uint32_t)> create;
+    };
+
+    std::vector<QuantFormatCase> sharedExpertPreparedFormatCases()
+    {
+        using llaminar2::test::TestTensorFactory;
+        return {
+            {"Q4_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createQ4_0Random(shape, seed); }},
+            {"Q4_1", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createQ4_1Random(shape, seed); }},
+            {"Q5_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createQ5_0Random(shape, seed); }},
+            {"Q5_1", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createQ5_1Random(shape, seed); }},
+            {"Q2_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createQ2_KRandom(shape, seed); }},
+            {"Q3_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createQ3_KRandom(shape, seed); }},
+            {"Q4_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createQ4_KRandom(shape, seed); }},
+            {"Q5_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createQ5_KRandom(shape, seed); }},
+            {"Q6_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createQ6_KRandom(shape, seed); }},
+            {"IQ4_NL", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }},
+            {"IQ4_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }},
+            {"IQ3_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createIQ3_SRandom(shape, seed); }},
+            {"IQ3_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createIQ3_XXSRandom(shape, seed); }},
+            {"IQ2_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createIQ2_SRandom(shape, seed); }},
+            {"IQ2_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createIQ2_XSRandom(shape, seed); }},
+            {"IQ2_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createIQ2_XXSRandom(shape, seed); }},
+            {"IQ1_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createIQ1_SRandom(shape, seed); }},
+            {"IQ1_M", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createIQ1_MRandom(shape, seed); }},
+            {"Q8_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createQ8_0Random(shape, seed); }},
+        };
+    }
+
+    const QuantFormatCase &sharedExpertPreparedFormatCase(const char *name)
+    {
+        static const std::vector<QuantFormatCase> cases = sharedExpertPreparedFormatCases();
+        const auto it = std::find_if(
+            cases.begin(), cases.end(),
+            [name](const QuantFormatCase &tc)
+            {
+                return std::string(tc.name) == name;
+            });
+        if (it == cases.end())
+            throw std::runtime_error(std::string("unknown shared expert format case: ") + name);
+        return *it;
+    }
 
     /**
      * @brief Temporarily override one environment variable.
@@ -122,6 +196,37 @@ namespace
         if (end == value || parsed <= 0)
             return fallback;
         return static_cast<int>(parsed);
+    }
+
+    bool envCsvContainsOrUnset(const char *name, const std::string &candidate)
+    {
+        const char *value = std::getenv(name);
+        if (!value || !*value)
+            return true;
+
+        std::string csv(value);
+        size_t start = 0;
+        while (start <= csv.size())
+        {
+            const size_t comma = csv.find(',', start);
+            std::string item = csv.substr(
+                start,
+                comma == std::string::npos ? std::string::npos : comma - start);
+            item.erase(item.begin(), std::find_if(item.begin(), item.end(), [](unsigned char ch)
+            {
+                return !std::isspace(ch);
+            }));
+            item.erase(std::find_if(item.rbegin(), item.rend(), [](unsigned char ch)
+            {
+                return !std::isspace(ch);
+            }).base(), item.end());
+            if (item == candidate)
+                return true;
+            if (comma == std::string::npos)
+                break;
+            start = comma + 1;
+        }
+        return false;
     }
 
     std::shared_ptr<llaminar2::FP32Tensor> makeTensor(
@@ -308,8 +413,19 @@ namespace
         double diff2 = 0.0;
         for (size_t i = 0; i < actual.size(); ++i)
         {
-            EXPECT_TRUE(std::isfinite(actual[i])) << "actual[" << i << "]";
-            EXPECT_TRUE(std::isfinite(expected[i])) << "expected[" << i << "]";
+            const bool actual_finite = std::isfinite(actual[i]);
+            const bool expected_finite = std::isfinite(expected[i]);
+            if (!actual_finite || !expected_finite)
+            {
+                if (metrics.nonfinite_count == 0)
+                    metrics.first_nonfinite_index = i;
+                ++metrics.nonfinite_count;
+                if (!actual_finite)
+                    ++metrics.nonfinite_actual_count;
+                if (!expected_finite)
+                    ++metrics.nonfinite_expected_count;
+                continue;
+            }
             const double a = actual[i];
             const double e = expected[i];
             const double diff = a - e;
@@ -340,6 +456,12 @@ namespace
                 double row_diff2 = 0.0;
                 for (size_t i = 0; i < row_width; ++i)
                 {
+                    if (!std::isfinite(row_actual[i]) || !std::isfinite(row_expected[i]))
+                    {
+                        row_norm_expected = std::numeric_limits<double>::infinity();
+                        row_diff2 = std::numeric_limits<double>::infinity();
+                        break;
+                    }
                     const double a = row_actual[i];
                     const double e = row_expected[i];
                     const double diff = a - e;
@@ -358,7 +480,10 @@ namespace
                                ? 0.0
                                : std::numeric_limits<double>::infinity())
                         : std::sqrt(row_diff2) / std::sqrt(row_norm_expected);
-                const double row_kl = rowSoftmaxKLDivergence(row_actual, row_expected, row_width);
+                const double row_kl =
+                    (std::isfinite(row_norm_actual) && std::isfinite(row_norm_expected))
+                        ? rowSoftmaxKLDivergence(row_actual, row_expected, row_width)
+                        : std::numeric_limits<double>::infinity();
                 if (row_cosine < metrics.min_row_cosine ||
                     row_relative_l2 > metrics.max_row_relative_l2 ||
                     row_kl > metrics.max_row_kl)
@@ -376,6 +501,12 @@ namespace
 
     void expectClose(const CloseMetrics &metrics)
     {
+        EXPECT_EQ(metrics.nonfinite_count, 0u)
+            << "first_nonfinite_index=" << metrics.first_nonfinite_index
+            << " nonfinite_actual=" << metrics.nonfinite_actual_count
+            << " nonfinite_expected=" << metrics.nonfinite_expected_count
+            << " cosine=" << metrics.cosine << " relative_l2=" << metrics.relative_l2
+            << " max_abs=" << metrics.max_abs;
         EXPECT_GE(metrics.cosine, 0.9999)
             << "relative_l2=" << metrics.relative_l2 << " max_abs=" << metrics.max_abs
             << " min_row_cosine=" << metrics.min_row_cosine
@@ -403,6 +534,12 @@ namespace
             << " min_row_cosine=" << metrics.min_row_cosine
             << " max_row_relative_l2=" << metrics.max_row_relative_l2
             << " worst_row=" << metrics.worst_row;
+        EXPECT_LE(metrics.max_abs, 5.0)
+            << "cosine=" << metrics.cosine << " relative_l2=" << metrics.relative_l2
+            << " min_row_cosine=" << metrics.min_row_cosine
+            << " max_row_relative_l2=" << metrics.max_row_relative_l2
+            << " max_row_kl=" << metrics.max_row_kl
+            << " worst_row=" << metrics.worst_row;
     }
 
     void printResult(const BenchResult &result)
@@ -414,7 +551,9 @@ namespace
                 << "backend,case,m,top_k,num_experts,d_model,intermediate,"
                    "eager_ms,graph_ms,rowwise_ms,speedup_vs_reference,"
                    "cosine,relative_l2,max_abs,"
-                   "min_row_cosine,max_row_relative_l2,max_row_kl,worst_row\n";
+                   "min_row_cosine,max_row_relative_l2,max_row_kl,"
+                   "nonfinite_count,nonfinite_actual_count,nonfinite_expected_count,"
+                   "first_nonfinite_index,worst_row\n";
             printed_header = true;
         }
 
@@ -438,6 +577,10 @@ namespace
                   << result.metrics.min_row_cosine << ','
                   << result.metrics.max_row_relative_l2 << ','
                   << result.metrics.max_row_kl << ','
+                  << result.metrics.nonfinite_count << ','
+                  << result.metrics.nonfinite_actual_count << ','
+                  << result.metrics.nonfinite_expected_count << ','
+                  << result.metrics.first_nonfinite_index << ','
                   << result.metrics.worst_row << '\n';
     }
 
@@ -465,6 +608,26 @@ namespace
     }
 
     /**
+     * @brief Shared expert FFN promotion gate for verifier rows.
+     *
+     * Keep the shared expert path independently measurable before it is fused
+     * with routed expert work.  A future CUDA shared-expert FFN kernel must be
+     * decode-equivalent under the strict metrics above and materially faster
+     * than serial row replay before the graph builder can promote it.
+     */
+    void expectSharedExpertFfnEconomical(const BenchResult &result)
+    {
+        expectGraphReplayFasterThanReference(result);
+        ASSERT_GT(result.graph_ms, 0.0)
+            << result.backend << " shared expert FFN M=" << result.m;
+        const double speedup = result.rowwise_ms / result.graph_ms;
+        EXPECT_GE(speedup, 2.0)
+            << result.backend << " shared expert FFN M=" << result.m
+            << " graph_ms=" << result.graph_ms
+            << " reference_ms=" << result.rowwise_ms;
+    }
+
+    /**
      * @brief Owns prepared expert descriptors and their backing GPU weights.
      *
      * The production grouped MoE kernels consume descriptor tables, but those
@@ -481,23 +644,6 @@ namespace
         std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
         int gateup_table_id = -1;
         int down_table_id = -1;
-    };
-
-    /**
-     * @brief Descriptor tables for the production Qwen3.6 MoE verifier shape.
-     *
-     * The combined vLLM-style verifier folds routed top-k experts and the
-     * shared expert into one grouped-prefill pipeline.  The split table IDs let
-     * the benchmark build an independent correctness oracle from the older
-     * routed-prefill + shared-prefill + shared-gate-add sequence.
-     */
-    struct PreparedCombinedSharedTables : PreparedExpertTables
-    {
-        int routed_gateup_table_id = -1;
-        int routed_down_table_id = -1;
-        int shared_gateup_table_id = -1;
-        int shared_down_table_id = -1;
-        int shared_slot = -1;
     };
 
     PreparedExpertTables prepareExpertTables(
@@ -586,132 +732,6 @@ namespace
         return tables;
     }
 
-    PreparedCombinedSharedTables prepareQwen36CombinedSharedTables(
-        llaminar2::IMoEKernel *moe,
-        llaminar2::DeviceId device,
-        int routed_experts,
-        int d_model,
-        int intermediate,
-        const std::string &backend_name,
-        uint64_t model_context_base,
-        std::vector<int> routed_materialized_experts)
-    {
-        constexpr int shared_experts = 1;
-        const int combined_experts = routed_experts + shared_experts;
-        const int shared_slot = routed_experts;
-        routed_materialized_experts =
-            sanitizeMaterializedExperts(std::move(routed_materialized_experts), routed_experts);
-        std::vector<int> materialized_experts = routed_materialized_experts;
-        materialized_experts.push_back(shared_slot);
-
-        PreparedCombinedSharedTables tables;
-        tables.shared_slot = shared_slot;
-        tables.weights.reserve(materialized_experts.size() * 3);
-        tables.prepared.reserve(materialized_experts.size() * 3);
-        tables.gate_descs.resize(combined_experts);
-        tables.up_descs.resize(combined_experts);
-        tables.down_descs.resize(combined_experts);
-        std::vector<bool> has_desc(static_cast<size_t>(combined_experts), false);
-
-        auto add_desc = [&](int rows, int cols, int seed, const char *role, int expected_codebook)
-        {
-            std::unique_ptr<llaminar2::TensorBase> weight;
-            if (expected_codebook == 13)
-            {
-                weight = llaminar2::test::TestTensorFactory::createIQ2_SRandom(
-                    {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-                    static_cast<unsigned>(seed));
-            }
-            else
-            {
-                weight = llaminar2::test::TestTensorFactory::createIQ4_XSRandom(
-                    {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-                    static_cast<unsigned>(seed));
-            }
-
-            auto *weight_ptr = weight.get();
-            tables.weights.push_back(std::move(weight));
-            tables.prepared.push_back(llaminar2::test::makeGpuPreparedGemm(
-                weight_ptr,
-                device,
-                "perf.moe_verifier." + backend_name + ".combined_shared." +
-                    role + "." + std::to_string(seed),
-                llaminar2::ModelContextId{model_context_base + static_cast<uint64_t>(seed)}));
-
-            llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-            EXPECT_TRUE(tables.prepared.back().kernel->exportNativeVNNIMatrixDesc(desc))
-                << "failed to export combined descriptor role=" << role;
-            EXPECT_EQ(desc.n, rows);
-            EXPECT_EQ(desc.k, cols);
-            EXPECT_EQ(desc.codebook_id, expected_codebook);
-            return desc;
-        };
-
-        for (int expert : materialized_experts)
-        {
-            const bool is_shared = expert == shared_slot;
-            const int gateup_codebook = is_shared ? 4 : 13;
-            const int down_codebook = is_shared ? 13 : 4;
-            tables.gate_descs[static_cast<size_t>(expert)] =
-                add_desc(intermediate, d_model, 5100 + expert, "gate", gateup_codebook);
-            tables.up_descs[static_cast<size_t>(expert)] =
-                add_desc(intermediate, d_model, 5200 + expert, "up", gateup_codebook);
-            tables.down_descs[static_cast<size_t>(expert)] =
-                add_desc(d_model, intermediate, 5300 + expert, "down", down_codebook);
-            has_desc[static_cast<size_t>(expert)] = true;
-        }
-
-        const int routed_alias = routed_materialized_experts.front();
-        for (int expert = 0; expert < routed_experts; ++expert)
-        {
-            if (has_desc[static_cast<size_t>(expert)])
-                continue;
-            tables.gate_descs[static_cast<size_t>(expert)] =
-                tables.gate_descs[static_cast<size_t>(routed_alias)];
-            tables.up_descs[static_cast<size_t>(expert)] =
-                tables.up_descs[static_cast<size_t>(routed_alias)];
-            tables.down_descs[static_cast<size_t>(expert)] =
-                tables.down_descs[static_cast<size_t>(routed_alias)];
-        }
-
-        tables.gateup_table_id = moe->uploadGroupedExpertGateUpDescriptorTables(
-            tables.gate_descs.data(), tables.up_descs.data(), combined_experts, d_model, intermediate);
-        EXPECT_GE(tables.gateup_table_id, 0);
-        tables.down_table_id = moe->uploadGroupedExpertDownDescriptorTable(
-            tables.down_descs.data(), combined_experts, d_model, intermediate);
-        EXPECT_GE(tables.down_table_id, 0);
-
-        tables.routed_gateup_table_id = moe->uploadGroupedExpertGateUpDescriptorTables(
-            tables.gate_descs.data(), tables.up_descs.data(), routed_experts, d_model, intermediate);
-        EXPECT_GE(tables.routed_gateup_table_id, 0);
-        tables.routed_down_table_id = moe->uploadGroupedExpertDownDescriptorTable(
-            tables.down_descs.data(), routed_experts, d_model, intermediate);
-        EXPECT_GE(tables.routed_down_table_id, 0);
-
-        tables.shared_gateup_table_id = moe->uploadGroupedExpertGateUpDescriptorTables(
-            tables.gate_descs.data() + shared_slot,
-            tables.up_descs.data() + shared_slot,
-            shared_experts, d_model, intermediate);
-        EXPECT_GE(tables.shared_gateup_table_id, 0);
-        tables.shared_down_table_id = moe->uploadGroupedExpertDownDescriptorTable(
-            tables.down_descs.data() + shared_slot,
-            shared_experts, d_model, intermediate);
-        EXPECT_GE(tables.shared_down_table_id, 0);
-        return tables;
-    }
-
-    std::vector<float> makeSharedGateValues(int d_model)
-    {
-        std::vector<float> values(static_cast<size_t>(d_model));
-        for (int i = 0; i < d_model; ++i)
-        {
-            // Keep sigmoid in a sensitive region so incorrect shared-gate rows
-            // move the final vector instead of saturating away the error.
-            values[static_cast<size_t>(i)] =
-                0.0005f * static_cast<float>((i % 31) - 15);
-        }
-        return values;
-    }
 }
 
 #ifdef HAVE_CUDA
@@ -1092,27 +1112,19 @@ namespace
             metrics};
     }
 
-    BenchResult runCudaCombinedSharedGateCase(int rows)
+    /**
+     * @brief Exercise the production SharedExpertFFNStage verifier route.
+     *
+     * This is stricter than the isolated IMoE shared-prefill kernel test.  It
+     * measures the graph-captured grouped route actually wired by
+     * `SharedExpertFFNStage` and compares it against that same stage's serial
+     * decode-equivalent replay.  Passing this gate is required before treating
+     * shared expert FFN M=2..4 as production-economical.
+     */
+    BenchResult runCudaSharedExpertStageCase(int rows, const QuantFormatCase &format)
     {
-        /*
-         * This is the production-shaped verifier speedometer.  Unlike the
-         * top-9 proxy, it calls prepareExpertGroupsWithSharedGateAsync(), so
-         * the measured graph includes the device-side shared-gate sigmoid
-         * weight and the combined routed+shared ordered scatter contract.
-         */
-        constexpr int routed_top_k = 8;
-        constexpr int routed_experts = 256;
-        constexpr int combined_experts = routed_experts + 1;
-        constexpr int combined_top_k = routed_top_k + 1;
         constexpr int d_model = 2048;
         constexpr int intermediate = 512;
-        /*
-         * This sub-millisecond production speedometer compares two already
-         * fast graph-captured paths.  Use a larger default timing window so
-         * CTest acceptance depends on verifier economics rather than a
-         * handful of scheduler-noisy event samples.  Tuning sweeps can still
-         * override this with LLAMINAR_MOE_VERIFIER_PREFILL_ITERS.
-         */
         const int iterations = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", 120);
         const int warmups = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS", 5);
         const auto device = llaminar2::DeviceId::cuda(0);
@@ -1121,109 +1133,92 @@ namespace
         cudaStream_t stream = nullptr;
         EXPECT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
 
-        auto *moe = KernelFactory::getOrCreateMoEKernel(device);
-        EXPECT_NE(moe, nullptr);
-        moe->setGPUStream(stream);
-        auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe);
-        EXPECT_NE(workspace_consumer, nullptr);
-        auto reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
-            /*max_seq_len=*/4,
-            d_model,
-            intermediate,
-            combined_experts,
-            combined_top_k);
+        auto gate_w = format.create(
+            {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 6101);
+        auto up_w = format.create(
+            {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 6102);
+        auto down_w = format.create(
+            {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)}, 6103);
+        auto prepared = llaminar2::test::makeGpuPreparedFFNFixture(
+            gate_w.get(),
+            up_w.get(),
+            down_w.get(),
+            device,
+            std::string("perf.moe_verifier.cuda.shared_stage.") + format.name,
+            llaminar2::ModelContextId{390100});
+
+        const auto hidden_values = makeHiddenValues(rows, d_model);
+        auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
+        auto grouped_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+        auto serial_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+        EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
+        EXPECT_TRUE(grouped_output->ensureOnDevice(device, stream));
+        EXPECT_TRUE(serial_output->ensureOnDevice(device, stream));
+
+        auto make_params = [&](llaminar2::TensorBase *output,
+                               bool grouped_verifier,
+                               bool serial_decode_equivalent)
+        {
+            llaminar2::SharedExpertFFNStage::Params params;
+            params.device_id = device;
+            params.input = hidden.get();
+            params.gate_w = gate_w.get();
+            params.up_w = up_w.get();
+            params.down_w = down_w.get();
+            params.output = output;
+            params.seq_len = rows;
+            params.d_model = d_model;
+            params.intermediate = intermediate;
+            params.prepared_ref_gate = prepared.gate_ref;
+            params.prepared_ref_up = prepared.up_ref;
+            params.prepared_ref_down = prepared.down_ref;
+            params.prepared_store = prepared.store.get();
+            params.force_grouped_verifier_prefill_for_decode = grouped_verifier;
+            params.force_decode_equivalent_verifier_prefill = serial_decode_equivalent;
+            return params;
+        };
+
+        llaminar2::SharedExpertFFNStage grouped_stage(
+            make_params(grouped_output.get(), /*grouped_verifier=*/true,
+                        /*serial_decode_equivalent=*/false));
+        llaminar2::SharedExpertFFNStage serial_stage(
+            make_params(serial_output.get(), /*grouped_verifier=*/false,
+                        /*serial_decode_equivalent=*/true));
+        grouped_stage.setGPUStream(stream);
+        serial_stage.setGPUStream(stream);
+        EXPECT_TRUE(grouped_stage.usesGroupedVerifierPrefillRouteForTesting());
+        EXPECT_TRUE(serial_stage.usesCPUDecodeEquivalentVerifierPrefillForTesting());
+
+        auto reqs = grouped_stage.getWorkspaceRequirements(rows, d_model, intermediate);
         auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
             device,
             reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);
         EXPECT_TRUE(workspace->allocate(reqs));
-        workspace_consumer->bindWorkspace(workspace.get());
+        grouped_stage.bindWorkspace(workspace.get());
+        serial_stage.bindWorkspace(workspace.get());
 
-        ScopedCudaMoEPrefillConfig prefill_config;
-        prefill_config.set(
-            envInt("LLAMINAR_MOE_VERIFIER_PREFILL_CUDA_TILE_M", 0),
-            /*fuse_swiglu=*/true);
-        ScopedCudaMoEGemmConfig gemm_config;
-        gemm_config.set(
-            /*gateup_kpart=*/true,
-            envInt("LLAMINAR_MOE_VERIFIER_PREFILL_CUDA_GATEUP_KPARTS",
-                   llaminar2::debugEnv().gemm.cuda_moe_gateup_kparts),
-            /*down_kpart=*/true,
-            envInt("LLAMINAR_MOE_VERIFIER_PREFILL_CUDA_DOWN_KPARTS",
-                   llaminar2::debugEnv().gemm.cuda_moe_down_kparts));
-
-        const auto hidden_values = makeHiddenValues(rows, d_model);
-        const auto shared_gate_values = makeSharedGateValues(d_model);
-        const auto routing_indices =
-            makeUniqueRoutingIndices(rows, routed_top_k, routed_experts);
-        const auto routing_weights = makeRoutingWeights(rows, routed_top_k);
-        auto tables = prepareQwen36CombinedSharedTables(
-            moe, device, routed_experts, d_model, intermediate, "cuda", 370000,
-            uniqueExpertIdsFromRoutes(routing_indices, routed_experts));
-
-        auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
-        auto shared_gate = makeTensor({static_cast<size_t>(d_model)}, shared_gate_values);
-        auto route_indices_tensor = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(routed_top_k)}, routing_indices);
-        auto route_weights_tensor = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(routed_top_k)}, routing_weights);
-        auto combined_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
-        auto routed_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
-        auto shared_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
-        auto split_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
-        EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
-        EXPECT_TRUE(shared_gate->ensureOnDevice(device, stream));
-        EXPECT_TRUE(route_indices_tensor->ensureOnDevice(device, stream));
-        EXPECT_TRUE(route_weights_tensor->ensureOnDevice(device, stream));
-        EXPECT_TRUE(combined_output->ensureOnDevice(device, stream));
-        EXPECT_TRUE(routed_output->ensureOnDevice(device, stream));
-        EXPECT_TRUE(shared_output->ensureOnDevice(device, stream));
-        EXPECT_TRUE(split_output->ensureOnDevice(device, stream));
-
-        auto run_combined = [&]()
+        llaminar2::testing::MockDeviceContext ctx(
+            device, llaminar2::ComputeBackendType::GPU_CUDA);
+        auto run_grouped = [&]()
         {
-            if (!moe->prepareExpertGroupsWithSharedGateAsync(
-                    route_indices_tensor.get(), route_weights_tensor.get(),
-                    hidden.get(), shared_gate.get(),
-                    rows, d_model, routed_experts, routed_top_k))
-            {
-                return false;
-            }
-            return moe->executeGroupedPrefillPipeline(
-                hidden.get(), combined_output.get(),
-                tables.gateup_table_id, tables.down_table_id,
-                rows, d_model, intermediate, combined_experts, combined_top_k);
+            return grouped_stage.execute(&ctx);
         };
-
-        auto run_split_reference = [&]()
+        auto run_serial = [&]()
         {
-            if (!moe->prepareExpertGroupsAsync(
-                    route_indices_tensor.get(), route_weights_tensor.get(),
-                    rows, routed_experts, routed_top_k) ||
-                !moe->executeGroupedPrefillPipeline(
-                    hidden.get(), routed_output.get(),
-                    tables.routed_gateup_table_id, tables.routed_down_table_id,
-                    rows, d_model, intermediate, routed_experts, routed_top_k) ||
-                !moe->prepareSharedExpertPrefillGroup(rows) ||
-                !moe->executeGroupedPrefillPipeline(
-                    hidden.get(), shared_output.get(),
-                    tables.shared_gateup_table_id, tables.shared_down_table_id,
-                    rows, d_model, intermediate, /*num_experts=*/1, /*top_k=*/1))
-            {
-                return false;
-            }
-            moe->sharedExpertGateAddFromTensors(
-                hidden.get(), shared_gate.get(), shared_output.get(),
-                routed_output.get(), split_output.get(), rows, d_model);
-            return true;
+            return serial_stage.execute(&ctx);
         };
 
         for (int i = 0; i < warmups; ++i)
-            EXPECT_TRUE(run_combined());
+            EXPECT_TRUE(run_grouped());
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-        const double eager_ms = timeCudaEvents(stream, iterations, run_combined);
+        EXPECT_TRUE(grouped_stage.isGraphCapturable());
+
+        const double eager_ms = timeCudaEvents(stream, iterations, run_grouped);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
         CudaGraphOwner graph;
         EXPECT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
-        const bool captured = run_combined();
+        const bool captured = run_grouped();
         const cudaError_t end_status = cudaStreamEndCapture(stream, graph.graphPtr());
         EXPECT_TRUE(captured);
         EXPECT_EQ(end_status, cudaSuccess) << cudaGetErrorString(end_status);
@@ -1241,38 +1236,40 @@ namespace
             });
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-        const double split_ms = timeCudaEvents(stream, iterations, run_split_reference);
+        const double serial_ms = timeCudaEvents(stream, std::max(1, iterations / 4), run_serial);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-        combined_output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        split_output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        std::vector<float> combined(
-            combined_output->data(),
-            combined_output->data() + combined_output->numel());
-        std::vector<float> split(
-            split_output->data(),
-            split_output->data() + split_output->numel());
-        CloseMetrics metrics = compareVectors(combined, split, static_cast<size_t>(d_model));
+        grouped_output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        serial_output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        std::vector<float> grouped(
+            grouped_output->data(),
+            grouped_output->data() + grouped_output->numel());
+        std::vector<float> serial(
+            serial_output->data(),
+            serial_output->data() + serial_output->numel());
+        CloseMetrics metrics = compareVectors(grouped, serial, static_cast<size_t>(d_model));
 
+        grouped_stage.unbindWorkspace();
+        serial_stage.unbindWorkspace();
         EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 
         return BenchResult{
             "cuda",
-            "combined_shared_gate",
+            std::string("shared_stage_ffn_") + format.name,
             rows,
-            combined_top_k,
-            combined_experts,
+            1,
+            1,
             d_model,
             intermediate,
             eager_ms,
             graph_ms,
-            split_ms,
+            serial_ms,
             metrics};
     }
 }
 #endif
 
-TEST(Perf__MoEVerifierPrefill, CUDA_M1234_RoutedAndShared)
+TEST(Perf__MoEVerifierPrefill, CUDA_M1234_RoutedExpertFFNDecodeEquivalent)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -1288,12 +1285,73 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M1234_RoutedAndShared)
         if (rows >= 2)
             expectGraphReplayFasterThanReference(routed);
         printResult(routed);
+    }
+#endif
+}
 
+TEST(Perf__MoEVerifierPrefill, CUDA_M1234_SharedExpertFFNDecodeEquivalent)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    for (int rows : {1, 2, 3, 4})
+    {
         auto shared = runCudaCase(/*shared=*/true, rows);
         expectClose(shared.metrics);
         if (rows >= 2)
-            expectGraphReplayFasterThanReference(shared);
+            expectSharedExpertFfnEconomical(shared);
         printResult(shared);
+    }
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, CUDA_M234_SharedExpertFFNStageDecodeEquivalent)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    const QuantFormatCase &format = sharedExpertPreparedFormatCase("IQ3_S");
+    for (int rows : {2, 3, 4})
+    {
+        auto shared = runCudaSharedExpertStageCase(rows, format);
+        expectClose(shared.metrics);
+        expectSharedExpertFfnEconomical(shared);
+        printResult(shared);
+    }
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, CUDA_M234_SharedExpertFFNStageAllCodebooksDecodeEquivalent)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvOverride iters_env("LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", "12");
+    ScopedEnvOverride warmups_env("LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS", "2");
+    for (const QuantFormatCase &format : sharedExpertPreparedFormatCases())
+    {
+        if (!envCsvContainsOrUnset("LLAMINAR_MOE_VERIFIER_PREFILL_FORMATS", format.name))
+            continue;
+        SCOPED_TRACE(format.name);
+        for (int rows : {2, 3, 4})
+        {
+            SCOPED_TRACE(rows);
+            auto shared = runCudaSharedExpertStageCase(rows, format);
+            expectClose(shared.metrics);
+            printResult(shared);
+        }
     }
 #endif
 }
@@ -1324,29 +1382,5 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M4_CombinedRoutedSharedUpperBound)
     expectClose(combined.metrics);
     expectGraphReplayFasterThanReference(combined);
     printResult(combined);
-#endif
-}
-
-TEST(Perf__MoEVerifierPrefill, CUDA_M234_CombinedSharedGateProductionShape)
-{
-#ifndef HAVE_CUDA
-    GTEST_SKIP() << "CUDA support not compiled";
-#else
-    if (!hasCudaDevice())
-        GTEST_SKIP() << "No CUDA device available";
-
-    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
-    /*
-     * Fixed MTP depths d1/d2/d3 verify draft_count + 1 target rows. Keep
-     * the production shared-gate speedometer aligned with those real verifier
-     * shapes instead of proving only the depth-3/M=4 case.
-     */
-    for (int rows : {2, 3, 4})
-    {
-        auto combined = runCudaCombinedSharedGateCase(rows);
-        expectClose(combined.metrics);
-        expectGraphReplayFasterThanReference(combined);
-        printResult(combined);
-    }
 #endif
 }

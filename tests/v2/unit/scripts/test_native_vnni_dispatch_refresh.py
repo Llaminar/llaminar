@@ -132,7 +132,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q8_0", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q4_0", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=IQ1_M", stdout)
-        self.assertNotIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q8_0", stdout)
+        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q8_0", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=Q4_0", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=IQ1_M", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=Q8_0", stdout)

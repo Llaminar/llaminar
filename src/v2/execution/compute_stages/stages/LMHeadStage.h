@@ -57,12 +57,13 @@ namespace llaminar2
             bool use_prefill_replay_row_offset = true; ///< False when input is already a one-row scratch.
             bool compute_all_positions = false;        ///< Compute logits for every input row instead of only the selected row.
             /**
-             * @brief Execute tiny all-position verifier rows through M=1 LM-head GEMVs.
+             * @brief Execute tiny all-position verifier rows through grouped LM-head GEMVs.
              *
              * Logit equivalence tests compare grouped verifier rows against
-             * serial decode.  When enabled, compact all-position rows are still
-             * materialized in the same output tensor, but each row uses the exact
-             * one-token LM-head path used by serial decoding.
+             * serial decode. When enabled, compact all-position rows are still
+             * materialized in the same output tensor, but the backend must use a
+             * graph-capturable grouped M=2..4 implementation with strict
+             * distribution-level equivalence proof.
              */
             bool force_decode_equivalent_verifier_prefill = false;
 

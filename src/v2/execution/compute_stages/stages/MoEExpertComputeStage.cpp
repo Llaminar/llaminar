@@ -33,8 +33,12 @@
 #include <cstdlib>
 #include <cmath>
 #include <iomanip>
+#include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <numeric>
+#include <typeindex>
+#include <unordered_set>
 #include <vector>
 
 namespace llaminar2
@@ -163,6 +167,46 @@ namespace llaminar2
 #endif
             return false;
 #endif
+        }
+
+        using VerifierKernelModeScopePtr =
+            std::unique_ptr<ITensorGemm::VerifierKernelModeScope>;
+
+        void appendVerifierDecodeEquivalentScope(
+            ITensorGemm *kernel,
+            std::vector<VerifierKernelModeScopePtr> &scopes,
+            std::unordered_set<std::type_index> &scoped_backend_types)
+        {
+            if (!kernel)
+                return;
+            const std::type_index backend_type(typeid(*kernel));
+            if (scoped_backend_types.find(backend_type) != scoped_backend_types.end())
+                return;
+            if (auto scope = kernel->beginVerifierDecodeEquivalentScope())
+            {
+                scoped_backend_types.insert(backend_type);
+                scopes.emplace_back(std::move(scope));
+            }
+        }
+
+        /**
+         * @brief Enter backend verifier modes for every GEMM used by a stage.
+         *
+         * Verifier replay can publish rows into live MTP/KV/GDN state, so stage
+         * code must not know or guess backend-specific switches.  Instead it
+         * asks each GEMM engine for an optional verifier mode scope.  CUDA and
+         * ROCm use this to select generated small-M dispatch policies that are
+         * reproducible against serial decode; CPU currently returns no scope.
+         */
+        std::vector<VerifierKernelModeScopePtr> beginVerifierDecodeEquivalentScopes(
+            std::initializer_list<ITensorGemm *> kernels)
+        {
+            std::vector<VerifierKernelModeScopePtr> scopes;
+            std::unordered_set<std::type_index> scoped_backend_types;
+            scopes.reserve(kernels.size());
+            for (ITensorGemm *kernel : kernels)
+                appendVerifierDecodeEquivalentScope(kernel, scopes, scoped_backend_types);
+            return scopes;
         }
 
         /**
@@ -548,10 +592,12 @@ namespace llaminar2
                 std::iota(all_expert_ids_.begin(), all_expert_ids_.end(), 0);
             }
 
-            if (canUseCombinedSharedVerifierPrefill())
+            if (canUseSafeCombinedSharedVerifierComposite())
             {
                 tables_ready = ensureGemmEnginesForExperts(all_expert_ids_) &&
-                               ensureCombinedSharedGroupedDescriptorTables(kernel, d_model, intermediate);
+                               ensureGroupedGateUpDescriptorTable(kernel, d_model, intermediate) &&
+                               ensureGroupedDownDescriptorTable(kernel, d_model, intermediate) &&
+                               ensureCombinedSharedVerifierResources(kernel, d_model, intermediate);
             }
             else if (grouped_gateup_desc_table_id_ < 0 || grouped_down_desc_table_id_ < 0)
             {
@@ -567,8 +613,8 @@ namespace llaminar2
                 return false;
             }
 
-            const bool grouped_ok = canUseCombinedSharedVerifierPrefill()
-                                        ? executeCombinedSharedVerifierPrefill(kernel)
+            const bool grouped_ok = canUseSafeCombinedSharedVerifierComposite()
+                                        ? executeSafeCombinedSharedVerifierComposite(kernel)
                                         : executeFixedTopologyGroupedPrefill(kernel, seq_len);
             if (!grouped_ok)
             {
@@ -1728,6 +1774,18 @@ namespace llaminar2
         TensorBase *full_output = params_.output;
         TensorBase *full_routing_indices = params_.routing_indices;
         TensorBase *full_routing_weights = params_.routing_weights;
+        ensureGemmEnginesCached();
+        std::vector<VerifierKernelModeScopePtr> verifier_scopes;
+        verifier_scopes.reserve(cached_gate_gemm_.size() + cached_up_gemm_.size() + cached_down_gemm_.size());
+        std::unordered_set<std::type_index> scoped_backend_types;
+        auto append_scopes_for = [&](const std::vector<ITensorGemm *> &kernels)
+        {
+            for (ITensorGemm *gemm : kernels)
+                appendVerifierDecodeEquivalentScope(gemm, verifier_scopes, scoped_backend_types);
+        };
+        append_scopes_for(cached_gate_gemm_);
+        append_scopes_for(cached_up_gemm_);
+        append_scopes_for(cached_down_gemm_);
         IMoEKernel *kernel = is_gpu ? ensureMoEKernel() : nullptr;
         if (is_gpu)
         {
@@ -1838,7 +1896,7 @@ namespace llaminar2
                               << row << " for layer " << params_.layer_idx);
                     return false;
                 }
-                if (std::getenv("LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC"))
+                if (debugEnv().runtime_debug.moe_grouped_verifier_snapshot_diagnostic)
                 {
                     if (!verifier_routing_indices_row_->ensureOnHost(gpuStream()) ||
                         !verifier_routing_weights_row_->ensureOnHost(gpuStream()))
@@ -2236,7 +2294,7 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEExpertComputeStage::ensureCombinedSharedGroupedDescriptorTables(
+    bool MoEExpertComputeStage::ensureCombinedSharedVerifierResources(
         IMoEKernel *kernel, int d_model, int intermediate)
     {
         if (!kernel || !params_.combine_shared_expert_in_verifier ||
@@ -2255,36 +2313,13 @@ namespace llaminar2
             return false;
         }
 
-        const int combined_experts = params_.num_experts + 1;
-        if (combined_shared_gateup_desc_table_id_ >= 0 &&
-            combined_shared_down_desc_table_id_ >= 0 &&
-            combined_shared_desc_table_num_experts_ == combined_experts &&
+        if (combined_shared_gate_gemm_ &&
+            combined_shared_up_gemm_ &&
+            combined_shared_down_gemm_ &&
             combined_shared_desc_table_d_model_ == d_model &&
             combined_shared_desc_table_intermediate_ == intermediate)
         {
             return true;
-        }
-
-        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(static_cast<size_t>(combined_experts));
-        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(static_cast<size_t>(combined_experts));
-        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(static_cast<size_t>(combined_experts));
-        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
-        {
-            if (cached_gate_gemm_.size() <= static_cast<size_t>(expert_id) ||
-                cached_up_gemm_.size() <= static_cast<size_t>(expert_id) ||
-                cached_down_gemm_.size() <= static_cast<size_t>(expert_id) ||
-                !cached_gate_gemm_[static_cast<size_t>(expert_id)] ||
-                !cached_up_gemm_[static_cast<size_t>(expert_id)] ||
-                !cached_down_gemm_[static_cast<size_t>(expert_id)])
-            {
-                return false;
-            }
-            if (!cached_gate_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(expert_id)]) ||
-                !cached_up_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(expert_id)]) ||
-                !cached_down_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert_id)]))
-            {
-                return false;
-            }
         }
 
         ITensorGemm *shared_gate =
@@ -2315,24 +2350,25 @@ namespace llaminar2
         bind_if_needed(shared_up);
         bind_if_needed(shared_down);
 
-        const int shared_slot = params_.num_experts;
-        if (!shared_gate->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(shared_slot)]) ||
-            !shared_up->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(shared_slot)]) ||
-            !shared_down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(shared_slot)]))
+        DeviceNativeVNNIMatrixDesc gate_desc;
+        DeviceNativeVNNIMatrixDesc up_desc;
+        DeviceNativeVNNIMatrixDesc down_desc;
+        if (!shared_gate->exportNativeVNNIMatrixDesc(gate_desc) ||
+            !shared_up->exportNativeVNNIMatrixDesc(up_desc) ||
+            !shared_down->exportNativeVNNIMatrixDesc(down_desc) ||
+            gate_desc.n != intermediate || gate_desc.k != d_model ||
+            up_desc.n != intermediate || up_desc.k != d_model ||
+            down_desc.n != d_model || down_desc.k != intermediate)
         {
+            LOG_ERROR("[MoEExpertComputeStage] Combined safe verifier requires shared expert "
+                      "GEMM engines with decode-equivalent native descriptors"
+                      << " layer=" << params_.layer_idx);
             return false;
         }
 
-        const int gateup_table = kernel->uploadGroupedExpertGateUpDescriptorTables(
-            gate_descs.data(), up_descs.data(), combined_experts, d_model, intermediate);
-        const int down_table = kernel->uploadGroupedExpertDownDescriptorTable(
-            down_descs.data(), combined_experts, d_model, intermediate);
-        if (gateup_table < 0 || down_table < 0)
-            return false;
-
-        combined_shared_gateup_desc_table_id_ = gateup_table;
-        combined_shared_down_desc_table_id_ = down_table;
-        combined_shared_desc_table_num_experts_ = combined_experts;
+        combined_shared_gate_gemm_ = shared_gate;
+        combined_shared_up_gemm_ = shared_up;
+        combined_shared_down_gemm_ = shared_down;
         combined_shared_desc_table_d_model_ = d_model;
         combined_shared_desc_table_intermediate_ = intermediate;
         return true;
@@ -2474,7 +2510,7 @@ namespace llaminar2
                params_.replica_set.num_replicated == 0;
     }
 
-    bool MoEExpertComputeStage::canUseCombinedSharedVerifierPrefill() const
+    bool MoEExpertComputeStage::canUseSafeCombinedSharedVerifierComposite() const
     {
         return params_.combine_shared_expert_in_verifier &&
                (params_.device_id.is_cuda() || params_.device_id.is_rocm()) &&
@@ -2496,7 +2532,7 @@ namespace llaminar2
                params_.replica_set.num_replicated == 0;
     }
 
-    TensorBase *MoEExpertComputeStage::effectiveCombinedSharedGateInput() const
+    TensorBase *MoEExpertComputeStage::effectiveSafeCompositeSharedGateInput() const
     {
         if (!params_.shared_gate_inp)
             return nullptr;
@@ -2510,6 +2546,13 @@ namespace llaminar2
             combined_shared_gate_inp_fp32_->shape() != params_.shared_gate_inp->shape();
         if (needs_refresh)
         {
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Combined verifier shared-gate "
+                          "input was not normalized before graph capture"
+                          << " layer=" << params_.layer_idx);
+                return nullptr;
+            }
             combined_shared_gate_inp_fp32_ =
                 std::make_shared<FP32Tensor>(params_.shared_gate_inp->shape());
             combined_shared_gate_inp_source_ = params_.shared_gate_inp;
@@ -2527,62 +2570,164 @@ namespace llaminar2
         return combined_shared_gate_inp_fp32_.get();
     }
 
-    bool MoEExpertComputeStage::executeCombinedSharedVerifierPrefill(IMoEKernel *kernel) const
+    bool MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite(IMoEKernel *kernel) const
     {
-        if (!kernel || combined_shared_gateup_desc_table_id_ < 0 ||
-            combined_shared_down_desc_table_id_ < 0)
+        if (!kernel || grouped_gateup_desc_table_id_ < 0 ||
+            grouped_down_desc_table_id_ < 0 ||
+            !combined_shared_gate_gemm_ ||
+            !combined_shared_up_gemm_ ||
+            !combined_shared_down_gemm_)
         {
             return false;
         }
 
-        TensorBase *shared_gate_inp = effectiveCombinedSharedGateInput();
+        TensorBase *shared_gate_inp = effectiveSafeCompositeSharedGateInput();
         if (!shared_gate_inp)
         {
-            LOG_ERROR("[MoEExpertComputeStage::executeCombinedSharedVerifierPrefill] "
+            LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] "
                       "failed to prepare FP32 shared gate input");
             return false;
         }
 
-        if (!kernel->prepareExpertGroupsWithSharedGateAsync(
-                params_.routing_indices,
-                params_.routing_weights,
-                params_.input,
-                shared_gate_inp,
-                params_.seq_len,
-                params_.d_model,
-                params_.num_experts,
-                params_.top_k))
+        const int seq_len = params_.seq_len;
+        const int d_model = params_.d_model;
+        const int intermediate = params_.expert_intermediate;
+
+        auto ensure_scratch = [&](std::shared_ptr<FP32Tensor> &slot,
+                                  size_t rows,
+                                  size_t cols,
+                                  const char *name) -> bool
         {
-            LOG_ERROR("[MoEExpertComputeStage::executeCombinedSharedVerifierPrefill] grouping failed");
+            const std::vector<size_t> expected{rows, cols};
+            if (slot && slot->shape() == expected)
+                return true;
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] "
+                          << name << " scratch was not warmed before graph capture"
+                          << " layer=" << params_.layer_idx
+                          << " rows=" << rows
+                          << " cols=" << cols);
+                return false;
+            }
+            slot = makeScratchFP32(rows, cols, params_.device_id);
+            return slot != nullptr;
+        };
+
+        if (!ensure_scratch(combined_routed_output_,
+                            static_cast<size_t>(seq_len),
+                            static_cast<size_t>(d_model),
+                            "routed_output") ||
+            !ensure_scratch(combined_shared_output_,
+                            static_cast<size_t>(seq_len),
+                            static_cast<size_t>(d_model),
+                            "shared_output") ||
+            !ensure_scratch(combined_shared_gate_scratch_,
+                            static_cast<size_t>(seq_len),
+                            static_cast<size_t>(intermediate),
+                            "shared_gate") ||
+            !ensure_scratch(combined_shared_up_scratch_,
+                            static_cast<size_t>(seq_len),
+                            static_cast<size_t>(intermediate),
+                            "shared_up"))
+        {
             return false;
         }
 
-        const int combined_experts = params_.num_experts + 1;
-        const int combined_top_k = params_.top_k + 1;
-        const bool ok = kernel->executeGroupedPrefillPipeline(
-            params_.input,
-            params_.output,
-            combined_shared_gateup_desc_table_id_,
-            combined_shared_down_desc_table_id_,
-            params_.seq_len,
-            params_.d_model,
-            params_.expert_intermediate,
-            combined_experts,
-            combined_top_k);
-        if (ok)
+        if (!kernel->prepareExpertGroupsAsync(
+                params_.routing_indices,
+                params_.routing_weights,
+                seq_len,
+                params_.num_experts,
+                params_.top_k))
         {
-            const char *counter_name = params_.device_id.is_rocm()
-                                           ? "rocm_moe_combined_shared_prefill_pipeline_calls"
-                                           : "cuda_moe_combined_shared_prefill_pipeline_calls";
-            PerfStatsCollector::addCounter(
-                "kernel", counter_name, 1.0, {}, {},
-                {{"seq_len", std::to_string(params_.seq_len)},
-                 {"mode", "single_table"},
-                 {"routed_top_k", std::to_string(params_.top_k)},
-                 {"combined_top_k", std::to_string(combined_top_k)},
-                 {"combined_experts", std::to_string(combined_experts)}});
+            LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] grouping failed");
+            return false;
         }
-        return ok;
+
+        /*
+         * This replaces the rejected "shared expert as one more routed expert"
+         * table.  Keep routed and shared math as separate, already-proven branch
+         * computations, but let one stage own the lifetime/order so the graph can
+         * later overlap them without reintroducing shared backend scratch races.
+         */
+        if (!kernel->executeGroupedPrefillPipeline(
+            params_.input,
+            combined_routed_output_.get(),
+            grouped_gateup_desc_table_id_,
+            grouped_down_desc_table_id_,
+            seq_len,
+            d_model,
+            intermediate,
+            params_.num_experts,
+            params_.top_k))
+        {
+            LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] routed grouped verifier failed");
+            return false;
+        }
+        markGpuTensorWritten(combined_routed_output_.get(), params_.device_id, gpuStream());
+
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {combined_shared_gate_gemm_, combined_shared_gate_scratch_.get(), intermediate, nullptr, "combined_shared_gate"},
+            {combined_shared_up_gemm_, combined_shared_up_scratch_.get(), intermediate, nullptr, "combined_shared_up"}};
+        {
+            auto verifier_scopes = beginVerifierDecodeEquivalentScopes(
+                {combined_shared_gate_gemm_, combined_shared_up_gemm_, combined_shared_down_gemm_});
+            if (!combined_shared_gate_gemm_->multiply_fused_verifier_rows_decode_equivalent(
+                    params_.input,
+                    projections,
+                    seq_len,
+                    d_model,
+                    nullptr,
+                    getWorkspace()))
+            {
+                LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] shared gate/up verifier failed");
+                return false;
+            }
+            for (const auto &projection : projections)
+                markGpuTensorWritten(projection.output, params_.device_id, gpuStream());
+
+            if (!combined_shared_down_gemm_->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                    combined_shared_gate_scratch_.get(),
+                    combined_shared_up_scratch_.get(),
+                    combined_shared_output_.get(),
+                    seq_len,
+                    d_model,
+                    intermediate,
+                    1.0f,
+                    0.0f,
+                    getWorkspace()))
+            {
+                LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] shared SwiGLU/down verifier failed");
+                return false;
+            }
+        }
+        markGpuTensorWritten(combined_shared_output_.get(), params_.device_id, gpuStream());
+
+        kernel->sharedExpertGateAddFromTensors(
+            params_.input,
+            shared_gate_inp,
+            combined_shared_output_.get(),
+            combined_routed_output_.get(),
+            params_.output,
+            seq_len,
+            d_model);
+        markGpuTensorWritten(combined_shared_output_.get(), params_.device_id, gpuStream());
+        markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "moe_combined_decode_equivalent_verifier_prefill_rows",
+            static_cast<double>(seq_len),
+            "verifier",
+            params_.device_id.toString(),
+            {{"stage", "routed_plus_shared"},
+             {"route", "safe_composite"},
+             {"seq_len", std::to_string(seq_len)},
+             {"routed_top_k", std::to_string(params_.top_k)},
+             {"routed_experts", std::to_string(params_.num_experts)},
+             {"layer", std::to_string(params_.layer_idx)}});
+        return true;
     }
 
     bool MoEExpertComputeStage::executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const
@@ -3002,10 +3147,8 @@ namespace llaminar2
     WorkspaceRequirements MoEExpertComputeStage::getWorkspaceRequirements(int m, int n, int k) const
     {
         WorkspaceRequirements combined;
-        const int workspace_experts =
-            params_.combine_shared_expert_in_verifier ? params_.num_experts + 1 : params_.num_experts;
-        const int workspace_top_k =
-            params_.combine_shared_expert_in_verifier ? params_.top_k + 1 : params_.top_k;
+        const int workspace_experts = params_.num_experts;
+        const int workspace_top_k = params_.top_k;
         if (params_.device_id.is_cuda())
         {
             combined.merge(MoEWorkspaceBuffers::expertExecution(
@@ -3043,8 +3186,38 @@ namespace llaminar2
                     params_.device_id,
                     m,
                     static_cast<size_t>(std::max(0, workspace_top_k)) * 2u);
-                return combined;
+                break;
             }
+        }
+
+        if (params_.combine_shared_expert_in_verifier &&
+            params_.prepared_store &&
+            params_.prepared_shared_ref_gate &&
+            params_.prepared_shared_ref_up &&
+            params_.prepared_shared_ref_down)
+        {
+            ITensorGemm *shared_gate =
+                params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_gate);
+            ITensorGemm *shared_up =
+                params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_up);
+            ITensorGemm *shared_down =
+                params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_down);
+            const int rows = std::max(1, m > 0 ? m : params_.seq_len);
+            const int d_model = params_.d_model > 0 ? params_.d_model : n;
+            const int intermediate =
+                params_.expert_intermediate > 0 ? params_.expert_intermediate : k;
+
+            if (auto *c = dynamic_cast<IWorkspaceConsumer *>(shared_gate))
+                combined.merge(c->getWorkspaceRequirements(rows, intermediate, d_model));
+            if (auto *c = dynamic_cast<IWorkspaceConsumer *>(shared_up))
+                combined.merge(c->getWorkspaceRequirements(rows, intermediate, d_model));
+            if (auto *c = dynamic_cast<IWorkspaceConsumer *>(shared_down))
+                combined.merge(c->getWorkspaceRequirements(rows, d_model, intermediate));
+            addCudaConcurrentDecodeGemvSideStreamWorkspace(
+                combined,
+                params_.device_id,
+                rows,
+                /*projection_count=*/2u);
         }
         return combined;
     }
@@ -3074,6 +3247,22 @@ namespace llaminar2
         bindAll(gate);
         bindAll(up);
         bindAll(down);
+
+        auto bindShared = [workspace](ITensorGemm *gemm)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
+                consumer->bindWorkspace(workspace);
+        };
+        if (params_.combine_shared_expert_in_verifier &&
+            params_.prepared_store &&
+            params_.prepared_shared_ref_gate &&
+            params_.prepared_shared_ref_up &&
+            params_.prepared_shared_ref_down)
+        {
+            bindShared(params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_gate));
+            bindShared(params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_up));
+            bindShared(params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_down));
+        }
 
         if (moe_kernel_)
         {
@@ -3107,6 +3296,22 @@ namespace llaminar2
         unbindAll(gate);
         unbindAll(up);
         unbindAll(down);
+
+        auto unbindShared = [](ITensorGemm *gemm)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
+                consumer->unbindWorkspace();
+        };
+        if (params_.combine_shared_expert_in_verifier &&
+            params_.prepared_store &&
+            params_.prepared_shared_ref_gate &&
+            params_.prepared_shared_ref_up &&
+            params_.prepared_shared_ref_down)
+        {
+            unbindShared(params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_gate));
+            unbindShared(params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_up));
+            unbindShared(params_.prepared_store->gemmKernel(*params_.prepared_shared_ref_down));
+        }
 
         if (moe_kernel_)
         {
@@ -3321,6 +3526,7 @@ namespace llaminar2
     {
         return params_.device_id.is_gpu() &&
                params_.seq_len == 1 &&
+               !params_.disable_grouped_decode_shortcut &&
                shouldUseSharedExpertGroupedDecode(params_.device_id);
     }
 
@@ -3366,6 +3572,8 @@ namespace llaminar2
         const bool is_gpu = params_.device_id.is_gpu();
         TensorBase *full_input = params_.input;
         TensorBase *full_output = params_.output;
+        auto verifier_scopes = beginVerifierDecodeEquivalentScopes(
+            {cached_gate_gemm_, cached_up_gemm_, cached_down_gemm_});
         const float *input = is_gpu ? nullptr : full_input->data();
         float *output = is_gpu ? nullptr : full_output->mutable_data();
         if (!input || !output)
@@ -3400,9 +3608,9 @@ namespace llaminar2
             /*
              * Re-enter the normal one-token shared-expert decode route instead
              * of open-coding a "close enough" grouped verifier path.  Serial
-             * decode is the source of truth for MTP publication; this scoped
-             * replay inherits whichever backend-specific M=1 path is currently
-             * accepted for production decode.
+             * verifier replay is the source of truth for MTP publication.  CUDA
+             * uses the scoped guard above to canonicalize M=1 verifier GEMVs to
+             * the same small-M reduction contract as grouped verifier rows.
              */
             struct ScopedSingleRowParams
             {
@@ -3411,6 +3619,7 @@ namespace llaminar2
                 TensorBase *output;
                 bool force_grouped_verifier_prefill_for_decode;
                 bool force_decode_equivalent_verifier_prefill;
+                bool disable_grouped_decode_shortcut;
                 int seq_len;
 
                 ~ScopedSingleRowParams()
@@ -3419,6 +3628,7 @@ namespace llaminar2
                     params.output = output;
                     params.force_grouped_verifier_prefill_for_decode = force_grouped_verifier_prefill_for_decode;
                     params.force_decode_equivalent_verifier_prefill = force_decode_equivalent_verifier_prefill;
+                    params.disable_grouped_decode_shortcut = disable_grouped_decode_shortcut;
                     params.seq_len = seq_len;
                 }
             } row_scope{
@@ -3427,6 +3637,7 @@ namespace llaminar2
                 params_.output,
                 params_.force_grouped_verifier_prefill_for_decode,
                 params_.force_decode_equivalent_verifier_prefill,
+                params_.disable_grouped_decode_shortcut,
                 params_.seq_len};
 
             params_.input = scratch_input_row_.get();
@@ -3434,6 +3645,7 @@ namespace llaminar2
             params_.seq_len = 1;
             params_.force_decode_equivalent_verifier_prefill = false;
             params_.force_grouped_verifier_prefill_for_decode = false;
+            params_.disable_grouped_decode_shortcut = true;
 
             if (!execute(ctx))
             {
@@ -3852,13 +4064,32 @@ namespace llaminar2
         auto *self = const_cast<SharedExpertFFNStage *>(this);
         self->ensureGemmEnginesCached();
 
+        const int rows = std::max(1, m > 0 ? m : params_.seq_len);
+        const int d_model =
+            params_.d_model > 0 ? params_.d_model : (n > 0 ? n : 0);
+        const int intermediate =
+            params_.intermediate > 0 ? params_.intermediate : (k > 0 ? k : 0);
+
+        /*
+         * Gate/up and down have transposed logical shapes:
+         *
+         *   gate/up: [rows, d_model]       x [intermediate, d_model]^T
+         *   down:    [rows, intermediate]  x [d_model, intermediate]^T
+         *
+         * The workspace names are intentionally shared by the GEMM engines and the
+         * manager keeps the maximum buffer per name.  Passing the down shape to
+         * gate/up under-sized QUANT_A/TEMP_A for M=2/3 verifier serial replay
+         * (rows * intermediate < 1 * d_model), which corrupted ROCm M=1 oracle
+         * rows.  Request each projection with its true shape so both grouped and
+         * row-wise decode-equivalent paths are covered by the declared workspace.
+         */
         WorkspaceRequirements combined;
         if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_gate_gemm_))
-            combined.merge(c->getWorkspaceRequirements(m, n, k));
+            combined.merge(c->getWorkspaceRequirements(rows, intermediate, d_model));
         if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_up_gemm_))
-            combined.merge(c->getWorkspaceRequirements(m, n, k));
+            combined.merge(c->getWorkspaceRequirements(rows, intermediate, d_model));
         if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_down_gemm_))
-            combined.merge(c->getWorkspaceRequirements(m, n, k));
+            combined.merge(c->getWorkspaceRequirements(rows, d_model, intermediate));
 
         /*
          * Grouped shared-expert decode and verifier prefill use IMoEKernel

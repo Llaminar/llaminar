@@ -51,6 +51,7 @@
 
 extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
 extern "C" void rocmGemv_native_vnni_reset_tuning_overrides();
+extern "C" void rocmGemv_native_vnni_set_decode_equivalent_m1_config(int enabled);
 extern "C" bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
     const float *d_A_fp32,
     int8_t *d_A_int8,
@@ -133,6 +134,43 @@ namespace
             sum_sq_ref += static_cast<double>(b[i]) * static_cast<double>(b[i]);
         }
         return static_cast<float>(std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30)));
+    }
+
+    /**
+     * @brief Symmetric KL divergence after treating two buffers as logits.
+     *
+     * The small-M verifier GEMV tests compare against serial decode outputs.
+     * Cosine and relative L2 catch geometry and magnitude drift; this catches
+     * distribution drift in the way the verifier sampler will consume logits.
+     */
+    float symmetricKLDivergenceFromLogits(const float *a, const float *b, size_t n)
+    {
+        if (n == 0)
+            return 0.0f;
+
+        const float max_a = *std::max_element(a, a + n);
+        const float max_b = *std::max_element(b, b + n);
+        double sum_a = 0.0;
+        double sum_b = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            sum_a += std::exp(static_cast<double>(a[i] - max_a));
+            sum_b += std::exp(static_cast<double>(b[i] - max_b));
+        }
+
+        constexpr double kEps = 1.0e-30;
+        double kl_ab = 0.0;
+        double kl_ba = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double pa =
+                std::max(std::exp(static_cast<double>(a[i] - max_a)) / sum_a, kEps);
+            const double pb =
+                std::max(std::exp(static_cast<double>(b[i] - max_b)) / sum_b, kEps);
+            kl_ab += pa * std::log(pa / pb);
+            kl_ba += pb * std::log(pb / pa);
+        }
+        return static_cast<float>(0.5 * (kl_ab + kl_ba));
     }
 
     size_t firstBitwiseMismatchIndex(const std::vector<float> &lhs,
@@ -427,6 +465,27 @@ namespace
             ~NativeVNNITuningOverrideGuard()
             {
                 rocmGemv_native_vnni_reset_tuning_overrides();
+            }
+        };
+
+        /**
+         * @brief Forces the M=2..4 verifier launch to reuse the generated M=1 policy.
+         *
+         * This is the production dense verifier contract: grouped rows may
+         * amortize work, but every row must remain numerically equivalent to a
+         * serial M=1 decode GEMV under the same split-K policy.
+         */
+        class NativeVNNIDecodeEquivalentM1PolicyGuard
+        {
+        public:
+            NativeVNNIDecodeEquivalentM1PolicyGuard()
+            {
+                rocmGemv_native_vnni_set_decode_equivalent_m1_config(1);
+            }
+
+            ~NativeVNNIDecodeEquivalentM1PolicyGuard()
+            {
+                rocmGemv_native_vnni_set_decode_equivalent_m1_config(0);
             }
         };
 
@@ -1140,6 +1199,7 @@ namespace
 
         ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
         NativeVNNITuningOverrideGuard force_direct(/*kb=*/1);
+        NativeVNNIDecodeEquivalentM1PolicyGuard force_decode_equivalent_policy;
         constexpr int N = 384;
         constexpr int K = 512;
         const std::array<int, 3> verifier_rows = {2, 3, 4};
@@ -1284,18 +1344,25 @@ namespace
                 const size_t count = static_cast<size_t>(M) * static_cast<size_t>(N);
                 const float rel_l2 = relativeL2Error(specialized, serial, count);
                 const float max_abs = maxAbsError(specialized, serial, count);
-                EXPECT_LE(rel_l2, 1e-5f)
+                const float cosine = cosineSimilarity(specialized, serial, count);
+                const float symmetric_kl =
+                    symmetricKLDivergenceFromLogits(specialized, serial, count);
+                EXPECT_LE(rel_l2, 1e-6f)
                     << fmt.name << " M=" << M << " relative L2 differs from serial GEMVs";
-                EXPECT_LE(max_abs, 1e-4f)
+                EXPECT_LE(max_abs, 2e-6f)
                     << fmt.name << " M=" << M << " max abs differs from serial GEMVs";
-                if (max_abs > 0.0f)
-                {
-                    EXPECT_GE(cosineSimilarity(specialized, serial, count), 0.999999f)
-                        << fmt.name << " M=" << M
-                        << " specialized ROCm small-M GEMV diverges from serial GEMVs"
-                        << " rel_l2=" << rel_l2
-                        << " max_abs=" << max_abs;
-                }
+                EXPECT_GE(cosine, 0.9999999f)
+                    << fmt.name << " M=" << M
+                    << " cosine differs from serial GEMVs"
+                    << " rel_l2=" << rel_l2
+                    << " max_abs=" << max_abs
+                    << " symmetric_kl=" << symmetric_kl;
+                EXPECT_LE(symmetric_kl, 1e-10f)
+                    << fmt.name << " M=" << M
+                    << " symmetric KLD differs from serial GEMVs"
+                    << " cosine=" << cosine
+                    << " rel_l2=" << rel_l2
+                    << " max_abs=" << max_abs;
             }
 
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);

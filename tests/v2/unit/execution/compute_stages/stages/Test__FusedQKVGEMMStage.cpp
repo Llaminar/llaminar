@@ -730,7 +730,7 @@ namespace llaminar2
         EXPECT_EQ(v->getWorkspace(), &workspace);
     }
 
-    TEST_F(Test__FusedQKVGEMMStage, DecodeEquivalentVerifierPrefillUsesOneRowCalls)
+    TEST_F(Test__FusedQKVGEMMStage, DecodeEquivalentVerifierPrefillFailsFastWithoutBackendSupport)
     {
         const ModelContextId model_id{9915};
         PreparedWeightStore store(model_id);
@@ -765,17 +765,15 @@ namespace llaminar2
         DeviceWorkspaceManager workspace(DeviceId::cpu(), 1024);
         stage.bindWorkspace(&workspace);
 
-        ASSERT_TRUE(stage.execute(ctx_.get()));
-
-        // The CPU verifier publication path must reuse the exact one-row
-        // decode projection route for every verifier row.  Multi-row CPU
-        // GEMV/GEMM routes can be numerically close but still produce distinct
-        // KV bytes, which breaks all-position state publication.
-        EXPECT_EQ(q->fused_call_count, m_);
-        EXPECT_EQ(q->observed_fused_m, std::vector<int>(static_cast<size_t>(m_), 1));
-        EXPECT_EQ(q->observed_fused_k, std::vector<int>(static_cast<size_t>(m_), k_));
-        EXPECT_EQ(q->observed_fused_projection_count, std::vector<int>(static_cast<size_t>(m_), 3));
-        EXPECT_EQ(q->last_fused_workspace, &workspace);
+        // CPU does not yet advertise a strict decode-equivalent grouped QKV
+        // verifier kernel.  The stage must fail loudly instead of silently
+        // replaying serial rows behind a grouped verifier request.
+        EXPECT_FALSE(stage.execute(ctx_.get()));
+        EXPECT_EQ(q->fused_call_count, 0);
+        EXPECT_TRUE(q->observed_fused_m.empty());
+        EXPECT_TRUE(q->observed_fused_k.empty());
+        EXPECT_TRUE(q->observed_fused_projection_count.empty());
+        EXPECT_EQ(q->last_fused_workspace, nullptr);
     }
 
     TEST_F(Test__FusedQKVGEMMStage, SupportsBackend)

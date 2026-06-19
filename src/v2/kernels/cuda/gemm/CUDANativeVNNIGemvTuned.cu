@@ -34,6 +34,13 @@
 #include <atomic>
 #include <mutex>
 
+static std::atomic<int> g_cuda_native_vnni_decode_equivalent_m1_config{0};
+
+static bool decodeEquivalentM1ConfigActive()
+{
+    return g_cuda_native_vnni_decode_equivalent_m1_config.load(std::memory_order_relaxed) != 0;
+}
+
 // =====================================================================
 // Per-device GEMV context — replaces static getSmCount() and
 // getKparPartials(). Owned by KernelFactory, one per CUDA device.
@@ -1870,7 +1877,8 @@ namespace
         const int num_sms = querySmCount(gemv_ctx);
         const int kb = selectKSplit(grid_n, k_groups, num_sms,
                                     target_waves, min_kgroups_per_cta);
-        const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+        const bool deterministic =
+            llaminar2::debugEnv().gemm.deterministic || decodeEquivalentM1ConfigActive();
         const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
         const int kb_capped = deterministic ? 1 : kb_capped_auto;
 
@@ -1948,7 +1956,8 @@ namespace
         const int num_sms = querySmCount(gemv_ctx);
         const int kb = selectKSplit(grid_n, k_groups, num_sms,
                                     target_waves, min_kgroups_per_cta);
-        const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+        const bool deterministic =
+            llaminar2::debugEnv().gemm.deterministic || decodeEquivalentM1ConfigActive();
         const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
         const int kb_capped = deterministic ? 1 : kb_capped_auto;
 
@@ -2082,7 +2091,8 @@ namespace
         const int num_sms = querySmCount(gemv_ctx);
         const int kb = selectKSplit(grid_n, k_groups, num_sms,
                                     target_waves, min_kgroups_per_cta);
-        const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+        const bool deterministic =
+            llaminar2::debugEnv().gemm.deterministic || decodeEquivalentM1ConfigActive();
         const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
         const int kb_capped = deterministic ? 1 : kb_capped_auto;
 
@@ -2947,16 +2957,14 @@ namespace
         else
         {
             /**
-             * Deterministic verifier replay is a stricter contract than raw
-             * GEMV parity: every grouped verifier row must be decode-equivalent
-             * to the canonical single-row decode path.  CUDA canonicalizes M=1
-             * decode by padding it to M=2, so all deterministic grouped rows use
-             * the same M=2 generated dispatch surface.  This keeps the
-             * per-output reduction order aligned while still running a single
-             * grouped M=2..4 kernel.  Non-deterministic inference remains
-             * M-aware and consumes the trained dispatch table for speed.
+             * Grouped verifier replay is stricter than raw GEMV parity: every
+             * row may become live state, so M=2..4 rows must use the same
+             * canonical small-M contract as verifier serial replay.  CUDA's
+             * canonical M=1 verifier route pads to M=2, matching global
+             * deterministic mode without forcing that process-wide mode.
              */
-            const int dispatch_m = llaminar2::debugEnv().gemm.deterministic ? 2 : M;
+            const int dispatch_m =
+                (decodeEquivalentM1ConfigActive() || llaminar2::debugEnv().gemm.deterministic) ? 2 : M;
             shape = classifyShapeGenerated<CB>(dispatch_m, N, K);
             tuning = selectGeneratedTuning<CB>(dispatch_m, N, K);
         }
@@ -3081,7 +3089,8 @@ namespace
         const int num_sms = querySmCount(gemv_ctx);
         const int kb = selectKSplit(grid_n, k_groups, num_sms,
                                     target_waves, min_kgroups_per_cta);
-        const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+        const bool deterministic =
+            llaminar2::debugEnv().gemm.deterministic || decodeEquivalentM1ConfigActive();
         const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
         const int kb_capped = deterministic ? 1 : kb_capped_auto;
 
@@ -3525,4 +3534,14 @@ extern "C"
             cudaFree(rm->d_emins);
         delete rm;
     }
+}
+
+extern "C" void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled)
+{
+    g_cuda_native_vnni_decode_equivalent_m1_config.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+extern "C" int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config()
+{
+    return g_cuda_native_vnni_decode_equivalent_m1_config.load(std::memory_order_relaxed);
 }

@@ -2755,25 +2755,17 @@ namespace llaminar2::test::parity::qwen36
             const char *routed_counter = device.is_rocm()
                                              ? "rocm_moe_grouped_prefill_active_expert_grid_calls"
                                              : "cuda_moe_grouped_prefill_swiglu_path_calls";
-            const char *shared_counter = device.is_rocm()
-                                             ? "rocm_moe_shared_expert_prefill_group_calls"
-                                             : "cuda_moe_shared_expert_prefill_group_calls";
-            const char *combined_counter = device.is_rocm()
-                                               ? "rocm_moe_combined_shared_prefill_pipeline_calls"
-                                               : "cuda_moe_combined_shared_prefill_pipeline_calls";
             const auto records = PerfStatsCollector::snapshot({"kernel", "mtp"});
             EXPECT_TRUE(hasMTPPerfCounter(records, routed_counter))
                 << "SingleDevice GPU MoE verifier must exercise the routed "
                    "grouped prefill path.\n"
                 << PerfStatsCollector::summaryString({"kernel", "mtp"});
-            EXPECT_TRUE(hasMTPPerfCounter(records, shared_counter))
-                << "SingleDevice GPU MoE verifier must exercise the standalone "
-                   "shared-expert grouped/decode-equivalent path.\n"
-                << PerfStatsCollector::summaryString({"kernel", "mtp"});
-            EXPECT_FALSE(hasMTPPerfCounter(records, combined_counter))
-                << "SingleDevice GPU MoE verifier must not promote the "
-                   "single-table routed+shared shortcut until full continuation "
-                   "proof is green.\n"
+            EXPECT_TRUE(hasMTPPerfCounter(
+                records,
+                "moe_combined_decode_equivalent_verifier_prefill_rows"))
+                << "SingleDevice GPU MoE verifier must exercise the safe composite "
+                   "routed+shared path: routed grouped prefill plus shared "
+                   "decode-equivalent GEMV-many, not row-serial replay.\n"
                 << PerfStatsCollector::summaryString({"kernel", "mtp"});
             EXPECT_FALSE(hasMTPPerfCounter(
                 records,
@@ -4730,10 +4722,7 @@ namespace llaminar2::test::parity::qwen36
 
     inline void expectCudaMoEMTPVerifierFusedPrefillPath(int expected_seq_len = 2)
     {
-        const auto records = PerfStatsCollector::snapshot(
-            {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls",
-             "kernel.cuda_moe_combined_shared_prefill_group_calls",
-             "kernel.cuda_moe_combined_shared_prefill_pipeline_calls"});
+        const auto records = PerfStatsCollector::snapshot({"kernel", "mtp"});
         auto tag_equals = [](const PerfStatRecord &record,
                              const char *key,
                              const char *value) -> bool
@@ -4775,48 +4764,30 @@ namespace llaminar2::test::parity::qwen36
             << "CUDA Qwen3.6 MoE MTP verifier path did not exercise the fused "
             << "routed grouped prefill SwiGLU/down kernels with the "
             << "verifier-sized tile. This is the accepted production contract "
-            << "while the single-table routed+shared shortcut remains blocked.\n"
-            << PerfStatsCollector::summaryString(
-                   {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls",
-                    "kernel.cuda_moe_combined_shared_prefill_group_calls",
-                    "kernel.cuda_moe_combined_shared_prefill_pipeline_calls"});
+            << "for the routed branch while shared-expert work is owned by the "
+            << "safe composite decode-equivalent verifier stage.\n"
+            << PerfStatsCollector::summaryString({"kernel", "mtp"});
         EXPECT_GT(match->count, 0u);
 
-        const auto combined_group = std::find_if(
+        const auto safe_composite = std::find_if(
             records.begin(),
             records.end(),
             [&](const PerfStatRecord &record)
             {
-                return record.name == "cuda_moe_combined_shared_prefill_group_calls" &&
+                return record.domain == "mtp" &&
+                       record.name == "moe_combined_decode_equivalent_verifier_prefill_rows" &&
+                       tag_equals(record, "route", "safe_composite") &&
+                       tag_equals(record, "stage", "routed_plus_shared") &&
                        tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
                        tag_equals(record, "routed_top_k", "8") &&
-                       tag_equals(record, "combined_top_k", "9") &&
-                       tag_equals(record, "combined_experts", "257") &&
-                       tag_equals(record, "active_expert_slots", active_slots_tag.c_str());
+                       tag_equals(record, "routed_experts", "256");
             });
-        ASSERT_EQ(combined_group, records.end())
-            << "CUDA combined routed+shared verifier grouping ran despite the "
-            << "Phase 9.8 full-continuation proof being red.\n"
-            << PerfStatsCollector::summaryString(
-                   {"kernel.cuda_moe_combined_shared_prefill_group_calls"});
+        ASSERT_NE(safe_composite, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier did not run the safe composite "
+            << "routed+shared owner. This path must replace the old standalone "
+            << "shared branch before claiming grouped verifier economics.\n"
+            << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
-        const auto combined_pipeline = std::find_if(
-            records.begin(),
-            records.end(),
-            [&](const PerfStatRecord &record)
-            {
-                return record.name == "cuda_moe_combined_shared_prefill_pipeline_calls" &&
-                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
-                       tag_equals(record, "routed_top_k", "8") &&
-                       tag_equals(record, "combined_top_k", "9") &&
-                       tag_equals(record, "combined_experts", "257") &&
-                       tag_equals(record, "mode", "single_table");
-            });
-        ASSERT_EQ(combined_pipeline, records.end())
-            << "CUDA combined routed+shared verifier pipeline ran despite the "
-            << "Phase 9.8 full-continuation proof being red.\n"
-            << PerfStatsCollector::summaryString(
-                   {"kernel.cuda_moe_combined_shared_prefill_pipeline_calls"});
     }
 
     inline void runMoEMTPDynamicDepthRequestStateResetBenchmarkStyle(

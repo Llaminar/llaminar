@@ -112,8 +112,9 @@ namespace llaminar2
          *
          * State publication may enqueue more work on @ref stream after this
          * handle is returned.  Host response materialization should wait on
-         * this event from its own explicit bridge stream so a response copy
-         * does not accidentally wait for later live-state publication work.
+         * this event before copying compact response rows, rather than
+         * synchronizing @ref stream directly, so the served-token bridge does
+         * not accidentally drain later live-state publication work.
          */
         std::shared_ptr<void> response_ready_event;
         /**
@@ -990,8 +991,6 @@ namespace llaminar2
             int draft_sample_slot,
             int32_t *out_token)
         {
-            if (!out_token)
-                return false;
             if (!forwardMTPFromDeviceTargetForDeviceSampling(
                     target_sample_slot,
                     position_id))
@@ -1050,15 +1049,15 @@ namespace llaminar2
          * @p out_token is the host-visible planning shadow.  The sampled token
          * must also be written to @p draft_sample_slot in the runner-owned
          * device draft-token arena so later verifier input construction can
-         * consume it without re-uploading the host shadow.
+         * consume it without re-uploading the host shadow.  A null
+         * @p out_token means the caller has a device-resident verifier/outcome
+         * path and is intentionally deferring the D2H token materialization.
          */
         virtual bool forwardMTPAndSampleGreedyToDeviceDraftSlot(
             int32_t draft_condition_token,
             int draft_sample_slot,
             int32_t *out_token)
         {
-            if (!out_token)
-                return false;
             if (!forwardMTP(draft_condition_token))
                 return false;
             return sampleGreedyFromMTPLogitsToDeviceDraftSlot(
@@ -1199,7 +1198,9 @@ namespace llaminar2
          * @brief Chained sidecar plus greedy sample into a device draft slot.
          *
          * This preserves fixed-depth greedy response planning while making the
-         * device slot the verifier source of truth.
+         * device slot the verifier source of truth.  A null @p out_token is
+         * valid only when a later device-resident verifier/outcome reducer will
+         * produce the response token list.
          */
         virtual bool forwardMTPFromLastDraftAndSampleGreedyToDeviceDraftSlot(
             int32_t draft_condition_token,
@@ -1207,10 +1208,37 @@ namespace llaminar2
             int draft_sample_slot,
             int32_t *out_token)
         {
-            if (!out_token)
-                return false;
             if (!forwardMTPFromLastDraft(draft_condition_token, position_id))
                 return false;
+            return sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+                draft_sample_slot,
+                out_token);
+        }
+
+        /**
+         * @brief Chained device-slot sidecar plus greedy sample into a device slot.
+         *
+         * This is the fixed-depth greedy hot-path companion to
+         * forwardMTPFromDeviceDraftForDeviceSampling().  The previous draft
+         * token is read from @p draft_condition_sample_slot in runner-owned
+         * device memory, the chained sidecar executes at @p position_id, and
+         * the next draft proposal is written to @p draft_sample_slot.  The
+         * optional host shadow in @p out_token is deliberately nullable; when
+         * it is null, callers must consume the compact verifier outcome rather
+         * than inspecting `draft_tokens` on the CPU.
+         */
+        virtual bool forwardMTPFromDeviceDraftAndSampleGreedyToDeviceDraftSlot(
+            int draft_condition_sample_slot,
+            int position_id,
+            int draft_sample_slot,
+            int32_t *out_token)
+        {
+            if (!forwardMTPFromDeviceDraftForDeviceSampling(
+                    draft_condition_sample_slot,
+                    position_id))
+            {
+                return false;
+            }
             return sampleGreedyFromMTPLogitsToDeviceDraftSlot(
                 draft_sample_slot,
                 out_token);
@@ -1517,8 +1545,12 @@ namespace llaminar2
         /**
          * @brief Sample MTP logits greedily and leave the token in a device slot.
          *
-         * The returned host token is still needed by the response planner, but
-         * the runner must also write @p draft_sample_slot in the same
+         * When @p out_token is non-null, implementations also return a host
+         * shadow for legacy response planning.  When @p out_token is null, the
+         * sample is fully deferred and must not perform a D2H copy; the compact
+         * verifier outcome is responsible for later host-visible response
+         * tokens.  In both cases the runner must write @p draft_sample_slot in
+         * the same
          * device-resident draft-token arena consumed by
          * prepareMTPVerifierInputTokensOnDevice().  This prevents the compact
          * verifier from uploading a host shadow of a token that was just

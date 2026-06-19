@@ -225,6 +225,10 @@ experiments.
    Keep the generated decision surface keyed by M as well as N/K.  Qwen3.6
    verifier buckets can prefer different families at M=1 versus M=2..4 for the
    same projection shape, and CUDA/ROCm refresh evidence must stay comparable.
+   The durable decode selector must generalize by aspect ratio plus work-size
+   segments. Exact `(M,N,K)` winners are allowed only as overlays above that
+   broad fallback; do not land an exact-shape-only table that would require
+   retraining for every nearby model dimension.
    Score generated tables on the runtime dispatch surface, not raw
    source-format rows. If several GGUF formats share a NativeVNNI codebook, the
    runtime can only choose one `(codebook,M,N,K)` tuning; analyzers should
@@ -280,6 +284,19 @@ experiments.
    `V2_Unit_ROCmNativeVNNITrainerGenerator`,
    `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`, and
    `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`.
+
+### MTP verifier dispatch mode
+
+ROCm grouped verifier kernels can be fast only if their generated small-M policy
+also matches rowwise serial decode. The shared convention is
+`ITensorGemm::beginVerifierDecodeEquivalentScope()`: stages keep the returned
+RAII scope alive while running serial verifier replay or grouped verifier
+publication. ROCm implements the scope by selecting the M=1 decode-equivalent
+NativeVNNI policy. Do not call ROCm mode toggles directly from stage code, and
+do not hide unsupported verifier modes behind quiet rowwise fallbacks.
+For shared-expert MoE verifier rows, compare grouped publication against the
+canonical M=1 GEMM/SwiGLU/down replay oracle unless a grouped decode shortcut
+has already passed the same strict all-codebook gates.
 
 Compact refresh example:
 

@@ -852,40 +852,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Prepare verifier grouping with the shared expert appended.
-         *
-         * The appended shared expert is exposed to the grouped-prefill pipeline
-         * as logical expert `num_experts` with one additional route slot per
-         * verifier row. Its route weight is the Qwen shared-expert gate:
-         *
-         *   sigmoid(dot(shared_gate_inp, hidden[row]))
-         *
-         * Descriptor tables passed to executeGroupedPrefillPipeline() must
-         * therefore contain `num_experts + 1` entries, with the final entry
-         * holding the shared expert's gate/up/down descriptors.
-         */
-        virtual bool prepareExpertGroupsWithSharedGateAsync(
-            ITensor *routing_indices,
-            ITensor *routing_weights,
-            ITensor *hidden,
-            ITensor *shared_gate_inp,
-            int seq_len,
-            int d_model,
-            int num_experts,
-            int top_k)
-        {
-            (void)routing_indices;
-            (void)routing_weights;
-            (void)hidden;
-            (void)shared_gate_inp;
-            (void)seq_len;
-            (void)d_model;
-            (void)num_experts;
-            (void)top_k;
-            return false;
-        }
-
-        /**
          * @brief Execute the full grouped MoE prefill pipeline (graph-capturable).
          *
          * Runs all 5 kernels (gather+quant, gate+up GEMM, SwiGLU+quant,

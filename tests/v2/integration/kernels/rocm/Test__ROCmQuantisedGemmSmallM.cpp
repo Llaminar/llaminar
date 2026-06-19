@@ -961,13 +961,25 @@ namespace
         if (graph_capture)
         {
             ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
-            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
+            /*
+             * This helper is the verifier contract proof, not the generic
+             * M-aware fused-SwiGLU throughput test.  The generated ROCm table
+             * may choose a different split-K policy for M=2..4 than serial
+             * decode's M=1 route; accepted-state publication must instead use
+             * the decode-equivalent wrapper so every grouped row keeps the
+             * serial verifier reduction order while still launching as a
+             * graph-capturable grouped kernel.
+             */
+            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                 gate.get(),
                 up.get(),
                 grouped_output.get(),
                 M,
                 N,
-                K));
+                K,
+                1.0f,
+                0.0f,
+                grouped_workspace.get()));
             ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
             ASSERT_NE(graph, nullptr);
             ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
@@ -988,13 +1000,16 @@ namespace
         }
         else
         {
-            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
+            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                 gate.get(),
                 up.get(),
                 grouped_output.get(),
                 M,
                 N,
-                K));
+                K,
+                1.0f,
+                0.0f,
+                grouped_workspace.get()));
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
         }
 #else

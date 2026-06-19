@@ -1449,7 +1449,6 @@ bool rocmMoE_grouped_prefill_pipeline(
     const int*    d_original_to_grouped,  // [seq_len * top_k] route slot -> grouped slot, optional
     const float*  d_group_weights,       // [total_slots] routing weights
     const int*    d_active_expert_ids,   // [active_expert_slots] compact active experts, optional
-    const int*    d_single_expert_ids,   // [1] optional appended singleton active expert
     // Scratch buffers (caller provides, sized for total_slots)
     int8_t*       d_scratch_A_int8,      // [total_slots, max(d_model, intermediate)]
     float*        d_scratch_scales,      // [total_slots, max_blocks_per_row]
@@ -1476,8 +1475,6 @@ bool rocmMoE_grouped_prefill_pipeline(
     uint8_t down_codebook_id,
     uint32_t gateup_codebook_mask,
     uint32_t down_codebook_mask,
-    uint8_t single_gateup_codebook_id,
-    uint8_t single_down_codebook_id,
     int requested_tile_m,
     int gateup_k_partitions,
     int device_id,
@@ -1565,38 +1562,6 @@ bool rocmMoE_grouped_prefill_pipeline(
                     d_group_counts, d_group_offsets, d_active_expert_ids, \
                     d_gate_partials, d_up_partials, intermediate, d_model, gateup_k_partitions); \
             } while (0)
-        #define LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, TM) \
-            do { \
-                if (use_gateup_kpart) { \
-                    dim3 single_grid(n_tiles, m_tiles, gateup_k_partitions); \
-                    hipLaunchKernelGGL( \
-                        HIP_KERNEL_NAME(moe_grouped_gate_up_prefill_kpart_kernel<FMT, TM>), \
-                        single_grid, block, 0, hip_stream, \
-                        d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
-                        d_group_counts, d_group_offsets, d_single_expert_ids, \
-                        d_gate_partials, d_up_partials, intermediate, d_model, gateup_k_partitions); \
-                } else { \
-                    dim3 single_grid(n_tiles, m_tiles, 1); \
-                    hipLaunchKernelGGL( \
-                        HIP_KERNEL_NAME(moe_grouped_gate_up_swiglu_prefill_gemm_kernel<FMT, TM>), \
-                        single_grid, block, 0, hip_stream, \
-                        d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
-                        d_group_counts, d_group_offsets, d_single_expert_ids, \
-                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model); \
-                } \
-            } while (0)
-        #define LAUNCH_GATEUP_SINGLE_PREFILL(FMT) \
-            do { \
-                if (use_gateup_kpart) { \
-                    if (tile_m <= 2)      LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 2); \
-                    else if (tile_m <= 4) LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 4); \
-                    else                  LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 8); \
-                } else { \
-                    if (tile_m <= 2)      LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 2); \
-                    else if (tile_m <= 4) LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 4); \
-                    else                  LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 8); \
-                } \
-            } while (0)
         #define LAUNCH_GATEUP_PREFILL(FMT) \
             do { \
                 if (use_gateup_kpart) { \
@@ -1635,33 +1600,6 @@ bool rocmMoE_grouped_prefill_pipeline(
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ1_S);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ1_M);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q8_0);
-        if (d_single_expert_ids)
-        {
-            #define LAUNCH_GATEUP_SINGLE_IF(FMT) \
-                do { \
-                    if (static_cast<uint8_t>(FMT) == single_gateup_codebook_id) { \
-                        LAUNCH_GATEUP_SINGLE_PREFILL(FMT); \
-                        launched_gateup = true; \
-                    } \
-                } while (0)
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q4_0);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ4_NL);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q4_1);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q5_0);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q5_1);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q6_K);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q3_K);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q2_K);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ3_S);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ3_XXS);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ2_S);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ2_XS);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ2_XXS);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ1_S);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ1_M);
-            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q8_0);
-            #undef LAUNCH_GATEUP_SINGLE_IF
-        }
         if (!launched_gateup)
         {
                 fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported gate/up codebook_id=%d mask=0x%x\n",
@@ -1669,8 +1607,6 @@ bool rocmMoE_grouped_prefill_pipeline(
                 return false;
         }
         #undef LAUNCH_GATEUP_IF_PRESENT
-        #undef LAUNCH_GATEUP_SINGLE_PREFILL
-        #undef LAUNCH_GATEUP_SINGLE_PREFILL_TM
         #undef LAUNCH_GATEUP_PREFILL
         #undef LAUNCH_GATEUP_KPART_PREFILL_TM
         #undef LAUNCH_GATEUP_PREFILL_TM
@@ -1735,25 +1671,6 @@ bool rocmMoE_grouped_prefill_pipeline(
                         d_scratch_down_out, d_model, intermediate); \
                 } \
             } while (0)
-        #define LAUNCH_DOWN_SINGLE_PREFILL_TM(FMT, TM) \
-            do { \
-                dim3 single_grid(n_tiles, m_tiles, 1); \
-                if (down_tile_n == 64) { \
-                    hipLaunchKernelGGL( \
-                        HIP_KERNEL_NAME(moe_grouped_down_prefill_gemm_kernel<FMT, TM, 64>), \
-                        single_grid, block, 0, hip_stream, \
-                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
-                        d_group_counts, d_group_offsets, d_single_expert_ids, \
-                        d_scratch_down_out, d_model, intermediate); \
-                } else { \
-                    hipLaunchKernelGGL( \
-                        HIP_KERNEL_NAME(moe_grouped_down_prefill_gemm_kernel<FMT, TM, 128>), \
-                        single_grid, block, 0, hip_stream, \
-                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
-                        d_group_counts, d_group_offsets, d_single_expert_ids, \
-                        d_scratch_down_out, d_model, intermediate); \
-                } \
-            } while (0)
         #define LAUNCH_DOWN_PREFILL(FMT) \
             do { \
                 if (tile_m <= 2)      LAUNCH_DOWN_PREFILL_TM(FMT, 2); \
@@ -1786,35 +1703,6 @@ bool rocmMoE_grouped_prefill_pipeline(
         LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_S);
         LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_M);
         LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q8_0);
-        if (d_single_expert_ids)
-        {
-            #define LAUNCH_DOWN_SINGLE_IF(FMT) \
-                do { \
-                    if (static_cast<uint8_t>(FMT) == single_down_codebook_id) { \
-                        if (tile_m <= 2)      LAUNCH_DOWN_SINGLE_PREFILL_TM(FMT, 2); \
-                        else if (tile_m <= 4) LAUNCH_DOWN_SINGLE_PREFILL_TM(FMT, 4); \
-                        else                  LAUNCH_DOWN_SINGLE_PREFILL_TM(FMT, 8); \
-                        launched_down = true; \
-                    } \
-                } while (0)
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q4_0);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ4_NL);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q4_1);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q5_0);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q5_1);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q6_K);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q3_K);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q2_K);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ3_S);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ3_XXS);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ2_S);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ2_XS);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ2_XXS);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ1_S);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ1_M);
-            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q8_0);
-            #undef LAUNCH_DOWN_SINGLE_IF
-        }
         if (!launched_down)
         {
                 fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported down codebook_id=%d mask=0x%x\n",
@@ -1823,7 +1711,6 @@ bool rocmMoE_grouped_prefill_pipeline(
         }
         #undef LAUNCH_DOWN_IF_PRESENT
         #undef LAUNCH_DOWN_PREFILL
-        #undef LAUNCH_DOWN_SINGLE_PREFILL_TM
         #undef LAUNCH_DOWN_PREFILL_TM
     }
 

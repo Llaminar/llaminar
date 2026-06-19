@@ -1346,7 +1346,6 @@ namespace
             last_sample_mtp_logits_device_draft_slot_ = draft_sample_slot;
             if (!supports_mtp_token_coordination_ ||
                 !supports_mtp_device_draft_token_input_ ||
-                !out_token ||
                 mtp_logits_.empty() ||
                 draft_sample_slot < 0 ||
                 draft_sample_slot >=
@@ -1359,7 +1358,8 @@ namespace
                 return false;
             device_draft_sample_tokens_[static_cast<size_t>(draft_sample_slot)] =
                 token;
-            *out_token = token;
+            if (out_token)
+                *out_token = token;
             return true;
         }
 
@@ -1444,11 +1444,15 @@ namespace
                 {0, 0, 0, 0};
             for (int row = 0; row < compare_rows; ++row)
             {
+                const int32_t expected_draft =
+                    draft_tokens[static_cast<size_t>(row + 1)] >= 0
+                        ? draft_tokens[static_cast<size_t>(row + 1)]
+                        : device_verifier_input_tokens_[
+                              static_cast<size_t>(row + 1)];
                 tokens[static_cast<size_t>(row)] =
                     verify_tokens[static_cast<size_t>(row)];
                 accepted[static_cast<size_t>(row)] =
-                    verify_tokens[static_cast<size_t>(row)] ==
-                            draft_tokens[static_cast<size_t>(row + 1)]
+                    verify_tokens[static_cast<size_t>(row)] == expected_draft
                         ? 1
                         : 0;
             }
@@ -6718,6 +6722,7 @@ namespace
             mock->hideMTPSpecStatePublicationFromPolicy();
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->enableMTPSidecarLogitsStreamHandoff();
             mock->enableMTPDeviceDraftTokenInput();
             mock->setVerifierAcceptedPrefixScript({2});
 
@@ -6752,10 +6757,17 @@ namespace
                    "device metadata, not replayed serially";
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
                 << "one grouped verifier forward; no catch-up forwards";
+            EXPECT_EQ(mock->forwardMTPFromDeviceDraftForDeviceSamplingCount(), 1)
+                << "The fused chained sidecar should consume the previous "
+                   "draft from the runner-owned device slot instead of a host "
+                   "shadow token.";
             EXPECT_THAT(mock->publicationEvents(),
                         ElementsAre("device_outcome_publish",
                                     "host_outcome_bridge",
                                     "host_state_adopt"));
+            EXPECT_EQ(mock->residentSidecarCountAtLastHostBridge(), 0)
+                << "Grouped greedy response materialization should not wait "
+                   "behind speculative next-step sidecar prelaunch work.";
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             EXPECT_EQ(findPerfRecord(records,
@@ -6769,6 +6781,20 @@ namespace
             EXPECT_EQ(findPerfRecord(records,
                                      PerfStatRecord::Kind::Timer,
                                      "decode_equivalent_catchup_forward_one"),
+                      nullptr);
+            EXPECT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "mtp_token_greedy_device_slot_deferred_host_reads",
+                          {{"draft_idx", "0"},
+                           {"path", "fused_first_sidecar"}}),
+                      nullptr);
+            EXPECT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "mtp_token_greedy_device_slot_deferred_host_reads",
+                          {{"draft_idx", "1"},
+                           {"path", "fused_chained_sidecar"}}),
                       nullptr);
             ASSERT_NE(findPerfRecord(records,
                                      PerfStatRecord::Kind::Timer,
@@ -6801,6 +6827,83 @@ namespace
                           PerfStatRecord::Kind::Counter,
                           "live_prefix_checkpoint_skipped_direct_publication",
                           {{"verifier_path", "grouped_decode_equivalent_outcome"}}),
+                      nullptr);
+            ASSERT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "stochastic_first_sidecar_prelaunches",
+                          {{"path", "grouped_outcome_device_resident_publication"},
+                           {"resident_state_kind", "device_publication_mailbox"},
+                           {"prelaunch_timing", "post_bridge"},
+                           {"sampling", "greedy"}}),
+                      nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, GroupedGreedyReusesResidentPrelaunchOnNextStep)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_grouped_greedy_prelaunch_reuse_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true,
+                /*sidecar_sample_fusion=*/true);
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableStochasticDeviceSampling();
+            mock->enableDeviceResidentMTPSpecStatePublication();
+            mock->hideMTPSpecStatePublicationFromPolicy();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->enableMTPSidecarLogitsStreamHandoff();
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->setVerifierAcceptedPrefixScript({2, 2});
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            ASSERT_THAT(step1.tokens, SizeIs(3));
+            EXPECT_EQ(mock->residentSidecarCountAtLastHostBridge(), 0);
+
+            const int resident_sidecar_count_after_step1 =
+                mock->forwardMTPFromResidentLogicalStateForDeviceSamplingCount();
+            const int device_target_sidecar_count_after_step1 =
+                mock->forwardMTPFromDeviceTargetForDeviceSamplingCount();
+
+            GenerationResult step2 = runner->decodeStep();
+            ASSERT_TRUE(step2.success()) << step2.error;
+            ASSERT_THAT(step2.tokens, SizeIs(3));
+
+            EXPECT_EQ(
+                mock->forwardMTPFromResidentLogicalStateForDeviceSamplingCount(),
+                resident_sidecar_count_after_step1 + 1)
+                << "Step two should reuse the already queued first sidecar, "
+                   "then enqueue exactly one replacement prelaunch for the "
+                   "following step.";
+            EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(),
+                      device_target_sidecar_count_after_step1)
+                << "A matching resident prelaunch must replace the older "
+                   "target-slot sidecar replay on the next greedy step.";
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            ASSERT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "stochastic_first_sidecar_prelaunch_reuses",
+                          {{"sampling", "greedy"}}),
                       nullptr);
         }
         std::filesystem::remove(export_path);
@@ -8433,6 +8536,89 @@ namespace
                                        "mtp_token_stochastic_deferred_host_reads",
                                        {{"draft_idx", "1"}});
             ASSERT_NE(deferred_drafts, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, GroupedGreedyDefersMTPDraftHostReadsWhenVerifierOwnsDeviceSlots)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_grouped_greedy_deferred_draft_slots_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true,
+                /*sidecar_sample_fusion=*/false);
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableStochasticDeviceSampling();
+            mock->enableDeviceResidentMTPSpecStatePublication();
+            mock->hideMTPSpecStatePublicationFromPolicy();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->enableMTPSidecarLogitsStreamHandoff();
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->setVerifierAcceptedPrefixScript({2});
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            GenerationResult step = runner->decodeStep();
+            ASSERT_TRUE(step.success()) << step.error;
+            EXPECT_THAT(step.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->sampleMTPLogitsToDeviceDraftSlotCount(), 2);
+            EXPECT_EQ(mock->forwardMTPFromDeviceDraftForDeviceSamplingCount(), 1)
+                << "The second sidecar should consume the first sampled draft "
+                   "directly from the runner-owned device slot.";
+            EXPECT_EQ(mock->forwardMTPFromLastDraftForDeviceSamplingCount(), 0)
+                << "Grouped greedy must not upload a host draft shadow when "
+                   "device draft slots are available.";
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
+            EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 1);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            EXPECT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "mtp_token_greedy_device_slot_deferred_host_reads",
+                          {{"draft_idx", "0"}}),
+                      nullptr);
+            EXPECT_EQ(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "mtp_token_greedy_device_slot_deferred_host_reads",
+                          {{"draft_idx", "1"}}),
+                      nullptr);
+            EXPECT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "mtp_token_greedy_device_slot_samples",
+                          {{"draft_idx", "1"}}),
+                      nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "mtp_token_greedy_device_slot_failures"),
+                      nullptr);
+            EXPECT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "grouped_outcome_verifier_device_token_inputs",
+                          {{"total_tokens", "3"}}),
+                      nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

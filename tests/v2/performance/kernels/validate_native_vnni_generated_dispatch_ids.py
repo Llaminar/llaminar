@@ -14,7 +14,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from native_vnni_codebooks import CODEBOOK_TO_FORMAT  # noqa: E402
 
-ROCM_DECODE_GRAPH_SAFE_KB_CAP = 8
+ROCM_DECODE_GRAPH_SAFE_KB_CAP = 16
 
 
 def parse_args() -> argparse.Namespace:

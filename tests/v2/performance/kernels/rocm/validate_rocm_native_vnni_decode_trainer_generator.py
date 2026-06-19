@@ -44,13 +44,18 @@ def main() -> int:
         required_fragments = [
             "packROCmNativeVNNIDecodeDispatchKey(int m, int n, int k)",
             "selectROCmNativeVNNIDecodeGenerated",
+            "selectROCmNativeVNNIDecodeAspectFallback",
+            "ROCmNativeVNNIDecodeAspectRule",
             "ROCmNativeVNNIDecodeDispatchConfig",
+            "aspect_ratio",
+            "work_items",
+            "Aspect fallback exact hit rate",
             "CB=5 (Q4_1)",
             "CB=7 (Q5_1)",
             "CB=19 (Q8_0)",
             "M=1",
-            "{1, 8}",
-            "KB1/TW8",
+            "{16, 24}",
+            "KB16/TW24",
             "alias_q4_1",
         ]
         for fragment in required_fragments:

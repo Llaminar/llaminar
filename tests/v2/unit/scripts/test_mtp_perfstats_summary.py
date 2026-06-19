@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = REPO_ROOT / "scripts" / "summarize_mtp_perfstats.py"
+EXPECTED_FIELD_COUNT = len(runpy.run_path(str(SCRIPT))["FIELDS"])
 
 
 class MTPPerfStatsSummaryTest(unittest.TestCase):
@@ -503,6 +505,13 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "stochastic_request_batch_summary_response_ready_wait",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 2.25,
+                },
+                {
+                    "domain": "mtp",
                     "name": "stochastic_request_batch_summary_d2h_enqueue",
                     "phase": "decode",
                     "count": 1,
@@ -860,6 +869,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["host_state_adoption_ms"], 0.375)
         self.assertEqual(summary["transaction_output_commit_ms"], 0.125)
         self.assertEqual(summary["stochastic_batch_d2h_sync_ms"], 23.0)
+        self.assertEqual(summary["stochastic_batch_response_ready_wait_ms"], 2.25)
         self.assertEqual(summary["stochastic_batch_d2h_enqueue_ms"], 0.75)
         self.assertEqual(summary["stochastic_batch_d2h_wait_ms"], 22.25)
         self.assertEqual(summary["bridge_stream_create_ms"], 1.5)
@@ -904,7 +914,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
             capture_output=True,
         )
         values = result.stdout.strip().split("\t")
-        self.assertEqual(len(values), 91)
+        self.assertEqual(len(values), EXPECTED_FIELD_COUNT)
         self.assertTrue(all(value in ("0", "0.0") for value in values))
 
     def test_multiple_paths_emit_table_for_matrix_comparison(self) -> None:

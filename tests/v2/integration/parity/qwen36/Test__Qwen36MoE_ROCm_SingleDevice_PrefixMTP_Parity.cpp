@@ -44,11 +44,9 @@ namespace
         return test_case;
     }
 
-    void expectRocmMoEMTPVerifierUsesSplitGroupedPrefillPath(int expected_seq_len = 2)
+    void expectRocmMoEMTPVerifierUsesSafeCompositeGroupedPrefillPath(int expected_seq_len = 2)
     {
-        const auto records = PerfStatsCollector::snapshot(
-            {"kernel.rocm_moe_combined_shared_prefill_group_calls",
-             "kernel.rocm_moe_grouped_prefill_active_expert_grid_calls"});
+        const auto records = PerfStatsCollector::snapshot({"kernel", "mtp"});
         auto tag_equals = [](const PerfStatRecord &record,
                              const char *key,
                              const char *value) -> bool
@@ -80,31 +78,14 @@ namespace
         // ROCm keeps Qwen3.6 MoE verifier buckets, including M=3/4, on the
         // compact tile-M=2 grouped-prefill lane. CUDA uses tile-M=4 for M=3/4,
         // but the ROCm MI50 evidence favored tile-M=2. The durable contract is
-        // routed expert grouping until the single-table routed+shared shortcut
-        // passes full continuation proof. The routed implementation may choose
-        // either fused or K-part gate/up internals.
+        // routed expert grouping plus the safe composite shared-expert owner.
+        // The routed implementation may choose either fused or K-part gate/up
+        // internals.
         const int expected_tile_m = 2;
         const std::string seq_len_tag = std::to_string(expected_seq_len);
         const std::string total_slots_tag = std::to_string(expected_total_slots);
         const std::string active_slots_tag = std::to_string(expected_active_slots);
         const std::string tile_m_tag = std::to_string(expected_tile_m);
-
-        const auto combined_group = std::find_if(
-            records.begin(),
-            records.end(),
-            [&](const PerfStatRecord &record)
-            {
-                return record.name == "rocm_moe_combined_shared_prefill_group_calls" &&
-                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
-                       tag_equals(record, "routed_top_k", "8") &&
-                       tag_equals(record, "combined_top_k", "9") &&
-                       tag_equals(record, "active_expert_slots", active_slots_tag.c_str());
-            });
-        ASSERT_EQ(combined_group, records.end())
-            << "ROCm Qwen3.6 MoE MTP verifier used the rejected single-table "
-            << "combined routed+shared expert grouping path.\n"
-            << PerfStatsCollector::summaryString(
-                   {"kernel.rocm_moe_combined_shared_prefill_group_calls"});
 
         const auto routed_grouped = std::find_if(
             records.begin(),
@@ -125,10 +106,29 @@ namespace
         ASSERT_NE(routed_grouped, records.end())
             << "ROCm Qwen3.6 MoE MTP verifier should stay on the current "
             << "graph-capturable active-expert grouped prefill path for verifier "
-            << "rows. Falling back to rowwise decode would be a Phase 10 "
-            << "performance regression.\n"
-            << PerfStatsCollector::summaryString(
-                   {"kernel.rocm_moe_grouped_prefill_active_expert_grid_calls"});
+            << "rows while shared-expert work is owned by the safe composite "
+            << "decode-equivalent verifier stage. Falling back to rowwise decode "
+            << "would be a Phase 10 performance regression.\n"
+            << PerfStatsCollector::summaryString({"kernel", "mtp"});
+
+        const auto safe_composite = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.domain == "mtp" &&
+                       record.name == "moe_combined_decode_equivalent_verifier_prefill_rows" &&
+                       tag_equals(record, "route", "safe_composite") &&
+                       tag_equals(record, "stage", "routed_plus_shared") &&
+                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
+                       tag_equals(record, "routed_top_k", "8") &&
+                       tag_equals(record, "routed_experts", "256");
+            });
+        ASSERT_NE(safe_composite, records.end())
+            << "ROCm Qwen3.6 MoE MTP verifier did not run the safe composite "
+            << "routed+shared owner. The old single-table shortcut must stay "
+            << "forbidden, but the verified composite path should be active.\n"
+            << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
     }
 } // namespace
@@ -151,7 +151,7 @@ TEST(Qwen36MoEROCmSingleDevicePrefixMTPPathGuards, GroupedVerifierUsesRoutedPref
     runMoEMainVerifierGroupedRowsMatchSerialDecode(
         rocmSingleDeviceBenchmarkPromptCase(),
         2);
-    expectRocmMoEMTPVerifierUsesSplitGroupedPrefillPath(2);
+    expectRocmMoEMTPVerifierUsesSafeCompositeGroupedPrefillPath(2);
     PerfStatsCollector::reset();
 }
 

@@ -4089,14 +4089,32 @@ bool rocmLaunch_native_vnni_small_m_fp32(
         1,
         kb > 1 && use_atomic_reduce);
 
-    const bool row_grid_launch = decode_equivalent;
-    dim3 block(THREADS, row_grid_launch ? 1 : SMALL_M, 1);
-    dim3 grid(grid_n, kb, row_grid_launch ? SMALL_M : 1);
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(gemv_native_vnni_small_m_row_parallel_kernel_t<TN, CPT, SMALL_M, FMT>),
-        grid, block, 0, static_cast<hipStream_t>(stream),
-        d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
-        d_C_fp32, partial_arg, d_scale_A_blockwise, d_sum_A_blockwise, N, K, kb);
+    if (decode_equivalent)
+    {
+        /*
+         * Decode-equivalent verifier rows must reuse the serial M=1 split-K
+         * policy, but they do not need to decode each packed weight block once
+         * per row.  The shared small-M kernel decodes a block once and then
+         * accumulates rows 0..M-1 with the same per-row b-order as serial
+         * replay.  This is the single-projection companion to the already
+         * promoted fused gate/up path.
+         */
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<TN, CPT, SMALL_M, FMT>),
+            dim3(grid_n, kb), dim3(THREADS, 1, 1), 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
+            d_C_fp32, partial_arg, d_scale_A_blockwise, d_sum_A_blockwise, N, K, kb);
+    }
+    else
+    {
+        dim3 block(THREADS, SMALL_M, 1);
+        dim3 grid(grid_n, kb, 1);
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_native_vnni_small_m_row_parallel_kernel_t<TN, CPT, SMALL_M, FMT>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
+            d_C_fp32, partial_arg, d_scale_A_blockwise, d_sum_A_blockwise, N, K, kb);
+    }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)

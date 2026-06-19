@@ -19,6 +19,9 @@ back to these files so the skill content stays in one place.
   diagnostics, CUDA GEMM perf harness work, and CUDA parity-preserving tuning.
 - `.agents/rocm-tuning/SKILL.md`: use for ROCm/HIP kernel profiling, rocprof
   diagnostics, LLVM ISA analysis, ROCm GEMM/GEMV tuning, and ROCm parity gates.
+- `.agents/mtp-tuning/SKILL.md`: use for vLLM-style MTP/speculative decode,
+  prefix-cache interaction, strict verifier-row parity, grouped MTP kernel
+  economics, depth-controller tuning, and the MTP plan/dashboard workflow.
 
 Do not copy these skill bodies into framework-specific folders. Add or update
 symlinks instead so Codex, Claude, and GitHub Copilot all read the same content.

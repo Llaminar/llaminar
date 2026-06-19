@@ -7267,9 +7267,8 @@ namespace llaminar2
         int draft_sample_slot,
         int32_t *out_token)
     {
-        if (!out_token)
-            return false;
-        *out_token = -1;
+        if (out_token)
+            *out_token = -1;
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
         {
             return false;
@@ -7930,9 +7929,8 @@ namespace llaminar2
         int draft_sample_slot,
         int32_t *out_token)
     {
-        if (!out_token)
-            return false;
-        *out_token = -1;
+        if (out_token)
+            *out_token = -1;
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
         {
             return false;
@@ -13438,9 +13436,8 @@ namespace llaminar2
         int draft_sample_slot,
         int32_t *out_token)
     {
-        if (!out_token)
-            return false;
-        *out_token = -1;
+        if (out_token)
+            *out_token = -1;
         if (globalTPContextForMTPCoordination())
         {
             /*
@@ -19373,9 +19370,11 @@ namespace llaminar2
                 {{"requests", std::to_string(request_count)}});
             /*
              * Queue both compact copies on a dedicated response bridge stream.
-             * The bridge waits for the compact-outcome event recorded before
-             * live-state publication, so materializing emitted tokens does not
-             * drain later publication work that may share the verifier stream.
+             * Host response materialization is already the ownership handoff for
+             * emitted tokens, so split the unavoidable wait into two pieces:
+             * response-ready dependency wait and the actual tiny D2H copy wait.
+             * Without this split, deferred verifier graph execution shows up as
+             * "D2H wait" and hides the real kernel target.
              */
             void *copy_stream = handle.stream;
             if (handle.device.is_gpu())
@@ -19423,13 +19422,20 @@ namespace llaminar2
                         state_.device_id.toString());
                 }
                 copy_stream = stochastic_outcome_response_bridge_stream_.get();
-                if (!backend->streamWaitEvent(
-                        copy_stream,
-                        handle.response_ready_event.get(),
-                        state_.device_id.gpu_ordinal()))
                 {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to queue stochastic outcome D2H bridge wait");
-                    return false;
+                    PerfStatsCollector::ScopedTimer ready_wait_timer(
+                        "mtp",
+                        "stochastic_request_batch_summary_response_ready_wait",
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"requests", std::to_string(request_count)}});
+                    if (!backend->waitForEvent(
+                            handle.response_ready_event.get(),
+                            state_.device_id.gpu_ordinal()))
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Failed waiting for stochastic outcome response-ready event");
+                        return false;
+                    }
                 }
             }
             {

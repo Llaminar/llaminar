@@ -334,25 +334,6 @@ namespace llaminar2
 
         bool prepareSharedExpertPrefillGroup(int seq_len) override;
 
-        /**
-         * @brief Build verifier-prefill groups with the Qwen shared expert appended.
-         *
-         * The grouped-prefill pipeline treats the shared expert as logical
-         * expert `num_experts`.  Its per-row route weight is the device-side
-         * sigmoid gate `sigmoid(dot(hidden[row], shared_gate_inp))`, which lets
-         * ROCm run the same combined routed+shared verifier path as CUDA
-         * without a host synchronization point.
-         */
-        bool prepareExpertGroupsWithSharedGateAsync(
-            ITensor *routing_indices,
-            ITensor *routing_weights,
-            ITensor *hidden,
-            ITensor *shared_gate_inp,
-            int seq_len,
-            int d_model,
-            int num_experts,
-            int top_k) override;
-
         bool executeGroupedPrefillPipeline(
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,
@@ -622,11 +603,9 @@ namespace llaminar2
         int *d_group_max_tokens_ = nullptr;    ///< [1] device-side max(d_group_counts_) (async reduction)
         int *d_group_token_indices_ = nullptr; ///< [total_slots] grouped token indices
         int *d_group_original_to_grouped_ = nullptr; ///< [total_slots] original route slot to grouped slot
-        int *d_group_single_expert_ids_ = nullptr; ///< [1] singleton active expert list for mixed verifier tables
         float *d_group_weights_ = nullptr;     ///< [total_slots] grouped routing weights
         int *d_group_active_expert_ids_ = nullptr; ///< [min(total_slots,num_experts)] compact active expert ids
         int group_active_expert_slots_ = 0;    ///< Fixed active-expert launch slots from the last small grouping pass
-        bool group_has_appended_single_expert_ = false; ///< Last grouping appended a singleton shared expert
         int group_slots_cap_ = 0;              ///< capacity for total_slots buffers
         int group_experts_cap_ = 0;            ///< capacity for num_experts buffers
 

@@ -670,7 +670,6 @@ extern "C"
         const int *d_original_to_grouped,
         const float *d_group_weights,
         const int *d_active_expert_ids,
-        const int *d_single_expert_ids,
         int8_t *d_scratch_A_int8,
         float *d_scratch_scales,
         float *d_scratch_gate,
@@ -692,32 +691,11 @@ extern "C"
         uint8_t down_codebook_id,
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
-        uint8_t single_gateup_codebook_id,
-        uint8_t single_down_codebook_id,
         int requested_tile_m,
         int gateup_k_partitions,
         int device_id,
         void *stream);
 
-    bool hipMoE_group_tokens_small_float_with_shared_gate(
-        const float *routing_indices,
-        const float *routing_weights,
-        const float *hidden,
-        const float *shared_gate_inp,
-        int *expert_counts,
-        int *expert_offsets,
-        int *grouped_token_indices,
-        int *original_to_grouped,
-        int *single_expert_ids,
-        int *active_expert_ids,
-        float *grouped_weights,
-        int seq_len,
-        int d_model,
-        int num_routed_experts,
-        int routed_top_k,
-        int max_active_experts,
-        int device_idx,
-        void *stream);
 }
 
 namespace
@@ -958,7 +936,6 @@ namespace llaminar2
         d_group_max_tokens_ = nullptr;
         d_group_token_indices_ = nullptr;
         d_group_original_to_grouped_ = nullptr;
-        d_group_single_expert_ids_ = nullptr;
         d_group_weights_ = nullptr;
         d_group_active_expert_ids_ = nullptr;
         d_prefill_A_int8_ = nullptr;
@@ -984,7 +961,6 @@ namespace llaminar2
         router_q8_hidden_d_model_cap_ = 0;
         router_q8_hidden_blocks_cap_ = 0;
         group_active_expert_slots_ = 0;
-        group_has_appended_single_expert_ = false;
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
         prefill_slots_cap_ = 0;
@@ -1162,11 +1138,6 @@ namespace llaminar2
         {
             hipFree(d_group_original_to_grouped_);
             d_group_original_to_grouped_ = nullptr;
-        }
-        if (d_group_single_expert_ids_)
-        {
-            hipFree(d_group_single_expert_ids_);
-            d_group_single_expert_ids_ = nullptr;
         }
         if (d_group_weights_)
         {
@@ -5039,7 +5010,6 @@ namespace llaminar2
                 return false;
             }
             group_active_expert_slots_ = active_expert_slots;
-            group_has_appended_single_expert_ = false;
 
             if (PerfStatsCollector::isEnabled())
             {
@@ -5061,7 +5031,6 @@ namespace llaminar2
 
         // 3. Convert float indices → int on device
         group_active_expert_slots_ = 0;
-        group_has_appended_single_expert_ = false;
         d_group_original_to_grouped_ = nullptr;
         if (!hipMoE_float_to_int(d_float_indices, d_group_int_indices_,
                                  total_slots, device_ordinal_, getStream()))
@@ -5182,7 +5151,6 @@ namespace llaminar2
 
         prepared_num_experts_ = 1;
         group_active_expert_slots_ = 1;
-        group_has_appended_single_expert_ = false;
         if (PerfStatsCollector::isEnabled())
         {
             PerfStatsCollector::addCounter(
@@ -5196,161 +5164,6 @@ namespace llaminar2
                     {"top_k", "1"},
                     {"active_expert_slots", "1"}});
         }
-        return true;
-    }
-
-    bool ROCmMoEKernel::prepareExpertGroupsWithSharedGateAsync(
-        ITensor *routing_indices,
-        ITensor *routing_weights,
-        ITensor *hidden,
-        ITensor *shared_gate_inp,
-        int seq_len,
-        int d_model,
-        int num_experts,
-        int top_k)
-    {
-        if (seq_len <= 0 || seq_len > 4 || d_model <= 0 ||
-            num_experts <= 0 || top_k <= 0 || top_k > 16)
-        {
-            return false;
-        }
-        if (!setMoEDevice(device_ordinal_, "prepareExpertGroupsWithSharedGateAsync"))
-            return false;
-
-        void *stream = getStream();
-        const DeviceId device = DeviceId::rocm(device_ordinal_);
-        if (!ensureTensorOnDevice(routing_indices, device, stream, "routing_indices",
-                                  "prepareExpertGroupsWithSharedGateAsync") ||
-            !ensureTensorOnDevice(routing_weights, device, stream, "routing_weights",
-                                  "prepareExpertGroupsWithSharedGateAsync") ||
-            !ensureTensorOnDevice(hidden, device, stream, "hidden",
-                                  "prepareExpertGroupsWithSharedGateAsync") ||
-            !ensureTensorOnDevice(shared_gate_inp, device, stream, "shared_gate_inp",
-                                  "prepareExpertGroupsWithSharedGateAsync"))
-        {
-            return false;
-        }
-
-        const auto *d_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
-        const auto *d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
-        const auto *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        const auto *d_shared_gate = static_cast<const float *>(shared_gate_inp->gpu_data_ptr());
-        if (!d_indices || !d_weights || !d_hidden || !d_shared_gate)
-        {
-            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsWithSharedGateAsync] null device pointer");
-            return false;
-        }
-
-        const int combined_experts = num_experts + 1;
-        const int combined_top_k = top_k + 1;
-        const int combined_slots = seq_len * combined_top_k;
-        /*
-         * Active expert slots are routed experts only.  The appended shared
-         * expert uses d_group_single_expert_ids_ so the grouped GEMM path can
-         * launch it under its own codebook without cross-decoding routed slots.
-         */
-        const int active_expert_slots = std::min(seq_len * top_k, num_experts);
-
-        if (combined_slots > group_slots_cap_ ||
-            !d_group_token_indices_ ||
-            !d_group_original_to_grouped_ ||
-            !d_group_single_expert_ids_ ||
-            !d_group_weights_ ||
-            !d_group_active_expert_ids_)
-        {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_token_indices_),
-                                     MoEWorkspaceBuffers::GROUP_TOKEN_INDICES,
-                                     static_cast<size_t>(combined_slots) * sizeof(int),
-                                     "prepareExpertGroupsWithSharedGateAsync(group_token_indices)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_to_grouped_),
-                                     MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
-                                     static_cast<size_t>(combined_slots) * sizeof(int),
-                                     "prepareExpertGroupsWithSharedGateAsync(group_original_to_grouped)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_single_expert_ids_),
-                                     MoEWorkspaceBuffers::GROUP_SINGLE_EXPERT_IDS,
-                                     sizeof(int),
-                                     "prepareExpertGroupsWithSharedGateAsync(group_single_expert_ids)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_weights_),
-                                     MoEWorkspaceBuffers::GROUP_WEIGHTS,
-                                     static_cast<size_t>(combined_slots) * sizeof(float),
-                                     "prepareExpertGroupsWithSharedGateAsync(group_weights)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
-                                     MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
-                                     static_cast<size_t>(active_expert_slots) * sizeof(int),
-                                     "prepareExpertGroupsWithSharedGateAsync(group_active_expert_ids)"))
-            {
-                d_group_token_indices_ = nullptr;
-                d_group_original_to_grouped_ = nullptr;
-                d_group_single_expert_ids_ = nullptr;
-                d_group_weights_ = nullptr;
-                d_group_active_expert_ids_ = nullptr;
-                group_slots_cap_ = 0;
-                group_active_expert_slots_ = 0;
-                return false;
-            }
-            group_slots_cap_ = combined_slots;
-        }
-        if (combined_experts > group_experts_cap_)
-        {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_offsets_),
-                                     MoEWorkspaceBuffers::GROUP_OFFSETS,
-                                     static_cast<size_t>(combined_experts) * sizeof(int),
-                                     "prepareExpertGroupsWithSharedGateAsync(group_offsets)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_counts_),
-                                     MoEWorkspaceBuffers::GROUP_COUNTS,
-                                     static_cast<size_t>(combined_experts) * sizeof(int),
-                                     "prepareExpertGroupsWithSharedGateAsync(group_counts)") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_max_tokens_),
-                                     MoEWorkspaceBuffers::ROCM_GROUP_MAX_TOKENS,
-                                     sizeof(int),
-                                     "prepareExpertGroupsWithSharedGateAsync(group_max_tokens)"))
-            {
-                d_group_offsets_ = nullptr;
-                d_group_counts_ = nullptr;
-                d_group_max_tokens_ = nullptr;
-                group_experts_cap_ = 0;
-                return false;
-            }
-            group_experts_cap_ = combined_experts;
-        }
-
-        if (!hipMoE_group_tokens_small_float_with_shared_gate(
-                d_indices,
-                d_weights,
-                d_hidden,
-                d_shared_gate,
-                d_group_counts_,
-                d_group_offsets_,
-                d_group_token_indices_,
-                d_group_original_to_grouped_,
-                d_group_single_expert_ids_,
-                d_group_active_expert_ids_,
-                d_group_weights_,
-                seq_len,
-                d_model,
-                num_experts,
-                top_k,
-                active_expert_slots,
-                device_ordinal_,
-                stream))
-        {
-            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsWithSharedGateAsync] grouping failed");
-            group_active_expert_slots_ = 0;
-            group_has_appended_single_expert_ = false;
-            return false;
-        }
-
-        prepared_num_experts_ = combined_experts;
-        group_active_expert_slots_ = active_expert_slots;
-        group_has_appended_single_expert_ = true;
-        PerfStatsCollector::addCounter(
-            "kernel", "rocm_moe_combined_shared_prefill_group_calls", 1.0, {}, {},
-            {{"seq_len", std::to_string(seq_len)},
-             {"routed_top_k", std::to_string(top_k)},
-             {"combined_top_k", std::to_string(combined_top_k)},
-             {"routed_slots", std::to_string(seq_len * top_k)},
-             {"active_expert_slots", std::to_string(active_expert_slots)},
-             {"combined_experts", std::to_string(combined_experts)}});
         return true;
     }
 
@@ -5476,48 +5289,6 @@ namespace llaminar2
         const int active_expert_slots = group_active_expert_slots_;
         const int *d_active_expert_ids =
             (active_expert_slots > 0) ? d_group_active_expert_ids_ : nullptr;
-        const bool appended_single_expert =
-            group_has_appended_single_expert_ &&
-            num_experts > 1 &&
-            top_k > 1 &&
-            d_group_single_expert_ids_ &&
-            gateup_table.host_gate_descs.size() == static_cast<size_t>(num_experts) &&
-            down_table.host_descs.size() == static_cast<size_t>(num_experts);
-        const int *d_single_expert_ids =
-            appended_single_expert ? d_group_single_expert_ids_ : nullptr;
-        auto singleton_codebook = [](const auto &descs) -> uint8_t
-        {
-            if (descs.empty())
-                return 0xffu;
-            return descs.back().codebook_id;
-        };
-        auto routed_codebook_mask = [](const auto &descs) -> uint32_t
-        {
-            uint32_t mask = 0;
-            for (size_t i = 0; i + 1 < descs.size(); ++i)
-            {
-                const uint8_t codebook = descs[i].codebook_id;
-                if (codebook < 32)
-                    mask |= uint32_t{1} << codebook;
-            }
-            return mask;
-        };
-        const uint8_t single_gateup_codebook_id =
-            appended_single_expert
-                ? singleton_codebook(gateup_table.host_gate_descs)
-                : 0xffu;
-        const uint8_t single_down_codebook_id =
-            appended_single_expert
-                ? singleton_codebook(down_table.host_descs)
-                : 0xffu;
-        const uint32_t gateup_codebook_mask =
-            appended_single_expert
-                ? routed_codebook_mask(gateup_table.host_gate_descs)
-                : gateup_table.codebook_mask;
-        const uint32_t down_codebook_mask =
-            appended_single_expert
-                ? routed_codebook_mask(down_table.host_descs)
-                : down_table.codebook_mask;
         if (active_expert_slots > 0 && !d_active_expert_ids)
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] compact active expert list missing");
@@ -5573,7 +5344,6 @@ namespace llaminar2
             d_group_original_to_grouped_,
             d_group_weights_,
             d_active_expert_ids,
-            d_single_expert_ids,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
             d_prefill_gate_,
@@ -5593,10 +5363,8 @@ namespace llaminar2
             active_expert_slots,
             gateup_table.codebook_id,
             down_table.codebook_id,
-            gateup_codebook_mask,
-            down_codebook_mask,
-            single_gateup_codebook_id,
-            single_down_codebook_id,
+            gateup_table.codebook_mask,
+            down_table.codebook_mask,
             debugEnv().rocm.moe_prefill_tile_m,
             use_gateup_kpart ? gateup_k_partitions : 0,
             device_ordinal_,

@@ -1070,6 +1070,45 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DeferredSampleReadinessPreservesVerifie
         << "Request-boundary clear_cache() must drop materialized verifier token rows.";
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, ClearCacheDropsStochasticDistributionSlotMetadata)
+{
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto clear_cache_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        header,
+        "void clear_cache() override",
+        "/**\n         * @brief Get current position")));
+
+    /*
+     * Regression guard for seeded stochastic MTP reproducibility after
+     * clearCache(): target/draft distribution slots are request-local metadata,
+     * not persistent graph topology.  Leaving top-k values alive lets a later
+     * request observe stale stochastic slots even after streams and row formats
+     * were cleared.
+     */
+    const std::string clear_target_top_k =
+        "std::fill(stochastic_target_top_k_.begin(),stochastic_target_top_k_.end(),0);";
+    const std::string clear_draft_top_k =
+        "std::fill(stochastic_draft_top_k_.begin(),stochastic_draft_top_k_.end(),0);";
+    const std::string clear_ready =
+        "clearStochasticTargetSampleReadySlots(StochasticSampleReadyClearMode::Force);";
+
+    EXPECT_NE(clear_cache_body.find(clear_target_top_k), std::string::npos)
+        << "clear_cache() must reset request-local target stochastic top-k metadata.";
+    EXPECT_NE(clear_cache_body.find(clear_draft_top_k), std::string::npos)
+        << "clear_cache() must reset request-local draft stochastic top-k metadata.";
+    expectNeedleBefore(
+        clear_cache_body,
+        clear_target_top_k,
+        clear_ready,
+        "clear_cache() must fully empty stochastic distribution slots before ready-event cleanup.");
+    expectNeedleBefore(
+        clear_cache_body,
+        clear_draft_top_k,
+        clear_ready,
+        "clear_cache() must fully empty stochastic distribution slots before ready-event cleanup.");
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, DeviceResidentShiftedMTPHostAdoptionAllowsTruncation)
 {
     const auto source =
@@ -2082,10 +2121,20 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnRespo
         << "The compact D2H bridge must not allocate a throwaway stream owner "
            "inside the decode hot path.";
     EXPECT_NE(compact_bridge.find(
+                  "backend->waitForEvent(handle.response_ready_event.get(),state_.device_id.gpu_ordinal())"),
+              std::string::npos)
+        << "The compatibility bridge must wait only for the compact response "
+           "event, not the full publication stream.";
+    EXPECT_NE(dgo_source.find(
+                  "\"stochastic_request_batch_summary_response_ready_wait\""),
+              std::string::npos)
+        << "Bridge accounting must split verifier dependency wait from the "
+           "actual compact D2H copy wait.";
+    EXPECT_EQ(compact_bridge.find(
                   "backend->streamWaitEvent(copy_stream,handle.response_ready_event.get(),state_.device_id.gpu_ordinal())"),
               std::string::npos)
-        << "The bridge stream must wait on the compact response event, not the "
-           "full publication stream.";
+        << "Do not hide verifier dependency time inside the D2H stream wait; "
+           "wait for response readiness explicitly so perfstats stay honest.";
     EXPECT_NE(compact_bridge.find(
                   "backend->synchronizeStream(copy_stream,state_.device_id.gpu_ordinal())"),
               std::string::npos);
@@ -4317,12 +4366,45 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
         graph_source,
         "const bool can_combine_shared_verifier =",
         "if (overlay_requested && !use_expert_overlay)");
-    EXPECT_NE(removeAsciiWhitespace(stripCommentsAndStringLiterals(combined_shared_section))
-                  .find("constboolcan_combine_shared_verifier=false;"),
+    const std::string compact_combined_shared =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(combined_shared_section));
+    EXPECT_NE(compact_combined_shared.find("!use_expert_overlay"),
               std::string::npos)
-        << "The single-table combined shared+routed verifier shortcut failed the "
-           "full continuation proof. Keep it out of graph promotion until a future "
-           "strict proof re-enables it intentionally.";
+        << "The safe composite routed+shared verifier owner is only proven for "
+           "single-device graph execution, not ExpertOverlay.";
+    EXPECT_NE(compact_combined_shared.find("!mtp_sidecar_context"),
+              std::string::npos)
+        << "MTP sidecars need their own persistent MoE metadata before using the "
+           "main-verifier routed+shared composite owner.";
+    EXPECT_NE(compact_combined_shared.find("config_.compute_all_position_logits"),
+              std::string::npos)
+        << "The composite owner is a verifier-row optimization and must not run "
+           "during ordinary decode.";
+    EXPECT_NE(compact_combined_shared.find("forceGroupedSharedMoEVerifierPrefill(device)"),
+              std::string::npos)
+        << "The composite owner must stay tied to the same strict GPU M=2..4 "
+           "grouped-verifier policy as the standalone shared-expert path.";
+    EXPECT_NE(compact_combined_shared.find("layer.shared_expert_gate&&"
+                                           "layer.shared_expert_up&&"
+                                           "layer.shared_expert_down&&"
+                                           "layer.shared_expert_gate_inp&&"
+                                           "buffers.attn_proj"),
+              std::string::npos)
+        << "The composite owner needs all shared expert weights plus the final "
+           "routed+shared output buffer before it can replace the separate "
+           "shared-expert graph branch.";
+
+    const auto expert_stage_section = sliceBetween(
+        graph_source,
+        "auto expert_params = makeExpertParams(can_combine_shared_verifier",
+        "if (!prepareExpertParams(expert_params, device))");
+    const std::string compact_expert_stage =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(expert_stage_section));
+    EXPECT_NE(compact_expert_stage.find("expert_params.combine_shared_expert_in_verifier=true;"),
+              std::string::npos)
+        << "The graph must explicitly ask MoEExpertComputeStage for the safe "
+           "composite routed+shared verifier owner instead of relying on a "
+           "separate shared branch.";
 
     const auto shared_stage_section = sliceBetween(
         graph_source,
@@ -4344,15 +4426,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
            "decode-equivalent path rather than quietly falling through.";
     EXPECT_NE(compact_shared_policy.find("forceGroupedMoEVerifierPrefill(candidate)"),
               std::string::npos)
-        << "The grouped shared-expert path may only be selected for the "
-           "speculative sidecar verifier-prefill lane until a full-model "
-           "M=2..4 proof re-promotes it.";
+        << "The standalone grouped shared-expert verifier path is promoted for "
+           "the same GPU small-M sidecar/main-verifier rows as the routed grouped "
+           "prefill path. Do not recouple this with the failed combined "
+           "routed+shared shortcut.";
     EXPECT_NE(compact_shared.find(
                   "shared_params.force_grouped_verifier_prefill_for_decode="
                   "shared_grouped_verifier_prefill;"),
               std::string::npos)
         << "The shared expert policy should still expose a named grouped route "
-           "for sidecar prefill and future re-promotion.";
+           "for the promoted standalone shared-expert verifier kernel.";
     EXPECT_NE(compact_shared.find(
                   "shared_params.force_decode_equivalent_verifier_prefill="
                   "!shared_grouped_verifier_prefill&&"
@@ -4364,6 +4447,26 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
               std::string::npos)
         << "Routing conservatism belongs to the router/routed-expert path only; "
            "recoupling it here reintroduces a large shared-expert replay cost.";
+
+    const auto shared_dependency_section = sliceBetween(
+        graph_source,
+        "const bool main_verifier_rows =",
+        "shared_ffn_last = prefix + \"shared_expert_ffn\";");
+    const std::string compact_shared_dependency =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(shared_dependency_section));
+    EXPECT_NE(compact_shared_dependency.find(
+                  "constboolshared_verifier_owns_branch_local_math="
+                  "main_verifier_rows&&shared_grouped_verifier_prefill;"),
+              std::string::npos)
+        << "The promoted standalone shared verifier route must stay separated "
+           "from backend MoE scratch ownership so routed and shared branches can "
+           "be optimized independently.";
+    EXPECT_NE(compact_shared_dependency.find(
+                  "if(main_verifier_rows&&!shared_verifier_owns_branch_local_math&&"
+                  "!ffn_terminal.empty())"),
+              std::string::npos)
+        << "Do not restore a blanket routed->shared verifier dependency. Only "
+           "routes without branch-local shared verifier ownership should serialize.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35GDNAllPositionVerifierBatchesCarryRequestShape)

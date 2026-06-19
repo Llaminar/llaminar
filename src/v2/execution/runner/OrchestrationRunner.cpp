@@ -218,14 +218,7 @@ namespace llaminar2
 
         bool traceChatGeneratedTokensEnabled()
         {
-            const char *value = std::getenv("LLAMINAR_TRACE_GENERATED_TOKENS");
-            if (!value || value[0] == '\0')
-                return false;
-            std::string flag(value);
-            std::transform(flag.begin(), flag.end(), flag.begin(),
-                           [](unsigned char c)
-                           { return static_cast<char>(std::tolower(c)); });
-            return flag != "0" && flag != "false" && flag != "off" && flag != "no";
+            return debugEnv().runtime_debug.trace_generated_tokens;
         }
 
         const char *perfBool(bool value)
@@ -4794,10 +4787,23 @@ namespace llaminar2
                             "decode",
                             {},
                             {{"draft_idx", std::to_string(draft_idx)}});
+                        int32_t *host_shadow =
+                            defer_host_read ? nullptr : &token;
                         sampled_to_slot =
                             runner_->sampleGreedyFromMTPLogitsToDeviceDraftSlot(
                                 draft_idx,
-                                &token);
+                                host_shadow);
+                    }
+                    if (sampled_to_slot && defer_host_read)
+                    {
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "mtp_token_greedy_device_slot_deferred_host_reads",
+                            1.0,
+                            "decode",
+                            {},
+                            {{"draft_idx", std::to_string(draft_idx)}});
+                        return kDeferredMTPDraftTokenShadow;
                     }
                     if (sampled_to_slot && token >= 0)
                     {
@@ -4858,14 +4864,21 @@ namespace llaminar2
          * paths remain synchronized because accepted-token history mutates the
          * logits before each sample.
          */
-        const bool use_sidecar_stream_handoff_for_stochastic =
-            stochastic_verify &&
-            stochastic_device_verify &&
+        const bool use_device_resident_sidecar_stream_handoff =
             runner_->primaryDeviceId().is_gpu() &&
             !active_sampling_params_.has_penalties() &&
             runner_->supportsMTPSidecarLogitsStreamHandoff();
+        const bool use_sidecar_stream_handoff_for_stochastic =
+            stochastic_verify &&
+            stochastic_device_verify &&
+            use_device_resident_sidecar_stream_handoff;
+        const bool use_sidecar_stream_handoff_for_grouped_greedy =
+            !stochastic_verify &&
+            use_grouped_outcome_device_resident_publication_verifier &&
+            use_device_resident_sidecar_stream_handoff;
         const bool use_device_draft_token_sidecar =
-            use_sidecar_stream_handoff_for_stochastic &&
+            (use_sidecar_stream_handoff_for_stochastic ||
+             use_sidecar_stream_handoff_for_grouped_greedy) &&
             runner_->supportsMTPDeviceDraftTokenInput();
         const bool use_resident_pending_condition_sidecar =
             use_pending_condition_row &&
@@ -4889,7 +4902,8 @@ namespace llaminar2
                        *expected);
         };
         const bool use_prelaunched_first_sidecar =
-            use_sidecar_stream_handoff_for_stochastic &&
+            (use_sidecar_stream_handoff_for_stochastic ||
+             use_sidecar_stream_handoff_for_grouped_greedy) &&
             ((use_resident_ready_condition_sidecar &&
               prelaunch_matches_resident_state(ready_sampled_resident_state)) ||
              (use_resident_pending_condition_sidecar &&
@@ -4912,16 +4926,50 @@ namespace llaminar2
             use_sidecar_stream_handoff_for_stochastic &&
             verifier_accepts_device_first_token &&
             !active_sampling_params_.has_penalties();
+        const bool can_defer_greedy_draft_host_reads =
+            !stochastic_verify &&
+            use_greedy_device_draft_slots &&
+            verifier_accepts_device_first_token &&
+            runner_->primaryDeviceId().is_gpu() &&
+            !use_sampling_penalties &&
+            !active_sampling_params_.has_penalties();
         for (int draft_idx = 0; draft_idx < speculative_draft_count; ++draft_idx)
         {
             bool sidecar_ok = false;
+            bool used_prelaunched_first_sidecar = false;
             int32_t mtp_token = -1;
             {
                 PerfStatsCollector::ScopedTimer timer("mtp", "sidecar_forward", "decode");
                 if (draft_idx == 0)
                 {
-                    if (use_sidecar_sample_fusion)
+                    if (use_prelaunched_first_sidecar)
                     {
+                        /*
+                         * The previous decode step already enqueued this
+                         * first sidecar from the same resident mailbox before
+                         * flushing host-visible response tokens. Reuse the
+                         * pending MTP logits instead of replaying the sidecar
+                         * and duplicating shifted-cache work. Greedy lanes
+                         * sample those pending logits into the usual device
+                         * draft slot below so verifier setup stays device
+                         * resident.
+                         */
+                        sidecar_ok = true;
+                        used_prelaunched_first_sidecar = true;
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "stochastic_first_sidecar_prelaunch_reuses",
+                            1.0,
+                            "decode",
+                            {},
+                            {{"sampling", stochastic_verify ? "stochastic" : "greedy"}});
+                    }
+                    else if (use_sidecar_sample_fusion)
+                    {
+                        const bool defer_fused_sample =
+                            can_defer_greedy_draft_host_reads;
+                        int32_t *sample_host_shadow =
+                            defer_fused_sample ? nullptr : &mtp_token;
                         if (first_token == kDeferredMTPFirstTokenShadow &&
                             use_greedy_device_draft_slots)
                         {
@@ -4930,7 +4978,7 @@ namespace llaminar2
                                     /*target_sample_slot=*/0,
                                     base_sidecar_position,
                                     draft_idx,
-                                    &mtp_token);
+                                    sample_host_shadow);
                         }
                         else
                         {
@@ -4939,27 +4987,23 @@ namespace llaminar2
                                     ? runner_->forwardMTPAndSampleGreedyToDeviceDraftSlot(
                                           draft_tokens.back(),
                                           draft_idx,
-                                          &mtp_token)
+                                          sample_host_shadow)
                                     : runner_->forwardMTPAndSampleGreedy(
                                           draft_tokens.back(),
                                           &mtp_token);
                         }
-                    }
-                    else if (use_prelaunched_first_sidecar)
-                    {
-                        /*
-                         * The previous decode step already enqueued this
-                         * first sidecar from the same resident mailbox before
-                         * flushing host-visible response tokens.  Reuse the
-                         * pending MTP logits instead of replaying the sidecar
-                         * and duplicating shifted-cache work.
-                         */
-                        sidecar_ok = true;
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            "stochastic_first_sidecar_prelaunch_reuses",
-                            1.0,
-                            "decode");
+                        if (sidecar_ok && defer_fused_sample)
+                        {
+                            mtp_token = kDeferredMTPDraftTokenShadow;
+                            PerfStatsCollector::addCounter(
+                                "mtp",
+                                "mtp_token_greedy_device_slot_deferred_host_reads",
+                                1.0,
+                                "decode",
+                                {},
+                                {{"draft_idx", std::to_string(draft_idx)},
+                                 {"path", "fused_first_sidecar"}});
+                        }
                     }
                     else if (use_sidecar_stream_handoff_for_stochastic)
                     {
@@ -5048,17 +5092,53 @@ namespace llaminar2
                 {
                     if (use_sidecar_sample_fusion)
                     {
-                        sidecar_ok =
-                            use_greedy_device_draft_slots
-                                ? runner_->forwardMTPFromLastDraftAndSampleGreedyToDeviceDraftSlot(
-                                      draft_tokens.back(),
-                                      base_sidecar_position + draft_idx,
-                                      draft_idx,
-                                      &mtp_token)
-                                : runner_->forwardMTPFromLastDraftAndSampleGreedy(
-                                      draft_tokens.back(),
-                                      base_sidecar_position + draft_idx,
-                                      &mtp_token);
+                        const bool defer_fused_sample =
+                            can_defer_greedy_draft_host_reads;
+                        int32_t *sample_host_shadow =
+                            defer_fused_sample ? nullptr : &mtp_token;
+                        if (use_greedy_device_draft_slots && defer_fused_sample)
+                        {
+                            /*
+                             * The previous draft row was sampled into the
+                             * runner-owned device slot with index draft_idx-1.
+                             * Consume that slot directly and write the next
+                             * proposal to draft_idx.  The compact verifier
+                             * outcome will materialize response tokens later,
+                             * so no intermediate D2H token copy is required.
+                             */
+                            sidecar_ok =
+                                runner_->forwardMTPFromDeviceDraftAndSampleGreedyToDeviceDraftSlot(
+                                    draft_idx - 1,
+                                    base_sidecar_position + draft_idx,
+                                    draft_idx,
+                                    sample_host_shadow);
+                        }
+                        else
+                        {
+                            sidecar_ok =
+                                use_greedy_device_draft_slots
+                                    ? runner_->forwardMTPFromLastDraftAndSampleGreedyToDeviceDraftSlot(
+                                          draft_tokens.back(),
+                                          base_sidecar_position + draft_idx,
+                                          draft_idx,
+                                          sample_host_shadow)
+                                    : runner_->forwardMTPFromLastDraftAndSampleGreedy(
+                                          draft_tokens.back(),
+                                          base_sidecar_position + draft_idx,
+                                          &mtp_token);
+                        }
+                        if (sidecar_ok && defer_fused_sample)
+                        {
+                            mtp_token = kDeferredMTPDraftTokenShadow;
+                            PerfStatsCollector::addCounter(
+                                "mtp",
+                                "mtp_token_greedy_device_slot_deferred_host_reads",
+                                1.0,
+                                "decode",
+                                {},
+                                {{"draft_idx", std::to_string(draft_idx)},
+                                 {"path", "fused_chained_sidecar"}});
+                        }
                     }
                     else if (use_device_draft_token_sidecar)
                     {
@@ -5095,7 +5175,8 @@ namespace llaminar2
                         ? "MTP sidecar forward failed"
                         : "Chained MTP sidecar forward failed");
             }
-            if (use_sidecar_stream_handoff_for_stochastic)
+            if (use_sidecar_stream_handoff_for_stochastic ||
+                used_prelaunched_first_sidecar)
             {
                 PerfStatsCollector::addCounter(
                     "mtp",
@@ -5184,14 +5265,22 @@ namespace llaminar2
                     "decode");
             }
 
-            if (!use_sidecar_sample_fusion)
+            const bool sidecar_sample_already_done =
+                use_sidecar_sample_fusion &&
+                !used_prelaunched_first_sidecar;
+            if (!sidecar_sample_already_done)
             {
                 const bool next_sidecar_needs_host_token =
                     draft_idx + 1 < speculative_draft_count &&
                     !use_device_draft_token_sidecar;
+                const bool greedy_next_sidecar_can_consume_device_token =
+                    can_defer_greedy_draft_host_reads &&
+                    use_device_draft_token_sidecar &&
+                    draft_idx + 1 < speculative_draft_count;
                 const bool defer_draft_host_read =
-                    can_defer_stochastic_draft_host_reads &&
-                    !next_sidecar_needs_host_token;
+                    (can_defer_stochastic_draft_host_reads &&
+                     !next_sidecar_needs_host_token) ||
+                    greedy_next_sidecar_can_consume_device_token;
                 mtp_token = sample_mtp_token(draft_idx, defer_draft_host_read);
             }
             if (mtp_token < 0)
@@ -5199,7 +5288,7 @@ namespace llaminar2
                 if (mtp_token != kDeferredMTPDraftTokenShadow)
                     return fail_after_checkpoint("No MTP logits available");
             }
-            if (use_sidecar_sample_fusion)
+            if (sidecar_sample_already_done)
             {
                 if (use_greedy_device_draft_slots)
                 {
@@ -9531,6 +9620,12 @@ namespace llaminar2
                       std::to_string(publication_request.max_draft_tokens)},
                      {"sampling", "greedy"}});
 
+                const bool can_prelaunch_next_first_sidecar =
+                    use_sidecar_stream_handoff_for_grouped_greedy &&
+                    use_device_draft_token_sidecar &&
+                    runner_->supportsMTPSidecarPreservesMainState() &&
+                    requested_speculative_draft_count > 0;
+
                 DeviceSpeculativeVerifyBatchOutcome device_outcome;
                 {
                     /*
@@ -9551,6 +9646,62 @@ namespace llaminar2
                         return fail_after_checkpoint(
                             "Grouped-outcome greedy MTP resident outcome materialization failed");
                     }
+                }
+                /*
+                 * Keep compatibility response materialization as the first
+                 * host-visible boundary after verifier outcome reduction.  A
+                 * previous pre-bridge prelaunch could make ROCm's response
+                 * bridge wait behind speculative next-step sidecar work.  The
+                 * sidecar is still prelaunched for reuse by the following
+                 * decode step, but only after emitted response tokens are
+                 * already materialized.
+                 */
+                if (can_prelaunch_next_first_sidecar)
+                {
+                    DeviceResidentLogicalSequenceStateHandle handle =
+                        runner_->deviceResidentLogicalSequenceState();
+                    if (!handle.valid())
+                    {
+                        return fail_after_checkpoint(
+                            "Grouped-outcome greedy MTP direct publication produced no resident logical-state row for sidecar prelaunch");
+                    }
+                    {
+                        PerfStatsCollector::ScopedTimer prelaunch_timer(
+                            "mtp",
+                            "stochastic_first_sidecar_prelaunch_enqueue",
+                            "decode",
+                            {},
+                            {{"verifier_path",
+                              "grouped_outcome_device_resident_publication"},
+                             {"resident_state_kind",
+                              "device_publication_mailbox"},
+                             {"prelaunch_timing", "post_bridge"},
+                             {"sampling", "greedy"}});
+                        if (!runner_->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+                                handle,
+                                /*request_index=*/0))
+                        {
+                            return fail_after_checkpoint(
+                                "Grouped-outcome greedy MTP resident first-sidecar prelaunch failed");
+                        }
+                    }
+                    prelaunched_mtp_first_sidecar_resident_state_ = handle;
+                    prelaunched_mtp_first_sidecar_params_ =
+                        active_sampling_params_;
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "stochastic_first_sidecar_prelaunches",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"request_index", "0"},
+                         {"path", "grouped_outcome_device_resident_publication"},
+                         {"resident_state_kind",
+                          "device_publication_mailbox"},
+                         {"prelaunch_timing", "post_bridge"},
+                         {"sampling", "greedy"},
+                         {"stop_tokens",
+                          std::to_string(stop_tokens_.size())}});
                 }
 
                 MTPDecodeCatchupGreedyRequest catchup_request;

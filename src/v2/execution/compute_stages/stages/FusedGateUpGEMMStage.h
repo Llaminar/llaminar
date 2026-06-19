@@ -77,12 +77,14 @@ namespace llaminar2
             PreparedWeightStore *prepared_store = nullptr;
 
             /**
-             * @brief Execute tiny verifier batches as repeated M=1 gate/up GEMVs.
+             * @brief Execute tiny verifier batches with grouped decode-equivalent gate/up GEMVs.
              *
              * The vLLM-style MTP verifier may batch M=2..4 rows into one graph,
-             * but accepted-state publication must be decode-equivalent.  This
-             * flag keeps the public output tensors shaped as [M, N] while each
-             * row uses the same fused gate/up route as ordinary one-token decode.
+             * but accepted-state publication must be decode-equivalent. This flag
+             * keeps the public output tensors shaped as [M, N] while requiring the
+             * kernel layer to use a grouped route with strict serial-decode
+             * equivalence proof. It must not silently fall back to hidden row-wise
+             * replay.
              */
             bool force_decode_equivalent_verifier_prefill = false;
         };

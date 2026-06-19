@@ -110,6 +110,8 @@ namespace llaminar2
         bool serialize_tp_forward = false;    ///< Serialize local TP forwards when LLAMINAR_SERIALIZE_TP_FORWARD is present.
         bool tp_host_allreduce_trace = false; ///< Trace host allreduce tensor slots when LLAMINAR_TP_HOST_ALLREDUCE_TRACE is present.
         bool layer_trace = false;             ///< Emit temporary per-layer residual trace when LLAMINAR_LAYER_TRACE is present.
+        bool trace_generated_tokens = false;  ///< Trace streamed/generated token text when LLAMINAR_TRACE_GENERATED_TOKENS is truthy.
+        bool moe_grouped_verifier_snapshot_diagnostic = false; ///< Emit grouped MoE verifier routing-row diagnostics.
 
         RuntimeDebugConfig()
         {
@@ -128,6 +130,9 @@ namespace llaminar2
             serialize_tp_forward = isPresent("LLAMINAR_SERIALIZE_TP_FORWARD");
             tp_host_allreduce_trace = isPresent("LLAMINAR_TP_HOST_ALLREDUCE_TRACE");
             layer_trace = isPresent("LLAMINAR_LAYER_TRACE");
+            trace_generated_tokens = readTruthy("LLAMINAR_TRACE_GENERATED_TOKENS");
+            moe_grouped_verifier_snapshot_diagnostic =
+                readTruthy("LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC");
         }
 
     private:
@@ -149,6 +154,19 @@ namespace llaminar2
         {
             const char *value = std::getenv(name);
             return value == nullptr || std::atoi(value) != 0;
+        }
+
+        /// @brief Parse common truthy/falsey debug toggle spellings.
+        static bool readTruthy(const char *name)
+        {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == '\0')
+                return false;
+            std::string flag(value);
+            std::transform(flag.begin(), flag.end(), flag.begin(),
+                           [](unsigned char ch)
+                           { return static_cast<char>(std::tolower(ch)); });
+            return flag != "0" && flag != "false" && flag != "off" && flag != "no";
         }
     };
 

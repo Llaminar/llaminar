@@ -6,6 +6,7 @@
 #include "app/modes/ChatCompletionHandler.h"
 #include "execution/runner/IOrchestrationRunner.h"
 #include "utils/Tokenizer.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/ToolCallParser.h"
 #include "nlohmann/json.hpp"
@@ -125,14 +126,7 @@ namespace llaminar2
 
         bool traceGeneratedTokensEnabled()
         {
-            const char *value = std::getenv("LLAMINAR_TRACE_GENERATED_TOKENS");
-            if (!value || value[0] == '\0')
-                return false;
-            std::string flag(value);
-            std::transform(flag.begin(), flag.end(), flag.begin(),
-                           [](unsigned char c)
-                           { return static_cast<char>(std::tolower(c)); });
-            return flag != "0" && flag != "false" && flag != "off" && flag != "no";
+            return debugEnv().runtime_debug.trace_generated_tokens;
         }
 
         std::string previewTokenText(std::string text)
