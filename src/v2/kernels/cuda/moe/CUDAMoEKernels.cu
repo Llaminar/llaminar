@@ -577,6 +577,34 @@ namespace
         batch_buffer[idx] = hidden[static_cast<size_t>(token) * d_model + col];
     }
 
+    /**
+     * @brief Copy one logical row without staging a host token-index buffer.
+     *
+     * MTP verifier replay uses this primitive to keep row selection owned by
+     * the captured GPU stream.  The scalar tail keeps routing rows such as
+     * top_k=8 valid even though model-width rows use the vectorized float4 path.
+     */
+    __global__ void copy_token_row_kernel(
+        const float *__restrict__ source,
+        float *__restrict__ row_buffer,
+        int row_index,
+        int row_width)
+    {
+        if (row_index < 0 || row_width <= 0)
+            return;
+        const float *src = source + static_cast<size_t>(row_index) * row_width;
+        const int n4 = row_width >> 2;
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < n4)
+        {
+            reinterpret_cast<float4 *>(row_buffer)[i] =
+                reinterpret_cast<const float4 *>(src)[i];
+        }
+        const int tail_start = n4 << 2;
+        for (int col = tail_start + i; col < row_width; col += gridDim.x * blockDim.x)
+            row_buffer[col] = src[col];
+    }
+
     __global__ void scatter_add_kernel(
         float *__restrict__ output,
         const float *__restrict__ expert_output,
@@ -623,6 +651,34 @@ namespace
         const int col = idx - token_slot * d_model;
         const int token = token_indices[token_slot];
         output[static_cast<size_t>(token) * d_model + col] += weights[token_slot] * expert_output[idx];
+    }
+
+    /**
+     * @brief Overwrite one destination row from a one-row scratch tensor.
+     *
+     * Decode-equivalent verifier replay writes each semantic row exactly once,
+     * so this direct store avoids atomics and avoids async H2D staging of
+     * `{row, weight}` metadata.
+     */
+    __global__ void write_token_row_kernel(
+        float *__restrict__ destination,
+        const float *__restrict__ row_buffer,
+        int row_index,
+        int row_width)
+    {
+        if (row_index < 0 || row_width <= 0)
+            return;
+        float *dst = destination + static_cast<size_t>(row_index) * row_width;
+        const int n4 = row_width >> 2;
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < n4)
+        {
+            reinterpret_cast<float4 *>(dst)[i] =
+                reinterpret_cast<const float4 *>(row_buffer)[i];
+        }
+        const int tail_start = n4 << 2;
+        for (int col = tail_start + i; col < row_width; col += gridDim.x * blockDim.x)
+            dst[col] = row_buffer[col];
     }
 
     __global__ void shared_expert_gate_kernel(
@@ -997,6 +1053,7 @@ namespace
         int *__restrict__ grouped_token_indices,
         int *__restrict__ original_to_grouped,
         int *__restrict__ original_expert_ids,
+        int *__restrict__ single_expert_ids,
         int *__restrict__ active_expert_ids,
         float *__restrict__ grouped_weights,
         int seq_len,
@@ -1014,66 +1071,100 @@ namespace
         if (blockIdx.x != 0)
             return;
 
+        __shared__ int counts[kDeviceMoEMaxExperts + 1];
+        __shared__ int offsets[kDeviceMoEMaxExperts + 1];
+        __shared__ float partial[kThreads];
+
+        /*
+         * Keep all per-request metadata publication on the capture stream.
+         * The old version serialized this whole setup on thread 0; striding
+         * it across the block mirrors the ROCm path and avoids a small but
+         * measurable verifier tax without changing the grouped order.
+         */
+        for (int expert = threadIdx.x; expert < combined_experts; expert += blockDim.x)
+        {
+            counts[expert] = 0;
+            offsets[expert] = 0;
+            expert_counts[expert] = 0;
+            expert_offsets[expert] = 0;
+        }
+        for (int slot = threadIdx.x; slot < combined_slots; slot += blockDim.x)
+        {
+            original_to_grouped[slot] = -1;
+            original_expert_ids[slot] = -1;
+        }
+        for (int slot = threadIdx.x; slot < max_active_experts; slot += blockDim.x)
+            active_expert_ids[slot] = -1;
+        if (threadIdx.x == 0)
+            single_expert_ids[0] = shared_expert;
+        __syncthreads();
+
+        if (threadIdx.x < routed_slots)
+        {
+            const int expert = static_cast<int>(routing_indices[threadIdx.x]);
+            if (expert >= 0 && expert < num_routed_experts)
+                atomicAdd(&counts[expert], 1);
+        }
+        if (threadIdx.x == 0)
+            counts[shared_expert] = seq_len;
+        __syncthreads();
+
         if (threadIdx.x == 0)
         {
-            for (int expert = 0; expert < combined_experts; ++expert)
-            {
-                expert_counts[expert] = 0;
-                expert_offsets[expert] = 0;
-            }
-            for (int slot = 0; slot < combined_slots; ++slot)
-            {
-                original_to_grouped[slot] = -1;
-                original_expert_ids[slot] = -1;
-            }
-            for (int slot = 0; slot < max_active_experts; ++slot)
-                active_expert_ids[slot] = -1;
-
-            for (int slot = 0; slot < routed_slots; ++slot)
-            {
-                const int expert = static_cast<int>(routing_indices[slot]);
-                if (expert >= 0 && expert < num_routed_experts)
-                    ++expert_counts[expert];
-            }
-            expert_counts[shared_expert] = seq_len;
-
             int running = 0;
             int active_count = 0;
             for (int expert = 0; expert < combined_experts; ++expert)
             {
-                expert_offsets[expert] = running;
-                const int count = expert_counts[expert];
-                if (count > 0 && active_count < max_active_experts)
+                offsets[expert] = running;
+                const int count = counts[expert];
+                /*
+                 * The appended shared expert can have a different quantized
+                 * codebook from the routed experts.  Keep it out of the normal
+                 * active-routed list so the routed codebook launches never
+                 * decode the shared descriptors with the wrong format.  The
+                 * caller launches the shared expert through single_expert_ids.
+                 */
+                if (expert != shared_expert &&
+                    count > 0 &&
+                    active_count < max_active_experts)
+                {
                     active_expert_ids[active_count++] = expert;
+                }
                 running += count;
             }
+        }
+        __syncthreads();
 
-            for (int slot = 0; slot < routed_slots; ++slot)
+        for (int expert = threadIdx.x; expert < combined_experts; expert += blockDim.x)
+        {
+            expert_counts[expert] = counts[expert];
+            expert_offsets[expert] = offsets[expert];
+        }
+
+        if (threadIdx.x < routed_slots)
+        {
+            const int expert = static_cast<int>(routing_indices[threadIdx.x]);
+            if (expert >= 0 && expert < num_routed_experts)
             {
-                const int expert = static_cast<int>(routing_indices[slot]);
-                if (expert < 0 || expert >= num_routed_experts)
-                    continue;
-
                 int local = 0;
-                for (int prev = 0; prev < slot; ++prev)
+                for (int prev = 0; prev < threadIdx.x; ++prev)
                 {
                     if (static_cast<int>(routing_indices[prev]) == expert)
                         ++local;
                 }
 
-                const int row = slot / routed_top_k;
-                const int route = slot - row * routed_top_k;
-                const int grouped = expert_offsets[expert] + local;
+                const int row = threadIdx.x / routed_top_k;
+                const int route = threadIdx.x - row * routed_top_k;
+                const int grouped = offsets[expert] + local;
                 const int original_slot = row * combined_top_k + route;
                 grouped_token_indices[grouped] = row;
-                grouped_weights[grouped] = routing_weights[slot];
+                grouped_weights[grouped] = routing_weights[threadIdx.x];
                 original_to_grouped[original_slot] = grouped;
                 original_expert_ids[original_slot] = expert;
             }
         }
         __syncthreads();
 
-        __shared__ float partial[kThreads];
         for (int row = 0; row < seq_len; ++row)
         {
             float dot = 0.0f;
@@ -1092,7 +1183,7 @@ namespace
 
             if (threadIdx.x == 0)
             {
-                const int grouped = routed_slots + row;
+                const int grouped = offsets[shared_expert] + row;
                 const int original_slot = row * combined_top_k + routed_top_k;
                 grouped_token_indices[grouped] = row;
                 grouped_weights[grouped] = 1.0f / (1.0f + expf(-partial[0]));
@@ -2421,10 +2512,11 @@ namespace
             break;
         }
 
-        if (max_tokens_per_expert <= 2)
-            return 2;
+        // Tiny MTP verifier groups (M=2..4) are fastest with the compact
+        // two-row template on CUDA. Wider M tiles add per-block work without
+        // improving occupancy for these active expert groups.
         if (max_tokens_per_expert <= 4)
-            return 4;
+            return 2;
         if (max_tokens_per_expert <= 8)
             return 8;
         return 16;
@@ -2562,6 +2654,18 @@ extern "C"
         return finishLaunch("cudaMoE_gather_tokens");
     }
 
+    bool cudaMoE_copy_token_row(const float *source, float *row_buffer,
+                                int row_index, int row_width, int device_idx, void *stream)
+    {
+        if (!source || !row_buffer || row_index < 0 || row_width <= 0 || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        const int vector_columns = (row_width + 3) >> 2;
+        copy_token_row_kernel<<<blocksFor(vector_columns), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            source, row_buffer, row_index, row_width);
+        return finishLaunch("cudaMoE_copy_token_row");
+    }
+
     bool cudaMoE_scatter_add(float *output, const float *expert_output, const int *token_indices,
                              const float *weights, int num_tokens, int d_model, int device_idx, void *stream)
     {
@@ -2584,6 +2688,18 @@ extern "C"
                 output, expert_output, token_indices, weights, total_elements, d_model);
         }
         return finishLaunch("cudaMoE_scatter_add");
+    }
+
+    bool cudaMoE_write_token_row(float *destination, const float *row_buffer,
+                                 int row_index, int row_width, int device_idx, void *stream)
+    {
+        if (!destination || !row_buffer || row_index < 0 || row_width <= 0 || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        const int vector_columns = (row_width + 3) >> 2;
+        write_token_row_kernel<<<blocksFor(vector_columns), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            destination, row_buffer, row_index, row_width);
+        return finishLaunch("cudaMoE_write_token_row");
     }
 
     bool cudaMoE_shared_expert_gate(const float *input, const float *gate_inp, float *shared_output,
@@ -2730,6 +2846,7 @@ extern "C"
         int *grouped_token_indices,
         int *original_to_grouped,
         int *original_expert_ids,
+        int *single_expert_ids,
         int *active_expert_ids,
         float *grouped_weights,
         int seq_len,
@@ -2743,8 +2860,10 @@ extern "C"
         if (!stream || !routing_indices || !routing_weights || !hidden ||
             !shared_gate_inp || !expert_counts || !expert_offsets ||
             !grouped_token_indices || !original_to_grouped ||
-            !original_expert_ids || !active_expert_ids || !grouped_weights ||
+            !original_expert_ids || !single_expert_ids ||
+            !active_expert_ids || !grouped_weights ||
             seq_len <= 0 || d_model <= 0 || num_routed_experts <= 0 ||
+            num_routed_experts > kDeviceMoEMaxExperts ||
             routed_top_k <= 0 || routed_top_k >= kMaxTopK ||
             max_active_experts <= 0)
         {
@@ -2754,7 +2873,8 @@ extern "C"
         group_tokens_with_shared_gate_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             routing_indices, routing_weights, hidden, shared_gate_inp,
             expert_counts, expert_offsets, grouped_token_indices,
-            original_to_grouped, original_expert_ids, active_expert_ids, grouped_weights,
+            original_to_grouped, original_expert_ids, single_expert_ids,
+            active_expert_ids, grouped_weights,
             seq_len, d_model, num_routed_experts, routed_top_k, max_active_experts);
         return finishLaunch("cudaMoE_group_tokens_small_float_with_shared_gate");
     }
@@ -3191,16 +3311,8 @@ extern "C"
         {
             const int requestedTileM =
                 llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
-            const bool shared_expert_group =
-                num_experts == 1 && top_k == 1 && active_expert_slots <= 1;
-            // The shared-expert verifier path has one active expert slot; on
-            // CUDA the compact TM=2 template is measurably faster for M=3/4
-            // than the generic routed-MoE selector. Explicit env overrides
-            // still win for experiments.
             const int kTileM =
-                requestedTileM == 0 && shared_expert_group
-                    ? 2
-                    : select_grouped_prefill_tile_m(requestedTileM, max_tokens_per_expert);
+                select_grouped_prefill_tile_m(requestedTileM, max_tokens_per_expert);
             const bool tiny_active_verifier =
                 active_expert_slots > 0 && max_tokens_per_expert <= 4;
             const int kTileN = tiny_active_verifier ? 64 : 128;
@@ -3215,56 +3327,81 @@ extern "C"
 
 #define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                   \
     do {                                                                                           \
-        const bool use_single =                                                                     \
-            d_single_expert_ids && static_cast<uint8_t>(CB) == single_gateup_codebook_id;          \
-        const int *active_ids_for_cb = use_single ? d_single_expert_ids : d_active_expert_ids;     \
-        const int active_slots_for_cb = use_single ? 1 : active_expert_slots;                      \
-        const int expert_grid_for_cb = use_single ? 1 : expert_grid;                               \
-        dim3 cb_grid(grid.x, grid.y, expert_grid_for_cb);                                           \
+        dim3 cb_grid(grid.x, grid.y, expert_grid);                                                  \
         if (kTileN == 64)                                                                            \
             grouped_native_vnni_gate_up_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
                 d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,             \
-                d_group_counts, d_group_offsets, active_ids_for_cb, active_slots_for_cb,            \
+                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
                 d_scratch_gate, d_scratch_up, intermediate, d_model);                               \
         else                                                                                         \
             grouped_native_vnni_gate_up_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
                 d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,             \
-                d_group_counts, d_group_offsets, active_ids_for_cb, active_slots_for_cb,            \
+                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
                 d_scratch_gate, d_scratch_up, intermediate, d_model);                               \
     } while (0)
 #define LAUNCH_GROUPED_GATEUP_KPART_PREFILL_TM(CB, TM)                                             \
     do {                                                                                           \
-        const bool use_single =                                                                     \
-            d_single_expert_ids && static_cast<uint8_t>(CB) == single_gateup_codebook_id;          \
-        const int *active_ids_for_cb = use_single ? d_single_expert_ids : d_active_expert_ids;     \
-        const int active_slots_for_cb = use_single ? 1 : active_expert_slots;                      \
-        const int expert_grid_for_cb = use_single ? 1 : expert_grid;                               \
-        dim3 cb_grid(grid.x, grid.y, expert_grid_for_cb * gateup_k_partitions);                    \
+        dim3 cb_grid(grid.x, grid.y, expert_grid * gateup_k_partitions);                           \
         grouped_native_vnni_gate_up_prefill_kpart_kernel<CB, TM><<<cb_grid, block, 0, cuda_stream>>>( \
             d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                 \
-            d_group_counts, d_group_offsets, active_ids_for_cb, active_slots_for_cb,                \
+            d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,              \
             d_gate_partials, d_up_partials, intermediate, d_model, gateup_k_partitions);            \
     } while (0)
 #define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                            \
     do {                                                                                           \
-        const bool use_single =                                                                     \
-            d_single_expert_ids && static_cast<uint8_t>(CB) == single_gateup_codebook_id;          \
-        const int *active_ids_for_cb = use_single ? d_single_expert_ids : d_active_expert_ids;     \
-        const int active_slots_for_cb = use_single ? 1 : active_expert_slots;                      \
-        const int expert_grid_for_cb = use_single ? 1 : expert_grid;                               \
-        dim3 cb_grid(grid.x, grid.y, expert_grid_for_cb);                                           \
+        dim3 cb_grid(grid.x, grid.y, expert_grid);                                                  \
         if (kTileN == 64)                                                                            \
             grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
                 d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,             \
-                d_group_counts, d_group_offsets, active_ids_for_cb, active_slots_for_cb,            \
+                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales,                                    \
                 intermediate, d_model);                                                             \
         else                                                                                         \
             grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
                 d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,             \
-                d_group_counts, d_group_offsets, active_ids_for_cb, active_slots_for_cb,            \
+                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales,                                    \
                 intermediate, d_model);                                                             \
+    } while (0)
+#define LAUNCH_GROUPED_GATEUP_SINGLE_PREFILL_TM(CB, TM)                                            \
+    do {                                                                                           \
+        dim3 cb_grid(grid.x, grid.y, 1);                                                            \
+        if (use_gateup_kpart) {                                                                     \
+            dim3 kpart_grid(grid.x, grid.y, gateup_k_partitions);                                   \
+            grouped_native_vnni_gate_up_prefill_kpart_kernel<CB, TM><<<kpart_grid, block, 0, cuda_stream>>> \
+                (d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,            \
+                 d_group_counts, d_group_offsets, d_single_expert_ids, 1,                           \
+                 d_gate_partials, d_up_partials, intermediate, d_model, gateup_k_partitions);       \
+        } else if (fuse_swiglu) {                                                                   \
+            if (kTileN == 64)                                                                        \
+                grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
+                    d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,         \
+                    d_group_counts, d_group_offsets, d_single_expert_ids, 1,                        \
+                    d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model);         \
+            else                                                                                     \
+                grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
+                    d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,         \
+                    d_group_counts, d_group_offsets, d_single_expert_ids, 1,                        \
+                    d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model);         \
+        } else {                                                                                    \
+            if (kTileN == 64)                                                                        \
+                grouped_native_vnni_gate_up_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
+                    d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,         \
+                    d_group_counts, d_group_offsets, d_single_expert_ids, 1,                        \
+                    d_scratch_gate, d_scratch_up, intermediate, d_model);                           \
+            else                                                                                     \
+                grouped_native_vnni_gate_up_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
+                    d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,         \
+                    d_group_counts, d_group_offsets, d_single_expert_ids, 1,                        \
+                    d_scratch_gate, d_scratch_up, intermediate, d_model);                           \
+        }                                                                                           \
+    } while (0)
+#define LAUNCH_GROUPED_GATEUP_SINGLE_PREFILL(CB)                                                    \
+    do {                                                                                            \
+        if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_SINGLE_PREFILL_TM(CB, 16);                     \
+        else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_SINGLE_PREFILL_TM(CB, 8);                      \
+        else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_SINGLE_PREFILL_TM(CB, 4);                      \
+        else                   LAUNCH_GROUPED_GATEUP_SINGLE_PREFILL_TM(CB, 2);                      \
     } while (0)
 #define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                          \
     do {                                                                                           \
@@ -3313,6 +3450,35 @@ extern "C"
             LAUNCH_GROUPED_GATEUP_IF_PRESENT(16);
             LAUNCH_GROUPED_GATEUP_IF_PRESENT(17);
             LAUNCH_GROUPED_GATEUP_IF_PRESENT(19);
+            if (d_single_expert_ids)
+            {
+#define LAUNCH_GROUPED_GATEUP_SINGLE_IF(CB)                                                        \
+    do {                                                                                            \
+        if (static_cast<uint8_t>(CB) == single_gateup_codebook_id) {                                \
+            LAUNCH_GROUPED_GATEUP_SINGLE_PREFILL(CB);                                               \
+            if (!finishLaunch("cudaMoE_grouped_gate_up_prefill_single"))                           \
+                return false;                                                                       \
+            launched_gateup = true;                                                                 \
+        }                                                                                           \
+    } while (0)
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(0);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(4);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(5);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(6);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(7);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(8);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(9);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(10);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(11);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(12);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(13);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(14);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(15);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(16);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(17);
+                LAUNCH_GROUPED_GATEUP_SINGLE_IF(19);
+#undef LAUNCH_GROUPED_GATEUP_SINGLE_IF
+            }
             if (!launched_gateup)
             {
                 std::fprintf(stderr,
@@ -3337,8 +3503,11 @@ extern "C"
             }
 
 #undef LAUNCH_GROUPED_GATEUP_IF_PRESENT
+#undef LAUNCH_GROUPED_GATEUP_SINGLE_PREFILL
+#undef LAUNCH_GROUPED_GATEUP_SINGLE_PREFILL_TM
 #undef LAUNCH_GROUPED_GATEUP_PREFILL
 #undef LAUNCH_GROUPED_GATEUP_KPART_PREFILL_TM
+#undef LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM
 #undef LAUNCH_GROUPED_GATEUP_PREFILL_TM
         }
 
@@ -3359,12 +3528,8 @@ extern "C"
         {
             const int requestedTileM =
                 llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
-            const bool shared_expert_group =
-                num_experts == 1 && top_k == 1 && active_expert_slots <= 1;
             const int kTileM =
-                requestedTileM == 0 && shared_expert_group
-                    ? 2
-                    : select_grouped_prefill_tile_m(requestedTileM, max_tokens_per_expert);
+                select_grouped_prefill_tile_m(requestedTileM, max_tokens_per_expert);
             const bool tiny_active_verifier =
                 active_expert_slots > 0 && max_tokens_per_expert <= 4;
             const int kTileN = tiny_active_verifier ? 64 : 128;
@@ -3375,21 +3540,30 @@ extern "C"
 
 #define LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, TM)                                                     \
     do {                                                                                           \
-        const bool use_single =                                                                     \
-            d_single_expert_ids && static_cast<uint8_t>(CB) == single_down_codebook_id;            \
-        const int *active_ids_for_cb = use_single ? d_single_expert_ids : d_active_expert_ids;     \
-        const int active_slots_for_cb = use_single ? 1 : active_expert_slots;                      \
-        const int expert_grid_for_cb = use_single ? 1 : expert_grid;                               \
-        dim3 cb_grid(grid.x, grid.y, expert_grid_for_cb);                                           \
+        dim3 cb_grid(grid.x, grid.y, expert_grid);                                                  \
         if (kTileN == 64)                                                                            \
             grouped_native_vnni_down_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                  \
-                d_group_counts, d_group_offsets, active_ids_for_cb, active_slots_for_cb,            \
+                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
                 d_scratch_down_out, d_model, intermediate);                                         \
         else                                                                                         \
             grouped_native_vnni_down_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                  \
-                d_group_counts, d_group_offsets, active_ids_for_cb, active_slots_for_cb,            \
+                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
+                d_scratch_down_out, d_model, intermediate);                                         \
+    } while (0)
+#define LAUNCH_GROUPED_DOWN_SINGLE_PREFILL_TM(CB, TM)                                              \
+    do {                                                                                           \
+        dim3 cb_grid(grid.x, grid.y, 1);                                                            \
+        if (kTileN == 64)                                                                            \
+            grouped_native_vnni_down_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
+                d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                  \
+                d_group_counts, d_group_offsets, d_single_expert_ids, 1,                            \
+                d_scratch_down_out, d_model, intermediate);                                         \
+        else                                                                                         \
+            grouped_native_vnni_down_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
+                d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                  \
+                d_group_counts, d_group_offsets, d_single_expert_ids, 1,                            \
                 d_scratch_down_out, d_model, intermediate);                                         \
     } while (0)
 #define LAUNCH_GROUPED_DOWN_PREFILL(CB)                                                            \
@@ -3427,6 +3601,38 @@ extern "C"
             LAUNCH_GROUPED_DOWN_IF_PRESENT(16);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(17);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(19);
+            if (d_single_expert_ids)
+            {
+#define LAUNCH_GROUPED_DOWN_SINGLE_IF(CB)                                                          \
+    do {                                                                                            \
+        if (static_cast<uint8_t>(CB) == single_down_codebook_id) {                                  \
+            if (kTileM == 16)      LAUNCH_GROUPED_DOWN_SINGLE_PREFILL_TM(CB, 16);                   \
+            else if (kTileM == 8)  LAUNCH_GROUPED_DOWN_SINGLE_PREFILL_TM(CB, 8);                    \
+            else if (kTileM == 4)  LAUNCH_GROUPED_DOWN_SINGLE_PREFILL_TM(CB, 4);                    \
+            else                   LAUNCH_GROUPED_DOWN_SINGLE_PREFILL_TM(CB, 2);                    \
+            if (!finishLaunch("cudaMoE_grouped_down_prefill_single"))                              \
+                return false;                                                                       \
+            launched_down = true;                                                                   \
+        }                                                                                           \
+    } while (0)
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(0);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(4);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(5);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(6);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(7);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(8);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(9);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(10);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(11);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(12);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(13);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(14);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(15);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(16);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(17);
+                LAUNCH_GROUPED_DOWN_SINGLE_IF(19);
+#undef LAUNCH_GROUPED_DOWN_SINGLE_IF
+            }
             if (!launched_down)
             {
                 std::fprintf(stderr,
@@ -3438,6 +3644,7 @@ extern "C"
 
 #undef LAUNCH_GROUPED_DOWN_IF_PRESENT
 #undef LAUNCH_GROUPED_DOWN_PREFILL
+#undef LAUNCH_GROUPED_DOWN_SINGLE_PREFILL_TM
 #undef LAUNCH_GROUPED_DOWN_PREFILL_TM
         }
 

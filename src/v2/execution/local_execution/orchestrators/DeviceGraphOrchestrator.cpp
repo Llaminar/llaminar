@@ -218,7 +218,7 @@ namespace llaminar2
             const size_t free_bytes = backend->deviceMemoryFree(ordinal);
             const size_t total_bytes = backend->deviceMemoryTotal(ordinal);
             const size_t used_bytes = total_bytes > free_bytes ? total_bytes - free_bytes : 0;
-            LOG_INFO("[VRAM_TRACE] " << label
+            LOG_TRACE("[VRAM_TRACE] " << label
                                      << " device=" << device.toString()
                                      << " used_mib=" << (used_bytes / (1024 * 1024))
                                      << " free_mib=" << (free_bytes / (1024 * 1024))
@@ -296,6 +296,64 @@ namespace llaminar2
                           << " failed on " << device.toString());
             }
             return ok;
+        }
+
+        /**
+         * @brief Apply sparse logit penalties to a host-owned FP32 logits row.
+         *
+         * The public runner API says "on device" because the caller is asking
+         * the runner to mutate whichever execution device owns the logits.  For
+         * CPU runners that device is the host, so this is not a fallback: it is
+         * the CPU implementation of the same sparse-penalty contract used by
+         * CUDA/ROCm kernels above.  `token_offset` lets tensor-parallel shards
+         * consume global token ids without touching tokens outside their local
+         * vocabulary slice.
+         */
+        bool applyPenaltiesToTensorRowOnHost(
+            TensorBase *tensor,
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size,
+            int row,
+            int token_offset,
+            const char *operation)
+        {
+            if (penalties.empty())
+                return true;
+            if (!tensor || vocab_size <= 0 || row < 0)
+                return false;
+
+            const auto &shape = tensor->shape();
+            if (shape.empty())
+                return false;
+            const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+            const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+            if (cols == 0 || static_cast<size_t>(row) >= rows ||
+                cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                return false;
+            }
+
+            float *data = tensor->mutable_fp32_data();
+            if (!data)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] "
+                          << (operation ? operation : "applyPenaltiesToTensorRowOnHost")
+                          << " requires a mutable FP32 logits tensor");
+                return false;
+            }
+
+            float *row_ptr = data + static_cast<size_t>(row) * cols;
+            const int local_vocab = static_cast<int>(cols);
+            const int local_begin = std::max(0, token_offset);
+            const int local_end = local_begin + local_vocab;
+            for (const auto &penalty : penalties)
+            {
+                if (penalty.token_id < local_begin || penalty.token_id >= local_end)
+                    continue;
+                row_ptr[static_cast<size_t>(penalty.token_id - local_begin)] -=
+                    penalty.penalty;
+            }
+            return true;
         }
 
         bool prefixCacheTraceEnabled()
@@ -405,7 +463,7 @@ namespace llaminar2
             bool ok = true;
             if (debugEnv().vram_trace)
             {
-                LOG_INFO("[VRAM_TRACE] mmap_release.before_sync device=" << device);
+                LOG_TRACE("[VRAM_TRACE] mmap_release.before_sync device=" << device);
             }
             else
             {
@@ -421,7 +479,7 @@ namespace llaminar2
             }
             else if (debugEnv().vram_trace)
             {
-                LOG_INFO("[VRAM_TRACE] mmap_release.after_sync device=" << device);
+                LOG_TRACE("[VRAM_TRACE] mmap_release.after_sync device=" << device);
             }
 
             return ok;
@@ -1870,6 +1928,12 @@ namespace llaminar2
             stochastic_draft_top_k_.assign(
                 static_cast<size_t>(stochastic_draft_row_capacity_),
                 0);
+            stochastic_target_row_formats_.assign(
+                static_cast<size_t>(stochastic_target_row_capacity_),
+                StochasticRowFormat::Empty);
+            stochastic_draft_row_formats_.assign(
+                static_cast<size_t>(stochastic_draft_row_capacity_),
+                StochasticRowFormat::Empty);
             stochastic_target_distribution_streams_.assign(
                 static_cast<size_t>(stochastic_target_row_capacity_),
                 nullptr);
@@ -2499,6 +2563,18 @@ namespace llaminar2
         return state_.logits.get();
     }
 
+    TensorBase *DeviceGraphOrchestrator::logitsPublicationTensor()
+    {
+        if (compute_all_position_logits_)
+        {
+            if (state_.all_position_logits)
+                return state_.all_position_logits.get();
+            if (state_.all_position_logits_local)
+                return state_.all_position_logits_local.get();
+        }
+        return logitsTensor();
+    }
+
     IForwardExecutionHost::PPCopyInfo
     DeviceGraphOrchestrator::resolvePPCopyInfo(
         const ForwardInput &input) const
@@ -2556,9 +2632,23 @@ namespace llaminar2
         // otherwise fire inside ensureOnHost() when logits->data() is called.
         ctx->synchronize();
 
-        // Clear the mapped sync flag so data()/fp32_data() return the mapped
-        // pointer immediately without any further synchronization.
-        if (state_.logits && state_.logits->isMapped())
+        // Clear the mapped sync flag on the active publication tensor so
+        // data()/fp32_data() return the mapped pointer immediately without any
+        // further synchronization.  For ordinary decode this is state_.logits;
+        // for all-position verifier replay it is state_.all_position_logits.
+        if (TensorBase *publication = logitsPublicationTensor();
+            publication && publication->isMapped())
+        {
+            publication->markMappedSynced();
+        }
+
+        // Some callers read ordinary terminal logits after an all-position
+        // verifier run during diagnostics.  Marking both mapped views synced is
+        // cheap and prevents a stale per-tensor sync flag from causing a later
+        // surprise device synchronization.
+        if (state_.logits &&
+            state_.logits.get() != logitsPublicationTensor() &&
+            state_.logits->isMapped())
         {
             state_.logits->markMappedSynced();
         }
@@ -2775,10 +2865,10 @@ namespace llaminar2
             return;
         }
         if (debugEnv().vram_trace)
-            LOG_INFO("[VRAM_TRACE] mmap_release.before_advise phase=after_first_prefill");
+            LOG_TRACE("[VRAM_TRACE] mmap_release.before_advise phase=after_first_prefill");
         const size_t advised_bytes = weight_manager_->adviseMmapDontneed();
         if (debugEnv().vram_trace)
-            LOG_INFO("[VRAM_TRACE] mmap_release.after_advise phase=after_first_prefill bytes=" << advised_bytes);
+            LOG_TRACE("[VRAM_TRACE] mmap_release.after_advise phase=after_first_prefill bytes=" << advised_bytes);
     }
 
     bool DeviceGraphOrchestrator::executeAttention(
@@ -3938,9 +4028,41 @@ namespace llaminar2
                 first_token,
                 -1,
                 false,
+                false,
                 first_draft_slot,
                 draft_token_count,
                 total_verifier_input_tokens};
+        return mtp_verifier_input_tokens_dev_;
+    }
+
+    const void *DeviceGraphOrchestrator::prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+        const int32_t *verifier_tokens,
+        int total_verifier_input_tokens,
+        int draft_token_count)
+    {
+        if (!state_.device_id.is_gpu() || !mtp_verifier_input_tokens_dev_)
+            return nullptr;
+        if (!verifier_tokens ||
+            total_verifier_input_tokens <= 0 ||
+            total_verifier_input_tokens >
+                static_cast<int>(sampling_math::kSpeculativeBatchMaxRows + 1) ||
+            draft_token_count < 0 ||
+            draft_token_count > static_cast<int>(sampling_math::kSpeculativeBatchMaxRows) ||
+            draft_token_count + 1 != total_verifier_input_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid host MTP verifier device-token row: total="
+                      << total_verifier_input_tokens
+                      << " drafts=" << draft_token_count);
+            return nullptr;
+        }
+
+        PendingMTPVerifierDeviceTokenPlan plan;
+        plan.all_tokens_from_host = true;
+        plan.draft_token_count = draft_token_count;
+        plan.total_verifier_input_tokens = total_verifier_input_tokens;
+        for (int i = 0; i < total_verifier_input_tokens; ++i)
+            plan.host_tokens[static_cast<size_t>(i)] = verifier_tokens[i];
+        pending_mtp_verifier_device_token_plan_ = plan;
         return mtp_verifier_input_tokens_dev_;
     }
 
@@ -3977,6 +4099,14 @@ namespace llaminar2
                       << " first_draft_slot=" << first_draft_slot);
             return nullptr;
         }
+        const auto &first_token_ready =
+            stochastic_target_sample_ready_[static_cast<size_t>(first_target_sample_slot)];
+        if (!first_token_ready.valid)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-first-token plan requires a ready target sample slot="
+                      << first_target_sample_slot);
+            return nullptr;
+        }
 
         /*
          * The sampled target token is still on the sampler stream.  Store a
@@ -3988,6 +4118,7 @@ namespace llaminar2
                 -1,
                 first_target_sample_slot,
                 true,
+                false,
                 first_draft_slot,
                 draft_token_count,
                 total_verifier_input_tokens};
@@ -6116,6 +6247,27 @@ namespace llaminar2
                           << " rows=" << total_rows);
                 return false;
             }
+            if (external_device_condition_tokens &&
+                draft_condition_ready_slot >= 0 &&
+                draft_condition_ready_is_target)
+            {
+                /*
+                 * The deferred first target token has two consumers in the
+                 * vLLM-style greedy lane: the first MTP sidecar and the later
+                 * verifier-token row materializer.  This sidecar stream has
+                 * already waited on the sampler event before staging the token,
+                 * so record a fresh ready event here.  The verifier can then
+                 * wait on the sidecar handoff even if the original sampler
+                 * event was consumed or replaced by intermediate graph work.
+                 */
+                if (!recordStochasticTargetSampleReady(
+                        draft_condition_ready_slot,
+                        sidecar_dynamic_stream))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to preserve deferred target token readiness after MTP sidecar staging");
+                    return false;
+                }
+            }
 
             if (debugEnv().validation.validate_buffers)
             {
@@ -7372,7 +7524,9 @@ namespace llaminar2
             return false;
 
         for (int row = 0; row < request_batch; ++row)
-            clearStochasticDraftSampleReadySlot(first_draft_slot + row * slot_stride);
+            clearStochasticDraftSampleReadySlot(
+                first_draft_slot + row * slot_stride,
+                StochasticSampleReadyClearMode::Force);
 
         auto *out_values_dev =
             static_cast<float *>(stochastic_draft_sample_probs_dev_) +
@@ -7410,7 +7564,10 @@ namespace llaminar2
 
         for (int row = 0; row < request_batch; ++row)
         {
-            if (!recordStochasticDraftSampleReady(first_draft_slot + row * slot_stride, stream))
+            if (!recordStochasticDraftSampleReady(
+                    first_draft_slot + row * slot_stride,
+                    stream,
+                    /*verifier_consumer_pending=*/true))
                 return false;
         }
 
@@ -8142,8 +8299,16 @@ namespace llaminar2
         std::fill(stochastic_draft_distribution_streams_.begin(),
                   stochastic_draft_distribution_streams_.end(),
                   nullptr);
-        clearStochasticTargetSampleReadySlots();
-        clearStochasticDraftSampleReadySlots();
+        /*
+         * Restoring the verifier-base checkpoint happens between sidecar
+         * sampling and verifier replay.  Drop stale sample slots, but preserve
+         * slots that were explicitly marked as verifier-owned so the token-row
+         * materializer can still order itself after their producer streams.
+         */
+        clearStochasticTargetSampleReadySlots(
+            StochasticSampleReadyClearMode::PreserveVerifierConsumer);
+        clearStochasticDraftSampleReadySlots(
+            StochasticSampleReadyClearMode::PreserveVerifierConsumer);
         clearDeviceResidentLogicalSequenceStateMailbox();
 
         PerfStatsCollector::addCounter(
@@ -8302,9 +8467,13 @@ namespace llaminar2
             capability.moe_decode_equivalent =
                 MTPVerifierRowEquivalenceSpec::proven(kPhase97ProvenVerifierRows);
             /*
-             * Qwen3.6 MoE remains on shared decode-equivalent replay.  Phase
-             * 9.7 found the direct all-position candidate numerically wrong on
-             * CUDA, and ROCm follows the same fail-closed contract.
+             * Direct all-position publication is stronger than grouped row
+             * equivalence. The grouped MoE verifier can now produce correct
+             * row-local outcomes on CUDA/ROCm, but publishing accepted KV/GDN,
+             * shifted MTP KV, terminal hidden/logits, and logical positions is
+             * still a separate transaction proof. Keep the direct publication
+             * field empty so callers cannot accidentally skip replay-published
+             * live-state adoption.
              */
             return capability;
         }
@@ -8329,21 +8498,54 @@ namespace llaminar2
         const MTPVerifierRowCapability correctness = mtpVerifierRowCapability();
 
         /*
-         * Phase 9.8 starts by recording the real production status rather than
-         * promoting a fast path prematurely.  The Phase 9.7 proofs make the
-         * shared serial verifier correct for M=1..4, but it is still a
-         * correctness fallback until grouped verifier, resident metadata,
-         * row-indexed LM-head, and host-bridge-free publication are proven.
+         * Phase 10 records increasingly strong contracts separately:
+         * serial decode-equivalent replay, grouped verifier outcomes with
+         * resident device publication, and fully economical grouped hot paths.
+         * This distinction prevents a correctness proof from masquerading as a
+         * fully performant vLLM-style transaction.
          */
         if (correctness.dense_decode_equivalent.enabled)
         {
-            economy.dense = MTPVerifierEconomyLane::serialFallbackCorrect(
-                correctness.dense_decode_equivalent.max_rows);
+            if (state_.device_id.is_gpu())
+            {
+                /*
+                 * Dense GPU runners have strict M=1..4 grouped verifier-row
+                 * equivalence and the resident publication mailbox needed by
+                 * the vLLM-style stochastic grouped-outcome path.  This is
+                 * still an economy-pending middle contract: direct
+                 * all-position publication stays disabled until the recurrent
+                 * continuation proof is green, and benchmarks must prove the
+                 * whole transaction before Phase 10 calls the lane economical.
+                 */
+                economy.dense =
+                    MTPVerifierEconomyLane::groupedOutcomeDevicePublicationEconomicsPending(
+                        correctness.dense_decode_equivalent.max_rows);
+            }
+            else
+            {
+                economy.dense = MTPVerifierEconomyLane::serialFallbackCorrect(
+                    correctness.dense_decode_equivalent.max_rows);
+            }
         }
         if (correctness.moe_decode_equivalent.enabled)
         {
-            economy.moe = MTPVerifierEconomyLane::serialFallbackCorrect(
-                correctness.moe_decode_equivalent.max_rows);
+            if (correctness.moe_direct_all_position.enabled &&
+                correctness.device_resident_direct_publication)
+            {
+                economy.moe = MTPVerifierEconomyLane::groupedPromoted(
+                    correctness.moe_direct_all_position.max_rows);
+            }
+            else if (state_.device_id.is_gpu())
+            {
+                economy.moe =
+                    MTPVerifierEconomyLane::groupedOutcomeDevicePublicationEconomicsPending(
+                        correctness.moe_decode_equivalent.max_rows);
+            }
+            else
+            {
+                economy.moe = MTPVerifierEconomyLane::serialFallbackCorrect(
+                    correctness.moe_decode_equivalent.max_rows);
+            }
         }
         return economy;
     }
@@ -8658,10 +8860,17 @@ namespace llaminar2
          * present: the cache can update device-visible head/count mirrors from
          * device metadata, and DGO can expose the resulting logical state through
          * a resident mailbox until the compatibility host bridge adopts matching
-         * host mirrors.  Callers still roll back from the live prefix checkpoint
-         * if any later part of the transaction fails.
+         * host mirrors.
+         *
+         * Do not require supportsMTPSpecStatePublication() here.  That older
+         * capability answers a stronger policy question: whether the runner may
+         * select the all-position verifier path directly.  Phase 10's grouped
+         * outcome path has a separate row-equivalence proof and should be able
+         * to consume the same resident publisher without accidentally promoting
+         * the older all-position policy.
          */
-        return supportsMTPSpecStatePublication() &&
+        return graph_builder_ &&
+               graph_builder_->config().mtp.enabled &&
                supportsDeviceResidentLogicalSequenceStatePublication();
     }
 
@@ -9308,16 +9517,31 @@ namespace llaminar2
                     computeMTPShiftedKVTargetCachedTokens(
                         step,
                         static_cast<int>(depth));
-                if (target_shifted < base_shifted)
-                {
-                    return fail("device-resident host-state adoption computed a negative shifted MTP KV delta");
-                }
+                const int current_shifted =
+                    cache->get_cached_tokens(
+                        cache->first_layer_index(),
+                        step.request_index);
+                if (current_shifted < 0)
+                    return fail("device-resident host-state adoption read an invalid shifted MTP KV host mirror");
 
                 const size_t idx =
                     static_cast<size_t>(step.request_index);
                 shifted_target_cached_tokens[idx] = target_shifted;
                 shifted_accepted_state_counts[idx] =
-                    target_shifted - base_shifted;
+                    std::max(0, target_shifted - current_shifted);
+                if (target_shifted < current_shifted)
+                {
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "device_resident_shifted_mtp_kv_host_truncations",
+                        1.0,
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"depth", std::to_string(depth)},
+                         {"current", std::to_string(current_shifted)},
+                         {"target", std::to_string(target_shifted)},
+                         {"base_shifted", std::to_string(base_shifted)}});
+                }
             }
 
             IKVCache::HostSequenceStatePublicationRequest shifted_host_request;
@@ -9605,15 +9829,32 @@ namespace llaminar2
                         base > shift ? base - shift : 0;
                     const int target_shifted =
                         target > shift ? target - shift : 0;
-                    if (target_shifted < base_shifted)
+                    const int current_shifted =
+                        cache->get_cached_tokens(
+                            cache->first_layer_index(),
+                            i);
+                    if (current_shifted < 0)
                     {
                         return fail(
-                            "device-resident host-state adoption from metadata computed a negative shifted MTP KV delta");
+                            "device-resident host-state adoption from metadata read an invalid shifted MTP KV host mirror");
                     }
                     shifted_target_cached_tokens[static_cast<size_t>(i)] =
                         target_shifted;
                     shifted_accepted_state_counts[static_cast<size_t>(i)] =
-                        target_shifted - base_shifted;
+                        std::max(0, target_shifted - current_shifted);
+                    if (target_shifted < current_shifted)
+                    {
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "device_resident_shifted_mtp_kv_host_truncations",
+                            1.0,
+                            "decode",
+                            state_.device_id.toString(),
+                            {{"depth", std::to_string(depth)},
+                             {"current", std::to_string(current_shifted)},
+                             {"target", std::to_string(target_shifted)},
+                             {"base_shifted", std::to_string(base_shifted)}});
+                    }
                 }
 
                 IKVCache::HostSequenceStatePublicationRequest shifted_host_request;
@@ -11199,6 +11440,7 @@ namespace llaminar2
 
         mtp_spec_decode_metadata_binding_.setShape(plan.shape);
         pending_mtp_spec_verifier_input_plan_ = plan;
+        pending_mtp_verifier_device_token_plan_.reset();
         mtp_publication_base_cache_snapshot_ready_ = false;
         mtp_publication_base_cache_snapshot_request_count_ = 0;
         materialized_mtp_verifier_device_token_row_ = {};
@@ -11214,8 +11456,10 @@ namespace llaminar2
          * forward, but direct publication still needs the pre-verifier
          * BASE_CACHED_TOKENS snapshot.  The next setMTPSpecVerifierInputPlan()
          * invalidates this marker before staging another verifier graph.
+         * Keep materialized_mtp_verifier_device_token_row_ alive as well: the
+         * greedy compact outcome reducer runs after this RAII cleanup and
+         * consumes the device token row that the verifier graph just used.
          */
-        materialized_mtp_verifier_device_token_row_ = {};
         if (graph_builder_)
             graph_builder_->setRowIndexedAllPositionLogitRows({});
     }
@@ -11236,9 +11480,15 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-token upload requires an explicit stream");
             return false;
         }
-        if (!mtp_verifier_input_tokens_dev_ || !stochastic_draft_sample_tokens_dev_)
+        if (!mtp_verifier_input_tokens_dev_)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-token buffers are not allocated");
+            return false;
+        }
+        const auto &plan = *pending_mtp_verifier_device_token_plan_;
+        if (!plan.all_tokens_from_host && !stochastic_draft_sample_tokens_dev_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-token plan requires STOCHASTIC_DRAFT_SAMPLE_TOKENS");
             return false;
         }
         if (pending_mtp_verifier_device_token_plan_->first_token_from_device &&
@@ -11258,9 +11508,40 @@ namespace llaminar2
             return false;
         }
 
-        const auto &plan = *pending_mtp_verifier_device_token_plan_;
         auto *verifier_tokens =
             static_cast<int32_t *>(mtp_verifier_input_tokens_dev_);
+        if (plan.all_tokens_from_host)
+        {
+            if (!backend->hostToDeviceOnStream(
+                    verifier_tokens,
+                    plan.host_tokens.data(),
+                    sizeof(int32_t) *
+                        static_cast<size_t>(plan.total_verifier_input_tokens),
+                    token_device.gpu_ordinal(),
+                    execution_stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload host-known MTP verifier token row");
+                return false;
+            }
+            materialized_mtp_verifier_device_token_row_.valid = true;
+            materialized_mtp_verifier_device_token_row_.first_token_from_device = false;
+            materialized_mtp_verifier_device_token_row_.first_target_sample_slot = -1;
+            materialized_mtp_verifier_device_token_row_.total_verifier_input_tokens =
+                plan.total_verifier_input_tokens;
+            materialized_mtp_verifier_device_token_row_.draft_token_count =
+                plan.draft_token_count;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "verifier_device_token_input_prepares",
+                1.0,
+                "decode",
+                token_device.toString(),
+                {{"total_tokens", std::to_string(plan.total_verifier_input_tokens)},
+                 {"draft_tokens", std::to_string(plan.draft_token_count)},
+                 {"source", "host_fixture"}});
+            pending_mtp_verifier_device_token_plan_.reset();
+            return true;
+        }
         const auto *draft_tokens =
             static_cast<const int32_t *>(stochastic_draft_sample_tokens_dev_) +
             plan.first_draft_slot;
@@ -11336,14 +11617,21 @@ namespace llaminar2
             {{"total_tokens", std::to_string(plan.total_verifier_input_tokens)},
              {"draft_tokens", std::to_string(plan.draft_token_count)}});
         materialized_mtp_verifier_device_token_row_.valid = true;
+        materialized_mtp_verifier_device_token_row_.first_token_from_device =
+            plan.first_token_from_device;
+        materialized_mtp_verifier_device_token_row_.first_target_sample_slot =
+            plan.first_target_sample_slot;
         materialized_mtp_verifier_device_token_row_.total_verifier_input_tokens =
             plan.total_verifier_input_tokens;
         materialized_mtp_verifier_device_token_row_.draft_token_count =
             plan.draft_token_count;
+        pending_mtp_verifier_device_token_plan_.reset();
         return true;
     }
 
-    void DeviceGraphOrchestrator::clearStochasticDraftSampleReadySlot(int slot)
+    void DeviceGraphOrchestrator::clearStochasticDraftSampleReadySlot(
+        int slot,
+        StochasticSampleReadyClearMode mode)
     {
         if (slot < 0 ||
             slot >= static_cast<int>(stochastic_draft_sample_ready_.size()))
@@ -11352,21 +11640,30 @@ namespace llaminar2
         }
 
         auto &ready = stochastic_draft_sample_ready_[static_cast<size_t>(slot)];
+        if (mode == StochasticSampleReadyClearMode::PreserveVerifierConsumer &&
+            ready.verifier_consumer_pending)
+        {
+            return;
+        }
         ready.valid = false;
         ready.producer_stream = nullptr;
+        ready.verifier_consumer_pending = false;
     }
 
-    void DeviceGraphOrchestrator::clearStochasticDraftSampleReadySlots()
+    void DeviceGraphOrchestrator::clearStochasticDraftSampleReadySlots(
+        StochasticSampleReadyClearMode mode)
     {
         for (int slot = 0;
              slot < static_cast<int>(stochastic_draft_sample_ready_.size());
              ++slot)
         {
-            clearStochasticDraftSampleReadySlot(slot);
+            clearStochasticDraftSampleReadySlot(slot, mode);
         }
     }
 
-    void DeviceGraphOrchestrator::clearStochasticTargetSampleReadySlot(int slot)
+    void DeviceGraphOrchestrator::clearStochasticTargetSampleReadySlot(
+        int slot,
+        StochasticSampleReadyClearMode mode)
     {
         if (slot < 0 ||
             slot >= static_cast<int>(stochastic_target_sample_ready_.size()))
@@ -11375,23 +11672,31 @@ namespace llaminar2
         }
 
         auto &ready = stochastic_target_sample_ready_[static_cast<size_t>(slot)];
+        if (mode == StochasticSampleReadyClearMode::PreserveVerifierConsumer &&
+            ready.verifier_consumer_pending)
+        {
+            return;
+        }
         ready.valid = false;
         ready.producer_stream = nullptr;
+        ready.verifier_consumer_pending = false;
     }
 
-    void DeviceGraphOrchestrator::clearStochasticTargetSampleReadySlots()
+    void DeviceGraphOrchestrator::clearStochasticTargetSampleReadySlots(
+        StochasticSampleReadyClearMode mode)
     {
         for (int slot = 0;
              slot < static_cast<int>(stochastic_target_sample_ready_.size());
              ++slot)
         {
-            clearStochasticTargetSampleReadySlot(slot);
+            clearStochasticTargetSampleReadySlot(slot, mode);
         }
     }
 
     bool DeviceGraphOrchestrator::recordStochasticDraftSampleReady(
         int slot,
-        void *producer_stream)
+        void *producer_stream,
+        bool verifier_consumer_pending)
     {
         if (!state_.device_id.is_gpu())
             return true;
@@ -11443,6 +11748,8 @@ namespace llaminar2
 
         ready.valid = true;
         ready.producer_stream = producer_stream;
+        ready.verifier_consumer_pending =
+            ready.verifier_consumer_pending || verifier_consumer_pending;
         PerfStatsCollector::addCounter(
             "mtp",
             "stochastic_draft_sample_ready_events",
@@ -11455,7 +11762,8 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::recordStochasticTargetSampleReady(
         int slot,
-        void *producer_stream)
+        void *producer_stream,
+        bool verifier_consumer_pending)
     {
         if (!state_.device_id.is_gpu())
             return true;
@@ -11507,6 +11815,8 @@ namespace llaminar2
 
         ready.valid = true;
         ready.producer_stream = producer_stream;
+        ready.verifier_consumer_pending =
+            ready.verifier_consumer_pending || verifier_consumer_pending;
         PerfStatsCollector::addCounter(
             "mtp",
             "stochastic_target_sample_ready_events",
@@ -12920,11 +13230,52 @@ namespace llaminar2
 
     const float *DeviceGraphOrchestrator::getAllPositionLogits() const
     {
-        if (!state_.all_position_logits)
+        TensorBase *tensor = state_.all_position_logits.get();
+        if (!tensor)
         {
             return nullptr;
         }
-        return state_.all_position_logits->fp32_data();
+
+        /*
+         * This accessor is a host publication boundary for tests, diagnostics,
+         * and non-device samplers.  If segmented replay deferred verifier sync,
+         * consume that producer stream here and let TransferEngine publish the
+         * exact all-position tensor the graph wrote.  Falling through to
+         * fp32_data() without an explicit stream can use backend default-stream
+         * transfer paths and, worse, can hide stale host rows when the ordinary
+         * logits tensor was synchronized instead of ALL_POSITION_LOGITS.
+         */
+        void *stream = nullptr;
+        if (state_.device_id.is_gpu() && tensor->deviceValid())
+        {
+            auto device = tensor->current_device().value_or(state_.device_id);
+            /*
+             * All-position verifier logits are produced by the graph on device.
+             * Treat device ownership as authoritative at this explicit host
+             * publication point, even if a reused tensor's host buffer still has
+             * a valid flag from an earlier read.  This prevents stale host rows
+             * from masquerading as the current verifier output.
+             */
+            tensor->transitionTo(
+                TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                device);
+
+            auto *self = const_cast<DeviceGraphOrchestrator *>(this);
+            stream = self->consumePendingLogitsStream(
+                PendingLogitsStreamRole::AllPositionVerifier,
+                "getAllPositionLogits");
+            if (!stream)
+                stream = explicitGPUStreamForOperation("getAllPositionLogits");
+            if (!stream)
+                return nullptr;
+        }
+
+        if (!const_cast<TensorBase *>(tensor)->ensureOnHost(stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to publish all-position logits to host");
+            return nullptr;
+        }
+        return tensor->fp32_data();
     }
 
     std::string DeviceGraphOrchestrator::mtpDecodeUnsupportedReason() const
@@ -12992,14 +13343,17 @@ namespace llaminar2
         }
 
         /*
-         * MoE sidecars still run a full routed FFN fragment before the target
-         * verifier.  All-position verifier-row parity proves the verifier math,
-         * but it does not prove that the preceding sidecar left every main-model
-         * live-state surface untouched.  Keep the verifier-base restore until a
-         * dedicated MoE sidecar-preservation test covers KV, GDN/conv state,
-         * terminal hidden, routed scratch, and overlay collectives.
+         * Full-owner GPU MoE sidecars use MTP-owned activation buffers and
+         * depth-scoped router/expert metadata.  The
+         * MTPSidecarPreservesMainRuntimeState parity gate runs the real sidecar
+         * path with KV payload and GDN device-state probes enabled, proving that
+         * main KV, GDN/short-conv state, positions, and sequence lengths match the
+         * verifier base after sidecar execution.  Keep this GPU-only and tied to
+         * resident logical-state publication so CPU and multi-participant MoE
+         * domains cannot skip their verifier-base restore without their own proof.
          */
-        return false;
+        return state_.device_id.is_gpu() &&
+               supportsDeviceResidentLogicalSequenceStatePublication();
     }
 
     bool DeviceGraphOrchestrator::supportsMTPShiftedRowReuseFromSidecar() const
@@ -13108,7 +13462,8 @@ namespace llaminar2
             greedy_params,
             vocab,
             /*threshold=*/0.0f,
-            out_token);
+            out_token,
+            /*verifier_consumer_pending=*/true);
     }
 
     bool DeviceGraphOrchestrator::sampleGreedyFromMainLogitsToDeviceTargetSlot(
@@ -13137,8 +13492,12 @@ namespace llaminar2
          * readiness marker before enqueueing a new argmax into the slot.
          */
         stochastic_target_top_k_[static_cast<size_t>(target_sample_slot)] = 0;
+        stochastic_target_row_formats_[static_cast<size_t>(target_sample_slot)] =
+            StochasticRowFormat::Empty;
         stochastic_target_distribution_streams_[static_cast<size_t>(target_sample_slot)] = nullptr;
-        clearStochasticTargetSampleReadySlot(target_sample_slot);
+        clearStochasticTargetSampleReadySlot(
+            target_sample_slot,
+            StochasticSampleReadyClearMode::Force);
 
         const auto &shape = state_.logits->shape();
         if (shape.empty())
@@ -13196,7 +13555,10 @@ namespace llaminar2
             }
         }
 
-        if (!recordStochasticTargetSampleReady(target_sample_slot, stream))
+        if (!recordStochasticTargetSampleReady(
+                target_sample_slot,
+                stream,
+                /*verifier_consumer_pending=*/out_token == nullptr))
             return false;
 
         if (!out_token)
@@ -13603,6 +13965,10 @@ namespace llaminar2
             state_.device_id.toString(),
             {{"tokens", std::to_string(draft_token_count)}});
         const void *summary_draft_tokens_device = mtp_verifier_input_tokens_dev_;
+        const bool materialized_first_token_from_device =
+            materialized_mtp_verifier_device_token_row_.first_token_from_device;
+        const int materialized_first_target_sample_slot =
+            materialized_mtp_verifier_device_token_row_.first_target_sample_slot;
 
         const auto *base = static_cast<const float *>(gpu_ptr);
         const bool argmax_ok = backend->enqueueArgmaxF32BatchedRowsDevice(
@@ -13739,13 +14105,13 @@ namespace llaminar2
             return false;
         }
 
-        if (use_prepared_device_tokens &&
-            pending_mtp_verifier_device_token_plan_ &&
-            pending_mtp_verifier_device_token_plan_->first_token_from_device)
+        if (materialized_first_token_from_device)
         {
             clearStochasticTargetSampleReadySlot(
-                pending_mtp_verifier_device_token_plan_->first_target_sample_slot);
+                materialized_first_target_sample_slot,
+                StochasticSampleReadyClearMode::Force);
         }
+        materialized_mtp_verifier_device_token_row_ = {};
 
         out_handle->output_tokens_device =
             static_cast<const int32_t *>(stochastic_batch_output_tokens_dev_);
@@ -16972,7 +17338,28 @@ namespace llaminar2
             return true; // Nothing to apply, success
 
         if (!state_.device_id.is_gpu())
-            return false;
+        {
+            TensorBase *tensor = nullptr;
+            int token_offset = 0;
+            if (graph_builder_ && graph_builder_->config().lm_head_column_parallel &&
+                state_.logits_local)
+            {
+                tensor = state_.logits_local.get();
+                token_offset = vocabOffsetForTPConfig(graph_builder_->config());
+            }
+            else
+            {
+                tensor = state_.logits.get();
+            }
+            return applyPenaltiesToTensorRowOnHost(
+                tensor,
+                penalties,
+                vocab_size,
+                0,
+                token_offset,
+                "applyPenaltiesOnDeviceHost");
+        }
+
         void *stream = peekPendingLogitsStream(PendingLogitsStreamRole::MainDecode);
         if (!stream)
             stream = explicitGPUStreamForOperation("applyPenaltiesOnDevice");
@@ -17036,12 +17423,24 @@ namespace llaminar2
     {
         if (penalties.empty())
             return true;
-        if (!state_.device_id.is_gpu())
-            return false;
 
         auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
         if (it == state_.extension_buffers.end() || !it->second)
             return false;
+
+        const int token_offset = graph_builder_
+                                     ? vocabOffsetForTPConfig(graph_builder_->config())
+                                     : 0;
+        if (!state_.device_id.is_gpu())
+        {
+            return applyPenaltiesToTensorRowOnHost(
+                it->second.get(),
+                penalties,
+                vocab_size,
+                0,
+                token_offset,
+                "applyPenaltiesToMTPLogitsOnDeviceHost");
+        }
 
         void *stream = peekPendingLogitsStream(PendingLogitsStreamRole::MTPSidecar);
         if (!stream)
@@ -17051,9 +17450,6 @@ namespace llaminar2
         if (!stream)
             return false;
 
-        const int token_offset = graph_builder_
-                                     ? vocabOffsetForTPConfig(graph_builder_->config())
-                                     : 0;
         const bool ok = applyPenaltiesToTensorRowOnDevice(
             it->second.get(),
             state_.device_id,
@@ -17088,7 +17484,7 @@ namespace llaminar2
     {
         if (penalties.empty())
             return true;
-        if (!state_.device_id.is_gpu() || row < 0)
+        if (row < 0)
             return false;
 
         TensorBase *tensor = nullptr;
@@ -17106,6 +17502,17 @@ namespace llaminar2
         }
         if (!tensor)
             return false;
+
+        if (!state_.device_id.is_gpu())
+        {
+            return applyPenaltiesToTensorRowOnHost(
+                tensor,
+                penalties,
+                vocab_size,
+                row,
+                token_offset,
+                "applyPenaltiesToAllPositionLogitsOnDeviceRowHost");
+        }
 
         void *stream = peekPendingLogitsStream(PendingLogitsStreamRole::AllPositionVerifier);
         if (!stream)
@@ -17133,6 +17540,17 @@ namespace llaminar2
                 "applyPenaltiesToAllPositionLogitsOnDeviceRow");
         }
         return ok;
+    }
+
+    bool DeviceGraphOrchestrator::supportsRowLocalAllPositionPenaltyApplication() const
+    {
+        /*
+         * CPU rows are already host-visible, but the promoted Phase 9.8 path is
+         * specifically for compact verifier reduction without full-logit host
+         * traffic.  GPU rows have the explicit-stream sparse penalty kernel
+         * used by applyPenaltiesToAllPositionLogitsOnDeviceRow().
+         */
+        return state_.device_id.is_gpu();
     }
 
     bool DeviceGraphOrchestrator::supportsDeviceStochasticMTPVerification() const
@@ -17322,11 +17740,15 @@ namespace llaminar2
             if (buffer == DeviceDistributionBuffer::Target)
             {
                 stochastic_target_top_k_[static_cast<size_t>(slot)] = params.top_k;
+                stochastic_target_row_formats_[static_cast<size_t>(slot)] =
+                    StochasticRowFormat::ProcessedLogits;
                 stochastic_target_distribution_streams_[static_cast<size_t>(slot)] = stream;
             }
             else
             {
                 stochastic_draft_top_k_[static_cast<size_t>(slot)] = params.top_k;
+                stochastic_draft_row_formats_[static_cast<size_t>(slot)] =
+                    StochasticRowFormat::ProcessedLogits;
                 stochastic_draft_distribution_streams_[static_cast<size_t>(slot)] = stream;
             }
         }
@@ -17444,13 +17866,19 @@ namespace llaminar2
         if (buffer == DeviceDistributionBuffer::Target)
         {
             stochastic_target_top_k_[static_cast<size_t>(slot)] = 0;
+            stochastic_target_row_formats_[static_cast<size_t>(slot)] =
+                StochasticRowFormat::Empty;
             stochastic_target_distribution_streams_[static_cast<size_t>(slot)] = nullptr;
         }
         else
         {
             stochastic_draft_top_k_[static_cast<size_t>(slot)] = 0;
+            stochastic_draft_row_formats_[static_cast<size_t>(slot)] =
+                StochasticRowFormat::Empty;
             stochastic_draft_distribution_streams_[static_cast<size_t>(slot)] = nullptr;
-            clearStochasticDraftSampleReadySlot(slot);
+            clearStochasticDraftSampleReadySlot(
+                slot,
+                StochasticSampleReadyClearMode::Force);
         }
 
         void *stream = nullptr;
@@ -17634,6 +18062,8 @@ namespace llaminar2
             if (buffer == DeviceDistributionBuffer::Target)
             {
                 stochastic_target_top_k_[static_cast<size_t>(slot)] = params.top_k;
+                stochastic_target_row_formats_[static_cast<size_t>(slot)] =
+                    StochasticRowFormat::CompactDistribution;
                 stochastic_target_distribution_streams_[static_cast<size_t>(slot)] = stream;
                 /*
                  * Target distribution slots are reused for all-position
@@ -17647,8 +18077,12 @@ namespace llaminar2
             else
             {
                 stochastic_draft_top_k_[static_cast<size_t>(slot)] = params.top_k;
+                stochastic_draft_row_formats_[static_cast<size_t>(slot)] =
+                    StochasticRowFormat::CompactDistribution;
                 stochastic_draft_distribution_streams_[static_cast<size_t>(slot)] = stream;
-                clearStochasticDraftSampleReadySlot(slot);
+                clearStochasticDraftSampleReadySlot(
+                    slot,
+                    StochasticSampleReadyClearMode::Force);
             }
         }
         return ok;
@@ -17687,6 +18121,8 @@ namespace llaminar2
         {
             const int slot = first_slot + row;
             stochastic_target_top_k_[static_cast<size_t>(slot)] = 0;
+            stochastic_target_row_formats_[static_cast<size_t>(slot)] =
+                StochasticRowFormat::Empty;
             stochastic_target_distribution_streams_[static_cast<size_t>(slot)] = nullptr;
         }
 
@@ -17782,6 +18218,8 @@ namespace llaminar2
         {
             const int slot = first_slot + row;
             stochastic_target_top_k_[static_cast<size_t>(slot)] = params.top_k;
+            stochastic_target_row_formats_[static_cast<size_t>(slot)] =
+                StochasticRowFormat::CompactDistribution;
             stochastic_target_distribution_streams_[static_cast<size_t>(slot)] = stream;
         }
 
@@ -17923,12 +18361,18 @@ namespace llaminar2
 
         if (buffer == DeviceDistributionBuffer::Draft)
         {
-            if (!recordStochasticDraftSampleReady(slot, stream))
+            if (!recordStochasticDraftSampleReady(
+                    slot,
+                    stream,
+                    /*verifier_consumer_pending=*/out_token_host == nullptr))
                 return false;
         }
         else
         {
-            if (!recordStochasticTargetSampleReady(slot, stream))
+            if (!recordStochasticTargetSampleReady(
+                    slot,
+                    stream,
+                    /*verifier_consumer_pending=*/out_token_host == nullptr))
                 return false;
         }
 
@@ -17980,7 +18424,8 @@ namespace llaminar2
         const SamplingParams &params,
         int vocab_size,
         float threshold,
-        int32_t *out_token_host)
+        int32_t *out_token_host,
+        bool verifier_consumer_pending)
     {
         (void)params;
         (void)threshold;
@@ -18031,8 +18476,12 @@ namespace llaminar2
             return false;
 
         stochastic_draft_top_k_[static_cast<size_t>(slot)] = 0;
+        stochastic_draft_row_formats_[static_cast<size_t>(slot)] =
+            StochasticRowFormat::Empty;
         stochastic_draft_distribution_streams_[static_cast<size_t>(slot)] = nullptr;
-        clearStochasticDraftSampleReadySlot(slot);
+        clearStochasticDraftSampleReadySlot(
+            slot,
+            StochasticSampleReadyClearMode::Force);
 
         const float *row_ptr =
             static_cast<const float *>(tensor->gpu_data_ptr()) +
@@ -18071,7 +18520,11 @@ namespace llaminar2
             }
         }
 
-        if (!recordStochasticDraftSampleReady(slot, stream))
+        if (!recordStochasticDraftSampleReady(
+                slot,
+                stream,
+                /*verifier_consumer_pending=*/
+                verifier_consumer_pending || out_token_host == nullptr))
             return false;
 
         PerfStatsCollector::addCounter(
@@ -18122,7 +18575,8 @@ namespace llaminar2
                 params,
                 vocab_size,
                 threshold,
-                &token))
+                &token,
+                /*verifier_consumer_pending=*/true))
         {
             return -1;
         }
@@ -18144,7 +18598,8 @@ namespace llaminar2
             params,
             vocab_size,
             threshold,
-            /*out_token_host=*/nullptr);
+            /*out_token_host=*/nullptr,
+            /*verifier_consumer_pending=*/true);
     }
 
     bool DeviceGraphOrchestrator::stageStochasticDraftTokensForDeviceVerification(
@@ -18172,7 +18627,9 @@ namespace llaminar2
             return false;
 
         for (int slot = 0; slot < draft_token_count; ++slot)
-            clearStochasticDraftSampleReadySlot(first_draft_slot + slot);
+            clearStochasticDraftSampleReadySlot(
+                first_draft_slot + slot,
+                StochasticSampleReadyClearMode::Force);
 
         if (!backend->hostToDeviceOnStream(
                 static_cast<int32_t *>(stochastic_draft_sample_tokens_dev_) +
@@ -18188,7 +18645,10 @@ namespace llaminar2
 
         for (int slot = 0; slot < draft_token_count; ++slot)
         {
-            if (!recordStochasticDraftSampleReady(first_draft_slot + slot, stream))
+            if (!recordStochasticDraftSampleReady(
+                    first_draft_slot + slot,
+                    stream,
+                    /*verifier_consumer_pending=*/true))
                 return false;
         }
 
@@ -19144,6 +19604,30 @@ namespace llaminar2
             inverse_sample_first_logical_position >= 0;
         const bool has_host_thresholds =
             accept_thresholds != nullptr && residual_thresholds != nullptr;
+        std::array<float, kSpeculativeBatchMaxRows> derived_accept_thresholds{};
+        std::array<float, kSpeculativeBatchMaxRows> derived_residual_thresholds{};
+        if (derive_thresholds_from_seed &&
+            row_count > 0 &&
+            row_count <= kSpeculativeBatchMaxRows)
+        {
+            for (int row = 0; row < row_count; ++row)
+            {
+                const int logical_position =
+                    inverse_sample_first_logical_position + row;
+                derived_accept_thresholds[static_cast<size_t>(row)] =
+                    mtp_spec_threshold_from_seed(
+                        inverse_sample_seed,
+                        logical_position,
+                        1 /* MTPSpecStochasticDrawPurpose::Accept */);
+                derived_residual_thresholds[static_cast<size_t>(row)] =
+                    mtp_spec_threshold_from_seed(
+                        inverse_sample_seed,
+                        logical_position,
+                        2 /* MTPSpecStochasticDrawPurpose::Residual */);
+            }
+            accept_thresholds = derived_accept_thresholds.data();
+            residual_thresholds = derived_residual_thresholds.data();
+        }
         if (!supportsDeviceStochasticMTPVerification() ||
             first_target_slot < 0 || first_draft_slot < 0 ||
             row_count <= 0 ||
@@ -19193,8 +19677,18 @@ namespace llaminar2
 
         const int target_top_k =
             stochastic_target_top_k_[static_cast<size_t>(first_target_slot)];
+        const StochasticRowFormat target_row_format =
+            stochastic_target_row_formats_[static_cast<size_t>(first_target_slot)];
+        const bool use_processed_target_rows =
+            use_vllm_probability_rejection &&
+            target_row_format == StochasticRowFormat::ProcessedLogits;
         if (target_top_k <= 0 ||
             target_top_k > static_cast<int>(kStochasticDistributionMaxK))
+        {
+            return false;
+        }
+        if (target_row_format != StochasticRowFormat::CompactDistribution &&
+            target_row_format != StochasticRowFormat::ProcessedLogits)
         {
             return false;
         }
@@ -19206,6 +19700,7 @@ namespace llaminar2
             const int draft_top_k =
                 stochastic_draft_top_k_[static_cast<size_t>(draft_slot)];
             if (stochastic_target_top_k_[static_cast<size_t>(target_slot)] != target_top_k ||
+                stochastic_target_row_formats_[static_cast<size_t>(target_slot)] != target_row_format ||
                 (!use_vllm_probability_rejection &&
                  draft_top_k != target_top_k))
             {
@@ -19213,11 +19708,16 @@ namespace llaminar2
             }
         }
         if (has_bonus &&
-            stochastic_target_top_k_[static_cast<size_t>(bonus_target_slot)] != target_top_k)
+            (stochastic_target_top_k_[static_cast<size_t>(bonus_target_slot)] != target_top_k ||
+             stochastic_target_row_formats_[static_cast<size_t>(bonus_target_slot)] != target_row_format))
         {
             return false;
         }
 
+        const int full_vocab_size =
+            graph_builder_ ? graph_builder_->config().vocab_size : state_.vocab_size;
+        if (full_vocab_size <= 0)
+            return false;
         auto *target_ids =
             static_cast<int *>(stochastic_target_token_ids_dev_) +
             static_cast<size_t>(first_target_slot) * kStochasticDistributionMaxK;
@@ -19236,8 +19736,12 @@ namespace llaminar2
             (!use_vllm_probability_rejection && stochastic_draft_sample_probs_dev_)
                 ? static_cast<float *>(stochastic_draft_sample_probs_dev_) + first_draft_slot
                 : nullptr;
-        const int full_vocab_size =
-            graph_builder_ ? graph_builder_->config().vocab_size : state_.vocab_size;
+        auto *processed_target_logits =
+            use_processed_target_rows
+                ? static_cast<float *>(stochastic_processed_logits_dev_) +
+                      static_cast<size_t>(first_target_slot) *
+                          static_cast<size_t>(full_vocab_size)
+                : nullptr;
         auto *out_token_dev =
             static_cast<int *>(stochastic_verify_tokens_dev_) + first_target_slot;
         auto *out_accepted_dev =
@@ -19310,34 +19814,65 @@ namespace llaminar2
 
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
-                    "stochastic_vllm_compact_batch_verify_enqueue",
+                    use_processed_target_rows
+                        ? "stochastic_vllm_processed_batch_verify_enqueue"
+                        : "stochastic_vllm_compact_batch_verify_enqueue",
                     "decode",
                     state_.device_id.toString(),
                     {{"rows", std::to_string(row_count)},
                      {"top_k", std::to_string(target_top_k)},
-                     {"draft", "one_hot"}});
-                verify_enqueued =
-                    backend->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
-                        target_ids,
-                        target_probs,
-                        /*draft_token_ids_device=*/nullptr,
-                        /*draft_probs_device=*/nullptr,
-                        target_top_k,
-                        static_cast<int>(kStochasticDistributionMaxK),
-                        sampled_draft_tokens,
-                        accept_thresholds,
-                        residual_thresholds,
-                        row_count,
-                        state_.device_id.gpu_ordinal(),
-                        stream,
-                        out_token_dev,
-                        out_accepted_dev,
-                        out_accept_prob_dev,
-                        out_threshold_dev,
-                        /*draft_token_probabilities_device=*/nullptr,
-                        inverse_sample_seed,
-                        inverse_sample_first_logical_position,
-                        full_vocab_size);
+                     {"draft", "one_hot"},
+                     {"target_format", use_processed_target_rows
+                                           ? "processed_logits"
+                                           : "compact_distribution"}});
+                if (use_processed_target_rows)
+                {
+                    verify_enqueued =
+                        processed_target_logits &&
+                        backend->enqueueSpeculativeVerifyProcessedTargetDraftProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
+                            processed_target_logits,
+                            /*draft_probabilities_device=*/nullptr,
+                            row_count,
+                            full_vocab_size,
+                            full_vocab_size,
+                            full_vocab_size,
+                            sampled_draft_tokens,
+                            accept_thresholds,
+                            inverse_sample_seed,
+                            inverse_sample_first_logical_position,
+                            state_.device_id.gpu_ordinal(),
+                            stream,
+                            out_token_dev,
+                            out_accepted_dev,
+                            out_accept_prob_dev,
+                            out_threshold_dev,
+                            /*no_draft_probabilities=*/true);
+                }
+                else
+                {
+                    verify_enqueued =
+                        backend->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+                            target_ids,
+                            target_probs,
+                            /*draft_token_ids_device=*/nullptr,
+                            /*draft_probs_device=*/nullptr,
+                            target_top_k,
+                            static_cast<int>(kStochasticDistributionMaxK),
+                            sampled_draft_tokens,
+                            accept_thresholds,
+                            residual_thresholds,
+                            row_count,
+                            state_.device_id.gpu_ordinal(),
+                            stream,
+                            out_token_dev,
+                            out_accepted_dev,
+                            out_accept_prob_dev,
+                            out_threshold_dev,
+                            /*draft_token_probabilities_device=*/nullptr,
+                            inverse_sample_seed,
+                            inverse_sample_first_logical_position,
+                            full_vocab_size);
+                }
             }
             else
             {
@@ -19448,26 +19983,54 @@ namespace llaminar2
             {
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
-                    "stochastic_batch_bonus_sample_enqueue",
+                    use_processed_target_rows
+                        ? "stochastic_batch_processed_bonus_sample_enqueue"
+                        : "stochastic_batch_bonus_sample_enqueue",
                     "decode",
                     state_.device_id.toString(),
                     {{"top_k", std::to_string(target_top_k)},
-                     {"lazy", "false"},
+                     {"lazy", use_processed_target_rows ? "true" : "false"},
                      {"verifier", "compact_draft_table"}});
-                auto *bonus_ids =
-                    static_cast<int *>(stochastic_target_token_ids_dev_) +
-                    static_cast<size_t>(bonus_target_slot) * kStochasticDistributionMaxK;
-                auto *bonus_probs =
-                    static_cast<float *>(stochastic_target_probs_dev_) +
-                    static_cast<size_t>(bonus_target_slot) * kStochasticDistributionMaxK;
-                bonus_enqueued = backend->enqueueSampleDistributionF32Device(
-                    bonus_ids,
-                    bonus_probs,
-                    target_top_k,
-                    bonus_threshold,
-                    state_.device_id.gpu_ordinal(),
-                    stream,
-                    bonus_out);
+                if (use_processed_target_rows)
+                {
+                    auto *bonus_logits =
+                        static_cast<float *>(stochastic_processed_logits_dev_) +
+                        static_cast<size_t>(bonus_target_slot) *
+                            static_cast<size_t>(full_vocab_size);
+                    bonus_enqueued =
+                        backend->enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
+                            bonus_logits,
+                            full_vocab_size,
+                            full_vocab_size,
+                            bonus_threshold,
+                            out_token_dev,
+                            out_accepted_dev,
+                            row_count,
+                            first_token_from_device ? -1 : first_token,
+                            first_token_dev,
+                            packed_stop_tokens.data(),
+                            stop_token_count,
+                            state_.device_id.gpu_ordinal(),
+                            stream,
+                            bonus_out);
+                }
+                else
+                {
+                    auto *bonus_ids =
+                        static_cast<int *>(stochastic_target_token_ids_dev_) +
+                        static_cast<size_t>(bonus_target_slot) * kStochasticDistributionMaxK;
+                    auto *bonus_probs =
+                        static_cast<float *>(stochastic_target_probs_dev_) +
+                        static_cast<size_t>(bonus_target_slot) * kStochasticDistributionMaxK;
+                    bonus_enqueued = backend->enqueueSampleDistributionF32Device(
+                        bonus_ids,
+                        bonus_probs,
+                        target_top_k,
+                        bonus_threshold,
+                        state_.device_id.gpu_ordinal(),
+                        stream,
+                        bonus_out);
+                }
             }
             if (!bonus_enqueued)
             {
@@ -19619,19 +20182,32 @@ namespace llaminar2
             {
                 stochastic_target_distribution_streams_[
                     static_cast<size_t>(first_target_slot + row)] = nullptr;
+                stochastic_target_row_formats_[
+                    static_cast<size_t>(first_target_slot + row)] =
+                    StochasticRowFormat::Empty;
                 stochastic_draft_distribution_streams_[
                     static_cast<size_t>(first_draft_slot + row)] = nullptr;
+                stochastic_draft_row_formats_[
+                    static_cast<size_t>(first_draft_slot + row)] =
+                    StochasticRowFormat::Empty;
                 stochastic_draft_top_k_[static_cast<size_t>(first_draft_slot + row)] = 0;
-                clearStochasticDraftSampleReadySlot(first_draft_slot + row);
+                clearStochasticDraftSampleReadySlot(
+                    first_draft_slot + row,
+                    StochasticSampleReadyClearMode::Force);
             }
             if (has_bonus)
             {
                 stochastic_target_distribution_streams_[
                     static_cast<size_t>(bonus_target_slot)] = nullptr;
+                stochastic_target_row_formats_[
+                    static_cast<size_t>(bonus_target_slot)] =
+                    StochasticRowFormat::Empty;
             }
             if (first_token_from_device)
             {
-                clearStochasticTargetSampleReadySlot(first_target_sample_slot);
+                clearStochasticTargetSampleReadySlot(
+                    first_target_sample_slot,
+                    StochasticSampleReadyClearMode::Force);
             }
 
             PerfStatsCollector::addCounter(
@@ -19699,19 +20275,32 @@ namespace llaminar2
         {
             stochastic_target_distribution_streams_[
                 static_cast<size_t>(first_target_slot + row)] = nullptr;
+            stochastic_target_row_formats_[
+                static_cast<size_t>(first_target_slot + row)] =
+                StochasticRowFormat::Empty;
             stochastic_draft_distribution_streams_[
                 static_cast<size_t>(first_draft_slot + row)] = nullptr;
+            stochastic_draft_row_formats_[
+                static_cast<size_t>(first_draft_slot + row)] =
+                StochasticRowFormat::Empty;
             stochastic_draft_top_k_[static_cast<size_t>(first_draft_slot + row)] = 0;
-            clearStochasticDraftSampleReadySlot(first_draft_slot + row);
+            clearStochasticDraftSampleReadySlot(
+                first_draft_slot + row,
+                StochasticSampleReadyClearMode::Force);
         }
         if (has_bonus)
         {
             stochastic_target_distribution_streams_[
                 static_cast<size_t>(bonus_target_slot)] = nullptr;
+            stochastic_target_row_formats_[
+                static_cast<size_t>(bonus_target_slot)] =
+                StochasticRowFormat::Empty;
         }
         if (first_token_from_device)
         {
-            clearStochasticTargetSampleReadySlot(first_target_sample_slot);
+            clearStochasticTargetSampleReadySlot(
+                first_target_sample_slot,
+                StochasticSampleReadyClearMode::Force);
         }
 
         out->ok = true;
@@ -19948,14 +20537,22 @@ namespace llaminar2
         std::fill(stochastic_draft_distribution_streams_.begin(),
                   stochastic_draft_distribution_streams_.end(),
                   nullptr);
+        std::fill(stochastic_target_row_formats_.begin(),
+                  stochastic_target_row_formats_.end(),
+                  StochasticRowFormat::Empty);
+        std::fill(stochastic_draft_row_formats_.begin(),
+                  stochastic_draft_row_formats_.end(),
+                  StochasticRowFormat::Empty);
         std::fill(stochastic_target_top_k_.begin(),
                   stochastic_target_top_k_.end(),
                   0);
         std::fill(stochastic_draft_top_k_.begin(),
                   stochastic_draft_top_k_.end(),
                   0);
-        clearStochasticTargetSampleReadySlots();
-        clearStochasticDraftSampleReadySlots();
+        clearStochasticTargetSampleReadySlots(StochasticSampleReadyClearMode::Force);
+        clearStochasticDraftSampleReadySlots(StochasticSampleReadyClearMode::Force);
+        pending_mtp_verifier_device_token_plan_.reset();
+        materialized_mtp_verifier_device_token_row_ = {};
 
         for (auto &cache : layer_graph_cache_)
         {

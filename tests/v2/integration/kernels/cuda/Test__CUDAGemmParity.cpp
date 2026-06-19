@@ -31,6 +31,7 @@
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "backends/ComputeBackend.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/compute_stages/ComputeStageUtils.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"        // For gpu_output(), with_gpu_coherence()
 #include "execution/local_execution/device/DeviceWorkspaceManager.h" // For workspace binding
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
@@ -60,6 +61,7 @@
 #include <random>
 #include <numeric>
 #include <filesystem>
+#include <limits>
 
 using namespace llaminar2;
 using namespace llaminar2::test::cuda;
@@ -362,6 +364,55 @@ namespace
         return max_err;
     }
 
+    /**
+     * @brief Compare two logit rows as probability distributions.
+     *
+     * Cosine and L2 catch amplitude drift, but speculative decoding is also
+     * sensitive to small probability-mass movement near the sampled frontier.
+     * This helper applies a numerically stable softmax to both rows and returns
+     * 0.5 * (KL(actual || expected) + KL(expected || actual)).
+     */
+    double symmetricKLFromLogits(const float *actual, const float *expected, size_t count)
+    {
+        if (!actual || !expected || count == 0)
+            return std::numeric_limits<double>::infinity();
+
+        double max_actual = -std::numeric_limits<double>::infinity();
+        double max_expected = -std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < count; ++i)
+        {
+            max_actual = std::max(max_actual, static_cast<double>(actual[i]));
+            max_expected = std::max(max_expected, static_cast<double>(expected[i]));
+        }
+
+        double sum_actual = 0.0;
+        double sum_expected = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            sum_actual += std::exp(static_cast<double>(actual[i]) - max_actual);
+            sum_expected += std::exp(static_cast<double>(expected[i]) - max_expected);
+        }
+
+        if (sum_actual <= 0.0 || sum_expected <= 0.0)
+            return std::numeric_limits<double>::infinity();
+
+        constexpr double kFloor = 1.0e-30;
+        double actual_to_expected = 0.0;
+        double expected_to_actual = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double p = std::max(
+                kFloor,
+                std::exp(static_cast<double>(actual[i]) - max_actual) / sum_actual);
+            const double q = std::max(
+                kFloor,
+                std::exp(static_cast<double>(expected[i]) - max_expected) / sum_expected);
+            actual_to_expected += p * std::log(p / q);
+            expected_to_actual += q * std::log(q / p);
+        }
+        return 0.5 * (actual_to_expected + expected_to_actual);
+    }
+
     // =========================================================================
     // Helpers: multiply via tensor interface (multiply() removed from ITensorGemm)
     // =========================================================================
@@ -524,6 +575,7 @@ protected:
     {
         double cosine_similarity = 0.0;
         double relative_l2_error = 0.0;
+        double symmetric_kl = 0.0;
         float max_abs_error = 0.0f;
         bool has_nan_inf = false;
         bool passed = false;
@@ -533,6 +585,7 @@ protected:
             std::cout << name << ":\n"
                       << "  Cosine similarity: " << cosine_similarity << "\n"
                       << "  Relative L2 error: " << (relative_l2_error * 100.0) << "%\n"
+                      << "  Symmetric KL:       " << symmetric_kl << "\n"
                       << "  Max abs error:     " << max_abs_error << "\n"
                       << "  Passed:            " << (passed ? "YES" : "NO") << "\n";
         }
@@ -555,6 +608,7 @@ protected:
         result.has_nan_inf = hasNaNOrInf(cuda_result, count);
         result.cosine_similarity = cosineSimilarity(cuda_result, cpu_result, count);
         result.relative_l2_error = relativeL2Error(cuda_result, cpu_result, count);
+        result.symmetric_kl = symmetricKLFromLogits(cuda_result, cpu_result, count);
         result.max_abs_error = maxAbsError(cuda_result, cpu_result, count);
 
         result.passed = !result.has_nan_inf &&
@@ -686,6 +740,12 @@ protected:
                 }
             }
         }
+
+        addCudaConcurrentDecodeGemvSideStreamWorkspace(
+            shared_reqs,
+            gpu_device_,
+            M,
+            kernels.size());
 
         workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, workspaceBudgetFor(shared_reqs));
         if (!workspace_->allocate(shared_reqs))
@@ -1644,6 +1704,307 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNOut_M4MatchesFourSingleRowDecodeGEMVs
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
+/**
+ * @brief Guard the Qwen3.6 GDN QKV verifier projection shape.
+ *
+ * The model-level grouped verifier parity test first diverged at
+ * `layer1_QKV_PROJECTION` for the Qwen3.6 dense model.  That projection is much
+ * wider than the older synthetic small-M tests, so this regression proves the
+ * exact MTP contract at the kernel boundary: a grouped M=4 verifier projection
+ * must produce the same rows as four ordinary M=1 decode GEMVs using the same
+ * CUDA tensor path.  The thresholds are intentionally strict because top-token
+ * equality can hide distribution drift that later breaks stochastic MTP.
+ */
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNQKV_M4MatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int N = 10240;
+    const int K = 5120;
+
+    auto weights = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 3321);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_m4(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_m4.data(), M, N, K, gpu_device_))
+        << "M=4 Qwen3.6 GDN QKV projection GEMM failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        std::vector<float> C_m1(static_cast<size_t>(N), 0.0f);
+        ASSERT_TRUE(cudaMultiplyViaTensor(
+            cuda_kernel,
+            A_data.data() + static_cast<size_t>(row) * K,
+            C_m1.data(),
+            1,
+            N,
+            K,
+            gpu_device_))
+            << "M=1 Qwen3.6 GDN QKV projection GEMV failed for row " << row;
+
+        const float *verifier_row = C_m4.data() + static_cast<size_t>(row) * N;
+        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
+        EXPECT_FALSE(result.has_nan_inf)
+            << "M=4 Qwen3.6 GDN QKV projection row " << row
+            << " produced non-finite output";
+        EXPECT_GE(result.cosine_similarity, 0.999999)
+            << "M=4 Qwen3.6 GDN QKV projection row " << row
+            << " diverges from single-row decode GEMV"
+            << " rel_l2=" << result.relative_l2_error
+            << " max_abs=" << result.max_abs_error;
+        EXPECT_LE(result.relative_l2_error, 1e-5)
+            << "M=4 Qwen3.6 GDN QKV projection row " << row
+            << " relative L2 differs from single-row decode GEMV"
+            << " cosine=" << result.cosine_similarity
+            << " max_abs=" << result.max_abs_error;
+    }
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "M=4 Qwen3.6 GDN QKV row-equivalence test must not leak CUDA dynamic state";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+/**
+ * @brief Guard the production Qwen3.6 GDN qkv+z fused verifier subgroup.
+ *
+ * `GDNProjectionStage` groups native CUDA qkv and z projections together when
+ * verifier rows use the decode-equivalent M=2..4 path.  The model-level M=4
+ * parity failure first appears at `layer1_QKV_PROJECTION`, so this test checks
+ * the grouped descriptor contract directly: one M=4 qkv+z fused verifier call
+ * must match four independent M=1 fused decode calls for both outputs.  That
+ * proves the shared-workspace/projection-descriptor path before we diagnose
+ * higher-level graph or stage ownership.
+ */
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int K = 5120;
+    const int N_QKV = 10240;
+    const int N_Z = 6144;
+
+    auto weights_qkv = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)}, 4331);
+    auto weights_z = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)}, 4332);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
+    auto *cuda_z = getPreparedKernel(weights_z.get(), gpu_device_);
+    ASSERT_NE(cuda_qkv, nullptr);
+    ASSERT_NE(cuda_z, nullptr);
+    ASSERT_TRUE(setupSharedWorkspace({cuda_qkv, cuda_z}, M, {N_QKV, N_Z}, K));
+
+    auto A_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_m4->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+    auto qkv_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_QKV)});
+    auto z_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Z)});
+    std::vector<TensorProjectionDesc> m4_projections = {
+        {cuda_qkv, qkv_m4.get(), N_QKV, nullptr, "gdn_qkv"},
+        {cuda_z, z_m4.get(), N_Z, nullptr, "gdn_z"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_m4.get()},
+        {qkv_m4.get(), z_m4.get()},
+        [&]
+        {
+            return cuda_qkv->multiply_fused_tensor(A_m4.get(), m4_projections, M, K);
+        }))
+        << "M=4 Qwen3.6 GDN qkv+z fused verifier projection failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        auto A_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(K)});
+        std::memcpy(
+            A_m1->mutable_data(),
+            A_data.data() + static_cast<size_t>(row) * K,
+            static_cast<size_t>(K) * sizeof(float));
+        auto qkv_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N_QKV)});
+        auto z_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N_Z)});
+        std::vector<TensorProjectionDesc> m1_projections = {
+            {cuda_qkv, qkv_m1.get(), N_QKV, nullptr, "gdn_qkv"},
+            {cuda_z, z_m1.get(), N_Z, nullptr, "gdn_z"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {A_m1.get()},
+            {qkv_m1.get(), z_m1.get()},
+            [&]
+            {
+                return cuda_qkv->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
+            }))
+            << "M=1 Qwen3.6 GDN qkv+z fused decode projection failed for row " << row;
+
+        const float *qkv_row = qkv_m4->data() + static_cast<size_t>(row) * N_QKV;
+        const float *z_row = z_m4->data() + static_cast<size_t>(row) * N_Z;
+        const auto qkv_result =
+            checkParity(qkv_row, qkv_m1->data(), static_cast<size_t>(N_QKV), 0.999999, 1.0e-5);
+        const auto z_result =
+            checkParity(z_row, z_m1->data(), static_cast<size_t>(N_Z), 0.999999, 1.0e-5);
+
+        EXPECT_FALSE(qkv_result.has_nan_inf)
+            << "M=4 Qwen3.6 GDN qkv row " << row << " produced non-finite output";
+        EXPECT_FALSE(z_result.has_nan_inf)
+            << "M=4 Qwen3.6 GDN z row " << row << " produced non-finite output";
+        EXPECT_GE(qkv_result.cosine_similarity, 0.999999)
+            << "M=4 Qwen3.6 GDN qkv row " << row
+            << " diverges from single-row fused decode"
+            << " rel_l2=" << qkv_result.relative_l2_error
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_GE(z_result.cosine_similarity, 0.999999)
+            << "M=4 Qwen3.6 GDN z row " << row
+            << " diverges from single-row fused decode"
+            << " rel_l2=" << z_result.relative_l2_error
+            << " max_abs=" << z_result.max_abs_error;
+        EXPECT_LE(qkv_result.relative_l2_error, 1.0e-5)
+            << "M=4 Qwen3.6 GDN qkv row " << row
+            << " relative L2 differs from single-row fused decode"
+            << " cosine=" << qkv_result.cosine_similarity
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_LE(z_result.relative_l2_error, 1.0e-5)
+            << "M=4 Qwen3.6 GDN z row " << row
+            << " relative L2 differs from single-row fused decode"
+            << " cosine=" << z_result.cosine_similarity
+            << " max_abs=" << z_result.max_abs_error;
+    }
+
+    cleanupSharedWorkspace({cuda_qkv, cuda_z});
+    EXPECT_FALSE(cuda_qkv->hasDynamicStateActive())
+        << "M=4 GDN qkv fused verifier test must not leak CUDA dynamic state";
+    EXPECT_FALSE(cuda_z->hasDynamicStateActive())
+        << "M=4 GDN z fused verifier test must not leak CUDA dynamic state";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+}
+
+/**
+ * @brief Guard the real Qwen3.6 dense GDN mixed-codebook qkv+z subgroup.
+ *
+ * The `Qwen3.6-27B-Q4_K_S` fixture stores `blk.1.attn_qkv.weight` as Q5_K
+ * while `blk.1.attn_gate.weight` (the GDN z projection) is Q4_K.  The stage
+ * groups them because both use CUDAQuantisedGemmKernel, so this test proves
+ * that mixed native codebooks in one fused verifier subgroup remain exactly
+ * decode-equivalent for M=4.
+ */
+TEST_F(Test__CUDAGemmParity, Q5KQ4K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int K = 5120;
+    const int N_QKV = 10240;
+    const int N_Z = 6144;
+
+    auto weights_qkv = TestTensorFactory::createQ5_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)}, 4431);
+    auto weights_z = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)}, 4432);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
+    auto *cuda_z = getPreparedKernel(weights_z.get(), gpu_device_);
+    ASSERT_NE(cuda_qkv, nullptr);
+    ASSERT_NE(cuda_z, nullptr);
+    ASSERT_TRUE(setupSharedWorkspace({cuda_qkv, cuda_z}, M, {N_QKV, N_Z}, K));
+
+    auto A_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_m4->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+    auto qkv_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_QKV)});
+    auto z_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Z)});
+    std::vector<TensorProjectionDesc> m4_projections = {
+        {cuda_qkv, qkv_m4.get(), N_QKV, nullptr, "gdn_qkv_q5k"},
+        {cuda_z, z_m4.get(), N_Z, nullptr, "gdn_z_q4k"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_m4.get()},
+        {qkv_m4.get(), z_m4.get()},
+        [&]
+        {
+            return cuda_qkv->multiply_fused_tensor(A_m4.get(), m4_projections, M, K);
+        }))
+        << "M=4 mixed Q5_K/Q4_K Qwen3.6 GDN qkv+z verifier projection failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        auto A_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(K)});
+        std::memcpy(
+            A_m1->mutable_data(),
+            A_data.data() + static_cast<size_t>(row) * K,
+            static_cast<size_t>(K) * sizeof(float));
+        auto qkv_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N_QKV)});
+        auto z_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N_Z)});
+        std::vector<TensorProjectionDesc> m1_projections = {
+            {cuda_qkv, qkv_m1.get(), N_QKV, nullptr, "gdn_qkv_q5k"},
+            {cuda_z, z_m1.get(), N_Z, nullptr, "gdn_z_q4k"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {A_m1.get()},
+            {qkv_m1.get(), z_m1.get()},
+            [&]
+            {
+                return cuda_qkv->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
+            }))
+            << "M=1 mixed Q5_K/Q4_K Qwen3.6 GDN qkv+z decode projection failed for row " << row;
+
+        const float *qkv_row = qkv_m4->data() + static_cast<size_t>(row) * N_QKV;
+        const float *z_row = z_m4->data() + static_cast<size_t>(row) * N_Z;
+        const auto qkv_result =
+            checkParity(qkv_row, qkv_m1->data(), static_cast<size_t>(N_QKV), 0.999999, 1.0e-5);
+        const auto z_result =
+            checkParity(z_row, z_m1->data(), static_cast<size_t>(N_Z), 0.999999, 1.0e-5);
+
+        EXPECT_FALSE(qkv_result.has_nan_inf)
+            << "M=4 mixed Q5_K/Q4_K GDN qkv row " << row << " produced non-finite output";
+        EXPECT_FALSE(z_result.has_nan_inf)
+            << "M=4 mixed Q5_K/Q4_K GDN z row " << row << " produced non-finite output";
+        EXPECT_GE(qkv_result.cosine_similarity, 0.999999)
+            << "M=4 mixed Q5_K/Q4_K GDN qkv row " << row
+            << " diverges from single-row fused decode"
+            << " rel_l2=" << qkv_result.relative_l2_error
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_GE(z_result.cosine_similarity, 0.999999)
+            << "M=4 mixed Q5_K/Q4_K GDN z row " << row
+            << " diverges from single-row fused decode"
+            << " rel_l2=" << z_result.relative_l2_error
+            << " max_abs=" << z_result.max_abs_error;
+        EXPECT_LE(qkv_result.relative_l2_error, 1.0e-5)
+            << "M=4 mixed Q5_K/Q4_K GDN qkv row " << row
+            << " relative L2 differs from single-row fused decode"
+            << " cosine=" << qkv_result.cosine_similarity
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_LE(z_result.relative_l2_error, 1.0e-5)
+            << "M=4 mixed Q5_K/Q4_K GDN z row " << row
+            << " relative L2 differs from single-row fused decode"
+            << " cosine=" << z_result.cosine_similarity
+            << " max_abs=" << z_result.max_abs_error;
+    }
+
+    cleanupSharedWorkspace({cuda_qkv, cuda_z});
+    EXPECT_FALSE(cuda_qkv->hasDynamicStateActive())
+        << "M=4 mixed-codebook GDN qkv fused verifier test must not leak CUDA dynamic state";
+    EXPECT_FALSE(cuda_z->hasDynamicStateActive())
+        << "M=4 mixed-codebook GDN z fused verifier test must not leak CUDA dynamic state";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+}
+
 TEST_F(Test__CUDAGemmParity, Q4_K_FusedVerifierSmallM_2RowsTwoProjections)
 {
     const int M = 2;
@@ -1931,10 +2292,10 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
                    record.tags.at("k") == std::to_string(K) &&
                    record.tags.at("n") == std::to_string(N_ALPHA) &&
                    record.tags.at("projections") == "2" &&
-                   record.tags.at("route") == "cublas_batched_same_a";
+                   record.tags.at("route") == "tiny_fp32_batched_projection";
         });
     ASSERT_NE(fp32_fused_record, fp32_fused_records.end())
-        << "CUDA alpha+beta GDN subgroup should execute the graph-capturable cuBLAS batched projection route";
+        << "CUDA alpha+beta GDN subgroup should execute the deterministic tiny FP32 projection route";
 
     const auto alpha_result =
         checkParity(output_alpha->data(), alpha_cpu.data(), alpha_cpu.size(), 0.9999, 0.01);
@@ -1952,6 +2313,412 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_alpha.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_beta.get());
     PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Prove production-width GDNProjectionStage verifier rows are decode-equivalent.
+ *
+ * The full Qwen3.6 dense grouped-verifier test compares the captured verifier
+ * graph against serial decode and first fails near `layer1_QKV_PROJECTION`.
+ * This stage-level regression keeps the real layer1 projection formats
+ * (Q5_K qkv, Q4_K z, F32 alpha/beta) and checks the exact graph stage API:
+ * one M=4 verifier-stage execution must match four ordinary M=1 stage
+ * executions row-for-row.  Passing here means remaining drift comes from
+ * surrounding graph state rather than GDNProjectionStage itself.
+ */
+TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MixedCodebooks_M4MatchesFourM1StageRows)
+{
+    const int M = 4;
+    const int K = 5120;
+    const int N_QKV = 10240;
+    const int N_Z = 6144;
+    const int N_ALPHA = 48;
+    const int N_BETA = 48;
+
+    auto weights_qkv = TestTensorFactory::createQ5_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)}, 4531);
+    auto weights_z = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)}, 4532);
+    auto weights_alpha = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_ALPHA), static_cast<size_t>(K)}, -0.1f, 0.1f, 4533);
+    auto weights_beta = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_BETA), static_cast<size_t>(K)}, -0.1f, 0.1f, 4534);
+    ASSERT_TRUE(weights_alpha->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(weights_beta->ensureOnDevice(gpu_device_));
+
+    auto *kernel_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
+    auto *kernel_z = getPreparedKernel(weights_z.get(), gpu_device_);
+    auto *kernel_alpha = getPreparedKernel(weights_alpha.get(), gpu_device_);
+    auto *kernel_beta = getPreparedKernel(weights_beta.get(), gpu_device_);
+    ASSERT_NE(kernel_qkv, nullptr);
+    ASSERT_NE(kernel_z, nullptr);
+    ASSERT_NE(kernel_alpha, nullptr);
+    ASSERT_NE(kernel_beta, nullptr);
+
+    struct StageOutputs
+    {
+        std::unique_ptr<FP32Tensor> qkv;
+        std::unique_ptr<FP32Tensor> z;
+        std::unique_ptr<FP32Tensor> alpha;
+        std::unique_ptr<FP32Tensor> beta;
+    };
+
+    auto make_outputs = [&](int rows) -> StageOutputs
+    {
+        return {
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(N_QKV)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(N_Z)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(N_ALPHA)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(N_BETA)})};
+    };
+
+    auto run_stage = [&](int rows, const float *input_data, StageOutputs *outputs)
+    {
+        auto input = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(K)});
+        std::memcpy(
+            input->mutable_data(),
+            input_data,
+            static_cast<size_t>(rows) * K * sizeof(float));
+
+        GDNProjectionStage::Params params;
+        params.device_id = gpu_device_;
+        params.input = input.get();
+        params.m = rows;
+        params.k = K;
+        params.w_qkv = weights_qkv.get();
+        params.output_qkv = outputs->qkv.get();
+        params.n_qkv = N_QKV;
+        params.w_z = weights_z.get();
+        params.output_z = outputs->z.get();
+        params.n_z = N_Z;
+        params.w_a = weights_alpha.get();
+        params.output_a = outputs->alpha.get();
+        params.n_a = N_ALPHA;
+        params.w_b = weights_beta.get();
+        params.output_b = outputs->beta.get();
+        params.n_b = N_BETA;
+        params.gemm_qkv = kernel_qkv;
+        params.gemm_z = kernel_z;
+        params.gemm_a = kernel_alpha;
+        params.gemm_b = kernel_beta;
+        params.force_decode_equivalent_verifier_prefill = true;
+
+        GDNProjectionStage stage(params);
+        WorkspaceRequirements reqs = stage.getWorkspaceRequirements(rows, 0, K);
+        DeviceWorkspaceManager workspace(gpu_device_, workspaceBudgetFor(reqs));
+        ASSERT_TRUE(workspace.allocate(reqs));
+        stage.bindWorkspace(&workspace);
+
+        cudaStream_t stream = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+        stage.setGPUStream(static_cast<void *>(stream));
+        CUDADeviceContext ctx(gpu_device_, gpu_device_.ordinal);
+        const bool ok = with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {outputs->qkv.get(), outputs->z.get(), outputs->alpha.get(), outputs->beta.get()},
+            [&]
+            {
+                return stage.execute(&ctx);
+            });
+        ASSERT_TRUE(ok);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+        stage.unbindWorkspace();
+        kernel_qkv->resetDynamicState();
+        kernel_z->resetDynamicState();
+        kernel_alpha->resetDynamicState();
+        kernel_beta->resetDynamicState();
+    };
+
+    const auto input_data = randomFP32(static_cast<size_t>(M) * K);
+    StageOutputs grouped = make_outputs(M);
+    run_stage(M, input_data.data(), &grouped);
+
+    for (int row = 0; row < M; ++row)
+    {
+        StageOutputs serial = make_outputs(1);
+        run_stage(1, input_data.data() + static_cast<size_t>(row) * K, &serial);
+
+        const auto qkv_result = checkParity(
+            grouped.qkv->data() + static_cast<size_t>(row) * N_QKV,
+            serial.qkv->data(),
+            static_cast<size_t>(N_QKV),
+            0.999999,
+            1.0e-5);
+        const auto z_result = checkParity(
+            grouped.z->data() + static_cast<size_t>(row) * N_Z,
+            serial.z->data(),
+            static_cast<size_t>(N_Z),
+            0.999999,
+            1.0e-5);
+        const auto alpha_result = checkParity(
+            grouped.alpha->data() + static_cast<size_t>(row) * N_ALPHA,
+            serial.alpha->data(),
+            static_cast<size_t>(N_ALPHA),
+            0.999999,
+            1.0e-5);
+        const auto beta_result = checkParity(
+            grouped.beta->data() + static_cast<size_t>(row) * N_BETA,
+            serial.beta->data(),
+            static_cast<size_t>(N_BETA),
+            0.999999,
+            1.0e-5);
+
+        EXPECT_FALSE(qkv_result.has_nan_inf);
+        EXPECT_FALSE(z_result.has_nan_inf);
+        EXPECT_FALSE(alpha_result.has_nan_inf);
+        EXPECT_FALSE(beta_result.has_nan_inf);
+        EXPECT_GE(qkv_result.cosine_similarity, 0.999999)
+            << "stage qkv row " << row << " rel_l2=" << qkv_result.relative_l2_error
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_GE(z_result.cosine_similarity, 0.999999)
+            << "stage z row " << row << " rel_l2=" << z_result.relative_l2_error
+            << " max_abs=" << z_result.max_abs_error;
+        EXPECT_GE(alpha_result.cosine_similarity, 0.999999)
+            << "stage alpha row " << row << " rel_l2=" << alpha_result.relative_l2_error
+            << " max_abs=" << alpha_result.max_abs_error;
+        EXPECT_GE(beta_result.cosine_similarity, 0.999999)
+            << "stage beta row " << row << " rel_l2=" << beta_result.relative_l2_error
+            << " max_abs=" << beta_result.max_abs_error;
+        EXPECT_LE(qkv_result.relative_l2_error, 1.0e-5)
+            << "stage qkv row " << row << " cosine=" << qkv_result.cosine_similarity
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_LE(z_result.relative_l2_error, 1.0e-5)
+            << "stage z row " << row << " cosine=" << z_result.cosine_similarity
+            << " max_abs=" << z_result.max_abs_error;
+        EXPECT_LE(alpha_result.relative_l2_error, 1.0e-5)
+            << "stage alpha row " << row << " cosine=" << alpha_result.cosine_similarity
+            << " max_abs=" << alpha_result.max_abs_error;
+        EXPECT_LE(beta_result.relative_l2_error, 1.0e-5)
+            << "stage beta row " << row << " cosine=" << beta_result.cosine_similarity
+            << " max_abs=" << beta_result.max_abs_error;
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_alpha.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_beta.get());
+}
+
+/**
+ * @brief Prove the real Qwen3.6 MoE GDN projection verifier rows are serial-decode equivalent.
+ *
+ * The MoE 35B fixture stores GDN qkv/z/out weights as Q6_K and uses the
+ * narrower MoE hidden width (`K=2048`, qkv=`8192`, z=`4096`, alpha/beta=`32`).
+ * Dense Qwen3.6 M=4 tests did not cover this shape or codebook, while the
+ * production continuation proof failed first around QKV/Z projection before
+ * attention and MoE routing amplified the error.  This regression checks the
+ * stage-level contract directly for every production verifier depth:
+ * grouped M=2/3/4 rows must match repeated M=1 decode-stage rows under tight
+ * cosine, relative-L2, max-absolute, and softmax symmetric-KL thresholds.
+ */
+TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_M234MatchesSerialStageRows)
+{
+    constexpr int kK = 2048;
+    constexpr int kNQKV = 8192;
+    constexpr int kNZ = 4096;
+    constexpr int kNAlpha = 32;
+    constexpr int kNBeta = 32;
+    constexpr std::array<int, 3> kVerifierRows = {2, 3, 4};
+
+    auto weights_qkv = TestTensorFactory::createQ6_KRandom(
+        {static_cast<size_t>(kNQKV), static_cast<size_t>(kK)}, 5531);
+    auto weights_z = TestTensorFactory::createQ6_KRandom(
+        {static_cast<size_t>(kNZ), static_cast<size_t>(kK)}, 5532);
+    auto weights_alpha = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kNAlpha), static_cast<size_t>(kK)}, -0.1f, 0.1f, 5533);
+    auto weights_beta = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kNBeta), static_cast<size_t>(kK)}, -0.1f, 0.1f, 5534);
+    ASSERT_TRUE(weights_alpha->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(weights_beta->ensureOnDevice(gpu_device_));
+
+    auto *kernel_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
+    auto *kernel_z = getPreparedKernel(weights_z.get(), gpu_device_);
+    auto *kernel_alpha = getPreparedKernel(weights_alpha.get(), gpu_device_);
+    auto *kernel_beta = getPreparedKernel(weights_beta.get(), gpu_device_);
+    ASSERT_NE(kernel_qkv, nullptr);
+    ASSERT_NE(kernel_z, nullptr);
+    ASSERT_NE(kernel_alpha, nullptr);
+    ASSERT_NE(kernel_beta, nullptr);
+
+    struct StageOutputs
+    {
+        std::unique_ptr<FP32Tensor> qkv;
+        std::unique_ptr<FP32Tensor> z;
+        std::unique_ptr<FP32Tensor> alpha;
+        std::unique_ptr<FP32Tensor> beta;
+    };
+
+    auto make_outputs = [](int rows) -> StageOutputs
+    {
+        return {
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNQKV)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNZ)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNAlpha)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNBeta)})};
+    };
+
+    auto run_stage = [&](int rows, const float *input_data, StageOutputs *outputs)
+    {
+        auto input = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kK)});
+        std::memcpy(
+            input->mutable_data(),
+            input_data,
+            static_cast<size_t>(rows) * kK * sizeof(float));
+
+        GDNProjectionStage::Params params;
+        params.device_id = gpu_device_;
+        params.input = input.get();
+        params.m = rows;
+        params.k = kK;
+        params.w_qkv = weights_qkv.get();
+        params.output_qkv = outputs->qkv.get();
+        params.n_qkv = kNQKV;
+        params.w_z = weights_z.get();
+        params.output_z = outputs->z.get();
+        params.n_z = kNZ;
+        params.w_a = weights_alpha.get();
+        params.output_a = outputs->alpha.get();
+        params.n_a = kNAlpha;
+        params.w_b = weights_beta.get();
+        params.output_b = outputs->beta.get();
+        params.n_b = kNBeta;
+        params.gemm_qkv = kernel_qkv;
+        params.gemm_z = kernel_z;
+        params.gemm_a = kernel_alpha;
+        params.gemm_b = kernel_beta;
+        params.force_decode_equivalent_verifier_prefill = true;
+
+        GDNProjectionStage stage(params);
+        WorkspaceRequirements reqs = stage.getWorkspaceRequirements(rows, 0, kK);
+        DeviceWorkspaceManager workspace(gpu_device_, workspaceBudgetFor(reqs));
+        ASSERT_TRUE(workspace.allocate(reqs));
+        stage.bindWorkspace(&workspace);
+
+        cudaStream_t stream = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+        stage.setGPUStream(static_cast<void *>(stream));
+        CUDADeviceContext ctx(gpu_device_, gpu_device_.ordinal);
+        const bool ok = with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {outputs->qkv.get(), outputs->z.get(), outputs->alpha.get(), outputs->beta.get()},
+            [&]
+            {
+                return stage.execute(&ctx);
+            });
+        ASSERT_TRUE(ok);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+        stage.unbindWorkspace();
+        kernel_qkv->resetDynamicState();
+        kernel_z->resetDynamicState();
+        kernel_alpha->resetDynamicState();
+        kernel_beta->resetDynamicState();
+    };
+
+    auto expect_strict_row = [](
+        const ParityResult &result,
+        const char *label,
+        int m,
+        int row,
+        double max_symmetric_kl = 1.0e-8)
+    {
+        EXPECT_FALSE(result.has_nan_inf)
+            << label << " M=" << m << " row=" << row << " produced non-finite output";
+        EXPECT_GE(result.cosine_similarity, 0.999999)
+            << label << " M=" << m << " row=" << row
+            << " cosine drift rel_l2=" << result.relative_l2_error
+            << " symmetric_kl=" << result.symmetric_kl
+            << " max_abs=" << result.max_abs_error;
+        EXPECT_LE(result.relative_l2_error, 1.0e-5)
+            << label << " M=" << m << " row=" << row
+            << " relative-L2 drift cosine=" << result.cosine_similarity
+            << " symmetric_kl=" << result.symmetric_kl
+            << " max_abs=" << result.max_abs_error;
+        EXPECT_LE(result.symmetric_kl, max_symmetric_kl)
+            << label << " M=" << m << " row=" << row
+            << " softmax distribution drift cosine=" << result.cosine_similarity
+            << " rel_l2=" << result.relative_l2_error
+            << " max_abs=" << result.max_abs_error;
+        EXPECT_LE(result.max_abs_error, 3.0e-4f)
+            << label << " M=" << m << " row=" << row
+            << " max-absolute drift cosine=" << result.cosine_similarity
+            << " rel_l2=" << result.relative_l2_error
+            << " symmetric_kl=" << result.symmetric_kl;
+    };
+
+    for (int M : kVerifierRows)
+    {
+        const auto input_data = randomFP32(static_cast<size_t>(M) * kK);
+        StageOutputs grouped = make_outputs(M);
+        run_stage(M, input_data.data(), &grouped);
+
+        for (int row = 0; row < M; ++row)
+        {
+            StageOutputs serial = make_outputs(1);
+            run_stage(1, input_data.data() + static_cast<size_t>(row) * kK, &serial);
+
+            expect_strict_row(
+                checkParity(
+                    grouped.qkv->data() + static_cast<size_t>(row) * kNQKV,
+                    serial.qkv->data(),
+                    static_cast<size_t>(kNQKV),
+                    0.999999,
+                    1.0e-5),
+                "qkv",
+                M,
+                row);
+            expect_strict_row(
+                checkParity(
+                    grouped.z->data() + static_cast<size_t>(row) * kNZ,
+                    serial.z->data(),
+                    static_cast<size_t>(kNZ),
+                    0.999999,
+                    1.0e-5),
+                "z",
+                M,
+                row);
+            expect_strict_row(
+                checkParity(
+                    grouped.alpha->data() + static_cast<size_t>(row) * kNAlpha,
+                    serial.alpha->data(),
+                    static_cast<size_t>(kNAlpha),
+                    0.999999,
+                    1.0e-5),
+                "alpha",
+                M,
+                row,
+                1.0e-10);
+            expect_strict_row(
+                checkParity(
+                    grouped.beta->data() + static_cast<size_t>(row) * kNBeta,
+                    serial.beta->data(),
+                    static_cast<size_t>(kNBeta),
+                    0.999999,
+                    1.0e-5),
+                "beta",
+                M,
+                row,
+                1.0e-10);
+        }
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_alpha.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_beta.get());
 }
 
 TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)

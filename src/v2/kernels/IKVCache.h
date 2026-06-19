@@ -88,11 +88,13 @@ namespace llaminar2
          * copying accepted counts back to the CPU.
          *
          * Long-context ring caches must treat @p target_cached_tokens_device as
-         * the target valid-token count and @p accepted_state_counts_device as
-         * the number of verifier rows committed from the current device-visible
-         * head.  The target count alone is not enough to reconstruct a wrapped
-         * ring head, so implementations need a live base-head mirror or an
-         * equivalent device-side state source.
+         * the target valid-token count.  Publication must preserve the live
+         * ring tail and move the head to `tail + target_cached_tokens`, matching
+         * truncateSequence() semantics after a verifier graph has written
+         * temporary rows.  @p accepted_state_counts_device records how many
+         * verifier rows were accepted for validation/accounting; it is not a
+         * reliable source of ring-head position because the live device head may
+         * already include rejected verifier rows.
          *
          * The stream is mandatory for GPU implementations.  Work enqueued by
          * this call must be ordered after the verifier outcome producer and
@@ -519,6 +521,38 @@ namespace llaminar2
         bool append(int layer, const ITensor *K, const ITensor *V, int num_tokens)
         {
             return append(layer, 0, K, V, num_tokens);
+        }
+
+        /**
+         * @brief Append MTP verifier rows with decode-equivalent ring semantics.
+         *
+         * The verifier path computes several future rows at once, but those rows
+         * must become KV-cache state exactly as if normal decode had appended
+         * them one token at a time.  Backends that implement this method should
+         * write all rows in one grouped/concurrent operation and update ring
+         * metadata once, preserving the same oldest-to-newest order and
+         * wraparound behavior as serial decode.
+         *
+         * Source tensors may be ordinary position-major rows
+         * `[verifier_rows][local_kv_heads * head_dim]` or head-major rows
+         * `[local_kv_heads * verifier_rows][head_dim]`.  Implementations must
+         * fail closed for unsupported layouts rather than silently falling back
+         * to stage-level row replay.
+         */
+        virtual bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                        int seq_idx,
+                                                        const ITensor *K,
+                                                        const ITensor *V,
+                                                        int verifier_rows,
+                                                        void *gpu_stream = nullptr)
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)K;
+            (void)V;
+            (void)verifier_rows;
+            (void)gpu_stream;
+            return false;
         }
 
         /**

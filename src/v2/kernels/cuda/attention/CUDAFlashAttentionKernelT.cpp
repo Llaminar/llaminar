@@ -1089,6 +1089,91 @@ namespace llaminar2
             }
         }
 
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::compute_verifier_rows_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            ITensor *output,
+            int verifier_rows,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size,
+            const IMPIContext *mpi_ctx,
+            int device_idx,
+            int head_start,
+            int gqa_n_rep)
+        {
+            if (!Q || !K || !V || !output)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Null tensor");
+                return false;
+            }
+            if (verifier_rows < 2 || verifier_rows > MAX_SMALL_DECODE_ROWS ||
+                kv_len <= verifier_rows || !causal)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Invalid verifier span"
+                          << " rows=" << verifier_rows
+                          << " kv_len=" << kv_len
+                          << " causal=" << causal);
+                return false;
+            }
+            if (!stream_ || !workspace_)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "requires explicit CUDA stream and bound workspace");
+                return false;
+            }
+            if (Q->native_type() != TensorType::FP32 || output->native_type() != TensorType::FP32)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "requires FP32 Q/output, got Q=" << Q->dtype_name()
+                                                           << " O=" << output->dtype_name());
+                return false;
+            }
+            if (K->native_type() != TensorType::FP16 || V->native_type() != TensorType::FP16)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "currently proven only for FP16 KV, got K=" << K->dtype_name()
+                                                                      << " V=" << V->dtype_name());
+                return false;
+            }
+
+            /*
+             * The M-row verifier path decides whether small-M decode is legal
+             * before compute_tensor() can lazily upload params, so prepare the
+             * row-local param block at this named contract boundary.
+             */
+            const int position_offset = kv_len - verifier_rows;
+            if (!dynamic_attn_device_derived_ &&
+                !prepareDynamicAttnParams(kv_len, position_offset, verifier_rows, stream_))
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "failed preparing dynamic params");
+                return false;
+            }
+
+            return compute_tensor(Q, K, V, output,
+                                  /*batch_size=*/1,
+                                  verifier_rows,
+                                  kv_len,
+                                  n_heads,
+                                  n_kv_heads,
+                                  head_dim,
+                                  causal,
+                                  window_size,
+                                  nullptr,
+                                  nullptr,
+                                  mpi_ctx,
+                                  device_idx,
+                                  head_start,
+                                  n_heads,
+                                  n_kv_heads,
+                                  gqa_n_rep);
+        }
+
         // =====================================================================
         // FP32 IWorkspaceConsumer Interface Implementation
         // =====================================================================

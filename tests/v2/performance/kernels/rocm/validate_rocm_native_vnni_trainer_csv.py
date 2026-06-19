@@ -42,6 +42,8 @@ PHASE_REQUIRED = {
         "variant",
         "kb",
         "target_waves",
+        "relative_l2",
+        "max_abs",
         "is_best",
     },
     "prefill": {"category", "m", "variant", "gflops", "is_best"},

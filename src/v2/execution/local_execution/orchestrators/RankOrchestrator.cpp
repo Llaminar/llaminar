@@ -102,7 +102,7 @@ namespace llaminar2
 
                 if (debugEnv().vram_trace)
                 {
-                    LOG_INFO("[VRAM_TRACE] rank_mmap_release.before_sync device=" << device);
+                    LOG_TRACE("[VRAM_TRACE] rank_mmap_release.before_sync device=" << device);
                 }
                 else
                 {
@@ -118,7 +118,7 @@ namespace llaminar2
                 }
                 else if (debugEnv().vram_trace)
                 {
-                    LOG_INFO("[VRAM_TRACE] rank_mmap_release.after_sync device=" << device);
+                    LOG_TRACE("[VRAM_TRACE] rank_mmap_release.after_sync device=" << device);
                 }
             }
             return ok;
@@ -1886,10 +1886,10 @@ namespace llaminar2
                         if (synchronizeGpuBackendsBeforeRankMmapRelease(config_))
                         {
                             if (debugEnv().vram_trace)
-                                LOG_INFO("[VRAM_TRACE] rank_mmap_release.before_advise phase=after_first_prefill");
+                                LOG_TRACE("[VRAM_TRACE] rank_mmap_release.before_advise phase=after_first_prefill");
                             const size_t advised_bytes = wm->adviseMmapDontneed();
                             if (debugEnv().vram_trace)
-                                LOG_INFO("[VRAM_TRACE] rank_mmap_release.after_advise phase=after_first_prefill bytes="
+                                LOG_TRACE("[VRAM_TRACE] rank_mmap_release.after_advise phase=after_first_prefill bytes="
                                          << advised_bytes);
                         }
                         else
@@ -3855,6 +3855,28 @@ namespace llaminar2
         return nullptr;
     }
 
+    const void *RankOrchestrator::prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+        const int32_t *verifier_tokens,
+        int total_verifier_input_tokens,
+        int draft_token_count)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+                verifier_tokens,
+                total_verifier_input_tokens,
+                draft_token_count);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+                verifier_tokens,
+                total_verifier_input_tokens,
+                draft_token_count);
+        }
+        return nullptr;
+    }
+
     const void *RankOrchestrator::prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
         int first_target_sample_slot,
         int first_draft_slot,
@@ -5231,6 +5253,36 @@ namespace llaminar2
                  ok;
         }
         return ok;
+    }
+
+    bool RankOrchestrator::supportsRowLocalAllPositionPenaltyApplication() const
+    {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->supportsRowLocalAllPositionPenaltyApplication();
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->supportsRowLocalAllPositionPenaltyApplication();
+        }
+
+        /*
+         * Multi-child TP/PP can promote penalty-greedy compact verification
+         * only after every participant can mutate its verifier shard with the
+         * same branch-local sampler history.  The compact reducer is a separate
+         * capability, so callers still need to check that too.
+         */
+        if (device_runners_.empty())
+            return false;
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner ||
+                !runner->supportsRowLocalAllPositionPenaltyApplication())
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     void RankOrchestrator::setSkipLogitsGatherDecode(bool skip)

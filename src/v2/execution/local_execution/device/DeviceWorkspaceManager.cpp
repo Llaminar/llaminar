@@ -195,7 +195,7 @@ namespace llaminar2
             }
         }
 
-        LOG_DEBUG("[WORKSPACE_ALLOC] block_ptr=" << block_
+        LOG_TRACE("[WORKSPACE_ALLOC] block_ptr=" << block_
                                                  << " bytes=" << total_size
                                                  << " device=" << device_.to_string()
                                                  << " ordinal=" << device_ordinal);
@@ -239,7 +239,7 @@ namespace llaminar2
                     return false;
                 }
             }
-            LOG_DEBUG("[WORKSPACE_SUBALLOC] '" << buf->name << "'"
+            LOG_TRACE("[WORKSPACE_SUBALLOC] '" << buf->name << "'"
                                                << " ptr=" << buf_ptr
                                                << " offset=" << current_offset
                                                << " size=" << buf->size_bytes
@@ -262,7 +262,7 @@ namespace llaminar2
         used_bytes_ = current_offset;
         allocated_ = true;
 
-        LOG_DEBUG("[DeviceWorkspaceManager] Allocated " << buffers_.size() << " buffers, "
+        LOG_TRACE("[DeviceWorkspaceManager] Allocated " << buffers_.size() << " buffers, "
                                                         << used_bytes_ << "/" << budget_bytes_ << " bytes used");
         return true;
     }

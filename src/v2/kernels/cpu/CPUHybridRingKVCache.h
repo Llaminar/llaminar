@@ -198,6 +198,29 @@ namespace llaminar2
             return Base::append_kv(kv_idx, seq_idx, new_k, new_v, num_tokens);
         }
 
+        /**
+         * @brief Forward grouped verifier KV publication through the hybrid layer map.
+         *
+         * Hybrid Qwen layers use global layer ids in graph stages, while the
+         * base ring cache stores only full-attention layers in a compressed
+         * index space.  This override keeps the Phase 9.8 grouped verifier
+         * append contract aligned with ordinary append_kv().
+         */
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream = nullptr) override
+        {
+            (void)gpu_stream;
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return true; // GDN layer — no KV payload to publish.
+            return Base::appendVerifierRowsDecodeEquivalent(
+                kv_idx, seq_idx, K, V, verifier_rows, nullptr);
+        }
+
         void clear() override
         {
             Base::clear();

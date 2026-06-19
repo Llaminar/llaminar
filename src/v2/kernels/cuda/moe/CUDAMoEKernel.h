@@ -100,10 +100,18 @@ namespace llaminar2
             ITensor *hidden, ITensor *batch_buffer,
             const int *host_token_indices, int num_tokens, int d_model) override;
 
+        bool copyTokenRowFromTensor(
+            ITensor *source, ITensor *row_buffer,
+            int row_index, int row_width) override;
+
         void scatterAddWeightedFromTensors(
             ITensor *output, ITensor *expert_output,
             const int *host_token_indices, const float *host_weights,
             int num_tokens, int d_model) override;
+
+        bool writeTokenRowToTensor(
+            ITensor *destination, ITensor *row_buffer,
+            int row_index, int row_width) override;
 
         void sharedExpertGateFromTensors(
             ITensor *input, ITensor *gate_inp, ITensor *shared_output,
@@ -197,6 +205,17 @@ namespace llaminar2
             int d_model,
             int intermediate) override;
 
+        /// @brief Execute grouped gate/up decode from FP32 routing indices already resident on CUDA.
+        bool groupedExpertGateUpDecodeFromRouting(
+            const TensorBase *input,
+            ITensor *routing_indices,
+            int table_id,
+            int top_k,
+            ITensor *const *gate_outputs,
+            ITensor *const *up_outputs,
+            int d_model,
+            int intermediate) override;
+
         /// @brief Execute graph-capturable grouped gate/up decode from runtime-table top-k ids.
         bool groupedExpertGateUpDecodeFromRuntime(
             DeviceMoELayerRuntime *runtime_layer,
@@ -205,6 +224,18 @@ namespace llaminar2
             int top_k,
             ITensor *const *gate_outputs,
             ITensor *const *up_outputs,
+            int d_model,
+            int intermediate) override;
+
+        /// @brief Execute grouped SwiGLU/down decode from FP32 routing indices and weights on CUDA.
+        bool groupedExpertDownDecodeFromRouting(
+            ITensor *const *gate_tensors,
+            ITensor *const *up_tensors,
+            ITensor *routing_indices,
+            ITensor *routing_weights,
+            int table_id,
+            int top_k,
+            ITensor *output,
             int d_model,
             int intermediate) override;
 
@@ -306,6 +337,17 @@ namespace llaminar2
         bool ensureGroupedGateUpKPartScratchCapacity(int top_k, int k_partitions, int intermediate);
         bool ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model, int slots = 1);
         bool ensureGroupedDownDecodeCapacity(int top_k, int intermediate);
+        /**
+         * @brief Ensure workspace-backed decode metadata buffers exist.
+         *
+         * Routing-tensor decode fills expert ids from a device FP32 index tensor
+         * via cudaMoE_float_to_int(), so it needs capacity without staging host
+         * expert ids.  The older host-table path still uses
+         * ensureGroupedDecodeMetadata() when it intentionally uploads metadata.
+         */
+        bool ensureGroupedDecodeMetadataCapacity(int num_active, bool include_weights);
+        /// @brief Ensure a routing-only expert-id buffer that cannot race host-table decode metadata.
+        bool ensureRoutingDecodeMetadataCapacity(int num_active);
         bool ensureGroupedDecodeMetadata(
             const int *expert_ids,
             const float *expert_weights,
@@ -393,6 +435,7 @@ namespace llaminar2
         int *d_group_token_indices_ = nullptr;
         int *d_group_original_to_grouped_ = nullptr;
         int *d_group_original_expert_ids_ = nullptr;
+        int *d_group_single_expert_ids_ = nullptr;
         int *d_group_write_heads_ = nullptr;
         float *d_group_weights_ = nullptr;
         int *d_group_active_expert_ids_ = nullptr;
@@ -448,7 +491,9 @@ namespace llaminar2
 
         int *d_grouped_decode_expert_ids_ = nullptr;
         float *d_grouped_decode_weights_ = nullptr;
+        int *d_routing_decode_expert_ids_ = nullptr;
         int grouped_decode_metadata_cap_ = 0;
+        int routing_decode_metadata_cap_ = 0;
         std::vector<int> grouped_decode_cached_expert_ids_;
         std::vector<float> grouped_decode_cached_weights_;
 

@@ -23,6 +23,7 @@ namespace llaminar2
         constexpr const char *GROUP_TOKEN_INDICES = "moe_group_token_indices";
         constexpr const char *GROUP_ORIGINAL_TO_GROUPED = "moe_group_original_to_grouped";
         constexpr const char *GROUP_ORIGINAL_EXPERT_IDS = "moe_group_original_expert_ids";
+        constexpr const char *GROUP_SINGLE_EXPERT_IDS = "moe_group_single_expert_ids";
         constexpr const char *GROUP_WRITE_HEADS = "moe_group_write_heads";
         constexpr const char *GROUP_WEIGHTS = "moe_group_weights";
         constexpr const char *GROUP_ACTIVE_EXPERT_IDS = "moe_group_active_expert_ids";
@@ -43,6 +44,7 @@ namespace llaminar2
         constexpr const char *DECODE_SWIGLU_SCALES = "moe_decode_swiglu_scales";
         constexpr const char *DECODE_EXPERT_IDS = "moe_grouped_decode_expert_ids";
         constexpr const char *DECODE_WEIGHTS = "moe_grouped_decode_weights";
+        constexpr const char *CUDA_ROUTING_DECODE_EXPERT_IDS = "cuda_moe_routing_decode_expert_ids";
         constexpr const char *CUDA_DECODE_GATEUP_GATE_PTRS = "cuda_moe_decode_gateup_gate_ptrs";
         constexpr const char *CUDA_DECODE_GATEUP_UP_PTRS = "cuda_moe_decode_gateup_up_ptrs";
         constexpr const char *CUDA_DECODE_DOWN_GATE_PTRS = "cuda_moe_decode_down_gate_ptrs";
@@ -123,6 +125,7 @@ namespace llaminar2
             add(reqs, GROUP_TOKEN_INDICES, total_slots * sizeof(int));
             add(reqs, GROUP_ORIGINAL_TO_GROUPED, total_slots * sizeof(int));
             add(reqs, GROUP_ORIGINAL_EXPERT_IDS, total_slots * sizeof(int));
+            add(reqs, GROUP_SINGLE_EXPERT_IDS, sizeof(int));
             add(reqs, GROUP_WEIGHTS, total_slots * sizeof(float));
             add(reqs, GROUP_ACTIVE_EXPERT_IDS, active_expert_id_slots * sizeof(int));
             add(reqs, GROUP_OFFSETS, static_cast<std::size_t>(num_experts) * sizeof(int));
@@ -160,6 +163,7 @@ namespace llaminar2
                 decode_slots * static_cast<std::size_t>(intermediate_blocks) * sizeof(float));
             add(reqs, DECODE_EXPERT_IDS, decode_slots * sizeof(int));
             add(reqs, DECODE_WEIGHTS, decode_slots * sizeof(float));
+            add(reqs, CUDA_ROUTING_DECODE_EXPERT_IDS, decode_slots * sizeof(int));
             add(reqs, CUDA_DECODE_GATEUP_GATE_PTRS,
                 static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
                     kRuntimePointerArrayMaxTopK * sizeof(float *));

@@ -128,10 +128,18 @@ namespace llaminar2
             ITensor *hidden, ITensor *batch_buffer,
             const int *host_token_indices, int num_tokens, int d_model) override;
 
+        bool copyTokenRowFromTensor(
+            ITensor *source, ITensor *row_buffer,
+            int row_index, int row_width) override;
+
         void scatterAddWeightedFromTensors(
             ITensor *output, ITensor *expert_output,
             const int *host_token_indices, const float *host_weights,
             int num_tokens, int d_model) override;
+
+        bool writeTokenRowToTensor(
+            ITensor *destination, ITensor *row_buffer,
+            int row_index, int row_width) override;
 
         void sharedExpertGateFromTensors(
             ITensor *input, ITensor *gate_inp, ITensor *shared_output,

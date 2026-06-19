@@ -46,8 +46,9 @@ namespace llaminar2
     /**
      * @brief RAII wrapper for a memory-mapped file region
      *
-     * Maps an entire file into the process address space using mmap(MAP_PRIVATE | MAP_POPULATE).
-     * MAP_POPULATE pre-faults all pages via kernel readahead, avoiding per-page faults during access.
+     * Maps an entire file into the process address space. CPU paths may use
+     * MAP_POPULATE to pre-fault pages, while GPU upload paths can demand-page
+     * the mapping to avoid blocking on a whole-file cold fault before H2D copy.
      * MAP_PRIVATE ensures the mapping is read-only and copy-on-write (safe for concurrent access).
      *
      * Lifetime: The mapped region stays valid until this object is destroyed.
@@ -56,6 +57,22 @@ namespace llaminar2
     class MmapRegion
     {
     public:
+        /**
+         * @brief Controls whether mmap creation eagerly faults file pages.
+         *
+         * CPU weight paths benefit from eager prefaulting because decode may read
+         * directly from the mapped file. GPU paths usually upload tensors to
+         * device memory immediately, so eager whole-file prefaulting can turn a
+         * cold 16+ GB model load into a long blocking page-fault stall before the
+         * first H2D copy even starts.
+         */
+        enum class PrefaultPolicy
+        {
+            Auto,          ///< Preserve historical behavior for this mapping mode.
+            EagerPopulate, ///< Use MAP_POPULATE when NUMA binding is not requested.
+            DemandPaged,   ///< Map lazily and rely on sequential readahead hints.
+        };
+
         ~MmapRegion()
         {
 #ifdef __linux__
@@ -76,11 +93,13 @@ namespace llaminar2
 
         // Movable
         MmapRegion(MmapRegion &&other) noexcept
-            : base_(other.base_), length_(other.length_), fd_(other.fd_), path_(std::move(other.path_))
+            : base_(other.base_), length_(other.length_), fd_(other.fd_), path_(std::move(other.path_)),
+              eager_prefaulted_(other.eager_prefaulted_)
         {
             other.base_ = nullptr;
             other.length_ = 0;
             other.fd_ = -1;
+            other.eager_prefaulted_ = false;
         }
 
         MmapRegion &operator=(MmapRegion &&other) noexcept
@@ -101,9 +120,11 @@ namespace llaminar2
                 length_ = other.length_;
                 fd_ = other.fd_;
                 path_ = std::move(other.path_);
+                eager_prefaulted_ = other.eager_prefaulted_;
                 other.base_ = nullptr;
                 other.length_ = 0;
                 other.fd_ = -1;
+                other.eager_prefaulted_ = false;
             }
             return *this;
         }
@@ -116,6 +137,15 @@ namespace llaminar2
 
         /** @brief Get the file path that was mapped */
         const std::string &path() const { return path_; }
+
+        /**
+         * @brief Whether create() used a synchronous eager prefault path.
+         *
+         * This is intentionally exposed for diagnostics and regression tests:
+         * GPU-target model loading must stay demand-paged, while CPU/NUMA model
+         * loading can deliberately prefault to stabilize host-side decode.
+         */
+        bool wasEagerPrefaulted() const { return eager_prefaulted_; }
 
         /**
          * @brief Release physical pages backing this mmap region.
@@ -256,8 +286,8 @@ namespace llaminar2
          *
          * When numa_node >= 0, uses mbind(MPOL_BIND) to ensure pages are allocated
          * on the specified NUMA node, then parallel first-touch to pre-fault.
-         * When numa_node < 0, uses MAP_POPULATE for immediate pre-faulting (default
-         * NUMA policy applies — pages land on the calling CPU's local node).
+         * When numa_node < 0, Auto/EagerPopulate uses MAP_POPULATE for immediate
+         * pre-faulting. DemandPaged maps lazily and issues readahead hints instead.
          *
          * @param file_path Path to the file to map
          * @param numa_node Target NUMA node for page placement (-1 = default)
@@ -265,10 +295,12 @@ namespace llaminar2
          *        mmap. Set this when the page cache has been pre-populated by
          *        prepopulatePageCache() — the first-touch loop will fault from the
          *        warm page cache instead of disk, giving ~10× faster loading.
+         * @param prefault_policy Controls whole-file prefault behavior.
          * @return Unique pointer to MmapRegion, or nullptr on failure
          */
         static std::unique_ptr<MmapRegion> create(const std::string &file_path, int numa_node = -1,
-                                                  bool skip_cache_eviction = false)
+                                                  bool skip_cache_eviction = false,
+                                                  PrefaultPolicy prefault_policy = PrefaultPolicy::Auto)
         {
 #ifdef __linux__
             // Open file read-only
@@ -317,10 +349,14 @@ namespace llaminar2
             ::posix_fadvise(fd, 0, file_size, POSIX_FADV_SEQUENTIAL);
 
             // Choose mmap strategy based on NUMA binding requirement:
-            // - With NUMA binding: mmap without MAP_POPULATE, then mbind() to target node
-            // - Without NUMA binding: mmap with MAP_POPULATE for immediate pre-fault
+            // - With NUMA binding: mmap without MAP_POPULATE, then mbind() to target node.
+            // - Without NUMA binding: historical Auto eagerly prefaults with MAP_POPULATE.
+            // - GPU upload paths select DemandPaged to avoid a whole-file cold-fault stall.
+            const bool eager_populate =
+                !numa_bind &&
+                prefault_policy != PrefaultPolicy::DemandPaged;
             int mmap_flags = MAP_PRIVATE;
-            if (!numa_bind)
+            if (eager_populate)
             {
                 mmap_flags |= MAP_POPULATE;
             }
@@ -389,29 +425,45 @@ namespace llaminar2
             }
             else
             {
-                // Non-NUMA path already pre-faulted via MAP_POPULATE
-                ::madvise(base, file_size, MADV_WILLNEED);
+                if (!eager_populate)
+                {
+                    // Demand-paged GPU staging should not request whole-file
+                    // prefault or prefetch. Sequential access hints are enough
+                    // for kernel readahead as the actual tensor uploads walk the
+                    // GGUF, and they avoid cold-load stalls before the first H2D.
+                    ::madvise(base, file_size, MADV_SEQUENTIAL);
+                }
+                else
+                {
+                    ::madvise(base, file_size, MADV_WILLNEED);
+                }
                 ::madvise(base, file_size, MADV_HUGEPAGE);
-                LOG_DEBUG("[MmapRegion] Mapped " << file_path << " (" << (file_size / (1024 * 1024)) << " MB, THP requested)");
+                LOG_DEBUG("[MmapRegion] Mapped " << file_path
+                                                 << " (" << (file_size / (1024 * 1024)) << " MB"
+                                                 << (eager_populate ? ", eager-prefault" : ", demand-paged")
+                                                 << ", THP requested)");
             }
 
-            return std::unique_ptr<MmapRegion>(new MmapRegion(base, file_size, fd, file_path));
+            return std::unique_ptr<MmapRegion>(
+                new MmapRegion(base, file_size, fd, file_path, numa_bind || eager_populate));
 #else
             (void)numa_node;
             (void)skip_cache_eviction;
+            (void)prefault_policy;
             LOG_WARN("[MmapRegion] mmap not supported on this platform, falling back to ifstream");
             return nullptr;
 #endif
         }
 
     private:
-        MmapRegion(void *base, size_t length, int fd, const std::string &path)
-            : base_(base), length_(length), fd_(fd), path_(path) {}
+        MmapRegion(void *base, size_t length, int fd, const std::string &path, bool eager_prefaulted)
+            : base_(base), length_(length), fd_(fd), path_(path), eager_prefaulted_(eager_prefaulted) {}
 
         void *base_ = nullptr;
         size_t length_ = 0;
         int fd_ = -1;
         std::string path_;
+        bool eager_prefaulted_ = false;
     };
 
 } // namespace llaminar2

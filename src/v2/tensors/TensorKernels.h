@@ -476,6 +476,43 @@ namespace llaminar2
         }
 
         /**
+         * @brief Grouped verifier-row SwiGLU + down projection.
+         *
+         * The MTP verifier publishes accepted rows from a compact M=2..4 graph,
+         * but the published row must be numerically equivalent to serial decode.
+         * Implementations that override this method must compute all verifier
+         * rows through a grouped/concurrent path while preserving the M=1 decode
+         * SwiGLU and GEMV contracts. Returning false is a hard capability miss:
+         * stages must not hide an unsupported backend behind row-wise replay.
+         *
+         * @param gate Gate projection rows [m, k].
+         * @param up Up projection rows [m, k].
+         * @param output Down projection output [m, n].
+         * @param m Verifier row count. Production MTP uses 2..4.
+         * @param n Output width.
+         * @param k Intermediate width.
+         */
+        virtual bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+            const TensorBase *gate,
+            const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha = 1.0f, float beta = 0.0f,
+            DeviceWorkspaceManager *workspace = nullptr)
+        {
+            (void)gate;
+            (void)up;
+            (void)output;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)alpha;
+            (void)beta;
+            (void)workspace;
+            return false;
+        }
+
+        /**
          * @brief Check if this kernel supports optimized fused multi-projection
          *
          * @return true if multiply_fused_tensor() has optimized implementation beyond sequential GEMMs
@@ -602,6 +639,41 @@ namespace llaminar2
                 }
             }
             return true;
+        }
+
+        /**
+         * @brief Grouped verifier-row projection with serial decode row math.
+         *
+         * MTP verifier graphs often evaluate M=2..4 candidate rows together.
+         * A normal GEMM kernel may legally change accumulation order across
+         * rows, K tiles, or projection groups, but verifier rows that publish
+         * recurrent/KV state need the same per-row numerical contract as M=1
+         * serial decode. Implementations that override this method must:
+         *
+         * - process all requested rows in one grouped/concurrent kernel path;
+         * - use the same activation quantization and per-row accumulation order
+         *   as their M=1 decode GEMV path;
+         * - write every projection output in the supplied batched tensors; and
+         * - return false rather than silently falling back to row-wise stage
+         *   replay when that contract is unsupported.
+         *
+         * The default implementation is unsupported. Stages use this as the
+         * Phase 9.8 promotion gate before retiring older serial verifier helpers.
+         */
+        virtual bool multiply_fused_verifier_rows_decode_equivalent(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const IMPIContext *mpi_ctx = nullptr,
+            DeviceWorkspaceManager *workspace = nullptr)
+        {
+            (void)input;
+            (void)projections;
+            (void)m;
+            (void)k;
+            (void)mpi_ctx;
+            (void)workspace;
+            return false;
         }
 
         /**
@@ -1480,6 +1552,58 @@ namespace llaminar2
             int local_n_kv_heads = -1, ///< Number of KV heads (-1 = all)
             int gqa_n_rep = 0)         ///< Global GQA repetition factor (0 = auto from n_heads/n_kv_heads)
             = 0;
+
+        /**
+         * @brief Compute MTP verifier rows through a grouped decode-equivalent path.
+         *
+         * The verifier input contains M compact rows (currently production M=2..4)
+         * appended after an existing prefix in the KV cache. The implementation
+         * must compute every row as if serial decode had processed rows
+         * `[0, M)` one at a time, including causal visibility:
+         *
+         * - row 0 may attend through `base_kv_len + 1`
+         * - row 1 may attend through `base_kv_len + 2`
+         * - ...
+         *
+         * This is a performance contract, not merely a correctness contract.
+         * Implementations must not hide M ordinary one-token `compute_tensor()`
+         * calls behind this method. Unsupported backends should return false so
+         * stages can fail closed instead of silently taking a serial fallback.
+         */
+        virtual bool compute_verifier_rows_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            ITensor *output,
+            int verifier_rows,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size = -1,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int head_start = 0,
+            int gqa_n_rep = 0)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)output;
+            (void)verifier_rows;
+            (void)kv_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)head_start;
+            (void)gqa_n_rep;
+            return false;
+        }
 
         /**
          * @brief Update attention device params stored in pinned host memory for graph replay
@@ -2484,6 +2608,49 @@ namespace llaminar2
             int rotary_dim = 0) = 0;
 
         /**
+         * @brief Apply RoPE to MTP verifier rows using serial-decode-equivalent math.
+         *
+         * Production MTP verifier graphs process a tiny M=2..4 row block, but
+         * the accepted-state publication contract is defined by serial decode:
+         * row 0, then row 1, and so on, each at its absolute position.  Backend
+         * implementations should provide a grouped kernel entry point for that
+         * contract rather than making `RoPEStage` allocate one-row tensors and
+         * replay itself.
+         *
+         * @return true when the backend applied the grouped verifier contract.
+         *         The default is fail-closed so callers cannot silently fall
+         *         back to non-equivalent prefill math.
+         */
+        virtual bool apply_verifier_rows_decode_equivalent(
+            TensorBase *Q,
+            TensorBase *K,
+            const int *position_ids,
+            int verifier_rows,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int pos_offset = 0,
+            int rotary_dim = 0)
+        {
+            (void)Q;
+            (void)K;
+            (void)position_ids;
+            (void)verifier_rows;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)rope_theta;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)pos_offset;
+            (void)rotary_dim;
+            return false;
+        }
+
+        /**
          * @brief Update the pos_offset stored in device params for graph replay
          *
          * GPU implementations should use this as a pre-capture/pre-replay hook:
@@ -3460,6 +3627,60 @@ namespace llaminar2
             (void)n_heads;
             (void)d_k;
             (void)d_v;
+            (void)chunk_size;
+            (void)use_qk_l2norm;
+            (void)state_snapshots;
+            (void)snapshot_stride_floats;
+            (void)max_snapshot_rows;
+            return false;
+        }
+
+        /**
+         * @brief Decode-equivalent verifier chunk directly from a merged QKV row layout.
+         *
+         * Some graph builders store GDN Q/K/V as one tensor row:
+         *
+         *   [Q(n_k_heads*d_k) | K(n_k_heads*d_k) | V(n_heads*d_v)]
+         *
+         * The generic stage path can deinterleave that tensor into separate
+         * contiguous Q/K/V matrices before calling chunkForwardWithStateSnapshots(),
+         * but all-position MTP verifier chunks are tiny (M=2..4), so the copy can
+         * dominate CPU replay time.  Implementations that can read this merged
+         * layout directly should override this method and publish the same
+         * post-row snapshots as serial recurrent_step().
+         *
+         * The Q/K head for local V-head h is:
+         *
+         *   qk_head = (h + global_v_head_offset) mod n_k_heads
+         *
+         * Returning false means the implementation has no direct merged-QKV
+         * verifier path; callers may use their explicit deinterleave path when
+         * that behavior is intended.
+         */
+        virtual bool chunkForwardMergedQKVWithStateSnapshots(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, int chunk_size, bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows)
+        {
+            (void)merged_qkv;
+            (void)qkv_stride;
+            (void)alpha;
+            (void)beta_raw;
+            (void)A_log;
+            (void)dt_bias;
+            (void)output;
+            (void)state;
+            (void)seq_len;
+            (void)n_k_heads;
+            (void)n_heads;
+            (void)d_k;
+            (void)d_v;
+            (void)global_v_head_offset;
             (void)chunk_size;
             (void)use_qk_l2norm;
             (void)state_snapshots;

@@ -347,6 +347,9 @@ namespace llaminar2
                 return mismatch("GDN recurrence value count mismatch");
             if (lhs.conv_values != rhs.conv_values)
                 return mismatch("GDN short-conv value count mismatch");
+            const bool compare_device_gdn_hashes =
+                lhs.device_state_hash_available &&
+                rhs.device_state_hash_available;
             if (options.compare_gdn_values_if_available)
             {
                 if (auto recurrence_result = compare_gdn_values(
@@ -367,6 +370,46 @@ namespace llaminar2
                 {
                     return conv_result;
                 }
+            }
+            if (compare_device_gdn_hashes)
+            {
+                if (lhs.recurrence_device_bytes != rhs.recurrence_device_bytes)
+                {
+                    std::ostringstream msg;
+                    msg << "GDN recurrence device byte count mismatch at layer "
+                        << lhs.global_layer;
+                    return mismatch(msg.str());
+                }
+                if (lhs.conv_device_bytes != rhs.conv_device_bytes)
+                {
+                    std::ostringstream msg;
+                    msg << "GDN short-conv device byte count mismatch at layer "
+                        << lhs.global_layer;
+                    return mismatch(msg.str());
+                }
+                if (options.compare_gdn_hashes &&
+                    lhs.recurrence_device_hash != rhs.recurrence_device_hash)
+                {
+                    std::ostringstream msg;
+                    msg << "GDN recurrence device hash mismatch at layer "
+                        << lhs.global_layer;
+                    return mismatch(msg.str());
+                }
+                if (options.compare_gdn_hashes &&
+                    lhs.conv_device_hash != rhs.conv_device_hash)
+                {
+                    std::ostringstream msg;
+                    msg << "GDN short-conv device hash mismatch at layer "
+                        << lhs.global_layer;
+                    return mismatch(msg.str());
+                }
+                /*
+                 * Phase 9.5 makes GPU GDN/short-conv state device-owned.
+                 * Host mirror zero flags can be stale after a device-only
+                 * publication, so a probe with device hashes must be judged
+                 * by those hashes rather than by host-mirror all-zero flags.
+                 */
+                continue;
             }
             if (options.compare_gdn_hashes &&
                 lhs.recurrence_hash != rhs.recurrence_hash)

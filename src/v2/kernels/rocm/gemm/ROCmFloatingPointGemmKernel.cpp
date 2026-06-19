@@ -369,6 +369,89 @@ namespace llaminar2
                 }
             }
 
+            /*
+             * Qwen3.6 GDN alpha/beta verifier projections are tiny FP32 GEMMs
+             * (M<=4, N<=64).  Grouped verifier rows use the local fixed-tree
+             * tiny kernel so their reduction order is stable and graph
+             * capturable.  Serial decode rows must use the same contract when a
+             * graph workspace is bound; otherwise a hipBLAS M=1 reference can
+             * differ by a few FP32 ULPs and the recurrent state amplifies that
+             * into a token-level mismatch.
+             */
+            DeviceWorkspaceManager *effective_workspace = workspace ? workspace : workspace_;
+            const bool can_use_tiny_decode_equivalent =
+                precision_ == Precision::FP32 &&
+                !d_bias &&
+                transpose_B &&
+                alpha == 1.0f &&
+                beta == 0.0f &&
+                m > 0 && m <= 4 &&
+                n > 0 && n <= 64 &&
+                k > 0 &&
+                d_weights_ &&
+                gpu_stream_ &&
+                effective_workspace &&
+                effective_workspace->hasBuffer(GemmWorkspaceBuffers::ROCM_FP32_BATCH_A_PTRS) &&
+                effective_workspace->hasBuffer(GemmWorkspaceBuffers::ROCM_FP32_BATCH_B_PTRS) &&
+                effective_workspace->hasBuffer(GemmWorkspaceBuffers::ROCM_FP32_BATCH_C_PTRS);
+
+            if (can_use_tiny_decode_equivalent)
+            {
+                std::vector<const float *> a_ptrs{d_A};
+                std::vector<const float *> b_ptrs{static_cast<const float *>(d_weights_)};
+                std::vector<float *> c_ptrs{d_C};
+                if (!stageBatchedPointers(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
+                    return false;
+
+                bool success = rocmFp32_tiny_batched_projection(
+                    d_batch_A_ptrs_,
+                    d_batch_B_ptrs_,
+                    d_batch_C_ptrs_,
+                    m,
+                    n,
+                    k,
+                    1,
+                    rocm_device_id_,
+                    gpu_stream_);
+                if (!success)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Tiny FP32 single projection failed"
+                              << " M=" << m << " N=" << n << " K=" << k);
+                    return false;
+                }
+
+                if (d_mapped_output)
+                {
+                    hipError_t copy_status = hipMemcpyAsync(
+                        d_mapped_output,
+                        d_C,
+                        static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float),
+                        hipMemcpyDeviceToDevice,
+                        static_cast<hipStream_t>(gpu_stream_));
+                    if (copy_status != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Tiny FP32 mapped-output copy failed: "
+                                  << hipGetErrorString(copy_status));
+                        return false;
+                    }
+                }
+
+                if (PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "rocm_fp32_tiny_single_projection_calls",
+                        1.0,
+                        "gemm",
+                        "rocm:" + std::to_string(rocm_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"m", std::to_string(m)},
+                            {"n", std::to_string(n)},
+                            {"k", std::to_string(k)}});
+                }
+                return true;
+            }
+
             // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
             if (d_bias)
             {
@@ -609,7 +692,18 @@ namespace llaminar2
                     return false;
 
                 const int batch_count = static_cast<int>(group_indices.size());
+                /*
+                 * Verifier-sized GDN alpha/beta projections must use the same
+                 * fixed reduction tree for M=1 and grouped M=2..4 rows.
+                 * hipBLAS may legally choose different reduction schedules for
+                 * those shapes; sub-ULP alpha/beta drift is then amplified by
+                 * quantized projections and recurrence state.  The tiny kernel
+                 * is workspace-backed, graph-capturable, and mirrors the CUDA
+                 * decode-equivalent contract for these small projections.
+                 */
+                constexpr bool kTinyFP32ProjectionDecodeEquivalent = true;
                 const bool use_tiny_fp32 =
+                    kTinyFP32ProjectionDecodeEquivalent &&
                     m > 0 && m <= 4 &&
                     seed.n > 0 && seed.n <= 64 &&
                     k > 0 &&
@@ -721,6 +815,22 @@ namespace llaminar2
             }
 
             return true;
+        }
+
+        bool ROCmFloatingPointGemmKernel::multiply_fused_verifier_rows_decode_equivalent(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const IMPIContext *mpi_ctx,
+            DeviceWorkspaceManager *workspace)
+        {
+            if (m <= 1 || m > 4)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] grouped verifier projection requires M=2..4, got M="
+                          << m);
+                return false;
+            }
+            return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
         }
 
         // =====================================================================

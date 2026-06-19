@@ -431,6 +431,135 @@ namespace llaminar2::cpu::native_vnni
             return true;
         }
 
+        /**
+         * @brief Grouped MTP verifier SwiGLU + down projection.
+         *
+         * This follows the same SwiGLU math as the ordinary CPU down path, but
+         * sends the resulting M=2..4 activation rows through
+         * gemm_native_vnni_preq_decode_equivalent_rows().  That helper shares
+         * Q8_1 activation quantization across rows and parallelizes the work,
+         * while each row keeps the same K-tile reduction order as M=1 decode.
+         */
+        bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+            const TensorBase *gate,
+            const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha = 1.0f, float beta = 0.0f,
+            DeviceWorkspaceManager *workspace = nullptr) override
+        {
+            (void)workspace;
+            if (!valid_ || !gate || !up || !output || m <= 1 || m > 4 || n <= 0 || k <= 0)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU rejected: valid="
+                          << valid_ << " gate=" << (gate != nullptr)
+                          << " up=" << (up != nullptr)
+                          << " output=" << (output != nullptr)
+                          << " m=" << m << " n=" << n << " k=" << k);
+                return false;
+            }
+            if (alpha != 1.0f || beta != 0.0f)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU only supports alpha=1,beta=0; got alpha="
+                          << alpha << " beta=" << beta);
+                return false;
+            }
+            if (packed_.N != n || packed_.K != k)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU dimension mismatch: packed N="
+                          << packed_.N << " K=" << packed_.K << ", call n=" << n << " k=" << k);
+                return false;
+            }
+
+            const size_t input_size = static_cast<size_t>(m) * static_cast<size_t>(k);
+            const size_t output_size = static_cast<size_t>(m) * static_cast<size_t>(n);
+            if (gate->numel() < input_size || up->numel() < input_size || output->numel() < output_size)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU tensor capacity mismatch");
+                return false;
+            }
+
+            const float *gate_fp32 = gate->data();
+            const float *up_fp32 = up->data();
+            float *output_fp32 = output->mutable_data();
+            if (!gate_fp32 || !up_fp32 || !output_fp32)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU requires FP32 host tensors");
+                return false;
+            }
+
+            thread_local AlignedVector<float> swiglu_scratch_tls;
+            if (swiglu_scratch_tls.size() < input_size)
+                swiglu_scratch_tls.resize_uninitialized(input_size);
+            const bool perf_enabled = PerfStatsCollector::isEnabled();
+            auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                           : PerfStatsCollector::Clock::time_point{};
+            primitives::compute_swiglu(
+                gate_fp32,
+                up_fp32,
+                swiglu_scratch_tls.data(),
+                static_cast<int>(input_size));
+            recordVerifierTiming(
+                "cpu_native_vnni_verifier_swiglu_compute",
+                perf_start,
+                m,
+                n,
+                k,
+                1);
+
+            const float *gemm_input = maybe_rotate_activation(swiglu_scratch_tls.data(), m, k);
+            const int K_blocks = (k + 31) / 32;
+            const size_t shared_q8_blocks = static_cast<size_t>(m) * K_blocks;
+            thread_local AlignedVector<Q8_1Block> shared_q8_tls;
+            if (shared_q8_tls.size() < shared_q8_blocks)
+                shared_q8_tls.resize_uninitialized(shared_q8_blocks);
+            perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                      : PerfStatsCollector::Clock::time_point{};
+            quantize_activations_to_q8_1(gemm_input, shared_q8_tls.data(), m, k, K_blocks);
+            recordVerifierTiming(
+                "cpu_native_vnni_verifier_activation_quantize",
+                perf_start,
+                m,
+                n,
+                k,
+                1);
+
+            if (deferred_packing_)
+                ensureWorkspace();
+            perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                      : PerfStatsCollector::Clock::time_point{};
+            gemm_native_vnni_preq_decode_equivalent_rows(
+                packed_,
+                shared_q8_tls.data(),
+                output_fp32,
+                m,
+                n);
+            recordVerifierTiming(
+                "cpu_native_vnni_verifier_swiglu_down_gemv",
+                perf_start,
+                m,
+                n,
+                k,
+                1);
+            if (deferred_packing_)
+                packed_.clearWorkspace();
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_native_vnni_grouped_verifier_swiglu_down_calls",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    PerfStatsCollector::Tags{
+                        {"m", std::to_string(m)},
+                        {"n", std::to_string(n)},
+                        {"k", std::to_string(k)}});
+            }
+            return true;
+        }
+
         // -------------------------------------------------------------------
         // Fused multi-projection with quantize-once + epilogues
         // -------------------------------------------------------------------
@@ -651,6 +780,233 @@ namespace llaminar2::cpu::native_vnni
                 PerfStatsCollector::addCounter(
                     "kernel",
                     "cpu_native_vnni_small_m_fused_projection_calls",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    PerfStatsCollector::Tags{
+                        {"m", std::to_string(m)},
+                        {"k", std::to_string(k)},
+                        {"projections", std::to_string(projections.size())}});
+            }
+            return true;
+        }
+
+        /**
+         * @brief Group MTP verifier rows while preserving M=1 decode GEMV math.
+         *
+         * This is the CPU implementation of ITensorGemm's Phase 9.8 verifier
+         * contract.  It quantizes the M verifier activation rows once, then
+         * runs every projection through gemm_native_vnni_preq_decode_equivalent_rows().
+         * That helper parallelizes across rows and N/K tasks, but each row uses
+         * the same chunk kernels and reduction order as serial decode.  The
+         * result is grouped/concurrent execution without the 2-row GEMM
+         * accumulation drift that can poison GDN/short-conv state publication.
+         */
+        bool multiply_fused_verifier_rows_decode_equivalent(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const IMPIContext *mpi_ctx = nullptr,
+            DeviceWorkspaceManager *workspace = nullptr) override
+        {
+            (void)mpi_ctx;
+            (void)workspace;
+
+            if (!valid_ || !input || m <= 1 || m > 4 || k <= 0 || projections.empty())
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected: valid="
+                          << valid_ << " input=" << (input != nullptr)
+                          << " m=" << m << " k=" << k
+                          << " projections=" << projections.size());
+                return false;
+            }
+
+            const float *input_data = input->data();
+            if (!input_data)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected: input has no host FP32 data");
+                return false;
+            }
+
+            std::vector<CPUNativeVNNIGemmKernel *> vnni_kernels;
+            vnni_kernels.reserve(projections.size());
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                const auto &proj = projections[i];
+                auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                if (!vnni || !vnni->valid_ || !proj.output || proj.n <= 0)
+                {
+                    LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected at projection "
+                              << i << ": native_vnni=" << (vnni != nullptr)
+                              << " valid=" << (vnni ? vnni->valid_ : false)
+                              << " output=" << (proj.output != nullptr)
+                              << " n=" << proj.n);
+                    return false;
+                }
+
+                /*
+                 * The fused projection API shares one activation transform.
+                 * If a future model ever mixes differently rotated weights in
+                 * one fused group, that is a real contract gap and must be
+                 * handled explicitly rather than silently producing drift.
+                 */
+                if (vnni->activation_rotation_ != activation_rotation_)
+                {
+                    LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected at projection "
+                              << i << ": mixed activation rotation contracts");
+                    return false;
+                }
+                vnni_kernels.push_back(vnni);
+            }
+
+            const bool perf_enabled = PerfStatsCollector::isEnabled();
+            auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                           : PerfStatsCollector::Clock::time_point{};
+            input_data = maybe_rotate_activation(input_data, m, k);
+
+            const int K_blocks = (k + 31) / 32;
+            const size_t shared_q8_blocks = static_cast<size_t>(m) * K_blocks;
+            thread_local AlignedVector<Q8_1Block> shared_q8_tls;
+            if (shared_q8_tls.size() < shared_q8_blocks)
+                shared_q8_tls.resize_uninitialized(shared_q8_blocks);
+            quantize_activations_to_q8_1(input_data, shared_q8_tls.data(), m, k, K_blocks);
+            recordVerifierTiming(
+                "cpu_native_vnni_verifier_projection_activation_quantize",
+                perf_start,
+                m,
+                /*n=*/0,
+                k,
+                static_cast<int>(projections.size()));
+
+            for (auto *vnni : vnni_kernels)
+            {
+                if (vnni->deferred_packing_)
+                    vnni->ensureWorkspace();
+            }
+
+            /*
+             * Multi-projection verifier path.
+             *
+             * GDN/QKV verifier graphs commonly have several projections fed by
+             * the same M=2..4 hidden-state rows.  The older implementation ran
+             * one grouped-row GEMV per projection, which was correct but paid
+             * an OpenMP team entry and scheduling cost for every projection.
+             * This fused descriptor path keeps the exact M=1 decode chunk math
+             * and schedules every projection under one OpenMP team.
+             */
+            if (projections.size() >= 2)
+            {
+                std::vector<FusedVerifierRowsDesc> fused_descs;
+                fused_descs.reserve(projections.size());
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &proj = projections[i];
+                    float *out_data = proj.output->mutable_data();
+                    if (!out_data)
+                        return false;
+
+                    fused_descs.push_back({
+                        &vnni_kernels[i]->packed_,
+                        out_data,
+                        proj.bias ? proj.bias->data() : nullptr,
+                        proj.n,
+                        proj.n});
+                }
+
+                perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                          : PerfStatsCollector::Clock::time_point{};
+                if (gemm_native_vnni_fused_verifier_rows_preq(
+                        shared_q8_tls.data(),
+                        fused_descs.data(),
+                        static_cast<int>(fused_descs.size()),
+                        m,
+                        K_blocks))
+                {
+                    recordVerifierTiming(
+                        "cpu_native_vnni_verifier_projection_fused_gemv",
+                        perf_start,
+                        m,
+                        /*n=*/0,
+                        k,
+                        static_cast<int>(fused_descs.size()));
+                    for (auto *vnni : vnni_kernels)
+                    {
+                        if (vnni->deferred_packing_)
+                            vnni->packed_.clearWorkspace();
+                    }
+
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "cpu_native_vnni_fused_grouped_verifier_projection_calls",
+                            1.0,
+                            "gemm",
+                            "cpu",
+                            PerfStatsCollector::Tags{
+                                {"m", std::to_string(m)},
+                                {"k", std::to_string(k)},
+                                {"projections", std::to_string(projections.size())}});
+                    }
+                    return true;
+                }
+
+                LOG_DEBUG("[CPUNativeVNNIGemmKernel] Fused grouped verifier "
+                          "projection path unavailable; using per-projection "
+                          "grouped verifier rows");
+                recordVerifierTiming(
+                    "cpu_native_vnni_verifier_projection_fused_gemv_rejected",
+                    perf_start,
+                    m,
+                    /*n=*/0,
+                    k,
+                    static_cast<int>(fused_descs.size()));
+            }
+
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                auto *vnni = vnni_kernels[i];
+                const auto &proj = projections[i];
+                float *out_data = proj.output->mutable_data();
+                if (!out_data)
+                    return false;
+
+                perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                          : PerfStatsCollector::Clock::time_point{};
+                gemm_native_vnni_preq_decode_equivalent_rows(
+                    vnni->packed_,
+                    shared_q8_tls.data(),
+                    out_data,
+                    m,
+                    proj.n);
+                recordVerifierTiming(
+                    "cpu_native_vnni_verifier_projection_per_gemv",
+                    perf_start,
+                    m,
+                    proj.n,
+                    k,
+                    1);
+
+                if (proj.bias)
+                {
+                    const float *bias_data = proj.bias->data();
+                    if (!bias_data)
+                        return false;
+                    apply_bias_epilogue(out_data, bias_data, m, proj.n, proj.n);
+                }
+            }
+
+            for (auto *vnni : vnni_kernels)
+            {
+                if (vnni->deferred_packing_)
+                    vnni->packed_.clearWorkspace();
+            }
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_native_vnni_grouped_verifier_projection_calls",
                     1.0,
                     "gemm",
                     "cpu",
@@ -1026,6 +1382,42 @@ namespace llaminar2::cpu::native_vnni
             std::memcpy(rotation_scratch_tls.data(), input, len * sizeof(float));
             activation_rotation_->rotate_rows_inplace(rotation_scratch_tls.data(), m, k);
             return rotation_scratch_tls.data();
+        }
+
+        /**
+         * @brief Record one coarse verifier-kernel timing sample.
+         *
+         * These timers intentionally sit at the projection bundle boundary, not
+         * inside the NativeVNNI block kernels.  That keeps ordinary inference
+         * cheap while still telling us whether Phase 9.8 verifier time is spent
+         * in activation preparation, grouped projection GEMV, or SwiGLU.
+         */
+        static void recordVerifierTiming(
+            const char *name,
+            PerfStatsCollector::Clock::time_point start,
+            int m,
+            int n,
+            int k,
+            int projections)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            const auto end = PerfStatsCollector::Clock::now();
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+            PerfStatsCollector::Tags tags{
+                {"m", std::to_string(m)},
+                {"k", std::to_string(k)},
+                {"projections", std::to_string(projections)}};
+            if (n > 0)
+                tags.emplace("n", std::to_string(n));
+            PerfStatsCollector::recordTimingNs(
+                "kernel",
+                name ? name : "cpu_native_vnni_verifier_unknown",
+                ns > 0 ? static_cast<uint64_t>(ns) : 0,
+                "gemm",
+                "cpu",
+                std::move(tags));
         }
     };
 

@@ -391,14 +391,26 @@ namespace llaminar2
 
         if (params_.force_decode_equivalent_verifier_prefill && seq_len > 1)
         {
-            return executeDecodeEquivalentVerifierRows(
-                kernel,
+            const bool success = kernel->apply_verifier_rows_decode_equivalent(
                 Q_base,
                 K_for_rope,
                 position_ids_ptr,
                 seq_len,
+                params_.n_heads,
                 n_kv_heads,
+                params_.head_dim,
+                params_.theta_base,
+                params_.mpi_ctx,
+                params_.device_id.toKernelDeviceIndex(),
+                params_.pos_offset,
                 rotary_dim);
+            if (!success)
+            {
+                LOG_ERROR("[RoPEStage] Backend does not support grouped decode-equivalent verifier RoPE for "
+                          << Q_base->dtype_name() << " rows=" << seq_len);
+                return false;
+            }
+            return true;
         }
 
         return kernel->apply_tensor(
@@ -414,129 +426,6 @@ namespace llaminar2
             params_.device_id.toKernelDeviceIndex(),
             params_.pos_offset,
             rotary_dim);
-    }
-
-    bool RoPEStage::executeDecodeEquivalentVerifierRows(
-        ITensorRoPE *kernel,
-        TensorBase *Q_base,
-        TensorBase *K_base,
-        const int *position_ids_ptr,
-        int seq_len,
-        int n_kv_heads,
-        int rotary_dim)
-    {
-        if (!kernel || !Q_base)
-            return false;
-        if (params_.device_id.is_gpu())
-        {
-            LOG_ERROR("[RoPEStage] Decode-equivalent verifier RoPE rows are not graph-capturable on GPU yet");
-            return false;
-        }
-        if (seq_len <= 1 || seq_len > 4)
-        {
-            LOG_ERROR("[RoPEStage] Decode-equivalent verifier RoPE expects M=2..4 rows, got "
-                      << seq_len);
-            return false;
-        }
-        if (Q_base->native_type() != TensorType::FP32 ||
-            (K_base && K_base->native_type() != TensorType::FP32))
-        {
-            LOG_ERROR("[RoPEStage] Decode-equivalent verifier RoPE currently requires FP32 Q/K tensors, got Q="
-                      << Q_base->dtype_name()
-                      << " K=" << (K_base ? K_base->dtype_name() : "null"));
-            return false;
-        }
-
-        const int q_cols = params_.n_heads * params_.head_dim;
-        const int k_cols = n_kv_heads * params_.head_dim;
-        if (q_cols <= 0 || k_cols <= 0)
-        {
-            LOG_ERROR("[RoPEStage] Invalid decode-equivalent verifier RoPE dimensions"
-                      << " q_cols=" << q_cols << " k_cols=" << k_cols);
-            return false;
-        }
-        if (static_cast<int>(Q_base->rows()) < seq_len ||
-            static_cast<int>(Q_base->cols()) < q_cols ||
-            (K_base && (static_cast<int>(K_base->rows()) < seq_len ||
-                        static_cast<int>(K_base->cols()) < k_cols)))
-        {
-            LOG_ERROR("[RoPEStage] Decode-equivalent verifier RoPE tensor extent mismatch");
-            return false;
-        }
-
-        const std::vector<size_t> q_shape{1, static_cast<size_t>(q_cols)};
-        if (!verifier_q_row_ || verifier_q_row_->shape() != q_shape)
-            verifier_q_row_ = std::make_shared<FP32Tensor>(q_shape);
-        const std::vector<size_t> k_shape{1, static_cast<size_t>(k_cols)};
-        if (K_base && (!verifier_k_row_ || verifier_k_row_->shape() != k_shape))
-            verifier_k_row_ = std::make_shared<FP32Tensor>(k_shape);
-
-        const float *q_data = Q_base->data();
-        float *q_out = Q_base->mutable_data();
-        const float *k_data = K_base ? K_base->data() : nullptr;
-        float *k_out = K_base ? K_base->mutable_data() : nullptr;
-        if (!q_data || !q_out || (K_base && (!k_data || !k_out)))
-        {
-            LOG_ERROR("[RoPEStage] Decode-equivalent verifier RoPE requires host-visible FP32 tensors");
-            return false;
-        }
-
-        for (int row = 0; row < seq_len; ++row)
-        {
-            std::copy_n(
-                q_data + static_cast<size_t>(row) * q_cols,
-                q_cols,
-                verifier_q_row_->mutable_data());
-            if (K_base)
-            {
-                std::copy_n(
-                    k_data + static_cast<size_t>(row) * k_cols,
-                    k_cols,
-                    verifier_k_row_->mutable_data());
-            }
-
-            const int row_position = position_ids_ptr ? position_ids_ptr[row]
-                                                      : (params_.pos_offset + row);
-            const int row_position_ids[1] = {row_position};
-            /*
-             * Call the same one-row kernel contract as live decode. This keeps
-             * CPU RoPE on the TLS-backed decode path instead of the normal
-             * multi-row prefill vector path, which is fast but not bitwise
-             * equivalent enough for verifier-state publication.
-             */
-            if (!kernel->apply_tensor(
-                    verifier_q_row_.get(),
-                    K_base ? verifier_k_row_.get() : nullptr,
-                    row_position_ids,
-                    1,
-                    params_.n_heads,
-                    n_kv_heads,
-                    params_.head_dim,
-                    params_.theta_base,
-                    params_.mpi_ctx,
-                    params_.device_id.toKernelDeviceIndex(),
-                    row_position,
-                    rotary_dim))
-            {
-                LOG_ERROR("[RoPEStage] Decode-equivalent verifier RoPE row "
-                          << row << " failed");
-                return false;
-            }
-
-            std::copy_n(
-                verifier_q_row_->data(),
-                q_cols,
-                q_out + static_cast<size_t>(row) * q_cols);
-            if (K_base)
-            {
-                std::copy_n(
-                    verifier_k_row_->data(),
-                    k_cols,
-                    k_out + static_cast<size_t>(row) * k_cols);
-            }
-        }
-
-        return true;
     }
 
     size_t RoPEStage::estimatedFlops() const

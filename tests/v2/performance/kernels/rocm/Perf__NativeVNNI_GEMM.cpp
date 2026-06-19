@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <fstream>
 #include <memory>
@@ -128,6 +129,7 @@ extern "C"
         void *stream);
 
     void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
+    void rocmGemv_native_vnni_set_decode_equivalent_m1_config(int enabled);
     void rocmGemv_native_vnni_reset_tuning_overrides();
 }
 #endif
@@ -158,6 +160,18 @@ namespace
     /// Small-M verifier paths compare against quantized-activation output, so use
     /// the same practical gate as focused integration regressions.
     constexpr float MTP_SMALL_M_COSINE_GATE = 0.985f;
+
+    /// Projection-level trainer rows are allowed only if they are also close in
+    /// relative L2. Cosine alone can miss scale-sensitive verifier drift.
+    constexpr double MTP_SMALL_M_REL_L2_GATE = 1.0e-3;
+
+    /// Split-K planes reserved for batched small-M projection partials.
+    ///
+    /// This must match NVNNI_SMALL_M_GRAPH_SAFE_KB_CAP in the ROCm NativeVNNI
+    /// launcher.  The grouped verifier trainer intentionally sweeps explicit
+    /// KB policies, so undersizing this scratch buffer can turn a bad test
+    /// fixture into a GPU memory fault before the candidate can be judged.
+    constexpr int BATCHED_DECODE_PARTIAL_PLANES = 64;
 
     /// Performance gate: speedup over INT8 GEMM baseline (grand total average)
     constexpr float SPEEDUP_GATE = 1.0f;
@@ -214,6 +228,26 @@ namespace
          { return TestTensorFactory::createIQ1_MRandom({N, K}); }},
     };
 
+    /**
+     * @brief Formats that the batched verifier-row trainer should cover.
+     *
+     * The broad GEMM sweep intentionally excludes Q8_0 because it has a large
+     * legacy INT8-VNNI route and would make that already-heavy suite larger.
+     * The MTP verifier path still needs Q8_0 coverage, so the focused batched
+     * trainer adds it here without widening unrelated perf tests.
+     */
+    static const std::vector<GEMMFormatSpec> &batchedProjectionFormats()
+    {
+        static const std::vector<GEMMFormatSpec> formats = []()
+        {
+            std::vector<GEMMFormatSpec> out = GEMM_FORMATS;
+            out.push_back({"Q8_0", 8.5, [](size_t N, size_t K)
+                           { return TestTensorFactory::createQ8_0Random({N, K}); }});
+            return out;
+        }();
+        return formats;
+    }
+
     // =============================================================================
     // GEMM shape definitions (N×K with variable M)
     // =============================================================================
@@ -256,6 +290,8 @@ namespace
         {"Qwen36_MTP_HiddenProjection", 5120, 5120},
         {"Qwen36_FFN_DownProjection", 5120, 17408},
         {"Qwen36_GDN_InnerProjection", 10240, 5120},
+        {"Qwen36MoE_GDN_QKVProjection", 8192, 2048},
+        {"Qwen36MoE_GDN_ZProjection", 4096, 2048},
         {"Qwen36_GDN_TimeProjection", 1024, 5120},
         {"Qwen36_GDN_OutputProjection", 5120, 6144},
     };
@@ -314,6 +350,7 @@ namespace
         std::string group_name;
         std::string format_name;
         std::string variant_name;
+        std::string failure_reason;
         int M = 0;
         int K = 0;
         int projections = 0;
@@ -325,11 +362,21 @@ namespace
         double mean_us = 0.0;
         double stddev_us = 0.0;
         float min_cosine_sim = 0.0f;
+        double max_relative_l2 = 0.0;
+        double max_abs_diff = 0.0;
         bool correctness_pass = false;
         bool valid = false;
     };
 
 #ifdef HAVE_ROCM
+    struct ProjectionComparisonMetrics
+    {
+        double cosine = 0.0;
+        double relative_l2 = 0.0;
+        double max_abs_diff = 0.0;
+        bool valid = false;
+    };
+
     struct HipBuffer
     {
         void *ptr = nullptr;
@@ -357,6 +404,105 @@ namespace
             return reinterpret_cast<const T *>(ptr);
         }
     };
+
+    /**
+     * @brief Ensure a packed weight object has a NativeVNNI payload.
+     *
+     * ROCm's normal packer intentionally routes Q8_0 through the legacy INT8
+     * path for ordinary decode. The small-M verifier trainer, however, must
+     * exercise the NativeVNNI grouped kernels for every production codebook.
+     * When the normal packer leaves the NativeVNNI fields empty, this helper
+     * asks the tensor to pack each 32-element block through its format-native
+     * `packVnniBlock()` implementation.
+     *
+     * The resulting `ROCmPackedWeights` is still consumed through
+     * `ROCmQuantisedGemmKernel::exportNativeVNNIMatrixDesc()`, so the benchmark
+     * uses the same device descriptor contract as production grouped verifier
+     * stages.
+     */
+    static bool ensureNativeVNNIPayloadForBatchedTrainer(
+        TensorBase *weights,
+        ROCmPackedWeights &packed,
+        int N,
+        int K,
+        std::string *failure_reason)
+    {
+        auto fail = [&](const char *reason)
+        {
+            if (failure_reason)
+                *failure_reason = reason;
+            return false;
+        };
+
+        if (!packed.native_vnni_payload.empty())
+            return true;
+        if (!weights)
+            return fail("missing_weight_tensor");
+        if (N <= 0 || K <= 0 || (K % 32) != 0)
+            return fail("invalid_native_vnni_shape");
+
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
+        if (!unpackable)
+            return fail("tensor_not_int8_unpackable");
+
+        const auto *fmt = unpackable->vnniFormatInfo();
+        if (!fmt)
+            return fail("missing_vnni_format_info");
+        if (fmt->payload_bytes <= 0)
+            return fail("invalid_vnni_payload_bytes");
+
+        const int blocks_per_row = K / 32;
+        const size_t total_blocks =
+            static_cast<size_t>(N) * static_cast<size_t>(blocks_per_row);
+
+        packed.native_vnni_payload.assign(
+            total_blocks * static_cast<size_t>(fmt->payload_bytes), uint8_t{0});
+        packed.native_vnni_scales.assign(total_blocks, uint16_t{0});
+        packed.native_vnni_mins.clear();
+        packed.native_vnni_emins.clear();
+        if (fmt->is_asymmetric)
+            packed.native_vnni_mins.assign(total_blocks, uint16_t{0});
+        if (fmt->has_emins)
+            packed.native_vnni_emins.assign(total_blocks, uint32_t{0});
+        packed.native_vnni_codebook_id = fmt->codebook_id;
+        packed.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
+        packed.N = N;
+        packed.K = K;
+
+        VnniPackContext ctx{};
+        ctx.raw_bytes = reinterpret_cast<const uint8_t *>(weights->raw_data());
+        ctx.N = N;
+        ctx.K = K;
+        ctx.blocks_per_row = blocks_per_row;
+        ctx.payload_bytes = fmt->payload_bytes;
+        ctx.payload_array = packed.native_vnni_payload.data();
+        ctx.scales_array = packed.native_vnni_scales.data();
+        ctx.mins_array = packed.native_vnni_mins.empty()
+                             ? nullptr
+                             : packed.native_vnni_mins.data();
+        ctx.emins_array = packed.native_vnni_emins.empty()
+                              ? nullptr
+                              : packed.native_vnni_emins.data();
+
+        try
+        {
+            for (int n = 0; n < N; ++n)
+                for (int b = 0; b < blocks_per_row; ++b)
+                    unpackable->packVnniBlock(ctx, n, b);
+        }
+        catch (const std::exception &)
+        {
+            packed.native_vnni_payload.clear();
+            packed.native_vnni_scales.clear();
+            packed.native_vnni_mins.clear();
+            packed.native_vnni_emins.clear();
+            packed.native_vnni_codebook_id = 0;
+            packed.native_vnni_blocks_per_row = 0;
+            return fail("pack_vnni_block_exception");
+        }
+
+        return true;
+    }
 
     struct HipStream
     {
@@ -403,6 +549,90 @@ namespace
             rocmGemv_native_vnni_reset_tuning_overrides();
         }
     };
+
+    /**
+     * @brief Temporarily force generated NativeVNNI lookup through M=1 rows.
+     *
+     * Batched verifier candidates must match serial decode, not merely an
+     * M-row projection reference.  The production verifier path uses the same
+     * serial-M1 policy while comparing grouped M=2..4 rows, so the trainer's
+     * correctness oracle should exercise that policy directly.
+     */
+    class DecodeEquivalentM1PolicyGuard
+    {
+    public:
+        DecodeEquivalentM1PolicyGuard()
+        {
+            rocmGemv_native_vnni_set_decode_equivalent_m1_config(1);
+        }
+
+        ~DecodeEquivalentM1PolicyGuard()
+        {
+            rocmGemv_native_vnni_set_decode_equivalent_m1_config(0);
+        }
+    };
+
+    /**
+     * @brief Compare two device-resident projection outputs after timing.
+     *
+     * The trainer uses this host-side copy only for correctness accounting, not
+     * for benchmark timing.  Keeping the measured candidate launch isolated lets
+     * us add strict metrics without accidentally benchmarking D2H traffic.
+     */
+    static ProjectionComparisonMetrics compareProjectionOutputs(
+        const float *candidate,
+        const float *reference,
+        size_t count,
+        hipStream_t stream)
+    {
+        ProjectionComparisonMetrics metrics{};
+        if (!candidate || !reference || count == 0 || stream == nullptr)
+            return metrics;
+
+        std::vector<float> candidate_host(count);
+        std::vector<float> reference_host(count);
+        if (hipMemcpyAsync(
+                candidate_host.data(),
+                candidate,
+                count * sizeof(float),
+                hipMemcpyDeviceToHost,
+                stream) != hipSuccess ||
+            hipMemcpyAsync(
+                reference_host.data(),
+                reference,
+                count * sizeof(float),
+                hipMemcpyDeviceToHost,
+                stream) != hipSuccess ||
+            hipStreamSynchronize(stream) != hipSuccess)
+        {
+            return metrics;
+        }
+
+        double dot = 0.0;
+        double candidate_norm_sq = 0.0;
+        double reference_norm_sq = 0.0;
+        double diff_norm_sq = 0.0;
+        double max_abs = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double a = static_cast<double>(candidate_host[i]);
+            const double b = static_cast<double>(reference_host[i]);
+            const double diff = a - b;
+            dot += a * b;
+            candidate_norm_sq += a * a;
+            reference_norm_sq += b * b;
+            diff_norm_sq += diff * diff;
+            max_abs = std::max(max_abs, std::abs(diff));
+        }
+
+        const double denom = std::sqrt(candidate_norm_sq) * std::sqrt(reference_norm_sq);
+        metrics.cosine = denom > 0.0 ? dot / denom : 0.0;
+        metrics.relative_l2 =
+            reference_norm_sq > 0.0 ? std::sqrt(diff_norm_sq / reference_norm_sq) : std::sqrt(diff_norm_sq);
+        metrics.max_abs_diff = max_abs;
+        metrics.valid = true;
+        return metrics;
+    }
 #endif
 
     static std::string trim(std::string value)
@@ -1066,9 +1296,14 @@ namespace
         {
             (void)hipSetDevice(device_id);
             BatchedGDNProjectionResult result{};
+            auto fail = [&](std::string reason)
+            {
+                result.failure_reason = std::move(reason);
+                return result;
+            };
             HipStream stream;
             if (!stream.create())
-                return result;
+                return fail("create_hip_stream");
 
             result.group_name = group_name;
             result.format_name = fmt.name;
@@ -1085,7 +1320,7 @@ namespace
                 M < 2 || M > 4 ||
                 K <= 0 || (K % 32) != 0)
             {
-                return result;
+                return fail("invalid_shape_or_projection_count");
             }
 
             std::vector<std::unique_ptr<TensorBase>> weights;
@@ -1101,22 +1336,28 @@ namespace
             {
                 weights.push_back(fmt.create(static_cast<size_t>(N), static_cast<size_t>(K)));
                 if (!weights.back())
-                    return result;
+                    return fail("create_weight_tensor");
 
                 packed.emplace_back();
                 if (!packWeightsToROCm(weights.back().get(), packed.back()))
-                    return result;
-                if (packed.back().native_vnni_payload.empty())
-                    return result;
+                    return fail("pack_weights_to_rocm");
+                std::string pack_failure;
+                if (!ensureNativeVNNIPayloadForBatchedTrainer(
+                        weights.back().get(), packed.back(), N, K, &pack_failure))
+                {
+                    return fail(pack_failure.empty()
+                                    ? "missing_native_vnni_payload"
+                                    : pack_failure);
+                }
 
                 kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed.back(), device_id));
                 DeviceNativeVNNIMatrixDesc desc{};
                 if (!kernels.back()->exportNativeVNNIMatrixDesc(desc))
-                    return result;
+                    return fail("export_native_vnni_desc");
                 if (!desc.valid())
-                    return result;
+                    return fail("invalid_native_vnni_desc");
                 if (!descs.empty() && desc.codebook_id != descs.front().codebook_id)
-                    return result;
+                    return fail("mixed_codebooks_in_homogeneous_benchmark");
                 descs.push_back(desc);
             }
 
@@ -1125,10 +1366,10 @@ namespace
             auto input = TestTensorFactory::createFP32Random(
                 {static_cast<size_t>(M), static_cast<size_t>(K)});
             if (!input || !input->ensureOnDevice(DeviceId::rocm(device_id)))
-                return result;
+                return fail("input_upload");
             auto *input_fp32 = dynamic_cast<FP32Tensor *>(input.get());
             if (!input_fp32 || !input_fp32->gpu_data_ptr())
-                return result;
+                return fail("input_gpu_pointer");
 
             HipBuffer d_A_int8;
             HipBuffer d_scales_A;
@@ -1139,7 +1380,7 @@ namespace
                 !d_scales_A_blockwise.allocate(static_cast<size_t>(M) * static_cast<size_t>(K / 32) * sizeof(float)) ||
                 !d_sums_A_blockwise.allocate(static_cast<size_t>(M) * static_cast<size_t>(K / 32) * sizeof(int32_t)))
             {
-                return result;
+                return fail("activation_workspace_alloc");
             }
 
             std::vector<float> row_scales(static_cast<size_t>(M), 1.0f);
@@ -1151,7 +1392,7 @@ namespace
                     stream.stream) != hipSuccess ||
                 hipStreamSynchronize(stream.stream) != hipSuccess)
             {
-                return result;
+                return fail("row_scale_upload");
             }
 
             std::array<HipBuffer, 8> outputs;
@@ -1172,12 +1413,15 @@ namespace
                 const size_t output_bytes =
                     static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(float);
                 const size_t partial_bytes =
-                    static_cast<size_t>(8) * static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(float);
+                    static_cast<size_t>(BATCHED_DECODE_PARTIAL_PLANES) *
+                    static_cast<size_t>(M) *
+                    static_cast<size_t>(N) *
+                    sizeof(float);
                 if (!outputs[i].allocate(output_bytes) ||
                     !refs[i].allocate(output_bytes) ||
                     !partials[i].allocate(partial_bytes))
                 {
-                    return result;
+                    return fail("projection_workspace_alloc");
                 }
 
                 payload_ptrs[i] = descs[i].payload;
@@ -1228,7 +1472,7 @@ namespace
             for (int i = 0; i < WARMUP_RUNS; ++i)
             {
                 if (!run_once())
-                    return result;
+                    return fail("warmup_launch");
             }
             (void)hipStreamSynchronize(stream.stream);
 
@@ -1246,7 +1490,7 @@ namespace
                 {
                     (void)hipEventDestroy(start);
                     (void)hipEventDestroy(stop);
-                    return result;
+                    return fail("timed_launch");
                 }
                 (void)hipEventRecord(stop, stream.stream);
                 (void)hipEventSynchronize(stop);
@@ -1260,7 +1504,7 @@ namespace
             std::sort(times_us.begin(), times_us.end());
 
             if (times_us.empty())
-                return result;
+                return fail("empty_timing_samples");
             double max_us = 0.0;
             computeStats(times_us, result.mean_us, result.min_us, max_us, result.stddev_us);
 
@@ -1274,7 +1518,7 @@ namespace
                     stream.asVoid(),
                     32))
             {
-                return result;
+                return fail("reference_quantize");
             }
             if (!rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
                     d_A_int8.as<int8_t>(),
@@ -1294,7 +1538,7 @@ namespace
                     device_id,
                     stream.asVoid()))
             {
-                return result;
+                return fail("reference_candidate_launch");
             }
             (void)hipStreamSynchronize(stream.stream);
 
@@ -1306,37 +1550,52 @@ namespace
             // path used outside the sweep.
             rocmGemv_native_vnni_reset_tuning_overrides();
 
-            float min_cosine = 1.0f;
+            double min_cosine = 1.0;
+            double max_relative_l2 = 0.0;
+            double max_abs_diff = 0.0;
             for (size_t i = 0; i < projection_Ns.size(); ++i)
             {
                 const int N = projection_Ns[i];
-                if (!rocmGemm_native_vnni_fp32(
-                        d_A_int8.as<int8_t>(),
-                        descs[i].payload,
-                        descs[i].scales,
-                        descs[i].mins,
-                        descs[i].emins,
-                        refs[i].as<float>(),
-                        d_scales_A.as<float>(),
-                        d_scales_A_blockwise.as<float>(),
-                        M, N, K,
-                        result.codebook_id,
-                        device_id,
-                        stream.asVoid()))
+                DecodeEquivalentM1PolicyGuard serial_policy;
+                for (int row = 0; row < M; ++row)
                 {
-                    return result;
+                    if (!rocmGemm_native_vnni_fp32(
+                            d_A_int8.as<int8_t>() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                            descs[i].payload,
+                            descs[i].scales,
+                            descs[i].mins,
+                            descs[i].emins,
+                            refs[i].as<float>() + static_cast<size_t>(row) * static_cast<size_t>(N),
+                            d_scales_A.as<float>() + row,
+                            d_scales_A_blockwise.as<float>() +
+                                static_cast<size_t>(row) * static_cast<size_t>(K / 32),
+                            1, N, K,
+                            result.codebook_id,
+                            device_id,
+                            stream.asVoid()))
+                    {
+                        return fail("single_projection_reference_launch");
+                    }
                 }
                 (void)hipStreamSynchronize(stream.stream);
-                const float cosine = gpuCosineSimilarity(
+                const ProjectionComparisonMetrics metrics = compareProjectionOutputs(
                     outputs[i].as<float>(),
                     refs[i].as<float>(),
                     static_cast<size_t>(M) * static_cast<size_t>(N),
-                    device_id);
-                min_cosine = std::min(min_cosine, cosine);
+                    stream.stream);
+                if (!metrics.valid)
+                    return fail("projection_metric_copy");
+                min_cosine = std::min(min_cosine, metrics.cosine);
+                max_relative_l2 = std::max(max_relative_l2, metrics.relative_l2);
+                max_abs_diff = std::max(max_abs_diff, metrics.max_abs_diff);
             }
 
-            result.min_cosine_sim = min_cosine;
-            result.correctness_pass = (min_cosine >= MTP_SMALL_M_COSINE_GATE);
+            result.min_cosine_sim = static_cast<float>(min_cosine);
+            result.max_relative_l2 = max_relative_l2;
+            result.max_abs_diff = max_abs_diff;
+            result.correctness_pass =
+                (min_cosine >= static_cast<double>(MTP_SMALL_M_COSINE_GATE) &&
+                 max_relative_l2 <= MTP_SMALL_M_REL_L2_GATE);
             result.valid = true;
             return result;
         }
@@ -2088,32 +2347,40 @@ namespace
             std::string name;
             std::string format;
             std::vector<int> projection_Ns;
+            int K = 5120;
         };
 
         const std::vector<GDNProjectionGroup> groups = {
-            {"Qwen36_FFN_Q4K_gate_up", "Q4_K", {17408, 17408}},
-            {"Qwen36_FFN_Q5K_gate_up", "Q5_K", {17408, 17408}},
-            {"Qwen36_GDN_Q4K_qkv_z", "Q4_K", {10240, 6144}},
-            {"Qwen36_GDN_Q5K_qkv_z", "Q5_K", {10240, 6144}},
-            {"Qwen36_GDN_Q4_1_qkv_z_a", "Q4_1", {12288, 6144, 1024}},
-            {"Qwen36_GDN_Q5_1_z_a", "Q5_1", {10240, 1024}},
+            {"Qwen36_FFN_Q4K_gate_up", "Q4_K", {17408, 17408}, 5120},
+            {"Qwen36_FFN_Q5K_gate_up", "Q5_K", {17408, 17408}, 5120},
+            {"Qwen36_GDN_Q4K_qkv_z", "Q4_K", {10240, 6144}, 5120},
+            {"Qwen36_GDN_Q5K_qkv_z", "Q5_K", {10240, 6144}, 5120},
+            {"Qwen36_GDN_Q4_1_qkv_z_a", "Q4_1", {12288, 6144, 1024}, 5120},
+            {"Qwen36_GDN_Q5_1_z_a", "Q5_1", {10240, 1024}, 5120},
+            {"Qwen36MoE_GDN_Q6K_qkv_z", "Q6_K", {8192, 4096}, 2048},
+            {"Qwen36MoE_Expert_Q6K_gate_up", "Q6_K", {512, 512}, 2048},
+            {"Qwen36MoE_Expert_Q6K_down", "Q6_K", {2048}, 512},
+            {"Qwen36MoE_GDN_Q8_0_qkv_z", "Q8_0", {8192, 4096}, 2048},
+            {"Qwen36MoE_Expert_Q8_0_gate_up", "Q8_0", {512, 512}, 2048},
+            {"Qwen36MoE_Expert_Q8_0_down", "Q8_0", {2048}, 512},
         };
 
         fprintf(stderr, "\n[NativeVNNI GEMM] Phase 13.5 batched GDN projection verifier benchmark\n");
         fprintf(stderr, "[NativeVNNI GEMM] Device: %s\n", device_name_.c_str());
-        fprintf(stderr, "[NativeVNNI GEMM] K=5120, heterogeneous projection widths, M in {2,3,4}\n");
+        fprintf(stderr, "[NativeVNNI GEMM] Heterogeneous projection widths, M in {2,3,4}\n");
 
         std::vector<BatchedGDNProjectionResult> results;
         for (const auto &group : groups)
         {
+            const auto &formats = batchedProjectionFormats();
             auto fmt_it = std::find_if(
-                GEMM_FORMATS.begin(),
-                GEMM_FORMATS.end(),
+                formats.begin(),
+                formats.end(),
                 [&](const GEMMFormatSpec &fmt)
                 {
                     return fmt.name == group.format;
                 });
-            ASSERT_NE(fmt_it, GEMM_FORMATS.end()) << group.format;
+            ASSERT_NE(fmt_it, formats.end()) << group.format;
 
             for (int M : MTP_SMALL_M_VALUES)
             {
@@ -2122,9 +2389,11 @@ namespace
                     *fmt_it,
                     group.projection_Ns,
                     M,
-                    5120,
+                    group.K,
                     0);
-                ASSERT_TRUE(r.valid) << group.name << " M=" << M;
+                ASSERT_TRUE(r.valid)
+                    << group.name << " M=" << M
+                    << " failure=" << r.failure_reason;
                 EXPECT_TRUE(r.correctness_pass)
                     << group.name << " M=" << M
                     << " cosine=" << r.min_cosine_sim;
@@ -2132,10 +2401,11 @@ namespace
 
                 const auto &last = results.back();
                 fprintf(stderr,
-                        "  %s/%s M=%d projections=%d total_N=%d codebook=%u: %.1f μs cosine=%.6f\n",
+                        "  %s/%s M=%d K=%d projections=%d total_N=%d codebook=%u: %.1f μs cosine=%.6f\n",
                         group.name.c_str(),
                         last.format_name.c_str(),
                         last.M,
+                        last.K,
                         last.projections,
                         last.total_N,
                         static_cast<unsigned>(last.codebook_id),
@@ -2149,16 +2419,16 @@ namespace
         table << fort::header
               << "Format" << "M" << "Proj" << "Total N"
               << "Codebook" << "Min μs" << "Mean μs"
-              << "Cosine" << "Gate" << fort::endr;
+              << "Cosine" << "Rel L2" << "Gate" << fort::endr;
 
         table.column(0).set_cell_text_align(fort::text_align::left);
-        for (int c = 1; c <= 8; ++c)
+        for (int c = 1; c <= 9; ++c)
             table.column(c).set_cell_text_align(fort::text_align::right);
 
         for (const auto &r : results)
         {
             char b_m[8], b_proj[8], b_total_n[16], b_codebook[8];
-            char b_min[16], b_mean[16], b_cos[16];
+            char b_min[16], b_mean[16], b_cos[16], b_rel_l2[20];
             snprintf(b_m, sizeof(b_m), "%d", r.M);
             snprintf(b_proj, sizeof(b_proj), "%d", r.projections);
             snprintf(b_total_n, sizeof(b_total_n), "%d", r.total_N);
@@ -2166,10 +2436,12 @@ namespace
             snprintf(b_min, sizeof(b_min), "%.1f", r.min_us);
             snprintf(b_mean, sizeof(b_mean), "%.1f", r.mean_us);
             snprintf(b_cos, sizeof(b_cos), "%.6f", r.min_cosine_sim);
+            snprintf(b_rel_l2, sizeof(b_rel_l2), "%.3e", r.max_relative_l2);
 
             table << r.format_name << b_m << b_proj << b_total_n
                   << b_codebook << b_min << b_mean << b_cos
-                  << (r.correctness_pass ? "PASS" : "COS FAIL")
+                  << b_rel_l2
+                  << (r.correctness_pass ? "PASS" : "METRIC FAIL")
                   << fort::endr;
         }
 
@@ -2200,6 +2472,12 @@ namespace
             {"Qwen36_GDN_Q5K_qkv_z", "Q5_K", {10240, 6144}, 5120},
             {"Qwen36_GDN_Q4_1_qkv_z_a", "Q4_1", {12288, 6144, 1024}, 5120},
             {"Qwen36_GDN_Q5_1_z_a", "Q5_1", {10240, 1024}, 5120},
+            {"Qwen36MoE_GDN_Q6K_qkv_z", "Q6_K", {8192, 4096}, 2048},
+            {"Qwen36MoE_Expert_Q6K_gate_up", "Q6_K", {512, 512}, 2048},
+            {"Qwen36MoE_Expert_Q6K_down", "Q6_K", {2048}, 512},
+            {"Qwen36MoE_GDN_Q8_0_qkv_z", "Q8_0", {8192, 4096}, 2048},
+            {"Qwen36MoE_Expert_Q8_0_gate_up", "Q8_0", {512, 512}, 2048},
+            {"Qwen36MoE_Expert_Q8_0_down", "Q8_0", {2048}, 512},
         };
 
         std::set<std::string> group_filters =
@@ -2224,7 +2502,7 @@ namespace
                 << "Failed to open ROCm NativeVNNI batched decode CSV: " << csv_path;
             std::fprintf(
                 csv,
-                "backend,phase,format,codebook,shape,n,k,m,projections,total_n,projection_ns,codebooks,variant,kb,target_waves,min_us,mean_us,stddev_us,cosine,correctness_pass,is_best\n");
+                "backend,phase,format,codebook,shape,n,k,m,projections,total_n,projection_ns,codebooks,variant,kb,target_waves,min_us,mean_us,stddev_us,cosine,relative_l2,max_abs,correctness_pass,is_best\n");
         }
 
         int executed_cases = 0;
@@ -2236,14 +2514,15 @@ namespace
             if (!shouldRunName(format_filters, group.format))
                 continue;
 
+            const auto &formats = batchedProjectionFormats();
             auto fmt_it = std::find_if(
-                GEMM_FORMATS.begin(),
-                GEMM_FORMATS.end(),
+                formats.begin(),
+                formats.end(),
                 [&](const GEMMFormatSpec &fmt)
                 {
                     return fmt.name == group.format;
                 });
-            ASSERT_NE(fmt_it, GEMM_FORMATS.end()) << group.format;
+            ASSERT_NE(fmt_it, formats.end()) << group.format;
 
             for (int M : MTP_SMALL_M_VALUES)
             {
@@ -2289,7 +2568,11 @@ namespace
 
                 ASSERT_GE(best_index, 0)
                     << "No correct ROCm NativeVNNI batched decode variant for "
-                    << group.name << " M=" << M;
+                    << group.name << " M=" << M
+                    << "; first_failure="
+                    << (rows.empty()
+                            ? "no_rows"
+                            : rows.front().result.failure_reason);
 
                 std::ostringstream ns_joined;
                 std::ostringstream codebooks_joined;
@@ -2312,7 +2595,7 @@ namespace
                         const auto &r = row.result;
                         std::fprintf(
                             csv,
-                            "rocm,batched_decode,%s,%u,%s,%d,%d,%d,%d,%d,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.6f,%d,%d\n",
+                            "rocm,batched_decode,%s,%u,%s,%d,%d,%d,%d,%d,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.6f,%.6e,%.6e,%d,%d\n",
                             group.format.c_str(),
                             static_cast<unsigned>(r.codebook_id),
                             group.name.c_str(),
@@ -2330,6 +2613,8 @@ namespace
                             r.mean_us,
                             r.stddev_us,
                             r.min_cosine_sim,
+                            r.max_relative_l2,
+                            r.max_abs_diff,
                             r.correctness_pass ? 1 : 0,
                             best_index >= 0 && static_cast<int>(row_index) == best_index ? 1 : 0);
                         ++executed_rows;
@@ -2340,17 +2625,20 @@ namespace
                 const auto &best = rows[static_cast<size_t>(best_index)];
                 std::fprintf(
                     stderr,
-                    "[ROCmNativeVNNI][BATCHED_DECODE][TRAINER] group=%s format=%s codebook=%u M=%d best=%s time_us=%.3f cosine=%.6f\n",
+                    "[ROCmNativeVNNI][BATCHED_DECODE][TRAINER] group=%s format=%s codebook=%u M=%d best=%s time_us=%.3f cosine=%.6f rel_l2=%.6e max_abs=%.6e\n",
                     group.name.c_str(),
                     group.format.c_str(),
                     static_cast<unsigned>(best.result.codebook_id),
                     M,
                     best.variant.name.c_str(),
                     best.result.min_us,
-                    best.result.min_cosine_sim);
+                    best.result.min_cosine_sim,
+                    best.result.max_relative_l2,
+                    best.result.max_abs_diff);
                 ASSERT_TRUE(best.result.correctness_pass)
                     << group.name << " M=" << M
-                    << " cosine=" << best.result.min_cosine_sim;
+                    << " cosine=" << best.result.min_cosine_sim
+                    << " rel_l2=" << best.result.max_relative_l2;
                 ++executed_cases;
             }
         }

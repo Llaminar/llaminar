@@ -546,6 +546,7 @@ namespace llaminar2
             int row,
             const std::vector<LogitPenalty> &penalties,
             int vocab_size) override;
+        bool supportsRowLocalAllPositionPenaltyApplication() const override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
         bool sampleGreedyFromMTPLogitsToDeviceDraftSlot(
             int draft_sample_slot,
@@ -625,6 +626,10 @@ namespace llaminar2
             int first_draft_slot,
             int draft_token_count,
             int total_verifier_input_tokens) override;
+        const void *prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+            const int32_t *verifier_tokens,
+            int total_verifier_input_tokens,
+            int draft_token_count) override;
         const void *prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
             int first_target_sample_slot,
             int first_draft_slot,

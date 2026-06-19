@@ -471,6 +471,23 @@ namespace llaminar2
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override;
 
+        /**
+         * @brief Append grouped verifier rows with serial-decode cache semantics.
+         *
+         * The verifier can produce K/V in either position-major
+         * `[rows, local_kv_heads * head_dim]` or head-major
+         * `[local_kv_heads * rows, head_dim]` order.  This method maps both
+         * forms into the CUDA ring cache in the same physical positions that
+         * serial one-token decode would have used, while preserving graph
+         * capture by requiring an explicit CUDA stream.
+         */
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream = nullptr) override;
+
         // Bring in IKVCache overloads to avoid hiding
         using ICUDARingKVCache::append;
         using ICUDARingKVCache::clear_sequence;

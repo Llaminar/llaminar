@@ -137,6 +137,18 @@ namespace llaminar2
             bool force_decode_equivalent_verifier_prefill = false;
 
             /**
+             * @brief Require GPU decode to consume routing tensors on device.
+             *
+             * Decode-equivalent verifier row replay gathers one row from the
+             * all-position routing tensors.  For GPU backends those row tensors
+             * are DEVICE_AUTHORITATIVE, so the scoped one-token expert replay
+             * must use grouped `FromRouting` kernels instead of falling back to
+             * `data()` on a stale host mirror.  When this flag is true, failure
+             * to use the device route tensors is a correctness error.
+             */
+            bool require_device_routing_tensor_decode = false;
+
+            /**
              * @brief Append the shared expert to the routed verifier pipeline.
              *
              * This GPU verifier fast path represents the shared expert as
@@ -349,6 +361,17 @@ namespace llaminar2
          * otherwise the helper can accumulate into its own intermediate buffer.
          */
         mutable std::shared_ptr<FP32Tensor> verifier_output_row_;
+        /**
+         * @brief Device-owned routing row scratch for verifier replay.
+         *
+         * MoERoutingStage writes all-position verifier routing tensors on the
+         * GPU.  The expert stage must gather the selected row from those
+         * device-owned tensors instead of reading stale host mirrors; otherwise
+         * CUDA/ROCm can replay a different expert set than the routing stage
+         * actually produced.
+         */
+        mutable std::shared_ptr<FP32Tensor> verifier_routing_indices_row_;
+        mutable std::shared_ptr<FP32Tensor> verifier_routing_weights_row_;
         mutable int scratch_capacity_ = 0;
 
         /// Batched gate+up scratch buffers for M=1 decode (one per top-k expert).

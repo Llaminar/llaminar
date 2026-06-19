@@ -99,7 +99,9 @@ namespace
 #define QWEN36_MOE_PREFIX_MTP_CASE cudaSingleDeviceCase
 #define QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE cudaSingleDeviceBenchmarkPromptCase
 #define QWEN36_MOE_PREFIX_MTP_DEPTH3_CASE cudaSingleDeviceDepth3Case
+#define QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION 0
 #define QWEN36_MOE_PREFIX_MTP_EXPECTS_PERSISTENT_SIDECAR_METADATA 1
+#define QWEN36_MOE_PREFIX_MTP_TESTS_DEVICE_RESIDENT_PUBLICATION 0
 #include "Qwen36MoESingleDevicePrefixMTPParityTests.inc"
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, NoMTPBenchmarkStyleUsesWorkspaceBackedGroupedSharedExpertTablePath)
@@ -112,6 +114,19 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, NoMTPBenchmarkStyleUsesWorksp
         cudaSingleDeviceBenchmarkPromptCase(),
         16);
     expectCudaMoENormalDecodeUsesGroupedSharedExpertTablePath();
+    PerfStatsCollector::reset();
+}
+
+TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, GroupedVerifierUsesRoutedPrefillPath)
+{
+    ScopedEnvironmentValues perf_stats_enabled({
+        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+    });
+    PerfStatsCollector::reset();
+    runMoEMainVerifierGroupedRowsMatchSerialDecode(
+        cudaSingleDeviceBenchmarkPromptCase(),
+        2);
+    expectCudaMoEMTPVerifierFusedPrefillPath(2);
     PerfStatsCollector::reset();
 }
 

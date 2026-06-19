@@ -45,6 +45,51 @@ namespace
         return out;
     }
 
+    std::shared_ptr<Q16_1Tensor> taggedQ16Tensor(const std::vector<size_t> &shape,
+                                                 Q16BlockSize block_size,
+                                                 uint8_t seed)
+    {
+        auto tensor = std::make_shared<Q16_1Tensor>(shape, block_size);
+        auto *bytes = static_cast<uint8_t *>(tensor->raw_mutable_data());
+        if (!bytes)
+        {
+            ADD_FAILURE() << "Q16 test tensor did not expose mutable raw data";
+            return tensor;
+        }
+        for (size_t i = 0; i < tensor->size_bytes(); ++i)
+        {
+            bytes[i] = static_cast<uint8_t>(seed + static_cast<uint8_t>((i * 17u) % 251u));
+        }
+        return tensor;
+    }
+
+    std::shared_ptr<Q16_1Tensor> q16PositionRowFromHeadMajor(
+        const Q16_1Tensor &head_major,
+        int verifier_row,
+        int verifier_rows,
+        int heads,
+        int head_dim)
+    {
+        auto row = std::make_shared<Q16_1Tensor>(
+            std::vector<size_t>{1, static_cast<size_t>(heads * head_dim)},
+            head_major.q16_block_size());
+        const size_t head_bytes = q16_block_size_bytes(head_major.q16_block_size());
+        const auto *src = static_cast<const uint8_t *>(head_major.raw_data());
+        auto *dst = static_cast<uint8_t *>(row->raw_mutable_data());
+        EXPECT_NE(src, nullptr);
+        EXPECT_NE(dst, nullptr);
+        for (int h = 0; h < heads; ++h)
+        {
+            const size_t src_row = static_cast<size_t>(h) *
+                                       static_cast<size_t>(verifier_rows) +
+                                   static_cast<size_t>(verifier_row);
+            std::memcpy(dst + static_cast<size_t>(h) * head_bytes,
+                        src + src_row * head_bytes,
+                        head_bytes);
+        }
+        return row;
+    }
+
     void expectFP32Rows(const std::vector<float> &actual, int rows, int cols,
                         const std::vector<float> &expected_first_values)
     {
@@ -306,6 +351,63 @@ TEST(Test__IKVCacheLogicalBlockIO, Q16HeadMajorLogicalBlockRoundTripsRawBytes)
     ASSERT_TRUE(cache.exportLogicalBlock(desc, out_k.data(), out_v.data()));
     EXPECT_EQ(out_k, k_payload);
     EXPECT_EQ(out_v, v_payload);
+}
+
+TEST(Test__IKVCacheLogicalBlockIO, Q16HeadMajorGroupedVerifierAppendMatchesSerialDecode)
+{
+    constexpr int HEADS = 2;
+    constexpr int HEAD_DIM = 64;
+    constexpr int MAX_SEQ = 4;
+    constexpr int PREFIX = 3;
+    constexpr int M = 3;
+
+    CPURingKVCacheQ16_1 serial(testMPI(), 1, 1, MAX_SEQ, HEADS, HEAD_DIM, DeviceId::cpu(),
+                               KVCacheLayoutMode::HEAD_MAJOR);
+    CPURingKVCacheQ16_1 grouped(testMPI(), 1, 1, MAX_SEQ, HEADS, HEAD_DIM, DeviceId::cpu(),
+                                KVCacheLayoutMode::HEAD_MAJOR);
+
+    const auto prefix_layout = serial.logicalBlockLayout(0, PREFIX);
+    auto prefix_k = taggedBytes(prefix_layout.k_bytes, 13);
+    auto prefix_v = taggedBytes(prefix_layout.v_bytes, 89);
+    const IKVCache::KVCacheLogicalBlockDescriptor prefix_desc{0, 0, 0, PREFIX, nullptr};
+    ASSERT_TRUE(serial.importLogicalBlock(prefix_desc, prefix_k.data(), prefix_v.data()));
+    ASSERT_TRUE(grouped.importLogicalBlock(prefix_desc, prefix_k.data(), prefix_v.data()));
+
+    auto verifier_k = taggedQ16Tensor({static_cast<size_t>(HEADS * M), HEAD_DIM},
+                                      Q16BlockSize::BLOCK_64,
+                                      41);
+    auto verifier_v = taggedQ16Tensor({static_cast<size_t>(HEADS * M), HEAD_DIM},
+                                      Q16BlockSize::BLOCK_64,
+                                      177);
+
+    for (int row = 0; row < M; ++row)
+    {
+        auto k_row = q16PositionRowFromHeadMajor(*verifier_k, row, M, HEADS, HEAD_DIM);
+        auto v_row = q16PositionRowFromHeadMajor(*verifier_v, row, M, HEADS, HEAD_DIM);
+        ASSERT_TRUE(serial.append_kv(0, 0, k_row.get(), v_row.get(), 1));
+    }
+
+    ASSERT_TRUE(grouped.appendVerifierRowsDecodeEquivalent(
+        0, 0, verifier_k.get(), verifier_v.get(), M));
+
+    const auto serial_state = serial.sequenceState(0, 0);
+    const auto grouped_state = grouped.sequenceState(0, 0);
+    EXPECT_EQ(grouped_state.cached_tokens, serial_state.cached_tokens);
+    EXPECT_EQ(grouped_state.implementation_head, serial_state.implementation_head);
+    EXPECT_EQ(grouped_state.wrapped, serial_state.wrapped);
+
+    const auto full_layout = serial.logicalBlockLayout(0, serial_state.cached_tokens);
+    std::vector<uint8_t> serial_k(full_layout.k_bytes, 0);
+    std::vector<uint8_t> serial_v(full_layout.v_bytes, 0);
+    std::vector<uint8_t> grouped_k(full_layout.k_bytes, 0);
+    std::vector<uint8_t> grouped_v(full_layout.v_bytes, 0);
+
+    const IKVCache::KVCacheLogicalBlockDescriptor full_desc{
+        0, 0, 0, serial_state.cached_tokens, nullptr};
+    ASSERT_TRUE(serial.exportLogicalBlock(full_desc, serial_k.data(), serial_v.data()));
+    ASSERT_TRUE(grouped.exportLogicalBlock(full_desc, grouped_k.data(), grouped_v.data()));
+    EXPECT_EQ(grouped_k, serial_k);
+    EXPECT_EQ(grouped_v, serial_v);
 }
 
 TEST(Test__IKVCacheLogicalBlockIO, SplitTQAsymmetricLogicalBlockRoundTripsRawBytes)

@@ -849,6 +849,155 @@ namespace llaminar2
         }
 
         /**
+         * @brief Grouped CPU verifier attention for compact MTP rows.
+         *
+         * This is the CPU implementation of the Phase 9.8 verifier contract:
+         * compute all compact verifier rows in one grouped attention call while
+         * preserving the causal visibility of serial one-token decode.  The
+         * promoted Qwen3.6 CPU lane stores hybrid KV cache rows as Q16_1, so the
+         * first production implementation handles Q16_1 K/V directly and fails
+         * closed for other cache formats until their grouped kernels are added.
+         */
+        bool compute_verifier_rows_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            ITensor *output,
+            int verifier_rows,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size = -1,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int head_start = 0,
+            int gqa_n_rep = 0) override
+        {
+            (void)mpi_ctx;
+            (void)device_idx;
+
+            if constexpr (!std::is_same_v<ElementType, float>)
+            {
+                return false;
+            }
+
+            if (!Q || !K || !V || !output ||
+                verifier_rows < 2 || verifier_rows > 4 ||
+                kv_len <= verifier_rows ||
+                n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
+                !causal)
+            {
+                return false;
+            }
+
+            const auto *Q_base = dynamic_cast<const TensorBase *>(Q);
+            const auto *K_base = dynamic_cast<const TensorBase *>(K);
+            const auto *V_base = dynamic_cast<const TensorBase *>(V);
+            const auto *K_q16 = dynamic_cast<const Q16_1Tensor *>(K);
+            const auto *V_q16 = dynamic_cast<const Q16_1Tensor *>(V);
+            auto *O_base = dynamic_cast<TensorBase *>(output);
+            if (!Q_base || !K_base || !V_base || !O_base ||
+                output->native_type() != TensorType::FP32)
+            {
+                return false;
+            }
+
+            const float *q_src = Q_base->data();
+            float *out = O_base->mutable_data();
+            if (!q_src || !out)
+            {
+                return false;
+            }
+
+            const int q_stride = n_heads * head_dim;
+            const float *q_rows = q_src;
+            std::vector<float> row_major_q;
+
+            /*
+             * Hybrid Q16 CPU RoPE may leave Q in [head][row][dim] order so the
+             * single-row integer attention kernel can consume one head block.
+             * The grouped kernel operates over logical verifier rows and
+             * therefore gathers that layout once into [row][head][dim].
+             */
+            const auto &q_shape = Q_base->shape();
+            const bool head_major_q =
+                Q_base->native_type() == TensorType::Q16_1 &&
+                q_shape.size() >= 2 &&
+                q_shape[0] == static_cast<size_t>(n_heads * verifier_rows) &&
+                q_shape[1] == static_cast<size_t>(head_dim);
+            if (head_major_q)
+            {
+                row_major_q.assign(static_cast<size_t>(verifier_rows) *
+                                       static_cast<size_t>(q_stride),
+                                   0.0f);
+                for (int row = 0; row < verifier_rows; ++row)
+                {
+                    for (int h = 0; h < n_heads; ++h)
+                    {
+                        const size_t src_offset =
+                            (static_cast<size_t>(h) * static_cast<size_t>(verifier_rows) +
+                             static_cast<size_t>(row)) *
+                            static_cast<size_t>(head_dim);
+                        const size_t dst_offset =
+                            static_cast<size_t>(row) * static_cast<size_t>(q_stride) +
+                            static_cast<size_t>(h) * static_cast<size_t>(head_dim);
+                        std::copy_n(q_src + src_offset, head_dim,
+                                    row_major_q.data() + dst_offset);
+                    }
+                }
+                q_rows = row_major_q.data();
+            }
+
+            const int base_position_offset = kv_len - verifier_rows;
+            if (K_q16 && V_q16)
+            {
+                return compute_prefill_q16kv(
+                    q_rows,
+                    K_q16,
+                    V_q16,
+                    out,
+                    verifier_rows,
+                    kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    causal,
+                    window_size,
+                    base_position_offset,
+                    head_start,
+                    gqa_n_rep,
+                    /*force_decode_tile_policy=*/true);
+            }
+
+            const float *k_fp32 = K_base->fp32_data();
+            const float *v_fp32 = V_base->fp32_data();
+            if (k_fp32 && v_fp32)
+            {
+                return compute_flash_fp32(
+                    q_rows,
+                    k_fp32,
+                    v_fp32,
+                    out,
+                    verifier_rows,
+                    kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    causal,
+                    window_size,
+                    base_position_offset,
+                    /*mask=*/nullptr,
+                    head_start,
+                    gqa_n_rep,
+                    /*force_decode_tile_policy=*/true);
+            }
+
+            return false;
+        }
+
+        /**
          * @brief Return metadata describing this kernel's I/O for the snapshot framework.
          *
          * The snapshot/dump system uses this to know what tensors to capture
@@ -3112,7 +3261,8 @@ namespace llaminar2
             bool causal, int window_size, int position_offset,
             const float *mask,
             int head_start = 0,
-            int gqa_n_rep = 0)
+            int gqa_n_rep = 0,
+            bool force_decode_tile_policy = false)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -3135,9 +3285,22 @@ namespace llaminar2
 
             // --- Pre-compute constants ---
             const bool use_avx512 = cpu_supports_avx512();
-            const bool is_decode = (seq_len == 1 && kv_len >= 1);
+            const bool is_decode = ((seq_len == 1 || force_decode_tile_policy) && kv_len >= 1);
 
-            // Choose the KV tile size based on cache hierarchy.
+            // Choose the KV tile size based on cache hierarchy.  Ordinary
+            // decode/prefill uses one logical KV length for the whole call.
+            // The MTP verifier is different: row r is mathematically the same
+            // as a serial one-token decode at KV length
+            // `position_offset + r + 1`, even though the cache already contains
+            // the later speculative rows.  In that mode we compute a row-local
+            // tile below so the grouped verifier matches serial decode
+            // numerically instead of merely relying on causal masks.
+            const bool decode_equivalent_verifier_rows =
+                force_decode_tile_policy &&
+                seq_len > 1 &&
+                kv_len > seq_len &&
+                causal &&
+                mask == nullptr;
             const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(head_dim, n_kv_heads, kv_len, is_decode);
 
             // For Grouped Query Attention: how many Q heads share one KV head.
@@ -3271,7 +3434,7 @@ namespace llaminar2
             }
 
             // ---------------------------------------------------------------
-            // Phase 2: Main flash-attention loop (parallel over heads)
+            // Phase 2: Main flash-attention loop.
             // ---------------------------------------------------------------
             // Compute optimal thread count.  For small problems (short
             // sequences, decode), the per-head work may be too small to
@@ -3283,8 +3446,32 @@ namespace llaminar2
             auto work = [&]()
             {
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
-                for (int h = 0; h < n_heads; ++h)
+                for (int task = 0;
+                     task < (decode_equivalent_verifier_rows
+                                 ? n_heads * seq_len
+                                 : n_heads);
+                     ++task)
                 {
+                    /*
+                     * Ordinary prefill/decode parallelizes by head and keeps
+                     * all query rows for a head in one task.  MTP verifier
+                     * decode-equivalent groups are different: M is only 2..4,
+                     * each row performs a long causal decode, and keeping all
+                     * rows inside one head task makes long-context M=2 slower
+                     * than two serial decodes.  Splitting only this verifier
+                     * mode by (head,row) improves task balance without changing
+                     * per-row floating-point order.
+                     */
+                    const int h = decode_equivalent_verifier_rows
+                                      ? (task / seq_len)
+                                      : task;
+                    const int q_begin = decode_equivalent_verifier_rows
+                                            ? (task % seq_len)
+                                            : 0;
+                    const int q_end = decode_equivalent_verifier_rows
+                                          ? q_begin + 1
+                                          : seq_len;
+
                     // GQA mapping: which KV head does this Q head read from?
                     // When gqa_n_rep > 0, KV heads are REPLICATED (each rank has all KV heads),
                     // so we need the global head position (head_start + h) to index into the
@@ -3304,7 +3491,7 @@ namespace llaminar2
                                                           : nullptr;
 
                     // --- Loop over query positions for this head ---
-                    for (int q_pos = 0; q_pos < seq_len; ++q_pos)
+                    for (int q_pos = q_begin; q_pos < q_end; ++q_pos)
                     {
                         // Pointer to this (q_pos, head) slice of the output buffer.
                         float *out = output + static_cast<size_t>(q_pos) * q_stride + static_cast<size_t>(h) * head_dim;
@@ -3326,6 +3513,14 @@ namespace llaminar2
                         // Optional additive mask row for this query position.
                         const float *mask_row = mask ? (mask + static_cast<size_t>(q_pos) * kv_len) : nullptr;
 
+                        const int query_kv_len = decode_equivalent_verifier_rows
+                                                     ? std::min(kv_len, position_offset + q_pos + 1)
+                                                     : kv_len;
+                        const int query_kv_tile = decode_equivalent_verifier_rows
+                                                      ? detail::DefaultFlashKVTilePolicy::choose(
+                                                            head_dim, n_kv_heads, query_kv_len, /*is_decode=*/true)
+                                                      : kv_tile;
+
                         // Stack-allocated I16 quantised Q buffer.
                         alignas(64) int16_t q_i16[detail::kMaxI16RowStride];
                         float q_scale_i16 = 0.0f;
@@ -3343,9 +3538,9 @@ namespace llaminar2
                         //   (a) compute QK scores (the "QK phase")
                         //   (b) run the online softmax correction
                         //   (c) accumulate weighted V into the output (the "V phase")
-                        for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
+                        for (int k0 = 0; k0 < query_kv_len; k0 += query_kv_tile)
                         {
-                            const int k1 = std::min(k0 + kv_tile, kv_len); // End of this tile
+                            const int k1 = std::min(k0 + query_kv_tile, query_kv_len); // End of this tile
                             float block_max = -std::numeric_limits<float>::infinity();
 
                             // Stack-allocated score buffer (max tile size bounded by policy).
@@ -3688,7 +3883,8 @@ namespace llaminar2
             int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset,
             int head_start = 0,
-            int gqa_n_rep = 0)
+            int gqa_n_rep = 0,
+            bool force_decode_tile_policy = false)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -3709,6 +3905,14 @@ namespace llaminar2
             const size_t blocks_per_kv_row = K_q16->blocks_per_row();
             constexpr size_t QS_OFFSET = sizeof(float) + sizeof(int32_t); // = 8 bytes
 
+            const size_t blocks_per_head_detect =
+                (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
+            const bool is_head_major =
+                (blocks_per_kv_row == blocks_per_head_detect && n_kv_heads > 1);
+            const size_t rows_per_head = is_head_major
+                                             ? (K_q16->rows() / static_cast<size_t>(n_kv_heads))
+                                             : 0;
+
             const uint8_t *k_raw = static_cast<const uint8_t *>(K_q16->raw_data());
             const uint8_t *v_raw = static_cast<const uint8_t *>(V_q16->raw_data());
             if (!k_raw || !v_raw)
@@ -3717,7 +3921,7 @@ namespace llaminar2
             const int q_stride = n_heads * head_dim;
 
             // KV tile size for prefill
-            const bool is_decode = (seq_len == 1 && kv_len >= 1);
+            const bool is_decode = ((seq_len == 1 || force_decode_tile_policy) && kv_len >= 1);
             const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
                 head_dim, n_kv_heads, kv_len, is_decode);
 
@@ -3744,10 +3948,16 @@ namespace llaminar2
                                          ? (head_start + h) / heads_per_kv
                                          : h / heads_per_kv;
 
-                    // Hoist per-head block layout invariants
+                    // Hoist per-head block layout invariants. Q16_1 KV caches
+                    // may be either [position][head][dim] or [head][position][dim].
+                    // The grouped verifier must read the same logical cache
+                    // rows as serial decode, so both layouts share the same
+                    // address formula as compute_decode_q16kv().
                     const size_t blocks_per_head = (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
-                    const size_t head_block_start = static_cast<size_t>(kv_h) * blocks_per_head;
                     const size_t row_stride_bytes = blocks_per_kv_row * block_bytes;
+                    const size_t head_block_start = is_head_major
+                                                        ? (static_cast<size_t>(kv_h) * rows_per_head * blocks_per_head)
+                                                        : (static_cast<size_t>(kv_h) * blocks_per_head);
                     const size_t blk_off_bytes = head_block_start * block_bytes;
 
                     float block_scores[detail::kMaxKVTile];

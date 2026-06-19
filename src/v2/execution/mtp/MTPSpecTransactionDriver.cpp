@@ -10,12 +10,20 @@ namespace llaminar2
     {
         MTPSpecTransactionBatchPlan planFromMetadata(
             MTPSpecDecodeMetadataBatch metadata,
-            const std::vector<int32_t> &base_cached_tokens)
+            const std::vector<int32_t> &base_cached_tokens,
+            MTPSpecTransactionPublicationContract publication_contract =
+                MTPSpecTransactionPublicationContract::
+                    DirectAcceptedStatePublication,
+            std::string publication_contract_reason =
+                "direct_accepted_state_publication")
         {
             MTPSpecTransactionBatchPlan plan;
             plan.shape = metadata.shape;
             plan.request_count = metadata.request_count;
             plan.metadata = std::move(metadata);
+            plan.publication_contract = publication_contract;
+            plan.publication_contract_reason =
+                std::move(publication_contract_reason);
 
             if (!plan.metadata.ok)
             {
@@ -104,16 +112,18 @@ namespace llaminar2
             std::vector<int32_t>{base_cached_tokens});
     }
 
-    MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
-        const MTPSpecDecodeMetadataShape &shape,
-        const std::vector<int> &request_ids,
-        int vocab_size,
-        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
-        const std::vector<MTPDeviceRejectionBatchOutcome> &device_outcomes,
-        const std::vector<int32_t> &base_cached_tokens)
-    {
-        if (!shape.valid())
-            return transactionPlanFailure(
+        MTPSpecTransactionBatchPlan buildDeviceRejectionOutcomePlan(
+            const MTPSpecDecodeMetadataShape &shape,
+            const std::vector<int> &request_ids,
+            int vocab_size,
+            const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+            const std::vector<MTPDeviceRejectionBatchOutcome> &device_outcomes,
+            const std::vector<int32_t> &base_cached_tokens,
+            MTPSpecTransactionPublicationContract publication_contract,
+            std::string publication_contract_reason)
+        {
+            if (!shape.valid())
+                return transactionPlanFailure(
                 "MTP device rejection transaction has invalid metadata shape");
         if (requests.empty())
             return transactionPlanFailure(
@@ -188,10 +198,54 @@ namespace llaminar2
             accepted_outcomes.push_back(std::move(accepted));
         }
 
-        return buildMTPSpecTransactionBatchPlanFromAcceptedOutcomes(
+        return planFromMetadata(
+            buildMTPSpecDecodeMetadataBatchFromAcceptedOutcomes(
+                shape,
+                accepted_outcomes),
+            base_cached_tokens,
+            publication_contract,
+            std::move(publication_contract_reason));
+    }
+
+    MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<int> &request_ids,
+        int vocab_size,
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<MTPDeviceRejectionBatchOutcome> &device_outcomes,
+        const std::vector<int32_t> &base_cached_tokens)
+    {
+        return buildDeviceRejectionOutcomePlan(
             shape,
-            accepted_outcomes,
-            base_cached_tokens);
+            request_ids,
+            vocab_size,
+            requests,
+            device_outcomes,
+            base_cached_tokens,
+            MTPSpecTransactionPublicationContract::
+                DirectAcceptedStatePublication,
+            "direct_accepted_state_publication");
+    }
+
+    MTPSpecTransactionBatchPlan
+    buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomesForReplayPublication(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<int> &request_ids,
+        int vocab_size,
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<MTPDeviceRejectionBatchOutcome> &device_outcomes,
+        const std::vector<int32_t> &base_cached_tokens)
+    {
+        return buildDeviceRejectionOutcomePlan(
+            shape,
+            request_ids,
+            vocab_size,
+            requests,
+            device_outcomes,
+            base_cached_tokens,
+            MTPSpecTransactionPublicationContract::
+                DecodeEquivalentReplayPublicationRequired,
+            "grouped_outcome_requires_decode_equivalent_replay_publication");
     }
 
     MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromGreedyCatchup(
@@ -211,6 +265,49 @@ namespace llaminar2
             std::vector<int32_t>{base_cached_tokens});
     }
 
+    MTPSpecTransactionBatchPlan
+    buildMTPSpecTransactionBatchPlanFromGreedyCatchupForReplayPublication(
+        const MTPSpecDecodeMetadataShape &shape,
+        int request_id,
+        int vocab_size,
+        const MTPDecodeCatchupGreedyRequest &request,
+        const MTPDecodeCatchupGreedyResult &result,
+        int32_t base_cached_tokens)
+    {
+        return buildMTPSpecTransactionBatchPlanFromGreedyCatchupsForReplayPublication(
+            shape,
+            std::vector<int>{request_id},
+            vocab_size,
+            std::vector<MTPDecodeCatchupGreedyRequest>{request},
+            std::vector<MTPDecodeCatchupGreedyResult>{result},
+            std::vector<int32_t>{base_cached_tokens});
+    }
+
+    namespace
+    {
+        MTPSpecTransactionBatchPlan buildGreedyCatchupPlan(
+            const MTPSpecDecodeMetadataShape &shape,
+            const std::vector<int> &request_ids,
+            int vocab_size,
+            const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+            const std::vector<MTPDecodeCatchupGreedyResult> &results,
+            const std::vector<int32_t> &base_cached_tokens,
+            MTPSpecTransactionPublicationContract publication_contract,
+            std::string publication_contract_reason)
+        {
+            return planFromMetadata(
+                buildMTPSpecDecodeMetadataBatchFromGreedyCatchups(
+                    shape,
+                    request_ids,
+                    vocab_size,
+                    requests,
+                    results),
+                base_cached_tokens,
+                publication_contract,
+                std::move(publication_contract_reason));
+        }
+    } // namespace
+
     MTPSpecTransactionBatchPlan buildMTPSpecTransactionBatchPlanFromGreedyCatchups(
         const MTPSpecDecodeMetadataShape &shape,
         const std::vector<int> &request_ids,
@@ -219,14 +316,37 @@ namespace llaminar2
         const std::vector<MTPDecodeCatchupGreedyResult> &results,
         const std::vector<int32_t> &base_cached_tokens)
     {
-        return planFromMetadata(
-            buildMTPSpecDecodeMetadataBatchFromGreedyCatchups(
-                shape,
-                request_ids,
-                vocab_size,
-                requests,
-                results),
-            base_cached_tokens);
+        return buildGreedyCatchupPlan(
+            shape,
+            request_ids,
+            vocab_size,
+            requests,
+            results,
+            base_cached_tokens,
+            MTPSpecTransactionPublicationContract::
+                DirectAcceptedStatePublication,
+            "direct_accepted_state_publication");
+    }
+
+    MTPSpecTransactionBatchPlan
+    buildMTPSpecTransactionBatchPlanFromGreedyCatchupsForReplayPublication(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<int> &request_ids,
+        int vocab_size,
+        const std::vector<MTPDecodeCatchupGreedyRequest> &requests,
+        const std::vector<MTPDecodeCatchupGreedyResult> &results,
+        const std::vector<int32_t> &base_cached_tokens)
+    {
+        return buildGreedyCatchupPlan(
+            shape,
+            request_ids,
+            vocab_size,
+            requests,
+            results,
+            base_cached_tokens,
+            MTPSpecTransactionPublicationContract::
+                DecodeEquivalentReplayPublicationRequired,
+            "grouped_greedy_outcome_requires_decode_equivalent_replay_publication");
     }
 
 } // namespace llaminar2

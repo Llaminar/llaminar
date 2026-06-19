@@ -479,6 +479,13 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override;
 
+            bool multiply_fused_verifier_rows_decode_equivalent(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
             bool supports_fused_projection() const override { return true; }
 
             /**
@@ -519,6 +526,14 @@ namespace llaminar2
             int m, int n, int k,
             float alpha = 1.0f, float beta = 0.0f,
             DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             // =========================================================================
             // ITensorKernel interface
@@ -614,7 +629,7 @@ namespace llaminar2
             int rocm_device_id() const { return rocm_device_id_; }
             size_t weight_rows() const { return N_; }
             size_t weight_cols() const { return K_; }
-            bool weights_converted() const { return weights_converted_; }
+            bool weights_converted() const override;
             bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
 
             /**

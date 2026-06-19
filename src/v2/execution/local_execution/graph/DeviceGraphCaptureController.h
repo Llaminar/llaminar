@@ -280,6 +280,7 @@ namespace llaminar2
             DeviceGraphExecutor::GraphSegment &segment,
             IDeviceContext *ctx,
             IWorkerGPUContext *gpu_ctx,
+            void *capture_stream,
             bool has_collective_nodes,
             uint64_t current_step,
             const std::function<bool(ComputeNode &)> &execute_node_cb);

@@ -342,7 +342,7 @@ namespace llaminar2
                 {"mtp_q", {"4", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection"},
                 {"mtp_k", {"4", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection"},
                 {"mtp_v", {"4", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection"},
-                {"mtp_attn_output", {"4", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention output"},
+                {"mtp_attn_output", {"4", "attn_output_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention/GDN output"},
                 {"mtp_attn_proj", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention projection"},
                 {"mtp_gate", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
                 {"mtp_up", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},

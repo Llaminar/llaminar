@@ -645,6 +645,20 @@ add_v2_test(V2_Unit_GPUVramPreflight
     MPI_PROCS 1
 )
 
+add_executable(v2_unit_mmap_region
+    unit/loaders/Test__MmapRegion.cpp
+)
+target_link_libraries(v2_unit_mmap_region
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MmapRegion
+    COMMAND $<TARGET_FILE:v2_unit_mmap_region>
+    LABELS "V2;Unit;Loaders;Mmap"
+    MPI_PROCS 1
+)
+
 # Test: MoE Expert Overlay Preparation - tier-aware preparation requests and CPU fallback packing
 add_executable(v2_unit_weight_manager_moe_expert_overlay_preparation
     unit/loaders/Test__WeightManagerMoEExpertOverlayPreparation.cpp
@@ -1686,6 +1700,7 @@ add_test(NAME V2_Unit_NativeVNNIGeneratedDispatchCodebooks
             ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc
             ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc
             ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeVNNIPrefillDispatchGenerated.inc
+            ${CMAKE_SOURCE_DIR}/kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc
 )
 set_tests_properties(V2_Unit_NativeVNNIGeneratedDispatchCodebooks PROPERTIES
     LABELS "V2;Unit;NativeVNNI;Quantization;Codebook;Dispatch;Regression"
@@ -4574,6 +4589,10 @@ add_v2_test(V2_Perf_MoEVerifierPrefill
     COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
     LABELS "V2;Performance;Benchmark;MoE;MTP;Verifier;CUDA;ROCm;GraphCapture"
     MPI_PROCS 1
+    # This speedometer times sub-millisecond CUDA/ROCm graph replays.  Share
+    # the real-model perf lock with dense verifier probes so CTest can stay
+    # parallel without running two GPU timing tests on the same accelerator.
+    RESOURCE_LOCK RealModel_Perf
 )
 
 # Focused GPU speculative-summary speedometer.
@@ -5545,6 +5564,47 @@ if(ZLIB_FOUND)
             "LLAMINAR_ROCM_CONCURRENT_M2_ROWS=0"
         )
     endif()
+
+    # Focused dense Qwen3.6 MTP verifier-row speedometer.
+    # Reuses the same real-model parity metadata as the Prefix/MTP parity tests,
+    # then proves warmed grouped verifier replay is faster than the serial
+    # decode-equivalent verifier fallback for M=2/3/4 on CPU, CUDA, and ROCm.
+    add_executable(v2_perf_dense_verifier_rows
+        performance/Perf__DenseVerifierRows.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_perf_dense_verifier_rows
+        llaminar2_core GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_perf_dense_verifier_rows PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_v2_test(V2_Perf_DenseVerifierRows_CPU
+        COMMAND $<TARGET_FILE:v2_perf_dense_verifier_rows>
+                --gtest_filter=Perf__DenseVerifierRows.CPU_M234_GroupedReplayFasterThanSerial
+        LABELS "V2;Performance;Benchmark;Qwen36;Dense;MTP;Verifier;CPU;RealModel;GraphCapture"
+        MPI_PROCS 1
+        RESOURCE_LOCK RealModel_Perf
+        TIMEOUT 3600
+    )
+    add_v2_test(V2_Perf_DenseVerifierRows_CUDA
+        COMMAND $<TARGET_FILE:v2_perf_dense_verifier_rows>
+                --gtest_filter=Perf__DenseVerifierRows.CUDA_M234_GroupedReplayFasterThanSerial
+        LABELS "V2;Performance;Benchmark;Qwen36;Dense;MTP;Verifier;CUDA;GPU;RealModel;GraphCapture"
+        MPI_PROCS 1
+        RESOURCE_LOCK RealModel_Perf
+        TIMEOUT 1800
+    )
+    add_v2_test(V2_Perf_DenseVerifierRows_ROCm
+        COMMAND $<TARGET_FILE:v2_perf_dense_verifier_rows>
+                --gtest_filter=Perf__DenseVerifierRows.ROCm_M234_GroupedReplayFasterThanSerial
+        LABELS "V2;Performance;Benchmark;Qwen36;Dense;MTP;Verifier;ROCm;GPU;RealModel;GraphCapture"
+        MPI_PROCS 1
+        RESOURCE_LOCK RealModel_Perf
+        TIMEOUT 1800
+    )
+
     add_executable(v2_integration_parity_qwen36_local_tp_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_LocalTP_PrefixMTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -8617,6 +8677,18 @@ add_v2_test(V2_Perf_CPUNativeVNNI_GEMV
     LABELS "V2;Performance;GEMV;NativeVNNI;CPU;Q8_0;Decode;Qwen;Tuning"
     MPI_PROCS 1
 )
+add_v2_test(V2_Perf_CPUNativeVNNI_VerifierRows
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
+            --gtest_filter=*MTP_VerifierRows_GroupedVsSerial_Synthetic
+    LABELS "V2;Performance;GEMV;NativeVNNI;CPU;MTP;Verifier;Qwen;Tuning"
+    MPI_PROCS 1
+    TIMEOUT 120
+)
+set_property(TEST V2_Perf_CPUNativeVNNI_VerifierRows
+    APPEND PROPERTY ENVIRONMENT
+    "LLAMINAR_CPU_NVNNI_VERIFIER_WARMUP=3"
+    "LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=10"
+)
 
 # Performance Test: CPU Flash Attention Sweep (all models, TP degrees, decode + prefill)
 add_executable(v2_perf_cpu_flash_attention_sweep performance/kernels/cpu/attention/Perf__CpuFlashAttentionSweep.cpp)
@@ -8629,6 +8701,33 @@ add_v2_test(V2_Perf_CPUFlashAttentionSweep
     COMMAND $<TARGET_FILE:v2_perf_cpu_flash_attention_sweep>
     LABELS "V2;Performance;Attention;FlashAttention;CPU;Decode;Prefill;Qwen;Tuning"
     MPI_PROCS 1
+)
+
+# Performance Test: CPU flash-attention MTP verifier rows
+add_executable(v2_perf_cpu_flash_attention_verifier_rows performance/kernels/cpu/attention/Perf__CPUFlashAttentionVerifierRows.cpp)
+target_link_libraries(v2_perf_cpu_flash_attention_verifier_rows
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_CPUFlashAttentionVerifierRows
+    COMMAND $<TARGET_FILE:v2_perf_cpu_flash_attention_verifier_rows>
+    LABELS "V2;Performance;Attention;FlashAttention;CPU;MTP;VerifierRows;Qwen36"
+    MPI_PROCS 1
+)
+
+# Performance Test: CPU GDN verifier-row grouped recurrence microbenchmark
+add_executable(v2_perf_cpu_gdn_verifier_rows performance/kernels/cpu/gdn/Perf__CPUGatedDeltaNetVerifierRows.cpp)
+target_link_libraries(v2_perf_cpu_gdn_verifier_rows
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_CPUGatedDeltaNetVerifierRows
+    COMMAND $<TARGET_FILE:v2_perf_cpu_gdn_verifier_rows>
+    LABELS "V2;Performance;GDN;CPU;MTP;VerifierRows;Phase9_8;DecodeEquivalent"
+    MPI_PROCS 1
+    TIMEOUT 120
 )
 
 # Performance Test: NativeVNNI vs oneDNN Reference (INT8 matmul baseline comparison)

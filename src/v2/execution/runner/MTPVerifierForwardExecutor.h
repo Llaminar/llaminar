@@ -79,6 +79,9 @@ namespace llaminar2
         std::vector<MTPDecodeCatchupGreedyRequest> requests;
         std::vector<int32_t> base_cached_tokens;
         MTPVerifierForwardExecutionOptions forward_options = {};
+        MTPSpecTransactionPublicationContract publication_contract =
+            MTPSpecTransactionPublicationContract::
+                DirectAcceptedStatePublication;
     };
 
     /**
@@ -120,7 +123,10 @@ namespace llaminar2
     MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierScheduledBatchTransaction(
         IInferenceRunner &runner,
         const MTPSpecRequestBatch &scheduled_batch,
-        MTPVerifierForwardExecutionOptions forward_options = {});
+        MTPVerifierForwardExecutionOptions forward_options = {},
+        MTPSpecTransactionPublicationContract publication_contract =
+            MTPSpecTransactionPublicationContract::
+                DirectAcceptedStatePublication);
 
     /**
      * @brief Result of scheduling and executing an owned greedy verifier batch.
@@ -153,7 +159,10 @@ namespace llaminar2
         IInferenceRunner &runner,
         MTPSpecRequestBatchOwner &owner,
         const MTPSpecRequestBatchScheduler &scheduler,
-        MTPVerifierForwardExecutionOptions forward_options = {});
+        MTPVerifierForwardExecutionOptions forward_options = {},
+        MTPSpecTransactionPublicationContract publication_contract =
+            MTPSpecTransactionPublicationContract::
+                DirectAcceptedStatePublication);
 
     /**
      * @brief Callback used to publish accepted verifier state before commit.
@@ -181,7 +190,10 @@ namespace llaminar2
         MTPSpecRequestBatchOwner &owner,
         const MTPSpecRequestBatchScheduler &scheduler,
         MTPGreedyVerifierBatchPublicationFn publish,
-        MTPVerifierForwardExecutionOptions forward_options = {});
+        MTPVerifierForwardExecutionOptions forward_options = {},
+        MTPSpecTransactionPublicationContract publication_contract =
+            MTPSpecTransactionPublicationContract::
+                DirectAcceptedStatePublication);
 
     /**
      * @brief Result of reducing a scheduled stochastic verifier batch.
@@ -205,7 +217,10 @@ namespace llaminar2
      */
     MTPDeviceOutcomeBatchTransactionResult executeMTPDeviceOutcomeScheduledBatchTransaction(
         const MTPSpecRequestBatch &scheduled_batch,
-        std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes);
+        std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes,
+        MTPSpecTransactionPublicationContract publication_contract =
+            MTPSpecTransactionPublicationContract::
+                DirectAcceptedStatePublication);
 
     /**
      * @brief Callback that produces compact stochastic verifier outcomes.
@@ -250,6 +265,9 @@ namespace llaminar2
         MTPSpecRequestBatchOwner &owner,
         const MTPSpecRequestBatchScheduler &scheduler,
         MTPDeviceOutcomeBatchProducerFn produce,
-        MTPGreedyVerifierBatchPublicationFn publish);
+        MTPGreedyVerifierBatchPublicationFn publish,
+        MTPSpecTransactionPublicationContract publication_contract =
+            MTPSpecTransactionPublicationContract::
+                DirectAcceptedStatePublication);
 
 } // namespace llaminar2

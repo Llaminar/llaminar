@@ -348,6 +348,49 @@ protected:
     }
 
     /**
+     * @brief Call the explicit grouped verifier attention hook.
+     *
+     * MTP verifier graphs use this API directly.  Comparing it to repeated
+     * one-row decode calls at this boundary catches grouped-kernel drift before
+     * it can hide inside a larger graph parity failure.
+     */
+    bool callQ16GroupedVerifier(
+        const float *Q_data, float *out_data,
+        const Q16_1Tensor *K_q16, const Q16_1Tensor *V_q16,
+        int verifier_rows, int kv_len, int n_heads, int n_kv_heads, int head_dim)
+    {
+        const size_t q_size = static_cast<size_t>(verifier_rows) *
+                              static_cast<size_t>(n_heads) *
+                              static_cast<size_t>(head_dim);
+
+        FP32Tensor Q_tensor({static_cast<size_t>(verifier_rows),
+                             static_cast<size_t>(n_heads) * head_dim});
+        std::memcpy(Q_tensor.mutable_data(), Q_data, q_size * sizeof(float));
+
+        FP32Tensor O_tensor({static_cast<size_t>(verifier_rows),
+                             static_cast<size_t>(n_heads) * head_dim});
+        std::memset(O_tensor.mutable_data(), 0, q_size * sizeof(float));
+
+        const bool ok = kernel_.compute_verifier_rows_decode_equivalent(
+            &Q_tensor,
+            K_q16,
+            V_q16,
+            &O_tensor,
+            verifier_rows,
+            kv_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            /*causal=*/true);
+
+        if (ok)
+        {
+            std::memcpy(out_data, O_tensor.data(), q_size * sizeof(float));
+        }
+        return ok;
+    }
+
+    /**
      * @brief Core test: run Q16 decode with HEAD_MAJOR layout, compare to FP32 ref
      */
     void runHeadMajorDecodeTest(
@@ -637,6 +680,142 @@ TEST_F(Test__Q16DecodeHeadMajor, SingleKVPosition)
 TEST_F(Test__Q16DecodeHeadMajor, SingleKVPosition_HD128)
 {
     runHeadMajorDecodeTest(1, 4, 2, 128, "SingleKV_HD128");
+}
+
+TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_M2ToM4)
+{
+    /*
+     * Production Q16 KV caches are head-major, while the MTP verifier presents
+     * a compact group of candidate rows.  Row r in the group must match serial
+     * decode at BASE_KV + r + 1 visible KV positions.
+     */
+    constexpr int BASE_KV = 19;
+    constexpr int MAX_M = 4;
+    constexpr int FULL_KV = BASE_KV + MAX_M;
+    constexpr int N_HEADS = 8;
+    constexpr int N_KV_HEADS = 4;
+    constexpr int HEAD_DIM = 64;
+    constexpr int Q_DIM = N_HEADS * HEAD_DIM;
+    constexpr int KV_DIM = N_KV_HEADS * HEAD_DIM;
+
+    rng().seed(88001);
+    std::vector<float> Q_all(static_cast<size_t>(MAX_M) * Q_DIM);
+    std::vector<float> K_fp32(static_cast<size_t>(FULL_KV) * KV_DIM);
+    std::vector<float> V_fp32(static_cast<size_t>(FULL_KV) * KV_DIM);
+    fill_random(Q_all.data(), Q_all.size(), -0.75f, 0.75f);
+    fill_random(K_fp32.data(), K_fp32.size(), -0.5f, 0.5f);
+    fill_random(V_fp32.data(), V_fp32.size(), -0.5f, 0.5f);
+
+    auto K_q16 = create_q16_head_major(K_fp32.data(), FULL_KV, N_KV_HEADS, HEAD_DIM);
+    auto V_q16 = create_q16_head_major(V_fp32.data(), FULL_KV, N_KV_HEADS, HEAD_DIM);
+    ASSERT_NE(K_q16, nullptr);
+    ASSERT_NE(V_q16, nullptr);
+
+    for (int m = 2; m <= MAX_M; ++m)
+    {
+        const int kv_len = BASE_KV + m;
+        std::vector<float> grouped(static_cast<size_t>(m) * Q_DIM, 0.0f);
+        ASSERT_TRUE(callQ16GroupedVerifier(
+            Q_all.data(),
+            grouped.data(),
+            K_q16.get(),
+            V_q16.get(),
+            m,
+            kv_len,
+            N_HEADS,
+            N_KV_HEADS,
+            HEAD_DIM))
+            << "M=" << m;
+
+        for (int row = 0; row < m; ++row)
+        {
+            std::vector<float> serial(Q_DIM, 0.0f);
+            ASSERT_TRUE(callQ16Decode(
+                Q_all.data() + static_cast<size_t>(row) * Q_DIM,
+                serial.data(),
+                K_q16.get(),
+                V_q16.get(),
+                BASE_KV + row + 1,
+                N_HEADS,
+                N_KV_HEADS,
+                HEAD_DIM))
+                << "M=" << m << " row=" << row;
+
+            const float *grouped_row = grouped.data() + static_cast<size_t>(row) * Q_DIM;
+            const float max_diff = max_abs_error(grouped_row, serial.data(), Q_DIM);
+            const float cos = cosine_similarity(grouped_row, serial.data(), Q_DIM);
+            EXPECT_LT(max_diff, 1e-5f) << "M=" << m << " row=" << row;
+            EXPECT_GT(cos, 0.999999f) << "M=" << m << " row=" << row;
+        }
+    }
+}
+
+TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_Qwen36Shape_M2ToM4)
+{
+    /*
+     * Qwen3.6 dense attention uses a wider head layout than the small unit
+     * case above.  This regression keeps the grouped verifier path honest for
+     * the model shape that exposed the first real parity drift.
+     */
+    constexpr int BASE_KV = 37;
+    constexpr int MAX_M = 4;
+    constexpr int FULL_KV = BASE_KV + MAX_M;
+    constexpr int N_HEADS = 28;
+    constexpr int N_KV_HEADS = 4;
+    constexpr int HEAD_DIM = 128;
+    constexpr int Q_DIM = N_HEADS * HEAD_DIM;
+    constexpr int KV_DIM = N_KV_HEADS * HEAD_DIM;
+
+    rng().seed(88002);
+    std::vector<float> Q_all(static_cast<size_t>(MAX_M) * Q_DIM);
+    std::vector<float> K_fp32(static_cast<size_t>(FULL_KV) * KV_DIM);
+    std::vector<float> V_fp32(static_cast<size_t>(FULL_KV) * KV_DIM);
+    fill_random(Q_all.data(), Q_all.size(), -0.25f, 0.25f);
+    fill_random(K_fp32.data(), K_fp32.size(), -0.25f, 0.25f);
+    fill_random(V_fp32.data(), V_fp32.size(), -0.25f, 0.25f);
+
+    auto K_q16 = create_q16_head_major(K_fp32.data(), FULL_KV, N_KV_HEADS, HEAD_DIM);
+    auto V_q16 = create_q16_head_major(V_fp32.data(), FULL_KV, N_KV_HEADS, HEAD_DIM);
+    ASSERT_NE(K_q16, nullptr);
+    ASSERT_NE(V_q16, nullptr);
+
+    for (int m = 2; m <= MAX_M; ++m)
+    {
+        const int kv_len = BASE_KV + m;
+        std::vector<float> grouped(static_cast<size_t>(m) * Q_DIM, 0.0f);
+        ASSERT_TRUE(callQ16GroupedVerifier(
+            Q_all.data(),
+            grouped.data(),
+            K_q16.get(),
+            V_q16.get(),
+            m,
+            kv_len,
+            N_HEADS,
+            N_KV_HEADS,
+            HEAD_DIM))
+            << "M=" << m;
+
+        for (int row = 0; row < m; ++row)
+        {
+            std::vector<float> serial(Q_DIM, 0.0f);
+            ASSERT_TRUE(callQ16Decode(
+                Q_all.data() + static_cast<size_t>(row) * Q_DIM,
+                serial.data(),
+                K_q16.get(),
+                V_q16.get(),
+                BASE_KV + row + 1,
+                N_HEADS,
+                N_KV_HEADS,
+                HEAD_DIM))
+                << "M=" << m << " row=" << row;
+
+            const float *grouped_row = grouped.data() + static_cast<size_t>(row) * Q_DIM;
+            const float max_diff = max_abs_error(grouped_row, serial.data(), Q_DIM);
+            const float cos = cosine_similarity(grouped_row, serial.data(), Q_DIM);
+            EXPECT_LT(max_diff, 1e-5f) << "M=" << m << " row=" << row;
+            EXPECT_GT(cos, 0.999999f) << "M=" << m << " row=" << row;
+        }
+    }
 }
 
 TEST_F(Test__Q16DecodeHeadMajor, NoCausal)

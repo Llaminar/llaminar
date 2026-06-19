@@ -506,6 +506,21 @@ namespace llaminar2
                               int *out_kv_len = nullptr,
                               const KVReadParams *rope = nullptr) override;
 
+        /**
+         * @brief Append grouped verifier rows with serial-decode cache semantics.
+         *
+         * ROCm MTP verifier rows can arrive as position-major rows or as
+         * head-major rows after grouped RoPE.  The grouped append kernel copies
+         * either source layout into the ring positions serial decode would have
+         * written, and it uses the caller-provided HIP stream for graph capture.
+         */
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream = nullptr) override;
+
         // Bring in IROCmRingKVCache overloads to avoid hiding
         using IROCmRingKVCache::append;
         using IROCmRingKVCache::clear_sequence;

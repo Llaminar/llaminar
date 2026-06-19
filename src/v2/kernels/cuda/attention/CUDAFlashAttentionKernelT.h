@@ -361,6 +361,33 @@ namespace llaminar2
                 int local_n_kv_heads = -1,
                 int gqa_n_rep = 0) override;
 
+            /**
+             * @brief Compute compact MTP verifier rows through the GPU small-M decode path.
+             *
+             * This is the graph-stage proof boundary for M=2..4 verifier rows.
+             * It prepares row-local attention parameters for the whole verifier
+             * span, then invokes one small-M attention dispatch.  The current
+             * CUDA backend still executes row-local flash-decode launches inside
+             * that dispatch, so this is correctness plumbing, not the final
+             * hardware-ceiling grouped attention kernel.
+             */
+            bool compute_verifier_rows_decode_equivalent(
+                const ITensor *Q,
+                const ITensor *K,
+                const ITensor *V,
+                ITensor *output,
+                int verifier_rows,
+                int kv_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                bool causal,
+                int window_size = -1,
+                const IMPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int head_start = 0,
+                int gqa_n_rep = 0) override;
+
             // =========================================================================
             // IWorkspaceConsumer Interface
             // =========================================================================

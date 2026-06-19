@@ -1,6 +1,6 @@
-backend,phase,format,codebook,shape,n,k,m,projections,total_n,projection_ns,codebooks,variant,kb,target_waves,min_us,mean_us,stddev_us,cosine,correctness_pass,is_best
-rocm,batched_decode,Q4_K,5,Qwen36_GDN_Q4K_qkv_z,16384,5120,4,2,16384,10240+6144,5+5,AUTO,0,0,151.800,158.400,3.000,1.000000,1,0
-rocm,batched_decode,Q4_K,5,Qwen36_GDN_Q4K_qkv_z,16384,5120,4,2,16384,10240+6144,5+5,KB4/TW12,4,12,119.000,127.000,3.000,1.000000,1,1
-rocm,batched_decode,Q4_K,5,Qwen36_GDN_Q4K_qkv_z,16384,5120,4,2,16384,10240+6144,5+5,KB8/TW12,8,12,122.000,128.000,3.000,1.000000,1,0
-rocm,batched_decode,Q5_K,7,Qwen36_GDN_Q5K_qkv_z,16384,5120,4,2,16384,10240+6144,7+7,AUTO,0,0,203.000,206.100,3.000,1.000000,1,0
-rocm,batched_decode,Q5_K,7,Qwen36_GDN_Q5K_qkv_z,16384,5120,4,2,16384,10240+6144,7+7,KB8/TW12,8,12,136.800,146.000,3.000,1.000000,1,1
+backend,phase,format,codebook,shape,n,k,m,projections,total_n,projection_ns,codebooks,variant,kb,target_waves,min_us,mean_us,stddev_us,cosine,relative_l2,max_abs,correctness_pass,is_best
+rocm,batched_decode,Q4_K,5,Qwen36_GDN_Q4K_qkv_z,16384,5120,4,2,16384,10240+6144,5+5,AUTO,0,0,151.800,158.400,3.000,1.000000,0.000000e+00,0.000000e+00,1,0
+rocm,batched_decode,Q4_K,5,Qwen36_GDN_Q4K_qkv_z,16384,5120,4,2,16384,10240+6144,5+5,KB4/TW12,4,12,119.000,127.000,3.000,1.000000,2.500000e-04,1.250000e-03,1,1
+rocm,batched_decode,Q4_K,5,Qwen36_GDN_Q4K_qkv_z,16384,5120,4,2,16384,10240+6144,5+5,KB8/TW12,8,12,122.000,128.000,3.000,1.000000,4.000000e-04,2.000000e-03,1,0
+rocm,batched_decode,Q5_K,7,Qwen36_GDN_Q5K_qkv_z,16384,5120,4,2,16384,10240+6144,7+7,AUTO,0,0,203.000,206.100,3.000,1.000000,0.000000e+00,0.000000e+00,1,0
+rocm,batched_decode,Q5_K,7,Qwen36_GDN_Q5K_qkv_z,16384,5120,4,2,16384,10240+6144,7+7,KB8/TW12,8,12,136.800,146.000,3.000,1.000000,3.750000e-04,1.750000e-03,1,1

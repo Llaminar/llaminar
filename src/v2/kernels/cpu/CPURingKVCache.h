@@ -397,6 +397,22 @@ namespace llaminar2
         /// Bring in ICPUKVCache convenience overloads (seq_idx=0 defaults).
         using ICPUKVCache::append_kv;
 
+        /**
+         * @brief Append grouped verifier rows using serial-decode ring semantics.
+         *
+         * This is the CPU implementation of the Phase 9.8 verifier contract.
+         * The source may be position-major or head-major, but the destination is
+         * always the cache's configured layout.  The method writes all rows in
+         * one cache operation and updates ring metadata once, so the stage layer
+         * no longer needs to recursively execute one-token append calls.
+         */
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream = nullptr) override;
+
         // =====================================================================
         // Batched Gather
         // =====================================================================

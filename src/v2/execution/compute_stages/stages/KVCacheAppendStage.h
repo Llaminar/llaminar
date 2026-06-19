@@ -161,45 +161,18 @@ namespace llaminar2
 
     private:
         /**
-         * @brief Returns true when a tiny CPU verifier append must exactly
-         * match serial decode append semantics.
+         * @brief Returns true when a tiny verifier append needs grouped
+         * decode-equivalent cache publication.
          *
          * Grouped MTP verifier rows are mathematically decode rows, not prompt
-         * prefill rows.  CPU cache conversion paths may choose different
-         * kernels for M=2..4 than they use for M=1, so this predicate routes
-         * those verifier-sized appends through the same one-row append contract
-         * used by serial decode.  GPU backends keep their graph-capturable
-         * device path and must not use this host-side row loop.
+         * prefill rows.  Cache publication must therefore use a dedicated
+         * cache-level grouped contract that handles backend source layout and
+         * updates ring metadata atomically.  Stage-level serial replay is not a
+         * production implementation for Phase 9.8.
          */
         bool shouldUseDecodeEquivalentVerifierAppend(int total_tokens,
                                                      int batch_size,
                                                      int seq_len) const;
-
-        /**
-         * @brief Copy one native host row out of a verifier K/V tensor.
-         *
-         * The helper preserves the source tensor's native format so recursive
-         * one-token append observes the same tensor type and quantization
-         * pathway as serial decode.  It intentionally fails for unsupported
-         * formats instead of silently dequantizing to FP32, because that would
-         * hide decode-equivalence bugs.
-         */
-        std::unique_ptr<TensorBase> cloneHostRowForDecodeEquivalentAppend(
-            const ITensor *source,
-            int row,
-            const char *debug_name) const;
-
-        /**
-         * @brief Execute a grouped CPU verifier append as serial one-row appends.
-         *
-         * Each row is appended with params_.num_tokens == 1, advancing the cache
-         * after every row exactly as a normal decode replay would.  This is the
-         * correctness oracle for Phase 9.8; production GPU speed comes from the
-         * later generated M=2..4 device kernels that must prove equivalence to
-         * this contract.
-         */
-        bool executeDecodeEquivalentVerifierAppend(IDeviceContext *ctx,
-                                                   int total_tokens);
 
         Params params_;
         std::unique_ptr<FP16Tensor> fp16_k_scratch_;

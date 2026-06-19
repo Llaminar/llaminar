@@ -2946,8 +2946,19 @@ namespace
         }
         else
         {
-            shape = classifyShapeGenerated<CB>(M, N, K);
-            tuning = selectGeneratedTuning<CB>(M, N, K);
+            /**
+             * Deterministic verifier replay is a stricter contract than raw
+             * GEMV parity: every grouped verifier row must be decode-equivalent
+             * to the canonical single-row decode path.  CUDA canonicalizes M=1
+             * decode by padding it to M=2, so all deterministic grouped rows use
+             * the same M=2 generated dispatch surface.  This keeps the
+             * per-output reduction order aligned while still running a single
+             * grouped M=2..4 kernel.  Non-deterministic inference remains
+             * M-aware and consumes the trained dispatch table for speed.
+             */
+            const int dispatch_m = llaminar2::debugEnv().gemm.deterministic ? 2 : M;
+            shape = classifyShapeGenerated<CB>(dispatch_m, N, K);
+            tuning = selectGeneratedTuning<CB>(dispatch_m, N, K);
         }
 
         if (shape == NativeGemvShape::WIDE)

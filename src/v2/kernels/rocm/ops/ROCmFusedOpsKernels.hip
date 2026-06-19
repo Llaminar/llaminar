@@ -47,6 +47,21 @@ __device__ __forceinline__ uint16_t float_to_fp16(float f)
     return *reinterpret_cast<uint16_t*>(&h);
 }
 
+/**
+ * @brief SiLU math shared with the standalone ROCm SwiGLU decode kernel.
+ *
+ * The MTP grouped verifier compares multi-row kernels against serial decode
+ * row-by-row.  Using the same fast exponential and reciprocal sequence here is
+ * therefore a correctness requirement, not only a speed choice; a different
+ * libm/division path can quantize activations differently and amplify through
+ * later recurrent state.
+ */
+__device__ __forceinline__ float silu_fast(float x)
+{
+    float e = __expf(-x);
+    return x * __builtin_amdgcn_rcpf(1.0f + e);
+}
+
 } // anonymous namespace
 
 // =========================================================================
@@ -85,7 +100,7 @@ __global__ void rocm_fused_swiglu_quantize_blockwise_kernel(
         float u = row_up[k_start + lane];
 
         // SwiGLU: silu(gate) * up
-        float val = (g / (1.0f + expf(-g))) * u;
+        float val = silu_fast(g) * u;
 
         // Warp-level max_abs reduction via shuffle
         float abs_val = fabsf(val);

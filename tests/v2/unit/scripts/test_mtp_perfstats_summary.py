@@ -36,6 +36,20 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "request_batch_stochastic_verifier_forward",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 5.5,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "grouped_outcome_stochastic_verifier_forward",
+                    "phase": "decode",
+                    "count": 2,
+                    "total_ms": 7.25,
+                },
+                {
+                    "domain": "mtp",
                     "name": "stochastic_device_physical_verify_rows",
                     "phase": "decode",
                     "count": 2,
@@ -175,6 +189,13 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                     "phase": "decode",
                     "count": 3,
                     "total_ms": 1.25,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "grouped_outcome_publish_accepted_state_device_resident",
+                    "phase": "decode",
+                    "count": 2,
+                    "total_ms": 2.0,
                 },
                 {
                     "domain": "mtp",
@@ -327,10 +348,24 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "grouped_outcome_stochastic_device_resident_outcome_enqueue",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 1.0,
+                },
+                {
+                    "domain": "mtp",
                     "name": "all_position_stochastic_device_outcome_host_bridge",
                     "phase": "decode",
                     "count": 1,
                     "total_ms": 12.0,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "grouped_outcome_stochastic_device_outcome_host_bridge",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 2.0,
                 },
                 {
                     "domain": "mtp",
@@ -412,10 +447,24 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
+                    "name": "grouped_outcome_transaction_plan_build",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 0.25,
+                },
+                {
+                    "domain": "mtp",
                     "name": "device_resident_publication_host_adoption",
                     "phase": "decode",
                     "count": 1,
                     "total_ms": 0.25,
+                },
+                {
+                    "domain": "mtp",
+                    "name": "grouped_outcome_device_resident_host_adoption",
+                    "phase": "decode",
+                    "count": 1,
+                    "total_ms": 0.125,
                 },
                 {
                     "domain": "mtp",
@@ -750,7 +799,7 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
 
         summary = json.loads(result.stdout)
         self.assertEqual(summary["decode_step_ms"], 30.5)
-        self.assertEqual(summary["verifier_ms"], 18.25)
+        self.assertEqual(summary["verifier_ms"], 31.0)
         self.assertEqual(summary["stochastic_physical_verify_rows"], 9.0)
         self.assertEqual(summary["stochastic_semantic_verify_rows"], 7.0)
         self.assertEqual(summary["stochastic_post_reject_rows"], 2.0)
@@ -773,9 +822,9 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["correction_count"], 2)
         self.assertEqual(summary["deferred_corrections"], 3)
         self.assertEqual(summary["rejection_no_ready"], 4)
-        self.assertEqual(summary["publish_ms"], 1.25)
-        self.assertEqual(summary["publish_count"], 3)
-        self.assertAlmostEqual(summary["publish_avg_ms"], 1.25 / 3.0)
+        self.assertEqual(summary["publish_ms"], 3.25)
+        self.assertEqual(summary["publish_count"], 5)
+        self.assertAlmostEqual(summary["publish_avg_ms"], 3.25 / 5.0)
         self.assertEqual(summary["sidecar_ms"], 2.5)
         self.assertEqual(summary["sidecar_depth0_decode_ms"], 3.5)
         self.assertEqual(summary["shifted_initial_ms"], 4.0)
@@ -793,8 +842,8 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["stochastic_distribution_batch_build_gpu_ms"], 9.0)
         self.assertEqual(summary["stochastic_processed_rows_build_gpu_ms"], 9.5)
         self.assertEqual(summary["stochastic_batch_outcome_ms"], 10.0)
-        self.assertEqual(summary["resident_outcome_enqueue_ms"], 11.0)
-        self.assertEqual(summary["resident_outcome_host_bridge_ms"], 12.0)
+        self.assertEqual(summary["resident_outcome_enqueue_ms"], 12.0)
+        self.assertEqual(summary["resident_outcome_host_bridge_ms"], 14.0)
         self.assertEqual(summary["stochastic_batch_gpu_reducer_ms"], 13.0)
         self.assertEqual(summary["first_sidecar_prelaunch_ms"], 1.5)
         self.assertEqual(summary["first_sidecar_prelaunches"], 3)
@@ -807,8 +856,8 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["sidecar_device_token_inputs_from_host"], 3)
         self.assertEqual(summary["sidecar_device_token_inputs_from_device"], 7)
         self.assertEqual(summary["outcome_catchup_plan_ms"], 0.75)
-        self.assertEqual(summary["transaction_plan_ms"], 0.5)
-        self.assertEqual(summary["host_state_adoption_ms"], 0.25)
+        self.assertEqual(summary["transaction_plan_ms"], 0.75)
+        self.assertEqual(summary["host_state_adoption_ms"], 0.375)
         self.assertEqual(summary["transaction_output_commit_ms"], 0.125)
         self.assertEqual(summary["stochastic_batch_d2h_sync_ms"], 23.0)
         self.assertEqual(summary["stochastic_batch_d2h_enqueue_ms"], 0.75)

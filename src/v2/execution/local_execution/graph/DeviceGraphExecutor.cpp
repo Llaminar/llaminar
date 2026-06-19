@@ -721,6 +721,8 @@ namespace llaminar2
         // =====================================================================
         const bool timeline_requested = PerfStatsCollector::gpuStageEventTimingEnabled();
         const bool timeline_active = policy.timeline && timeline_requested && ctx->isGPU() && !isGraphCaptureActive();
+        const bool cpu_stage_timing_active =
+            PerfStatsCollector::isEnabled() && ctx && !ctx->isGPU();
         IWorkerGPUContext *timeline_gpu_ctx = nullptr;
         if (timeline_active)
         {
@@ -780,23 +782,56 @@ namespace llaminar2
             if (debugEnv().vram_trace && ctx->isGPU())
             {
                 const DeviceId stage_device = node->device.is_valid() ? node->device : node->stage->device();
-                LOG_INFO("[VRAM_TRACE] stage.before index=" << i
+                LOG_TRACE("[VRAM_TRACE] stage.before index=" << i
                                                             << " name=" << node->name
                                                             << " type=" << computeStageTypeName(node->stage->type())
                                                             << " device=" << stage_device.toString());
             }
 
+            const auto cpu_stage_start =
+                cpu_stage_timing_active ? PerfStatsCollector::Clock::now()
+                                        : PerfStatsCollector::Clock::time_point{};
             if (!runStage(*node, ctx, policy, is_coll))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << node->name);
                 notifyStageFailure(node->name, "stage execution returned false");
                 return false;
             }
+            if (cpu_stage_timing_active)
+            {
+                const auto cpu_stage_end = PerfStatsCollector::Clock::now();
+                const auto ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_stage_end - cpu_stage_start).count();
+                const std::string stage_type_name = computeStageTypeName(node->stage->type());
+
+                // Keep the coarse aggregate stable for existing dashboards, then
+                // add a node-level record so verifier tuning can identify the
+                // exact graph stage that dominates an M=2..4 replay.
+                PerfStatsCollector::recordTimingNs(
+                    "stage_cpu",
+                    std::string("type.") + stage_type_name,
+                    ns > 0 ? static_cast<uint64_t>(ns) : 0,
+                    "execute",
+                    ctx->deviceId().to_string(),
+                    PerfStatsCollector::Tags{
+                        {"attribution", "cpu_wall"},
+                        {"source", "device_graph_executor"}});
+                PerfStatsCollector::recordTimingNs(
+                    "stage_cpu_detail",
+                    node->name,
+                    ns > 0 ? static_cast<uint64_t>(ns) : 0,
+                    "execute",
+                    ctx->deviceId().to_string(),
+                    PerfStatsCollector::Tags{
+                        {"attribution", "cpu_wall"},
+                        {"source", "device_graph_executor"},
+                        {"stage_type", stage_type_name}});
+            }
 
             if (debugEnv().vram_trace && ctx->isGPU())
             {
                 const DeviceId stage_device = node->device.is_valid() ? node->device : node->stage->device();
-                LOG_INFO("[VRAM_TRACE] stage.after index=" << i
+                LOG_TRACE("[VRAM_TRACE] stage.after index=" << i
                                                            << " name=" << node->name
                                                            << " type=" << computeStageTypeName(node->stage->type())
                                                            << " device=" << stage_device.toString());

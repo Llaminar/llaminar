@@ -20,6 +20,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -30,6 +31,7 @@
 
 #include "kernels/cpu/rotation/ActivationRotation.h"
 #include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "loaders/ModelLoader.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
@@ -44,6 +46,12 @@ using namespace llaminar2::test;
 
 namespace
 {
+    std::filesystem::path qwen36DenseModelPath()
+    {
+        if (const char *env = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL"))
+            return std::filesystem::path(env);
+        return std::filesystem::path("/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf");
+    }
 
     // =========================================================================
     // MPI global environment: init once, finalize on exit, abort on crash
@@ -902,8 +910,11 @@ namespace
                 ASSERT_NE(input, nullptr);
 
                 FP32Tensor batched({static_cast<size_t>(M), static_cast<size_t>(N)});
-                ASSERT_TRUE(kernel.multiply_tensor(input.get(), &batched, M, N, K))
-                    << fmt.name << " batched verifier GEMM failed at M=" << M;
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {&kernel, &batched, N, nullptr, "mtp_verifier_projection"}};
+                ASSERT_TRUE(kernel.multiply_fused_verifier_rows_decode_equivalent(
+                    input.get(), projections, M, K))
+                    << fmt.name << " grouped verifier GEMM hook failed at M=" << M;
 
                 std::vector<float> serial(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
                 for (int row = 0; row < M; ++row)
@@ -923,13 +934,69 @@ namespace
                 const float cos = cosineSimilarity(batched.data(), serial.data(), count);
                 const float max_err = maxAbsError(batched.data(), serial.data(), count);
                 EXPECT_GE(cos, 0.999999f)
-                    << fmt.name << " M=" << M
-                    << " batched small-M verifier differs from serial decode rows";
-                EXPECT_LE(max_err, 1e-5f)
-                    << fmt.name << " M=" << M
-                    << " batched small-M verifier max error differs from serial decode rows";
+                << fmt.name << " M=" << M
+                << " grouped verifier hook differs from serial decode rows";
+            EXPECT_LE(max_err, 1e-5f)
+                << fmt.name << " M=" << M
+                << " grouped verifier hook max error differs from serial decode rows";
             }
         }
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierRowsUntrainedShapeUsesPairwiseFloor)
+    {
+        /**
+         * Phase 9.8 regression: the generated verifier-row policy table only
+         * promotes shapes that were measured by the trainer.  The square
+         * 5120x5120 Q4_K probe is intentionally not a production Qwen3.6
+         * projection key, and the wide M=3 candidate is much slower there.
+         * Unknown keys must therefore use Pairwise, the conservative grouped
+         * floor, instead of silently guessing a wide-row policy.
+         */
+        const int N = 5120;
+        const int K = 5120;
+        const int M = 3;
+
+        auto weights = createWeightsForFormat("Q4_K", N, K);
+        ASSERT_NE(weights, nullptr);
+
+        CPUNativeVNNIGemmKernel kernel(weights.get());
+        ASSERT_TRUE(kernel.isValid());
+        const auto &packed = kernel.packedWeights();
+        ASSERT_EQ(
+            selectVerifierRowsPolicy(packed, M, N, K),
+            VerifierRowsPolicy::Pairwise);
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -1.0f,
+            1.0f,
+            9603u);
+        ASSERT_NE(input, nullptr);
+
+        FP32Tensor batched({static_cast<size_t>(M), static_cast<size_t>(N)});
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {&kernel, &batched, N, nullptr, "untrained_square_verifier_projection"}};
+        ASSERT_TRUE(kernel.multiply_fused_verifier_rows_decode_equivalent(
+            input.get(), projections, M, K));
+
+        std::vector<float> serial(
+            static_cast<size_t>(M) * static_cast<size_t>(N),
+            0.0f);
+        for (int row = 0; row < M; ++row)
+        {
+            ASSERT_TRUE(multiplyViaTensor(
+                kernel,
+                input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                serial.data() + static_cast<size_t>(row) * static_cast<size_t>(N),
+                1,
+                N,
+                K));
+        }
+
+        const size_t count = static_cast<size_t>(M) * static_cast<size_t>(N);
+        EXPECT_GE(cosineSimilarity(batched.data(), serial.data(), count), 0.999999f);
+        EXPECT_LE(maxAbsError(batched.data(), serial.data(), count), 1e-5f);
     }
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_FusedProjectionWithActivationRotationMatchesSerialDecodeRows)
@@ -962,7 +1029,8 @@ namespace
             {&kernel0, &grouped0, N0, nullptr, "proj0"},
             {&kernel1, &grouped1, N1, nullptr, "proj1"}};
 
-        ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), grouped_projections, M, K))
+        ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
+            input.get(), grouped_projections, M, K))
             << "Grouped verifier projection should support rotated CPU NativeVNNI weights";
 
         std::vector<float> serial0(static_cast<size_t>(M) * static_cast<size_t>(N0), 0.0f);
@@ -1018,17 +1086,26 @@ namespace
             const char *format;
             int N;
             int K;
-            int M;
         };
 
-        static const std::array<Shape, 6> shapes = {{
-            {"DenseGDNInner_Q4_K", "Q4_K", 10240, 5120, 2},
-            {"DenseGDNZ_Q4_K", "Q4_K", 6144, 5120, 2},
-            {"DenseGDNOut_Q4_K", "Q4_K", 5120, 6144, 4},
-            {"MoEGateUp_IQ2_S", "IQ2_S", 512, 256, 2},
-            {"MoEDown_IQ4_XS", "IQ4_XS", 256, 512, 2},
-            {"MoEBlock_IQ3_S", "IQ3_S", 7168, 5120, 2},
+        static const std::array<Shape, 9> shapes = {{
+            {"DenseGDNInner_Q4_K", "Q4_K", 10240, 5120},
+            {"DenseGDNZ_Q4_K", "Q4_K", 6144, 5120},
+            {"DenseGDNOut_Q4_K", "Q4_K", 5120, 6144},
+            /*
+             * Qwen3.6 Q4_K_S stores several output projections as Q5_K even
+             * when adjacent in-projections are Q4_K.  The grouped verifier
+             * path must prove the exact production codebook, not just a shape
+             * alias, because Q5_K uses the asymmetric K-quant decode path.
+             */
+            {"DenseGDNOut_Q5_K", "Q5_K", 5120, 6144},
+            {"DenseAttentionWo_Q4_K", "Q4_K", 5120, 6144},
+            {"DenseFFNDown_Q5_K", "Q5_K", 5120, 17408},
+            {"MoEGateUp_IQ2_S", "IQ2_S", 512, 256},
+            {"MoEDown_IQ4_XS", "IQ4_XS", 256, 512},
+            {"MoEBlock_IQ3_S", "IQ3_S", 7168, 5120},
         }};
+        static const std::array<int, 3> verifier_rows = {2, 3, 4};
 
         for (const auto &shape : shapes)
         {
@@ -1043,36 +1120,140 @@ namespace
             CPUNativeVNNIGemmKernel kernel(weights.get());
             ASSERT_TRUE(kernel.isValid()) << shape.name << " failed to pack";
 
-            auto input = TestTensorFactory::createFP32Random(
-                {static_cast<size_t>(shape.M), static_cast<size_t>(shape.K)}, -1.0f, 1.0f,
-                static_cast<uint32_t>(2200 + shape.N + shape.K + shape.M));
-            ASSERT_NE(input, nullptr);
-
-            FP32Tensor batched({static_cast<size_t>(shape.M), static_cast<size_t>(shape.N)});
-            ASSERT_TRUE(kernel.multiply_tensor(input.get(), &batched, shape.M, shape.N, shape.K))
-                << shape.name << " batched verifier GEMM failed";
-
-            std::vector<float> serial(
-                static_cast<size_t>(shape.M) * static_cast<size_t>(shape.N), 0.0f);
-            for (int row = 0; row < shape.M; ++row)
+            for (const int M : verifier_rows)
             {
-                ASSERT_TRUE(multiplyViaTensor(
-                    kernel,
-                    input->data() + static_cast<size_t>(row) * static_cast<size_t>(shape.K),
-                    serial.data() + static_cast<size_t>(row) * static_cast<size_t>(shape.N),
-                    1,
-                    shape.N,
-                    shape.K))
-                    << shape.name << " serial decode GEMV failed at row=" << row;
-            }
+                SCOPED_TRACE(std::string("M=") + std::to_string(M));
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(shape.K)}, -1.0f, 1.0f,
+                    static_cast<uint32_t>(2200 + shape.N + shape.K + M));
+                ASSERT_NE(input, nullptr);
 
-            const size_t count = static_cast<size_t>(shape.M) * static_cast<size_t>(shape.N);
-            const float cos = cosineSimilarity(batched.data(), serial.data(), count);
-            const float max_err = maxAbsError(batched.data(), serial.data(), count);
-            EXPECT_GE(cos, 0.999999f)
-                << shape.name << " batched small-M verifier differs from serial decode rows";
-            EXPECT_LE(max_err, 1e-5f)
-                << shape.name << " batched small-M verifier max error differs from serial decode rows";
+                FP32Tensor batched({static_cast<size_t>(M), static_cast<size_t>(shape.N)});
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {&kernel, &batched, shape.N, nullptr, "qwen36_verifier_projection"}};
+                ASSERT_TRUE(kernel.multiply_fused_verifier_rows_decode_equivalent(
+                    input.get(), projections, M, shape.K))
+                    << shape.name << " grouped verifier GEMM hook failed";
+
+                std::vector<float> serial(
+                    static_cast<size_t>(M) * static_cast<size_t>(shape.N), 0.0f);
+                for (int row = 0; row < M; ++row)
+                {
+                    ASSERT_TRUE(multiplyViaTensor(
+                        kernel,
+                        input->data() + static_cast<size_t>(row) * static_cast<size_t>(shape.K),
+                        serial.data() + static_cast<size_t>(row) * static_cast<size_t>(shape.N),
+                        1,
+                        shape.N,
+                        shape.K))
+                        << shape.name << " serial decode GEMV failed at row=" << row;
+                }
+
+                const size_t count = static_cast<size_t>(M) * static_cast<size_t>(shape.N);
+                const float cos = cosineSimilarity(batched.data(), serial.data(), count);
+                const float max_err = maxAbsError(batched.data(), serial.data(), count);
+                EXPECT_GE(cos, 0.999999f)
+                    << shape.name << " grouped verifier hook differs from serial decode rows";
+                EXPECT_LE(max_err, 1e-5f)
+                    << shape.name << " grouped verifier hook max error differs from serial decode rows";
+            }
+        }
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_RealQwen36GDNOutputWeightsMatchSerialDecodeRows)
+    {
+        const auto model_path = qwen36DenseModelPath();
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << "Qwen3.6 dense GGUF not found at " << model_path
+                         << "; set LLAMINAR_QWEN36_DENSE_MODEL to run this real-weight regression";
+        }
+
+        ModelLoader loader;
+        loader.setUseMmap(true);
+        ASSERT_TRUE(loader.loadModel(model_path.string()))
+            << "Failed to load Qwen3.6 dense model header from " << model_path;
+
+        /*
+         * The full CPU grouped-verifier parity regression first diverged at
+         * these GDN output projections.  This focused test proves the exact
+         * production weights and codebooks against the serial decode GEMV path
+         * before we blame graph state wiring.
+         */
+        const std::array<const char *, 2> tensors = {
+            "blk.6.ssm_out.weight",
+            "blk.24.ssm_out.weight"};
+        struct ActivationCase
+        {
+            const char *label;
+            float min_value;
+            float max_value;
+            uint32_t seed_base;
+        };
+        const std::array<ActivationCase, 4> activation_cases = {{
+            {"small_gdn_like", -0.25f, 0.25f, 3600u},
+            {"medium_hidden", -1.0f, 1.0f, 3700u},
+            {"wide_hidden", -3.0f, 3.0f, 3800u},
+            {"positive_skew", -0.1f, 2.0f, 3900u},
+        }};
+
+        for (const char *tensor_name : tensors)
+        {
+            SCOPED_TRACE(tensor_name);
+            auto weights = loader.loadTensor(tensor_name, DeviceId::cpu(), WeightPrecision::NATIVE);
+            ASSERT_NE(weights, nullptr) << "Failed to load " << tensor_name;
+            ASSERT_GE(weights->shape().size(), 2u);
+
+            const int N = static_cast<int>(weights->shape()[0]);
+            const int K = static_cast<int>(weights->shape()[1]);
+            ASSERT_EQ(N, 5120);
+            ASSERT_EQ(K, 6144);
+
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid()) << tensor_name << " failed NativeVNNI packing";
+
+            for (int M : {2, 3, 4})
+            {
+                SCOPED_TRACE(std::string("M=") + std::to_string(M));
+                for (const ActivationCase &activation_case : activation_cases)
+                {
+                    SCOPED_TRACE(activation_case.label);
+                    auto input = TestTensorFactory::createFP32Random(
+                        {static_cast<size_t>(M), static_cast<size_t>(K)},
+                        activation_case.min_value,
+                        activation_case.max_value,
+                        activation_case.seed_base + static_cast<uint32_t>(M));
+                    ASSERT_NE(input, nullptr);
+
+                    FP32Tensor grouped({static_cast<size_t>(M), static_cast<size_t>(N)});
+                    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                        {&kernel, &grouped, N, nullptr, "qwen36_gdn_out"}};
+                    ASSERT_TRUE(kernel.multiply_fused_verifier_rows_decode_equivalent(
+                        input.get(), projections, M, K))
+                        << tensor_name << " grouped verifier GEMM hook failed";
+
+                    std::vector<float> serial(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+                    for (int row = 0; row < M; ++row)
+                    {
+                        ASSERT_TRUE(multiplyViaTensor(
+                            kernel,
+                            input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                            serial.data() + static_cast<size_t>(row) * static_cast<size_t>(N),
+                            1,
+                            N,
+                            K))
+                            << tensor_name << " serial decode GEMV failed at row=" << row;
+                    }
+
+                    const size_t count = static_cast<size_t>(M) * static_cast<size_t>(N);
+                    const float cos = cosineSimilarity(grouped.data(), serial.data(), count);
+                    const float max_err = maxAbsError(grouped.data(), serial.data(), count);
+                    EXPECT_GE(cos, 0.999999f)
+                        << tensor_name << " real-weight grouped verifier output drifted from serial decode";
+                    EXPECT_LE(max_err, 1e-5f)
+                        << tensor_name << " real-weight grouped verifier max error";
+                }
+            }
         }
     }
 

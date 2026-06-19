@@ -151,7 +151,6 @@ namespace
          { return TestTensorFactory::createQ5_0Random({N, K}); }},
         {"Q5_1", 6.0, false, [](size_t N, size_t K)
          { return TestTensorFactory::createQ5_1Random({N, K}); }},
-
         // Tier 1 super-block
         {"IQ4_XS", 4.5, true, [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_XSRandom({N, K}); }},
@@ -185,6 +184,11 @@ namespace
          { return TestTensorFactory::createIQ1_SRandom({N, K}); }},
         {"IQ1_M", 1.9, true, [](size_t N, size_t K)
          { return TestTensorFactory::createIQ1_MRandom({N, K}); }},
+        // Direct 8-bit path. The default ROCm packer still owns the INT8
+        // scatter route, so focused NativeVNNI training explicitly packs this
+        // through IINT8Unpackable below before dispatching codebook 19.
+        {"Q8_0", 8.5, false, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_0Random({N, K}); }},
     };
 
     // Model-realistic GEMV shapes (N×K)
@@ -204,6 +208,9 @@ namespace
         // Qwen3.5/Qwen3.6 MoE expert FFN decode shapes.
         {"35BMoE_Expert_GateUp", 512, 2048},
         {"35BMoE_Expert_Down", 2048, 512},
+        // Qwen3.6 MoE hybrid GDN verifier decode shapes.
+        {"Qwen36MoE_GDN_QKVProjection", 8192, 2048},
+        {"Qwen36MoE_GDN_ZProjection", 4096, 2048},
         // Qwen2.5-0.5B
         {"0.5B_AttnOut", 896, 896},    // Qwen2.5-0.5B attention output projection
         {"0.5B_QKV", 896 * 3, 896},    // Qwen2.5-0.5B attention QKV projection
@@ -220,6 +227,7 @@ namespace
         {"7B_FFN_Up", 18944, 3584}, // Qwen2.5-7B FFN gate/up
         {"7B_FFN_Dn", 3584, 18944}, // Qwen2.5-7B FFN down
         // Qwen3.6 27B dense / hybrid GDN production shapes.
+        {"Qwen36_Attn_QKVProjection", 12288, 5120},
         {"Qwen36_FFN_GateUp", 17408, 5120},
         {"Qwen36_FFN_DownProjection", 5120, 17408},
         {"Qwen36_GDN_InnerProjection", 10240, 5120},
@@ -420,6 +428,75 @@ namespace
         if (!info)
             throw std::runtime_error("ROCm NativeVNNI decode format " + format_name + " did not expose vnniFormatInfo()");
         return *info;
+    }
+
+    /**
+     * @brief Populate NativeVNNI host fields for formats not emitted by the default packer.
+     *
+     * Q8_0 normally uses ROCm's INT8 scatter GEMV path, but the generated
+     * verifier-row dispatch table has to cover codebook 19 as well.  This
+     * helper uses the tensor's native packing interface to create the same
+     * payload/scales/mins arrays that production NativeVNNI descriptors expose.
+     */
+    static bool ensureNativeVNNIPayloadForDecodeTrainer(
+        TensorBase *weights,
+        ROCmPackedWeights &packed,
+        int N,
+        int K,
+        const std::string &format_name)
+    {
+        if (!packed.native_vnni_payload.empty())
+            return true;
+        if (!weights || N <= 0 || K <= 0 || (K % 32) != 0)
+            return false;
+
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
+        const NativeVnniFormatInfo *info = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        if (!info || info->payload_bytes <= 0)
+        {
+            std::fprintf(stderr,
+                         "[ROCmNativeVNNI][DECODE][TRAINER][ERROR] %s does not expose packable NativeVNNI metadata\n",
+                         format_name.c_str());
+            return false;
+        }
+
+        const int blocks_per_row = K / 32;
+        const size_t total_blocks =
+            static_cast<size_t>(N) * static_cast<size_t>(blocks_per_row);
+        packed.native_vnni_payload.assign(
+            total_blocks * static_cast<size_t>(info->payload_bytes), uint8_t{0});
+        packed.native_vnni_scales.assign(total_blocks, uint16_t{0});
+        packed.native_vnni_mins.clear();
+        packed.native_vnni_emins.clear();
+        if (info->is_asymmetric)
+            packed.native_vnni_mins.assign(total_blocks, uint16_t{0});
+        if (info->has_emins)
+            packed.native_vnni_emins.assign(total_blocks, uint32_t{0});
+        packed.native_vnni_codebook_id = info->codebook_id;
+        packed.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
+        packed.N = N;
+        packed.K = K;
+
+        VnniPackContext ctx{};
+        ctx.raw_bytes = reinterpret_cast<const uint8_t *>(weights->raw_data());
+        ctx.N = N;
+        ctx.K = K;
+        ctx.blocks_per_row = blocks_per_row;
+        ctx.payload_bytes = info->payload_bytes;
+        ctx.payload_array = packed.native_vnni_payload.data();
+        ctx.scales_array = packed.native_vnni_scales.data();
+        ctx.mins_array = packed.native_vnni_mins.empty()
+                             ? nullptr
+                             : packed.native_vnni_mins.data();
+        ctx.emins_array = packed.native_vnni_emins.empty()
+                              ? nullptr
+                              : packed.native_vnni_emins.data();
+
+        for (int n = 0; n < N; ++n)
+            for (int b = 0; b < blocks_per_row; ++b)
+                unpackable->packVnniBlock(ctx, n, b);
+
+        return true;
     }
 
     // =============================================================================
@@ -838,6 +915,18 @@ namespace
                 result.K = shape.K;
                 return result;
             }
+            if (!ensureNativeVNNIPayloadForDecodeTrainer(
+                    weights, packed, shape.N, shape.K, fmt.name))
+            {
+                BenchResult result{};
+                result.format_name = fmt.name;
+                result.bpw = fmt.bpw;
+                result.shape_name = shape.name;
+                result.M = M;
+                result.N = shape.N;
+                result.K = shape.K;
+                return result;
+            }
             return benchmarkFormat(fmt,
                                    shape,
                                    M,
@@ -1045,7 +1134,8 @@ namespace
                 ROCmPackedWeights packed;
                 ASSERT_TRUE(packWeightsToROCm(weights.get(), packed))
                     << "Failed to pack " << fmt.name << "/" << shape.name;
-                ASSERT_FALSE(packed.native_vnni_payload.empty())
+                ASSERT_TRUE(ensureNativeVNNIPayloadForDecodeTrainer(
+                    weights.get(), packed, shape.N, shape.K, fmt.name))
                     << fmt.name << "/" << shape.name << " did not produce a native-VNNI payload";
                 const double packed_weight_bytes = nativePackedWeightBytes(packed);
 

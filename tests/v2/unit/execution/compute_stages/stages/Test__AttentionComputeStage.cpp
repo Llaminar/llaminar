@@ -290,6 +290,51 @@ namespace
     }
 
     /**
+     * @brief Long-context CUDA verifier signatures stop changing after split cap.
+     *
+     * CUDA small-M verifier attention caps the flash-decode split count by SM
+     * occupancy and MAX_NUM_SPLITS.  The capture signature must mirror that
+     * real launch split count rather than raw KV length; otherwise long-context
+     * MTP decode recaptures every sixteen tokens even though the kernel grid is
+     * unchanged.
+     */
+    TEST_F(Test__AttentionComputeStage, CUDAMultirowCaptureSignatureIgnoresFalseLongContextSplitBoundary)
+    {
+        FakeCaptureKVCache kv_cache;
+
+        auto make_params = [&]()
+        {
+            AttentionComputeStage::Params params;
+            params.device_id = DeviceId::cuda(0);
+            params.kv_cache = &kv_cache;
+            params.layer_idx = 0;
+            params.batch_size = 1;
+            params.seq_len = 2;
+            params.kv_len = kv_cache.cached_tokens;
+            params.n_heads = 16;
+            params.n_kv_heads = 2;
+            params.head_dim = 256;
+            params.causal = true;
+            params.auto_detect_mode = true;
+            params.apply_rope_to_k = true;
+            params.rope_theta = 10000000.0f;
+            params.partial_rotary_factor = 0.25f;
+            return params;
+        };
+
+        kv_cache.cached_tokens = 621; // post-append top row kv_len=623.
+        AttentionComputeStage before(make_params());
+        const uint64_t before_sig = before.graphCaptureVariantSignature();
+        ASSERT_NE(before_sig, 0u);
+
+        kv_cache.cached_tokens = 622; // crosses raw kv_len/16, but not real split cap.
+        AttentionComputeStage after(make_params());
+        EXPECT_EQ(before_sig, after.graphCaptureVariantSignature())
+            << "CUDA capture signature should remain stable after the real "
+               "small-M decode split count is capped";
+    }
+
+    /**
      * @brief One-row decode does not recapture on every token position.
      *
      * The multirow verifier needs exact KV-length keys because its RoPE-on-read

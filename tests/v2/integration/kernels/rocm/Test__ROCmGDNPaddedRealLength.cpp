@@ -262,6 +262,108 @@ namespace
         return {max_abs, rel_l2};
     }
 
+    /// @brief Strict row-distribution metrics for grouped verifier equivalence checks.
+    struct StrictVectorMetrics
+    {
+        float max_abs = 0.0f;         ///< Largest elementwise absolute difference.
+        double relative_l2 = 0.0;     ///< L2(actual-expected) normalized by expected.
+        double cosine = 1.0;          ///< Cosine similarity between the two vectors.
+        double symmetric_kl = 0.0;    ///< Symmetric KL after stable softmax normalization.
+    };
+
+    /**
+     * @brief Computes strict numerical metrics over one row or state slice.
+     *
+     * MTP verifier rows must be decode-equivalent, not merely close enough for
+     * top-token parity.  This helper mirrors the full-model parity checks by
+     * combining L2, cosine, and a softmaxed symmetric-KL view so tiny but
+     * systematic row drift is caught before it amplifies through later layers.
+     */
+    StrictVectorMetrics strictVectorMetrics(
+        const std::vector<float> &actual,
+        const std::vector<float> &expected,
+        size_t offset,
+        size_t count)
+    {
+        StrictVectorMetrics metrics;
+        if (count == 0)
+            return metrics;
+
+        double dot = 0.0;
+        double sum_sq_actual = 0.0;
+        double sum_sq_expected = 0.0;
+        double sum_sq_diff = 0.0;
+        float max_actual = actual[offset];
+        float max_expected = expected[offset];
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            const float a = actual[offset + i];
+            const float b = expected[offset + i];
+            const float diff = a - b;
+            metrics.max_abs = std::max(metrics.max_abs, std::abs(diff));
+            dot += static_cast<double>(a) * static_cast<double>(b);
+            sum_sq_actual += static_cast<double>(a) * static_cast<double>(a);
+            sum_sq_expected += static_cast<double>(b) * static_cast<double>(b);
+            sum_sq_diff += static_cast<double>(diff) * static_cast<double>(diff);
+            max_actual = std::max(max_actual, a);
+            max_expected = std::max(max_expected, b);
+        }
+
+        metrics.relative_l2 = std::sqrt(sum_sq_diff / std::max(sum_sq_expected, 1e-30));
+        const double denom = std::sqrt(sum_sq_actual * sum_sq_expected);
+        metrics.cosine = denom > 0.0 ? dot / denom : (sum_sq_actual == sum_sq_expected ? 1.0 : 0.0);
+
+        std::vector<double> actual_prob(count);
+        std::vector<double> expected_prob(count);
+        double actual_sum = 0.0;
+        double expected_sum = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            actual_prob[i] = std::exp(static_cast<double>(actual[offset + i] - max_actual));
+            expected_prob[i] = std::exp(static_cast<double>(expected[offset + i] - max_expected));
+            actual_sum += actual_prob[i];
+            expected_sum += expected_prob[i];
+        }
+
+        constexpr double eps = 1e-30;
+        double actual_to_expected = 0.0;
+        double expected_to_actual = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double p = std::max(actual_prob[i] / actual_sum, eps);
+            const double q = std::max(expected_prob[i] / expected_sum, eps);
+            actual_to_expected += p * std::log(p / q);
+            expected_to_actual += q * std::log(q / p);
+        }
+        metrics.symmetric_kl = 0.5 * (actual_to_expected + expected_to_actual);
+        return metrics;
+    }
+
+    /// @brief Asserts strict decode-equivalence and prints all metrics on failure.
+    void expectStrictEquivalent(
+        const char *label,
+        const std::vector<float> &actual,
+        const std::vector<float> &expected,
+        size_t offset,
+        size_t count,
+        float max_abs_threshold = 1e-6f,
+        double relative_l2_threshold = 1e-7,
+        double min_cosine = 0.9999999,
+        double max_symmetric_kl = 1e-10)
+    {
+        const StrictVectorMetrics metrics =
+            strictVectorMetrics(actual, expected, offset, count);
+        EXPECT_LE(metrics.max_abs, max_abs_threshold)
+            << label << " max_abs=" << metrics.max_abs;
+        EXPECT_LE(metrics.relative_l2, relative_l2_threshold)
+            << label << " relative_l2=" << metrics.relative_l2;
+        EXPECT_GE(metrics.cosine, min_cosine)
+            << label << " cosine=" << metrics.cosine;
+        EXPECT_LE(metrics.symmetric_kl, max_symmetric_kl)
+            << label << " symmetric_kl=" << metrics.symmetric_kl;
+    }
+
     /**
      * @brief Verifies that verifier publication refreshed the host state mirror.
      *
@@ -1189,17 +1291,379 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeVerifierCaptureIs
         static_cast<size_t>(state_floats),
         final_snapshot.data());
 
-    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
-    const auto snapshot_diff = diffStats(final_snapshot, step_state, 0, final_snapshot.size());
-    const auto live_state_diff = diffStats(m4_state, initial_state, 0, m4_state.size());
-    EXPECT_LT(out_diff.first, 2e-4f);
-    EXPECT_LT(out_diff.second, 1e-4);
-    EXPECT_LT(snapshot_diff.first, 2e-4f);
-    EXPECT_LT(snapshot_diff.second, 1e-4)
-        << "ROCm Qwen3.6 verifier capture snapshot must match four decode steps";
-    EXPECT_LT(live_state_diff.first, 1e-7f);
-    EXPECT_LT(live_state_diff.second, 1e-7)
-        << "ROCm verifier capture must not mutate live recurrence state before publication";
+    expectStrictEquivalent(
+        "ROCm Qwen3.6 GDN M4 verifier output",
+        m4_out,
+        step_out,
+        0,
+        output_elems,
+        /*max_abs_threshold=*/2e-4f,
+        /*relative_l2_threshold=*/1e-4,
+        /*min_cosine=*/0.999999,
+        /*max_symmetric_kl=*/1e-8);
+    expectStrictEquivalent(
+        "ROCm Qwen3.6 GDN M4 final state snapshot",
+        final_snapshot,
+        step_state,
+        0,
+        final_snapshot.size(),
+        /*max_abs_threshold=*/2e-4f,
+        /*relative_l2_threshold=*/1e-4,
+        /*min_cosine=*/0.999999,
+        /*max_symmetric_kl=*/1e-8);
+    expectStrictEquivalent(
+        "ROCm Qwen3.6 GDN M4 live state remains initial during verifier capture",
+        m4_state,
+        initial_state,
+        0,
+        m4_state.size(),
+        /*max_abs_threshold=*/1e-7f,
+        /*relative_l2_threshold=*/1e-7,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+}
+
+TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int n_k_heads = 16;
+    constexpr int n_v_heads = 48;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int verifier_len = 2;
+    constexpr int q_src_dim = n_k_heads * d_k;
+    constexpr int k_src_dim = n_k_heads * d_k;
+    constexpr int v_dim = n_v_heads * d_v;
+    constexpr int qkv_stride = q_src_dim + k_src_dim + v_dim;
+    constexpr int qk_stride = n_v_heads * d_k;
+    constexpr int state_floats = n_v_heads * d_k * d_v;
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(v_dim);
+    constexpr size_t deinterleave_elems =
+        static_cast<size_t>(verifier_len) *
+        static_cast<size_t>(qk_stride + qk_stride + v_dim);
+
+    const auto Q_src = makeSequenceRows(verifier_len, q_src_dim, verifier_len, verifier_len, 0.0067f, 0.0f, 0.0067f);
+    const auto K_src = makeSequenceRows(verifier_len, k_src_dim, verifier_len, verifier_len, -0.0059f, 0.0f, -0.0059f);
+    const auto V_src = makeSequenceRows(verifier_len, v_dim, verifier_len, verifier_len, 0.0073f, 0.0f, 0.0073f);
+
+    std::vector<float> merged(static_cast<size_t>(verifier_len) * static_cast<size_t>(qkv_stride));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *dst = merged.data() + static_cast<size_t>(row) * qkv_stride;
+        std::copy_n(Q_src.data() + static_cast<size_t>(row) * q_src_dim, q_src_dim, dst);
+        std::copy_n(K_src.data() + static_cast<size_t>(row) * k_src_dim, k_src_dim, dst + q_src_dim);
+        std::copy_n(V_src.data() + static_cast<size_t>(row) * v_dim, v_dim, dst + q_src_dim + k_src_dim);
+    }
+
+    const auto alpha = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, 0.087f, 0.0f, 0.087f);
+    const auto beta = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, -0.071f, 0.0f, -0.071f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.021f);
+    const std::vector<float> A_log(static_cast<size_t>(n_v_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_v_heads), 0.1f);
+
+    HipFloatBuffer d_merged_grouped(merged);
+    HipFloatBuffer d_merged_step(merged);
+    HipFloatBuffer d_alpha_grouped(alpha);
+    HipFloatBuffer d_beta_grouped(beta);
+    HipFloatBuffer d_alpha_step(alpha);
+    HipFloatBuffer d_beta_step(beta);
+    HipFloatBuffer d_A_log(A_log);
+    HipFloatBuffer d_dt_bias(dt_bias);
+    HipFloatBuffer d_grouped_out(output_elems, 0.0f);
+    HipFloatBuffer d_step_out(output_elems, 0.0f);
+    HipFloatBuffer d_grouped_scratch(deinterleave_elems, 0.0f);
+    HipFloatBuffer d_step_scratch(static_cast<size_t>(qk_stride + qk_stride + v_dim), 0.0f);
+    HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+    HipFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    HipStreamHandle stream;
+
+    ROCmGatedDeltaNet grouped_kernel(0);
+    grouped_kernel.allocateGPUState(state_floats);
+    grouped_kernel.setGPUStream(stream.stream);
+    grouped_kernel.bindDeinterleaveWorkspace(d_grouped_scratch.ptr, d_grouped_scratch.count);
+    grouped_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    grouped_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
+    ASSERT_TRUE(grouped_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    float *grouped_q = nullptr;
+    float *grouped_k = nullptr;
+    float *grouped_v = nullptr;
+    ASSERT_TRUE(grouped_kernel.deinterleave_qkv_device(
+        d_merged_grouped.ptr,
+        grouped_q,
+        grouped_k,
+        grouped_v,
+        verifier_len,
+        n_k_heads,
+        n_v_heads,
+        d_k,
+        d_v,
+        /*global_v_head_offset=*/0));
+    ASSERT_TRUE(grouped_kernel.chunk_forward(
+        grouped_q, grouped_k, grouped_v,
+        d_alpha_grouped.ptr, d_beta_grouped.ptr,
+        d_A_log.ptr, d_dt_bias.ptr,
+        d_grouped_out.ptr, nullptr,
+        verifier_len, n_v_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(strict grouped GDN M2)");
+    std::vector<float> grouped_live_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(grouped_kernel.exportState(grouped_live_state.data(), nullptr, nullptr));
+
+    ROCmGatedDeltaNet step_kernel(0);
+    step_kernel.allocateGPUState(state_floats);
+    step_kernel.setGPUStream(stream.stream);
+    step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    std::vector<float> step_state_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *step_q = nullptr;
+        float *step_k = nullptr;
+        float *step_v = nullptr;
+        ASSERT_TRUE(step_kernel.deinterleave_qkv_device(
+            d_merged_step.ptr + static_cast<size_t>(row) * qkv_stride,
+            step_q,
+            step_k,
+            step_v,
+            1,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
+            /*global_v_head_offset=*/0));
+        ASSERT_TRUE(step_kernel.recurrent_step(
+            step_q,
+            step_k,
+            step_v,
+            d_alpha_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_beta_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * v_dim,
+            nullptr,
+            n_v_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(strict stepwise GDN M2 row)");
+
+        std::vector<float> row_state(static_cast<size_t>(state_floats));
+        ASSERT_TRUE(step_kernel.exportState(row_state.data(), nullptr, nullptr));
+        std::copy_n(
+            row_state.data(),
+            static_cast<size_t>(state_floats),
+            step_state_snapshots.data() + static_cast<size_t>(row) * static_cast<size_t>(state_floats));
+    }
+
+    const auto grouped_out = d_grouped_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto grouped_snapshots = d_snapshots.toHost();
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        const size_t output_offset = static_cast<size_t>(row) * static_cast<size_t>(v_dim);
+        expectStrictEquivalent(
+            row == 0 ? "GDN M2 row0 output" : "GDN M2 row1 output",
+            grouped_out,
+            step_out,
+            output_offset,
+            static_cast<size_t>(v_dim));
+
+        const size_t state_offset = static_cast<size_t>(row) * static_cast<size_t>(state_floats);
+        expectStrictEquivalent(
+            row == 0 ? "GDN M2 row0 state snapshot" : "GDN M2 row1 state snapshot",
+            grouped_snapshots,
+            step_state_snapshots,
+            state_offset,
+            static_cast<size_t>(state_floats));
+    }
+
+    expectStrictEquivalent(
+        "GDN M2 grouped live state remains initial during verifier capture",
+        grouped_live_state,
+        initial_state,
+        0,
+        grouped_live_state.size(),
+        /*max_abs_threshold=*/1e-7f,
+        /*relative_l2_threshold=*/1e-7,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+}
+
+TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    /*
+     * Depth-3 MTP verifier rows are the production shape that exposed GDN
+     * drift in the full continuation proof.  Keep ROCm under the same strict
+     * merged-QKV row/snapshot contract as CUDA.
+     */
+    constexpr int n_k_heads = 16;
+    constexpr int n_v_heads = 48;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int verifier_len = 3;
+    constexpr int q_src_dim = n_k_heads * d_k;
+    constexpr int k_src_dim = n_k_heads * d_k;
+    constexpr int v_dim = n_v_heads * d_v;
+    constexpr int qkv_stride = q_src_dim + k_src_dim + v_dim;
+    constexpr int qk_stride = n_v_heads * d_k;
+    constexpr int state_floats = n_v_heads * d_k * d_v;
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(v_dim);
+    constexpr size_t deinterleave_elems =
+        static_cast<size_t>(verifier_len) *
+        static_cast<size_t>(qk_stride + qk_stride + v_dim);
+
+    const auto Q_src = makeSequenceRows(verifier_len, q_src_dim, verifier_len, verifier_len, 0.0067f, 0.0f, 0.0067f);
+    const auto K_src = makeSequenceRows(verifier_len, k_src_dim, verifier_len, verifier_len, -0.0059f, 0.0f, -0.0059f);
+    const auto V_src = makeSequenceRows(verifier_len, v_dim, verifier_len, verifier_len, 0.0073f, 0.0f, 0.0073f);
+
+    std::vector<float> merged(static_cast<size_t>(verifier_len) * static_cast<size_t>(qkv_stride));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *dst = merged.data() + static_cast<size_t>(row) * qkv_stride;
+        std::copy_n(Q_src.data() + static_cast<size_t>(row) * q_src_dim, q_src_dim, dst);
+        std::copy_n(K_src.data() + static_cast<size_t>(row) * k_src_dim, k_src_dim, dst + q_src_dim);
+        std::copy_n(V_src.data() + static_cast<size_t>(row) * v_dim, v_dim, dst + q_src_dim + k_src_dim);
+    }
+
+    const auto alpha = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, 0.087f, 0.0f, 0.087f);
+    const auto beta = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, -0.071f, 0.0f, -0.071f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.021f);
+    const std::vector<float> A_log(static_cast<size_t>(n_v_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_v_heads), 0.1f);
+
+    HipFloatBuffer d_merged_grouped(merged);
+    HipFloatBuffer d_merged_step(merged);
+    HipFloatBuffer d_alpha_grouped(alpha);
+    HipFloatBuffer d_beta_grouped(beta);
+    HipFloatBuffer d_alpha_step(alpha);
+    HipFloatBuffer d_beta_step(beta);
+    HipFloatBuffer d_A_log(A_log);
+    HipFloatBuffer d_dt_bias(dt_bias);
+    HipFloatBuffer d_grouped_out(output_elems, 0.0f);
+    HipFloatBuffer d_step_out(output_elems, 0.0f);
+    HipFloatBuffer d_grouped_scratch(deinterleave_elems, 0.0f);
+    HipFloatBuffer d_step_scratch(static_cast<size_t>(qk_stride + qk_stride + v_dim), 0.0f);
+    HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+    HipFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    HipStreamHandle stream;
+
+    ROCmGatedDeltaNet grouped_kernel(0);
+    grouped_kernel.allocateGPUState(state_floats);
+    grouped_kernel.setGPUStream(stream.stream);
+    grouped_kernel.bindDeinterleaveWorkspace(d_grouped_scratch.ptr, d_grouped_scratch.count);
+    grouped_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    grouped_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
+    ASSERT_TRUE(grouped_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    float *grouped_q = nullptr;
+    float *grouped_k = nullptr;
+    float *grouped_v = nullptr;
+    ASSERT_TRUE(grouped_kernel.deinterleave_qkv_device(
+        d_merged_grouped.ptr,
+        grouped_q,
+        grouped_k,
+        grouped_v,
+        verifier_len,
+        n_k_heads,
+        n_v_heads,
+        d_k,
+        d_v,
+        /*global_v_head_offset=*/0));
+    ASSERT_TRUE(grouped_kernel.chunk_forward(
+        grouped_q, grouped_k, grouped_v,
+        d_alpha_grouped.ptr, d_beta_grouped.ptr,
+        d_A_log.ptr, d_dt_bias.ptr,
+        d_grouped_out.ptr, nullptr,
+        verifier_len, n_v_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(strict grouped ROCm GDN M3)");
+    std::vector<float> grouped_live_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(grouped_kernel.exportState(grouped_live_state.data(), nullptr, nullptr));
+
+    ROCmGatedDeltaNet step_kernel(0);
+    step_kernel.allocateGPUState(state_floats);
+    step_kernel.setGPUStream(stream.stream);
+    step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    std::vector<float> step_state_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *step_q = nullptr;
+        float *step_k = nullptr;
+        float *step_v = nullptr;
+        ASSERT_TRUE(step_kernel.deinterleave_qkv_device(
+            d_merged_step.ptr + static_cast<size_t>(row) * qkv_stride,
+            step_q,
+            step_k,
+            step_v,
+            1,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
+            /*global_v_head_offset=*/0));
+        ASSERT_TRUE(step_kernel.recurrent_step(
+            step_q,
+            step_k,
+            step_v,
+            d_alpha_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_beta_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * v_dim,
+            nullptr,
+            n_v_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(strict stepwise ROCm GDN M3 row)");
+
+        std::vector<float> row_state(static_cast<size_t>(state_floats));
+        ASSERT_TRUE(step_kernel.exportState(row_state.data(), nullptr, nullptr));
+        std::copy_n(
+            row_state.data(),
+            static_cast<size_t>(state_floats),
+            step_state_snapshots.data() + static_cast<size_t>(row) * static_cast<size_t>(state_floats));
+    }
+
+    const auto grouped_out = d_grouped_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto grouped_snapshots = d_snapshots.toHost();
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        const size_t output_offset = static_cast<size_t>(row) * static_cast<size_t>(v_dim);
+        const std::string output_label =
+            "ROCm GDN M3 row" + std::to_string(row) + " output";
+        expectStrictEquivalent(
+            output_label.c_str(),
+            grouped_out,
+            step_out,
+            output_offset,
+            static_cast<size_t>(v_dim));
+
+        const size_t state_offset = static_cast<size_t>(row) * static_cast<size_t>(state_floats);
+        const std::string state_label =
+            "ROCm GDN M3 row" + std::to_string(row) + " state snapshot";
+        expectStrictEquivalent(
+            state_label.c_str(),
+            grouped_snapshots,
+            step_state_snapshots,
+            state_offset,
+            static_cast<size_t>(state_floats));
+    }
+
+    expectStrictEquivalent(
+        "ROCm GDN M3 grouped live state remains initial during verifier capture",
+        grouped_live_state,
+        initial_state,
+        0,
+        grouped_live_state.size(),
+        /*max_abs_threshold=*/1e-7f,
+        /*relative_l2_threshold=*/1e-7,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcceptedRow)
@@ -1364,6 +1828,99 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay)
         << "ROCm M=4 short-conv must leave the same kernel-owned state as four decode steps";
 }
 
+TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    /*
+     * Keep ROCm aligned with CUDA for the depth-3 verifier shape.  The MTP
+     * graph relies on the grouped kernel being numerically equivalent to three
+     * explicit decode rows while preserving raw projection history in-place.
+     */
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    constexpr int verifier_len = 3;
+    constexpr int state_floats = channels * (kernel_size - 1);
+    constexpr size_t output_elems =
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(channels);
+
+    const auto input = makeSequenceRows(
+        verifier_len, channels, verifier_len, verifier_len,
+        0.0095f, 0.0f, 0.0095f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state =
+        makeInitialState(static_cast<size_t>(state_floats), 0.0027f);
+
+    HipFloatBuffer d_m3_inout(input);
+    HipFloatBuffer d_step_inout(input);
+    HipFloatBuffer d_weight(weight);
+    HipFloatBuffer d_bias(bias);
+    HipStreamHandle stream;
+
+    ROCmShortConvolution m3_kernel(0);
+    m3_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(m3_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    m3_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(m3_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(m3_kernel.forward(
+        d_m3_inout.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_m3_inout.ptr,
+        nullptr,
+        verifier_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(Qwen36 M3 in-place short-conv)");
+    std::vector<float> m3_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m3_kernel.exportState(m3_state.data(), nullptr, nullptr));
+
+    ROCmShortConvolution step_kernel(0);
+    step_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    step_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.forward(
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            d_weight.ptr,
+            d_bias.ptr,
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(Qwen36 stepwise M3 in-place short-conv)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m3_out = d_m3_inout.toHost();
+    const auto step_out = d_step_inout.toHost();
+    expectStrictEquivalent(
+        "ROCm Qwen3.6 short-conv M3 output",
+        m3_out,
+        step_out,
+        0,
+        output_elems,
+        /*max_abs_threshold=*/1e-5f,
+        /*relative_l2_threshold=*/1e-5,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+    expectStrictEquivalent(
+        "ROCm Qwen3.6 short-conv M3 state",
+        m3_state,
+        step_state,
+        0,
+        m3_state.size(),
+        /*max_abs_threshold=*/1e-5f,
+        /*relative_l2_threshold=*/1e-5,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+}
+
 TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay)
 {
     if (!hasROCm())
@@ -1430,14 +1987,26 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwise
 
     const auto m4_out = d_m4_inout.toHost();
     const auto step_out = d_step_inout.toHost();
-    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
-    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
-    EXPECT_LT(out_diff.first, 1e-5f);
-    EXPECT_LT(out_diff.second, 1e-5);
-    EXPECT_LT(state_diff.first, 1e-5f);
-    EXPECT_LT(state_diff.second, 1e-5)
-        << "ROCm Qwen3.6-shaped in-place M=4 short-conv must leave the same "
-           "kernel-owned state as four decode steps";
+    expectStrictEquivalent(
+        "ROCm Qwen3.6 short-conv M4 output",
+        m4_out,
+        step_out,
+        0,
+        output_elems,
+        /*max_abs_threshold=*/1e-5f,
+        /*relative_l2_threshold=*/1e-5,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+    expectStrictEquivalent(
+        "ROCm Qwen3.6 short-conv M4 state",
+        m4_state,
+        step_state,
+        0,
+        m4_state.size(),
+        /*max_abs_threshold=*/1e-5f,
+        /*relative_l2_threshold=*/1e-5,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiStepReplay)

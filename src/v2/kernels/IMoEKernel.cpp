@@ -53,6 +53,18 @@ namespace llaminar2
                          host_token_indices, num_tokens, d_model);
     }
 
+    bool IMoEKernel::copyTokenRowFromTensor(
+        ITensor *source, ITensor *row_buffer,
+        int row_index, int row_width)
+    {
+        if (!source || !row_buffer || row_index < 0 || row_width <= 0)
+            return false;
+        std::copy_n(source->data() + static_cast<size_t>(row_index) * row_width,
+                    row_width,
+                    row_buffer->mutable_data());
+        return true;
+    }
+
     void IMoEKernel::scatterAddWeightedFromTensors(
         ITensor *output, ITensor *expert_output,
         const int *host_token_indices, const float *host_weights,
@@ -61,6 +73,18 @@ namespace llaminar2
         scatterAddWeighted(output->mutable_data(), expert_output->data(),
                            host_token_indices, host_weights,
                            num_tokens, d_model);
+    }
+
+    bool IMoEKernel::writeTokenRowToTensor(
+        ITensor *destination, ITensor *row_buffer,
+        int row_index, int row_width)
+    {
+        if (!destination || !row_buffer || row_index < 0 || row_width <= 0)
+            return false;
+        std::copy_n(row_buffer->data(),
+                    row_width,
+                    destination->mutable_data() + static_cast<size_t>(row_index) * row_width);
+        return true;
     }
 
     void IMoEKernel::sharedExpertGateFromTensors(

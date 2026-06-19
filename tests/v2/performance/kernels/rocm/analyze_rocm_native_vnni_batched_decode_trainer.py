@@ -37,6 +37,8 @@ class BatchedDecodeRow:
     target_waves: int
     min_us: float
     mean_us: float
+    relative_l2: float
+    max_abs: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +81,19 @@ def _to_float(path: Path, row_index: int, column: str, value: str) -> float:
         return float(value)
     except ValueError as exc:
         raise SystemExit(f"{path}:{row_index}: invalid {column}={value!r}") from exc
+
+
+def _to_optional_float(
+    path: Path,
+    row_index: int,
+    column: str,
+    row: dict[str, str],
+    default: float,
+) -> float:
+    value = row.get(column)
+    if value is None or value == "":
+        return default
+    return _to_float(path, row_index, column, value)
 
 
 def _parse_plus_ints(path: Path, row_index: int, column: str, value: str) -> tuple[int, ...]:
@@ -200,6 +215,8 @@ def load_rows(
                     target_waves=target_waves,
                     min_us=min_us,
                     mean_us=_to_float(path, row_index, "mean_us", row.get("mean_us", "0")),
+                    relative_l2=_to_optional_float(path, row_index, "relative_l2", row, 0.0),
+                    max_abs=_to_optional_float(path, row_index, "max_abs", row, 0.0),
                 )
                 previous = best_by_key.get(key)
                 if previous is None or entry.min_us < previous.min_us:
@@ -290,7 +307,8 @@ def emit_cpp(rows: list[BatchedDecodeRow], output: Path) -> None:
             f"        {{{row.m}, {row.projections}, {row.k}, {row.total_n}, "
             f"{_array_literal(row.codebooks, 'uint8_t')}, {_array_literal(row.projection_ns)}, "
             f"{{{row.kb}, {row.target_waves}}}}}, // {codebook_comment} "
-            f"Ns={ns_comment} {row.variant} {row.shape} {row.min_us:.3f}us"
+            f"Ns={ns_comment} {row.variant} {row.shape} {row.min_us:.3f}us "
+            f"rel_l2={row.relative_l2:.3e} max_abs={row.max_abs:.3e}"
         )
     lines.append("    };")
     lines.append("    for (const auto &entry : kTable)")
@@ -313,14 +331,15 @@ def emit_cpp(rows: list[BatchedDecodeRow], output: Path) -> None:
 def emit_summary(rows: list[BatchedDecodeRow], summary_path: Path) -> None:
     lines = [
         f"ROCm NativeVNNI batched decode generated entries: {len(rows)}",
-        "format,shape,m,k,projections,projection_ns,codebooks,variant,kb,target_waves,min_us",
+        "format,shape,m,k,projections,projection_ns,codebooks,variant,kb,target_waves,min_us,relative_l2,max_abs",
     ]
     for row in rows:
         lines.append(
             f"{row.fmt},{row.shape},{row.m},{row.k},{row.projections},"
             f"{'+'.join(str(value) for value in row.projection_ns)},"
             f"{'+'.join(str(value) for value in row.codebooks)},"
-            f"{row.variant},{row.kb},{row.target_waves},{row.min_us:.3f}"
+            f"{row.variant},{row.kb},{row.target_waves},{row.min_us:.3f},"
+            f"{row.relative_l2:.6e},{row.max_abs:.6e}"
         )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text("\n".join(lines) + "\n")

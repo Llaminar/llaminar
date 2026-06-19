@@ -452,6 +452,76 @@ namespace llaminar2
             position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
     }
 
+    bool CPURoPEKernelT<ActivationPrecision::FP32>::apply_verifier_rows_decode_equivalent(
+        TensorBase *Q,
+        TensorBase *K,
+        const int *position_ids,
+        int verifier_rows,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        const IMPIContext *mpi_ctx,
+        int device_idx,
+        int pos_offset,
+        int rotary_dim)
+    {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
+        (void)mpi_ctx;
+        (void)device_idx;
+
+        if (!Q || Q->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("CPURoPEKernelT<FP32>::apply_verifier_rows_decode_equivalent: Q must be FP32Tensor");
+            return false;
+        }
+        if (K && K->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("CPURoPEKernelT<FP32>::apply_verifier_rows_decode_equivalent: K must be FP32Tensor");
+            return false;
+        }
+        if (verifier_rows <= 1 || verifier_rows > 4)
+        {
+            LOG_ERROR("CPURoPEKernelT<FP32>::apply_verifier_rows_decode_equivalent: verifier_rows must be M=2..4, got "
+                      << verifier_rows);
+            return false;
+        }
+        if (head_dim <= 0 || (head_dim % 2) != 0 || n_heads <= 0 || n_kv_heads < 0)
+        {
+            LOG_ERROR("CPURoPEKernelT<FP32>::apply_verifier_rows_decode_equivalent: invalid dimensions");
+            return false;
+        }
+
+        auto *q_fp32 = dynamic_cast<FP32Tensor *>(Q);
+        auto *k_fp32 = K ? dynamic_cast<FP32Tensor *>(K) : nullptr;
+        const int q_cols = n_heads * head_dim;
+        const int k_cols = n_kv_heads * head_dim;
+        if (!q_fp32 || !q_fp32->mutable_data() ||
+            static_cast<int>(q_fp32->rows()) < verifier_rows ||
+            static_cast<int>(q_fp32->cols()) < q_cols ||
+            (K && (!k_fp32 || !k_fp32->mutable_data() ||
+                   static_cast<int>(k_fp32->rows()) < verifier_rows ||
+                   static_cast<int>(k_fp32->cols()) < k_cols)))
+        {
+            LOG_ERROR("CPURoPEKernelT<FP32>::apply_verifier_rows_decode_equivalent: tensor extent mismatch");
+            return false;
+        }
+
+        primitives::apply_rope_decode_equivalent_rows(
+            q_fp32->mutable_data(),
+            k_fp32 ? k_fp32->mutable_data() : nullptr,
+            position_ids,
+            verifier_rows,
+            head_dim,
+            rotary_dim,
+            n_heads,
+            n_kv_heads,
+            pos_offset,
+            rope_theta,
+            &tls_state_);
+        return true;
+    }
+
     // --- BF16 apply_bf16() ---
     bool CPURoPEKernelT<ActivationPrecision::BF16>::apply_bf16(
         uint16_t *data, uint16_t *output,

@@ -5,9 +5,6 @@
 
 #include "FusedQKVGEMMStage.h"
 #include "../ComputeStageUtils.h"
-#include "../../../backends/BackendManager.h"
-#include "../../../backends/IBackend.h"
-#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
@@ -24,112 +21,11 @@ namespace llaminar2
 {
     namespace
     {
-        std::shared_ptr<FP32Tensor> makeScratchFP32(size_t rows, size_t cols, DeviceId device, void *stream)
-        {
-            auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{rows, cols});
-            if (device.is_gpu())
-                tensor->allocateOnDevice(device, stream);
-            return tensor;
-        }
-
-        bool ensureScratchFP32(
-            std::shared_ptr<FP32Tensor> &tensor,
-            size_t rows,
-            size_t cols,
-            DeviceId device,
-            void *stream,
-            const char *name)
-        {
-            const std::vector<size_t> expected_shape{rows, cols};
-            if (!tensor || tensor->shape() != expected_shape)
-            {
-                if (device.is_gpu() && isGraphCaptureActive())
-                {
-                    LOG_ERROR("[FusedQKVGEMMStage] Cannot allocate verifier scratch tensor '"
-                              << name << "' during graph capture");
-                    return false;
-                }
-                tensor = makeScratchFP32(rows, cols, device, stream);
-            }
-
-            if (device.is_gpu() && !tensor->gpu_data_ptr())
-            {
-                if (isGraphCaptureActive())
-                {
-                    LOG_ERROR("[FusedQKVGEMMStage] Verifier scratch tensor '"
-                              << name << "' was not device-resident before graph capture");
-                    return false;
-                }
-                if (!tensor->allocateOnDevice(device, stream))
-                {
-                    LOG_ERROR("[FusedQKVGEMMStage] Failed to allocate verifier scratch tensor '"
-                              << name << "' on " << device.to_string());
-                    return false;
-                }
-            }
-            return true;
-        }
-
         void markGpuTensorWritten(TensorBase *output, DeviceId device, void *stream)
         {
             if (!output || !device.is_gpu())
                 return;
             output->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
-        }
-
-        bool copyFP32DeviceRow(
-            TensorBase *dst,
-            int dst_row,
-            int dst_cols,
-            const TensorBase *src,
-            int src_row,
-            int src_cols,
-            int copy_cols,
-            DeviceId device,
-            void *stream,
-            const char *label)
-        {
-            if (!stream)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] " << label
-                                                  << " requires an explicit GPU stream");
-                return false;
-            }
-
-            IBackend *backend = getBackendFor(device);
-            if (!backend)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] No backend for " << device.to_string()
-                                                                 << " while copying " << label);
-                return false;
-            }
-
-            auto *dst_ptr = static_cast<float *>(dst ? dst->gpu_data_ptr() : nullptr);
-            const auto *src_ptr = static_cast<const float *>(src ? src->gpu_data_ptr() : nullptr);
-            if (!dst_ptr || !src_ptr)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Null device pointer while copying "
-                          << label << " dst=" << static_cast<void *>(dst_ptr)
-                          << " src=" << static_cast<const void *>(src_ptr));
-                return false;
-            }
-
-            const size_t dst_offset = static_cast<size_t>(dst_row) * static_cast<size_t>(dst_cols);
-            const size_t src_offset = static_cast<size_t>(src_row) * static_cast<size_t>(src_cols);
-            const size_t bytes = static_cast<size_t>(copy_cols) * sizeof(float);
-            const bool ok = backend->deviceCopyAsync(
-                dst_ptr + dst_offset,
-                src_ptr + src_offset,
-                bytes,
-                device.gpu_ordinal(),
-                stream);
-            if (!ok)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Device row copy failed for " << label
-                                                                            << " bytes=" << bytes);
-                return false;
-            }
-            return true;
         }
     }
 
@@ -399,154 +295,26 @@ namespace llaminar2
         void *stream = gpuStream();
         if (is_gpu && !stream)
         {
-            LOG_ERROR("[FusedQKVGEMMStage] Decode-equivalent GPU verifier prefill requires an explicit stream");
+            LOG_ERROR("[FusedQKVGEMMStage] Grouped verifier GPU QKV requires an explicit stream");
             return false;
         }
 
-        if (!ensureScratchFP32(verifier_input_row_, 1, static_cast<size_t>(params_.k),
-                               params_.device_id, stream, "input_row") ||
-            !ensureScratchFP32(verifier_output_q_row_, 1, static_cast<size_t>(params_.n_q),
-                               params_.device_id, stream, "output_q_row") ||
-            !ensureScratchFP32(verifier_output_k_row_, 1, static_cast<size_t>(params_.n_k),
-                               params_.device_id, stream, "output_k_row") ||
-            !ensureScratchFP32(verifier_output_v_row_, 1, static_cast<size_t>(params_.n_v),
-                               params_.device_id, stream, "output_v_row"))
-        {
-            return false;
-        }
-
-        const float *input_data = is_gpu ? nullptr : input_base->data();
-        float *output_q_data = is_gpu ? nullptr : output_q_base->mutable_data();
-        float *output_k_data = is_gpu ? nullptr : output_k_base->mutable_data();
-        float *output_v_data = is_gpu ? nullptr : output_v_base->mutable_data();
-        if (!is_gpu && (!input_data || !output_q_data || !output_k_data || !output_v_data))
-        {
-            LOG_ERROR("[FusedQKVGEMMStage] Decode-equivalent verifier prefill requires FP32 host-visible tensors");
-            return false;
-        }
-
-        if (is_gpu)
-        {
-            if (!input_base->gpu_data_ptr())
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Decode-equivalent verifier input is not device-resident on "
-                          << params_.device_id.to_string()
-                          << "; StageBufferContract/BufferArena coherence must prepare graph inputs");
-                return false;
-            }
-            if (!output_q_base->allocateOnDevice(params_.device_id, stream) ||
-                !output_k_base->allocateOnDevice(params_.device_id, stream) ||
-                !output_v_base->allocateOnDevice(params_.device_id, stream))
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Failed to prepare verifier QKV tensors on "
-                          << params_.device_id.to_string());
-                return false;
-            }
-        }
-
-        bool success = true;
-        for (int row = 0; row < params_.m; ++row)
-        {
-            if (is_gpu)
-            {
-                if (!copyFP32DeviceRow(
-                        verifier_input_row_.get(), 0, params_.k,
-                        input_base, row, params_.k,
-                        params_.k, params_.device_id, stream,
-                        "verifier_input_row"))
-                {
-                    success = false;
-                    break;
-                }
-                markGpuTensorWritten(verifier_input_row_.get(), params_.device_id, stream);
-            }
-            else
-            {
-                // Keep the row operation on the exact M=1 path used by serial
-                // decode. This avoids small-M routing drift in quantized GEMMs
-                // while still publishing all verifier rows in one stage.
-                std::copy(input_data + static_cast<size_t>(row) * params_.k,
-                          input_data + static_cast<size_t>(row + 1) * params_.k,
-                          verifier_input_row_->mutable_data());
-            }
-
-            std::vector<ITensorGemm::TensorProjectionDesc> row_projections = {
-                {gemm_q, verifier_output_q_row_.get(), params_.n_q, params_.bias_q, "Q"},
-                {gemm_k, verifier_output_k_row_.get(), params_.n_k, params_.bias_k, "K"},
-                {gemm_v, verifier_output_v_row_.get(), params_.n_v, params_.bias_v, "V"}};
-
-            const bool row_success = gemm_q->multiply_fused_tensor(
-                verifier_input_row_.get(),
-                row_projections,
-                1,
-                params_.k,
-                nullptr,
-                bound_workspace_);
-            if (!row_success)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Decode-equivalent verifier row "
-                          << row << " failed");
-                success = false;
-                break;
-            }
-
-            /*
-             * Each fused row projection writes GPU scratch tensors that are
-             * immediately copied into the batched verifier outputs. Make that
-             * stream-local producer/consumer handoff explicit so future
-             * coherence checks cannot read stale host shadows.
-             */
-            if (is_gpu)
-            {
-                markGpuTensorWritten(
-                    verifier_output_q_row_.get(),
-                    params_.device_id,
-                    stream);
-                markGpuTensorWritten(
-                    verifier_output_k_row_.get(),
-                    params_.device_id,
-                    stream);
-                markGpuTensorWritten(
-                    verifier_output_v_row_.get(),
-                    params_.device_id,
-                    stream);
-            }
-
-            if (is_gpu)
-            {
-                if (!copyFP32DeviceRow(
-                        output_q_base, row, params_.n_q,
-                        verifier_output_q_row_.get(), 0, params_.n_q,
-                        params_.n_q, params_.device_id, stream,
-                        "verifier_output_q_row") ||
-                    !copyFP32DeviceRow(
-                        output_k_base, row, params_.n_k,
-                        verifier_output_k_row_.get(), 0, params_.n_k,
-                        params_.n_k, params_.device_id, stream,
-                        "verifier_output_k_row") ||
-                    !copyFP32DeviceRow(
-                        output_v_base, row, params_.n_v,
-                        verifier_output_v_row_.get(), 0, params_.n_v,
-                        params_.n_v, params_.device_id, stream,
-                        "verifier_output_v_row"))
-                {
-                    success = false;
-                    break;
-                }
-            }
-            else
-            {
-                std::copy(verifier_output_q_row_->data(),
-                          verifier_output_q_row_->data() + params_.n_q,
-                          output_q_data + static_cast<size_t>(row) * params_.n_q);
-                std::copy(verifier_output_k_row_->data(),
-                          verifier_output_k_row_->data() + params_.n_k,
-                          output_k_data + static_cast<size_t>(row) * params_.n_k);
-                std::copy(verifier_output_v_row_->data(),
-                          verifier_output_v_row_->data() + params_.n_v,
-                          output_v_data + static_cast<size_t>(row) * params_.n_v);
-            }
-        }
+        /*
+         * Real verifier fast path: all rows and projections are grouped in the
+         * kernel layer.  The older scratch-row helper remains useful for
+         * diagnostics, but it must not be the production implementation.
+         */
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
+            {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
+            {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
+        const bool success = gemm_q->multiply_fused_verifier_rows_decode_equivalent(
+            input_base,
+            projections,
+            params_.m,
+            params_.k,
+            nullptr,
+            bound_workspace_);
 
         if (success)
         {
@@ -562,7 +330,15 @@ namespace llaminar2
                 static_cast<double>(params_.m),
                 {},
                 params_.device_id.to_string(),
-                {{"stage", "FusedQKVGEMM"}});
+                {{"stage", "FusedQKVGEMM"},
+                 {"route", "grouped"}});
+        }
+        else
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Grouped decode-equivalent verifier QKV is unsupported or failed"
+                      << " device=" << params_.device_id.to_string()
+                      << " m=" << params_.m
+                      << " k=" << params_.k);
         }
 
         return success;

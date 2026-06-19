@@ -32,6 +32,26 @@
 extern "C"
 {
     bool cudaQuantGemm_copyDeviceToDeviceAsync(float *d_dst, const float *d_src, size_t count, int cuda_device_id, void *stream);
+    bool cudaFp32_stage_batched_projection_pointers(
+        const float **d_A_array,
+        const float **d_B_array,
+        float **d_C_array,
+        const float *const *h_A_ptrs,
+        const float *const *h_B_ptrs,
+        float *const *h_C_ptrs,
+        int batch_count,
+        int device_id,
+        void *stream);
+    bool cudaFp32_tiny_batched_projection(
+        const float *const *d_A_array,
+        const float *const *d_B_array,
+        float *const *d_C_array,
+        int M,
+        int N,
+        int K,
+        int batch_count,
+        int device_id,
+        void *stream);
 }
 
 namespace llaminar2
@@ -383,7 +403,7 @@ namespace llaminar2
             const std::vector<TensorProjectionDesc> &projections,
             int m, int k,
             const IMPIContext * /*mpi_ctx*/,
-            DeviceWorkspaceManager * /*workspace*/)
+            DeviceWorkspaceManager *workspace)
         {
             if (!input || projections.empty())
             {
@@ -411,7 +431,8 @@ namespace llaminar2
                 LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] No explicit CUDA stream is bound");
                 return false;
             }
-            if (!bound_workspace_)
+            DeviceWorkspaceManager *effective_workspace = workspace ? workspace : bound_workspace_;
+            if (!effective_workspace)
             {
                 LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Batched FP32 projection workspace is not bound");
                 return false;
@@ -548,8 +569,8 @@ namespace llaminar2
                 {
                     if (!d_mapped_redirect_base)
                     {
-                        if (!bound_workspace_->hasBuffer(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT) ||
-                            bound_workspace_->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT) < mapped_redirect_bytes)
+                        if (!effective_workspace->hasBuffer(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT) ||
+                            effective_workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT) < mapped_redirect_bytes)
                         {
                             LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Missing or undersized "
                                       << "declared graph workspace buffer '"
@@ -559,7 +580,7 @@ namespace llaminar2
                             return false;
                         }
                         d_mapped_redirect_base = static_cast<float *>(
-                            bound_workspace_->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT));
+                            effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT));
                         if (!d_mapped_redirect_base)
                         {
                             LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Batched mapped-output redirect workspace resolved to null");
@@ -575,18 +596,93 @@ namespace llaminar2
                 d_mapped_outputs.push_back(d_mapped_output);
             }
 
-            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
-            bool success = cublas_kernel_->execute_batched_same_a(
-                d_A,
-                d_B_matrices,
-                d_C_matrices,
-                m,
-                n,
-                k,
-                false,
-                true,
-                1.0f,
-                0.0f);
+            const int batch_count = static_cast<int>(projections.size());
+            /*
+             * The tiny FP32 projection kernel owns the verifier-sized alpha /
+             * beta contract for CUDA.  cuBLAS can legally choose different
+             * reduction schedules for M=1 and M=2..4, and even sub-ULP GDN
+             * alpha/beta drift is amplified by later quantized projections.
+             *
+             * The local kernel uses the same fixed reduction tree for every
+             * row, so grouped verifier rows are decode-equivalent to repeated
+             * single-row decode while staying device-resident and graph
+             * capturable.
+             */
+            constexpr bool kTinyFP32ProjectionDecodeEquivalent = true;
+            const bool use_tiny_fp32 =
+                kTinyFP32ProjectionDecodeEquivalent &&
+                m > 0 && m <= 4 &&
+                n > 0 && n <= 64 &&
+                k > 0 &&
+                batch_count > 0 &&
+                batch_count <= 8;
+
+            bool success = false;
+            bool used_tiny_fp32 = false;
+            if (use_tiny_fp32)
+            {
+                const size_t pointer_array_bytes = static_cast<size_t>(batch_count) * sizeof(float *);
+                auto *d_A_array = static_cast<const float **>(
+                    effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS));
+                auto *d_B_array = static_cast<const float **>(
+                    effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS));
+                auto *d_C_array = static_cast<float **>(
+                    effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_C_PTRS));
+                if (!d_A_array || !d_B_array || !d_C_array ||
+                    effective_workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS) < pointer_array_bytes ||
+                    effective_workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS) < pointer_array_bytes ||
+                    effective_workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_BATCH_C_PTRS) < pointer_array_bytes)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Missing or undersized "
+                              << "workspace pointer-array buffers for tiny FP32 projection. required_count="
+                              << batch_count);
+                    return false;
+                }
+
+                std::vector<const float *> d_A_matrices(static_cast<size_t>(batch_count), d_A);
+                if (!cudaFp32_stage_batched_projection_pointers(
+                        d_A_array,
+                        d_B_array,
+                        d_C_array,
+                        d_A_matrices.data(),
+                        d_B_matrices.data(),
+                        d_C_matrices.data(),
+                        batch_count,
+                        cuda_device_id_,
+                        gpu_stream_))
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Failed to stage tiny FP32 projection pointers");
+                    return false;
+                }
+
+                CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
+                success = cudaFp32_tiny_batched_projection(
+                    d_A_array,
+                    d_B_array,
+                    d_C_array,
+                    m,
+                    n,
+                    k,
+                    batch_count,
+                    cuda_device_id_,
+                    gpu_stream_);
+                used_tiny_fp32 = success;
+            }
+            else
+            {
+                CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
+                success = cublas_kernel_->execute_batched_same_a(
+                    d_A,
+                    d_B_matrices,
+                    d_C_matrices,
+                    m,
+                    n,
+                    k,
+                    false,
+                    true,
+                    1.0f,
+                    0.0f);
+            }
 
             if (success)
             {
@@ -623,10 +719,26 @@ namespace llaminar2
                         {"n", std::to_string(n)},
                         {"projections", std::to_string(projections.size())},
                         {"mapped_redirect", d_mapped_redirect_base ? "1" : "0"},
-                        {"route", "cublas_batched_same_a"}});
+                        {"route", used_tiny_fp32 ? "tiny_fp32_batched_projection" : "cublas_batched_same_a"}});
             }
 
             return success;
+        }
+
+        bool CUDAFloatingPointGemmKernel::multiply_fused_verifier_rows_decode_equivalent(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const IMPIContext *mpi_ctx,
+            DeviceWorkspaceManager *workspace)
+        {
+            if (m <= 1 || m > 4)
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel] grouped verifier projection requires M=2..4, got M="
+                          << m);
+                return false;
+            }
+            return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
         }
 
         // =====================================================================
@@ -668,11 +780,15 @@ namespace llaminar2
             if (!cublas_kernel_)
                 return WorkspaceRequirements{};
             WorkspaceRequirements reqs = cublas_kernel_->getWorkspaceRequirements(m, n, k);
+            constexpr size_t kMaxBatchedFP32Projections = 8;
+            const size_t pointer_array_bytes = kMaxBatchedFP32Projections * sizeof(float *);
+            reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS, pointer_array_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS, pointer_array_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_BATCH_C_PTRS, pointer_array_bytes, 256, true});
             if (n == 0)
                 n = static_cast<int>(N_);
             if (m > 0 && n > 0)
             {
-                constexpr size_t kMaxBatchedFP32Projections = 8;
                 const size_t redirect_bytes =
                     kMaxBatchedFP32Projections *
                     static_cast<size_t>(m) *

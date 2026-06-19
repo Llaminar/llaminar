@@ -254,12 +254,37 @@ namespace llaminar2
             ITensor *hidden, ITensor *batch_buffer,
             const int *host_token_indices, int num_tokens, int d_model);
 
+        /**
+         * @brief Copy one logical row between tensors without host-side index staging.
+         *
+         * This is the verifier publication primitive: MTP row replay often needs
+         * "row N of the all-position tensor" copied into a one-row scratch tensor.
+         * GPU backends must implement this as a kernel that receives @p row_index
+         * by value so the hot path never enqueues H2D copies from stack-owned
+         * host indices.
+         */
+        virtual bool copyTokenRowFromTensor(
+            ITensor *source, ITensor *row_buffer,
+            int row_index, int row_width);
+
         /// Tensor-aware scatter-add.  host indices/weights live on the host;
         /// GPU implementations upload them internally.
         virtual void scatterAddWeightedFromTensors(
             ITensor *output, ITensor *expert_output,
             const int *host_token_indices, const float *host_weights,
             int num_tokens, int d_model);
+
+        /**
+         * @brief Write one scratch row into a logical row of a destination tensor.
+         *
+         * The destination row is overwritten, not accumulated.  Decode-equivalent
+         * verifier replay zeroes or owns its destination row before writing, so a
+         * direct row store is both clearer and cheaper than scatter-add with a
+         * host-staged `{row, 1.0}` pair.
+         */
+        virtual bool writeTokenRowToTensor(
+            ITensor *destination, ITensor *row_buffer,
+            int row_index, int row_width);
 
         /// Tensor-aware shared expert gate (sigmoid gating in-place).
         virtual void sharedExpertGateFromTensors(

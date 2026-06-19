@@ -265,8 +265,10 @@ TEST(Test__CUDARingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirro
         << device_error;
     stream.synchronize();
 
+    const int host_tail_before =
+        (host_head_before - host_count_before + max_seq_len) % max_seq_len;
     const int expected_device_head =
-        (host_head_before + accepted_state_count) % max_seq_len;
+        (host_tail_before + target_cached_tokens) % max_seq_len;
     int device_count = -1;
     int device_head = -1;
     ASSERT_NE(cache->deviceCachedTokenCountPtr(0, 0), nullptr);

@@ -132,6 +132,31 @@ namespace llaminar2
     extern "C" void hip_kv_sequence_state_advance(
         int *, int *, int, int, hipStream_t);
 
+    extern "C" void hip_ring_append_verifier_rows_fp32(
+        float *, float *, const float *, const float *,
+        int, int, int, int, int, int, int, bool, bool, hipStream_t);
+    extern "C" void hip_ring_append_verifier_rows_fp16(
+        _Float16 *, _Float16 *, const _Float16 *, const _Float16 *,
+        int, int, int, int, int, int, int, bool, bool, hipStream_t);
+    extern "C" void hip_ring_append_verifier_rows_bf16(
+        hip_bfloat16 *, hip_bfloat16 *, const hip_bfloat16 *, const hip_bfloat16 *,
+        int, int, int, int, int, int, int, bool, bool, hipStream_t);
+    extern "C" void hip_ring_append_verifier_rows_q8_1(
+        Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
+        int, int, int, int, int, int, int, bool, bool, hipStream_t);
+    extern "C" void hip_ring_append_verifier_rows_dynamic_fp32(
+        float *, float *, const float *, const float *,
+        const int *, int, int, int, int, int, int, bool, bool, hipStream_t);
+    extern "C" void hip_ring_append_verifier_rows_dynamic_fp16(
+        _Float16 *, _Float16 *, const _Float16 *, const _Float16 *,
+        const int *, int, int, int, int, int, int, bool, bool, hipStream_t);
+    extern "C" void hip_ring_append_verifier_rows_dynamic_bf16(
+        hip_bfloat16 *, hip_bfloat16 *, const hip_bfloat16 *, const hip_bfloat16 *,
+        const int *, int, int, int, int, int, int, bool, bool, hipStream_t);
+    extern "C" void hip_ring_append_verifier_rows_dynamic_q8_1(
+        Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
+        const int *, int, int, int, int, int, int, bool, bool, hipStream_t);
+
     extern "C" bool hip_convert_tensor_to_fp16(
         const void *d_src,
         TensorType src_type,
@@ -955,6 +980,271 @@ namespace llaminar2
             entry.head = (entry.head + tokens_to_write) % max_seq_len_;
             entry.count += tokens_to_write;
             if (d_count_params_ && !uploadHostDeviceParamMirror(layer, seq_idx, effective_stream))
+                return false;
+        }
+
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::appendVerifierRowsDecodeEquivalent(
+        int layer,
+        int seq_idx,
+        const ITensor *K,
+        const ITensor *V,
+        int verifier_rows,
+        void *gpu_stream)
+    {
+        if (layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            verifier_rows < 1 || verifier_rows > 4 ||
+            !K || !V || !gpu_stream)
+        {
+            LOG_ERROR("[ROCmRingKVCache] Invalid verifier append request: layer="
+                      << layer << " n_layers=" << n_layers_
+                      << " first_layer=" << first_layer_index()
+                      << " seq_idx=" << seq_idx << " batch_size=" << batch_size_
+                      << " rows=" << verifier_rows
+                      << " K=" << (K ? "set" : "null")
+                      << " V=" << (V ? "set" : "null")
+                      << " stream=" << gpu_stream);
+            return false;
+        }
+
+        const auto layout_for = [&](const ITensor *tensor,
+                                    const char *label,
+                                    bool *head_major,
+                                    int *convert_rows,
+                                    int *convert_cols) -> bool
+        {
+            if (!tensor || !head_major || !convert_rows || !convert_cols ||
+                tensor->shape().size() < 2)
+            {
+                return false;
+            }
+
+            const size_t rows = tensor->shape()[0];
+            const size_t cols = tensor->shape()[1];
+            const bool position_major =
+                rows >= static_cast<size_t>(verifier_rows) &&
+                cols == static_cast<size_t>(kv_dim_);
+            const bool verifier_head_major =
+                rows == static_cast<size_t>(local_n_kv_heads_) *
+                            static_cast<size_t>(verifier_rows) &&
+                cols == static_cast<size_t>(head_dim_);
+
+            if (!position_major && !verifier_head_major)
+            {
+                LOG_ERROR("[ROCmRingKVCache] Unsupported verifier " << label
+                                                                    << " source shape ["
+                                                                    << rows << "," << cols
+                                                                    << "] rows=" << verifier_rows
+                                                                    << " local_heads="
+                                                                    << local_n_kv_heads_
+                                                                    << " head_dim=" << head_dim_
+                                                                    << " kv_dim=" << kv_dim_);
+                return false;
+            }
+
+            *head_major = verifier_head_major && !position_major;
+            *convert_rows = *head_major ? local_n_kv_heads_ * verifier_rows : verifier_rows;
+            *convert_cols = *head_major ? head_dim_ : kv_dim_;
+            return true;
+        };
+
+        bool k_head_major = false;
+        bool v_head_major = false;
+        int k_convert_rows = 0;
+        int k_convert_cols = 0;
+        int v_convert_rows = 0;
+        int v_convert_cols = 0;
+        if (!layout_for(K, "K", &k_head_major, &k_convert_rows, &k_convert_cols) ||
+            !layout_for(V, "V", &v_head_major, &v_convert_rows, &v_convert_cols))
+        {
+            return false;
+        }
+
+        const void *d_k_src = K->gpu_data_ptr();
+        const void *d_v_src = V->gpu_data_ptr();
+        if (!d_k_src || !d_v_src)
+        {
+            LOG_ERROR("[ROCmRingKVCache] Verifier append requires device-resident K/V tensors");
+            return false;
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(gpu_stream);
+        const auto target_type = []() constexpr
+        {
+            if constexpr (Precision == ActivationPrecision::FP32)
+                return TensorType::FP32;
+            else if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            else
+                return TensorType::Q8_1;
+        }();
+
+        const DataT *typed_k = static_cast<const DataT *>(d_k_src);
+        const DataT *typed_v = static_cast<const DataT *>(d_v_src);
+        if (K->native_type() != target_type || V->native_type() != target_type)
+        {
+            if constexpr (Precision == ActivationPrecision::FP16)
+            {
+                const size_t k_bytes = static_cast<size_t>(k_convert_rows) *
+                                       static_cast<size_t>(k_convert_cols) * sizeof(uint16_t);
+                const size_t v_bytes = static_cast<size_t>(v_convert_rows) *
+                                       static_cast<size_t>(v_convert_cols) * sizeof(uint16_t);
+                if (!ensureConvScratch(std::max(k_bytes, v_bytes)))
+                    return false;
+                if (!hip_convert_tensor_to_fp16(d_k_src, K->native_type(),
+                                                static_cast<uint16_t *>(conv_scratch_k_),
+                                                k_convert_rows * k_convert_cols, stream) ||
+                    !hip_convert_tensor_to_fp16(d_v_src, V->native_type(),
+                                                static_cast<uint16_t *>(conv_scratch_v_),
+                                                v_convert_rows * v_convert_cols, stream))
+                {
+                    LOG_ERROR("[ROCmRingKVCache] FP16 verifier append conversion failed");
+                    return false;
+                }
+                typed_k = static_cast<const DataT *>(conv_scratch_k_);
+                typed_v = static_cast<const DataT *>(conv_scratch_v_);
+            }
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+            {
+                const auto q8_bytes = [](int rows, int cols) -> size_t
+                {
+                    const int blocks = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                    return static_cast<size_t>(rows) * static_cast<size_t>(blocks) * sizeof(Q8_1Block);
+                };
+                if (!ensureConvScratch(std::max(q8_bytes(k_convert_rows, k_convert_cols),
+                                                q8_bytes(v_convert_rows, v_convert_cols))))
+                    return false;
+                if (!hip_convert_tensor_to_q8_1(d_k_src, K->native_type(),
+                                                static_cast<Q8_1Block *>(conv_scratch_k_),
+                                                k_convert_rows, k_convert_cols, stream) ||
+                    !hip_convert_tensor_to_q8_1(d_v_src, V->native_type(),
+                                                static_cast<Q8_1Block *>(conv_scratch_v_),
+                                                v_convert_rows, v_convert_cols, stream))
+                {
+                    LOG_ERROR("[ROCmRingKVCache] Q8_1 verifier append conversion failed");
+                    return false;
+                }
+                typed_k = static_cast<const DataT *>(conv_scratch_k_);
+                typed_v = static_cast<const DataT *>(conv_scratch_v_);
+            }
+            else
+            {
+                LOG_ERROR("[ROCmRingKVCache] Verifier append conversion is unsupported for cache precision "
+                          << static_cast<int>(Precision));
+                return false;
+            }
+        }
+
+        EntryT &entry = entries_[layer][seq_idx];
+        const bool capture_active = isGraphCaptureActive();
+        int source_start = 0;
+        int rows_to_write = verifier_rows;
+        if (!capture_active && entry.count + verifier_rows > max_seq_len_)
+        {
+            const int to_evict = entry.count + verifier_rows - max_seq_len_;
+            if (to_evict > entry.count)
+            {
+                source_start = to_evict - entry.count;
+                rows_to_write = verifier_rows - source_start;
+                total_evicted_ += entry.count + source_start;
+                entry.count = 0;
+            }
+            else
+            {
+                entry.count -= to_evict;
+                total_evicted_ += to_evict;
+            }
+        }
+
+        const int head_storage_dim =
+            (Precision == ActivationPrecision::Q8_1)
+                ? (head_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE
+                : head_dim_;
+
+        auto launch_static = [&]()
+        {
+            if constexpr (Precision == ActivationPrecision::FP32)
+                hip_ring_append_verifier_rows_fp32(entry.d_K, entry.d_V, typed_k, typed_v,
+                                                   entry.head, max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                   verifier_rows, source_start, rows_to_write,
+                                                   k_head_major, v_head_major, stream);
+            else if constexpr (Precision == ActivationPrecision::FP16)
+                hip_ring_append_verifier_rows_fp16(entry.d_K, entry.d_V, typed_k, typed_v,
+                                                   entry.head, max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                   verifier_rows, source_start, rows_to_write,
+                                                   k_head_major, v_head_major, stream);
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                hip_ring_append_verifier_rows_bf16(entry.d_K, entry.d_V, typed_k, typed_v,
+                                                   entry.head, max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                   verifier_rows, source_start, rows_to_write,
+                                                   k_head_major, v_head_major, stream);
+            else
+                hip_ring_append_verifier_rows_q8_1(entry.d_K, entry.d_V, typed_k, typed_v,
+                                                   entry.head, max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                   verifier_rows, source_start, rows_to_write,
+                                                   k_head_major, v_head_major, stream);
+        };
+
+        auto launch_dynamic = [&](const int *d_head)
+        {
+            if constexpr (Precision == ActivationPrecision::FP32)
+                hip_ring_append_verifier_rows_dynamic_fp32(entry.d_K, entry.d_V, typed_k, typed_v,
+                                                           d_head, max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                           verifier_rows, source_start, rows_to_write,
+                                                           k_head_major, v_head_major, stream);
+            else if constexpr (Precision == ActivationPrecision::FP16)
+                hip_ring_append_verifier_rows_dynamic_fp16(entry.d_K, entry.d_V, typed_k, typed_v,
+                                                           d_head, max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                           verifier_rows, source_start, rows_to_write,
+                                                           k_head_major, v_head_major, stream);
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                hip_ring_append_verifier_rows_dynamic_bf16(entry.d_K, entry.d_V, typed_k, typed_v,
+                                                           d_head, max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                           verifier_rows, source_start, rows_to_write,
+                                                           k_head_major, v_head_major, stream);
+            else
+                hip_ring_append_verifier_rows_dynamic_q8_1(entry.d_K, entry.d_V, typed_k, typed_v,
+                                                           d_head, max_seq_len_, kv_storage_dim_, head_storage_dim,
+                                                           verifier_rows, source_start, rows_to_write,
+                                                           k_head_major, v_head_major, stream);
+        };
+
+        if (capture_active && d_head_params_ && h_head_params_)
+        {
+            const int idx = layer * batch_size_ + seq_idx;
+            launch_dynamic(&d_head_params_[idx]);
+            if (d_count_params_)
+            {
+                hip_kv_sequence_state_advance(
+                    &d_head_params_[idx], &d_count_params_[idx],
+                    rows_to_write, max_seq_len_, stream);
+            }
+        }
+        else
+        {
+            launch_static();
+        }
+
+        const hipError_t launch_err = hipGetLastError();
+        if (launch_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCache] Verifier append kernel launch failed: "
+                      << hipGetErrorString(launch_err));
+            return false;
+        }
+
+        if (!capture_active)
+        {
+            entry.head = (entry.head + rows_to_write) % max_seq_len_;
+            entry.count += rows_to_write;
+            invalidateRoPEShadow(layer, seq_idx);
+            if (d_count_params_ && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
                 return false;
         }
 

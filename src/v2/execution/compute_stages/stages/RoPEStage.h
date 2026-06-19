@@ -18,8 +18,6 @@ namespace llaminar2
 {
     // Forward declarations
     class ITensorRoPE;
-    class FP32Tensor;
-
     /**
      * @brief Rotary position encoding stage
      *
@@ -82,13 +80,13 @@ namespace llaminar2
             bool skip_k = false;
 
             /**
-             * @brief Force tiny verifier prefill to run as serial decode rows.
+             * @brief Force tiny verifier prefill through grouped decode-equivalent RoPE.
              *
              * MTP all-position verifier graphs use M=2..4 rows but must be
              * numerically equivalent to running M one-token decode steps.
-             * Some CPU RoPE kernels intentionally use a different vectorized
-             * multi-row path for normal prefill, so verifier graphs request
-             * this mode to row-walk the exact decode contract.
+             * Some kernels intentionally use different multi-row prefill math,
+             * so verifier graphs request this mode and require the backend to
+             * provide an explicit grouped decode-equivalent kernel contract.
              */
             bool force_decode_equivalent_verifier_prefill = false;
 
@@ -216,14 +214,6 @@ namespace llaminar2
 
     private:
         ITensorRoPE *getOrCreateStageKernel(TensorBase *Q_base);
-        bool executeDecodeEquivalentVerifierRows(
-            ITensorRoPE *kernel,
-            TensorBase *Q_base,
-            TensorBase *K_base,
-            const int *position_ids_ptr,
-            int seq_len,
-            int n_kv_heads,
-            int rotary_dim);
 
         Params params_;
 
@@ -243,10 +233,6 @@ namespace llaminar2
         // Stable host-side position_ids for graph capture (copied to device each step).
         mutable std::vector<int> position_ids_cache_;
 
-        // CPU verifier row scratch. These are stage-owned so a tiny verifier
-        // graph can replay serial decode RoPE without allocating per layer.
-        std::shared_ptr<FP32Tensor> verifier_q_row_;
-        std::shared_ptr<FP32Tensor> verifier_k_row_;
     };
 
 } // namespace llaminar2

@@ -770,7 +770,7 @@ namespace llaminar2
             per_request_verifier_state_capture_rows * std::max(1, batch_size);
         const bool force_decode_equivalent_gdn_verifier_prefill =
             verifier_state_capture_supported &&
-            (device.is_cuda() || device.is_rocm()) &&
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4;
 
@@ -1033,7 +1033,7 @@ namespace llaminar2
         const int k_n = static_cast<int>(layer.wk->shape()[0]);
         const int v_n = static_cast<int>(layer.wv->shape()[0]);
         const bool force_decode_equivalent_qkv_verifier_prefill =
-            (device.is_cuda() || device.is_rocm()) &&
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4 &&
             config_.compute_all_position_logits &&
@@ -1183,7 +1183,7 @@ namespace llaminar2
             int k_n = static_cast<int>(layer.wk->shape()[0]);
             int v_n = static_cast<int>(layer.wv->shape()[0]);
             const bool force_decode_equivalent_qkv_verifier_prefill =
-                (device.is_cuda() || device.is_rocm()) &&
+                (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
                 total_tokens > 1 &&
                 total_tokens <= 4 &&
                 config_.compute_all_position_logits &&

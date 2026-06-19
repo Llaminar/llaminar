@@ -203,30 +203,6 @@ namespace
         }
     }
 
-    __global__ void cuda_gdn_copy_state_snapshot_if_active_kernel(
-        const float *__restrict__ state,
-        float *__restrict__ state_snapshots,
-        const int *__restrict__ effective_seq_len_ptr,
-        int row_idx,
-        int state_floats,
-        int snapshot_stride_floats)
-    {
-        if (!state || !state_snapshots || !effective_seq_len_ptr ||
-            row_idx >= *effective_seq_len_ptr)
-        {
-            return;
-        }
-
-        const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-        const int stride = blockDim.x * gridDim.x;
-        float *snapshot =
-            state_snapshots +
-            static_cast<size_t>(row_idx) *
-                static_cast<size_t>(snapshot_stride_floats);
-        for (int i = tid; i < state_floats; i += stride)
-            snapshot[i] = state[i];
-    }
-
     // =========================================================================
     // Prefill Recurrence Kernel (seq_len>1, multi-block per head)
     //
@@ -640,74 +616,6 @@ namespace
         conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
     }
 
-    /**
-     * @brief Decode-equivalent short-conv verifier row with a post-row snapshot.
-     *
-     * MTP all-position publication restores future decode from these snapshots.
-     * The snapshot must therefore be the exact state that serial one-token decode
-     * would leave after this row, not the state inferred by the parallel prefill
-     * kernel.  The optional device effective length lets padded captured graphs
-     * keep inactive rows as no-ops without a host readback.
-     */
-    __global__ void cuda_short_conv1d_decode_snapshot_row_kernel(
-        const float *__restrict__ input,  // [channels]
-        const float *__restrict__ weight, // [channels, kernel_size]
-        const float *__restrict__ bias,   // [channels] or nullptr
-        float *__restrict__ output,       // [channels]
-        float *__restrict__ conv_state,   // [channels, kernel_size-1]
-        const int *__restrict__ effective_seq_len_ptr,
-        float *__restrict__ state_snapshots,
-        int snapshot_stride_floats,
-        int max_snapshot_rows,
-        int row,
-        int channels, int kernel_size,
-        bool apply_silu)
-    {
-        int ch = blockIdx.x * blockDim.x + threadIdx.x;
-        if (ch >= channels)
-            return;
-
-        bool active = true;
-        if (effective_seq_len_ptr)
-        {
-            const int raw_effective = *effective_seq_len_ptr;
-            const int effective =
-                raw_effective < 0 ? 0 : raw_effective;
-            active = row < effective;
-        }
-        if (!active)
-        {
-            output[ch] = 0.0f;
-            return;
-        }
-
-        const int ks_minus1 = kernel_size - 1;
-        float sum = 0.0f;
-        for (int k = 0; k < ks_minus1; k++)
-            sum += conv_state[ch * ks_minus1 + k] * weight[ch * kernel_size + k];
-        sum += input[ch] * weight[ch * kernel_size + ks_minus1];
-
-        if (bias)
-            sum += bias[ch];
-        if (apply_silu)
-            sum = sum / (1.0f + expf(-sum));
-        output[ch] = sum;
-
-        for (int k = 0; k < ks_minus1 - 1; k++)
-            conv_state[ch * ks_minus1 + k] = conv_state[ch * ks_minus1 + k + 1];
-        conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
-
-        if (state_snapshots && row < max_snapshot_rows)
-        {
-            float *snapshot =
-                state_snapshots +
-                static_cast<size_t>(row) * static_cast<size_t>(snapshot_stride_floats) +
-                static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
-            for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
-                snapshot[state_idx] = conv_state[ch * ks_minus1 + state_idx];
-        }
-    }
-
     // =========================================================================
     // Short Conv1d Kernel - Prefill (seq_len>1)
     //
@@ -781,6 +689,109 @@ namespace
         }
     }
 
+    /**
+     * @brief Decode-equivalent grouped short-conv kernel for MTP verifier rows.
+     *
+     * MTP verifier groups are tiny (M=2..4).  The long-prefill kernel uses a
+     * second launch to update live state safely; doing that for verifier rows
+     * burns most of the M=2 win.  This kernel keeps one lane responsible for a
+     * channel, walks the small row group in causal order, writes every row
+     * snapshot, and only then publishes the channel's final live state.
+     */
+    __global__ void cuda_short_conv1d_small_m_kernel(
+        const float *__restrict__ input,
+        const float *__restrict__ weight,
+        const float *__restrict__ bias,
+        float *__restrict__ output,
+        float *__restrict__ conv_state,
+        const int *__restrict__ effective_seq_len_ptr,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int seq_len, int channels, int kernel_size,
+        bool apply_silu)
+    {
+        const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+        if (ch >= channels)
+            return;
+
+        const int ks_minus1 = kernel_size - 1;
+        if (ks_minus1 <= 0)
+            return;
+
+        int effective_seq_len = seq_len;
+        if (effective_seq_len_ptr)
+        {
+            const int raw_effective = *effective_seq_len_ptr;
+            effective_seq_len =
+                raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+        }
+
+        const float *channel_weight =
+            weight + static_cast<size_t>(ch) * static_cast<size_t>(kernel_size);
+        const float *initial_state =
+            conv_state
+                ? conv_state + static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1)
+                : nullptr;
+
+        for (int t = 0; t < seq_len; ++t)
+        {
+            float sum = 0.0f;
+            if (t < effective_seq_len)
+            {
+                for (int k = 0; k < kernel_size; ++k)
+                {
+                    const int src_t = t - ks_minus1 + k;
+                    const float val =
+                        (src_t >= 0)
+                            ? input[static_cast<size_t>(src_t) * channels + ch]
+                            : (initial_state
+                                   ? initial_state[ks_minus1 + src_t]
+                                   : 0.0f);
+                    sum += val * channel_weight[k];
+                }
+
+                if (bias)
+                    sum += bias[ch];
+                if (apply_silu)
+                    sum = sum / (1.0f + expf(-sum));
+            }
+            output[static_cast<size_t>(t) * channels + ch] = sum;
+
+            if (state_snapshots && t < effective_seq_len && t < max_snapshot_rows)
+            {
+                float *snapshot =
+                    state_snapshots +
+                    static_cast<size_t>(t) * static_cast<size_t>(snapshot_stride_floats) +
+                    static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+                for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+                {
+                    const int src_t = t - ks_minus1 + 1 + state_idx;
+                    snapshot[state_idx] =
+                        (src_t >= 0)
+                            ? input[static_cast<size_t>(src_t) * channels + ch]
+                            : (initial_state
+                                   ? initial_state[ks_minus1 + src_t]
+                                   : 0.0f);
+                }
+            }
+        }
+
+        if (conv_state)
+        {
+            float *state =
+                conv_state + static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+            for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+            {
+                const int src_t = effective_seq_len - ks_minus1 + state_idx;
+                state[state_idx] =
+                    (src_t >= 0 && src_t < effective_seq_len)
+                        ? input[static_cast<size_t>(src_t) * channels + ch]
+                        : initial_state[ks_minus1 + src_t];
+            }
+        }
+    }
+
     __global__ void cuda_short_conv1d_state_update_kernel(
         const float *__restrict__ input,
         float *__restrict__ conv_state,
@@ -810,61 +821,6 @@ namespace
                 (src_t >= 0 && src_t < effective_seq_len) ? input[src_t * channels + ch]
                                                            : state[ks_minus1 + src_t];
         }
-    }
-
-    bool cudaGDN_short_conv1d_via_single_row_chunks(
-        const float *input, const float *weight, const float *bias,
-        float *output, float *conv_state,
-        const int *device_effective_seq_len,
-        int seq_len, int channels, int kernel_size,
-        bool apply_silu,
-        float *state_snapshots,
-        int snapshot_stride_floats,
-        int max_snapshot_rows,
-        void *stream)
-    {
-        if (!input || !weight || !output || !conv_state ||
-            seq_len <= 0 || channels <= 0 || kernel_size <= 1 ||
-            !state_snapshots || snapshot_stride_floats < channels * (kernel_size - 1) ||
-            max_snapshot_rows <= 0)
-        {
-            return false;
-        }
-
-        /*
-         * This is the short-conv twin of the GDN recurrent verifier route:
-         * run each verifier row through the one-token decode update and store
-         * the post-row history.  It is intentionally small-M only; ordinary
-         * long prefill keeps using the parallel prefill kernel.
-         */
-        int threads = 256;
-        int blocks = (channels + threads - 1) / threads;
-        const size_t row_stride = static_cast<size_t>(channels);
-        for (int row = 0; row < seq_len; ++row)
-        {
-            cuda_short_conv1d_decode_snapshot_row_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input + static_cast<size_t>(row) * row_stride,
-                weight,
-                bias,
-                output + static_cast<size_t>(row) * row_stride,
-                conv_state,
-                device_effective_seq_len,
-                state_snapshots,
-                snapshot_stride_floats,
-                max_snapshot_rows,
-                row,
-                channels,
-                kernel_size,
-                apply_silu);
-            cudaError_t err = cudaGetLastError();
-            if (err != cudaSuccess)
-            {
-                fprintf(stderr, "[cudaGDN_short_conv1d_decode_snapshot_row] %s\n",
-                        cudaGetErrorString(err));
-                return false;
-            }
-        }
-        return true;
     }
 
     // =========================================================================
@@ -1474,163 +1430,6 @@ extern "C"
         return true;
     }
 
-    bool cudaGDN_chunk_forward_via_single_row_chunks(
-        const float *Q, const float *K, const float *V,
-        const float *alpha, const float *beta_raw,
-        const float *A_log, const float *dt_bias,
-        float *output, float *state,
-        int seq_len, int n_heads, int d_k, int d_v,
-        bool use_qk_l2norm,
-        float *state_snapshots,
-        int snapshot_stride_floats,
-        int max_snapshot_rows,
-        int device_idx, void *stream)
-    {
-        if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
-            !output || !state ||
-            seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
-            (state_snapshots && max_snapshot_rows <= 0))
-        {
-            return false;
-        }
-
-        const int qk_stride = n_heads * d_k;
-        const int v_stride = n_heads * d_v;
-        const int state_floats = n_heads * d_k * d_v;
-        if (state_snapshots && snapshot_stride_floats < state_floats)
-            return false;
-
-        /*
-         * Publishable MTP verifier rows must be decode-equivalent.
-         *
-         * The optimized CUDA prefill route uses a different reduction geometry
-         * and preprocesses Q/K/gates in-place. That is fine for ordinary
-         * prefill, but it is not a safe source of recurrent-state checkpoints:
-         * publishing row N must produce exactly the same live state as N serial
-         * decode steps so the next real token can continue from it. Keep this
-         * tiny verifier helper on the decode recurrent_step kernel, then copy
-         * the resulting live state into the row snapshot.
-         */
-        for (int row = 0; row < seq_len; ++row)
-        {
-            if (!cudaGDN_recurrent_step(
-                    Q + static_cast<size_t>(row) * qk_stride,
-                    K + static_cast<size_t>(row) * qk_stride,
-                    V + static_cast<size_t>(row) * v_stride,
-                    alpha + static_cast<size_t>(row) * n_heads,
-                    beta_raw + static_cast<size_t>(row) * n_heads,
-                    A_log,
-                    dt_bias,
-                    output + static_cast<size_t>(row) * v_stride,
-                    state,
-                    n_heads, d_k, d_v, use_qk_l2norm,
-                    device_idx, stream))
-            {
-                return false;
-            }
-
-            if (state_snapshots && row < max_snapshot_rows)
-            {
-                float *snapshot =
-                    state_snapshots +
-                    static_cast<size_t>(row) *
-                        static_cast<size_t>(snapshot_stride_floats);
-                cudaMemcpyAsync(
-                    snapshot,
-                    state,
-                    static_cast<size_t>(state_floats) * sizeof(float),
-                    cudaMemcpyDeviceToDevice,
-                    static_cast<cudaStream_t>(stream));
-                const cudaError_t err = cudaGetLastError();
-                if (err != cudaSuccess)
-                {
-                    fprintf(stderr, "[cudaGDN_chunk_forward_snapshot] %s\n",
-                            cudaGetErrorString(err));
-                    return false;
-                }
-            }
-        }
-
-        return true;
-    }
-
-    bool cudaGDN_chunk_forward_effective_via_single_row_chunks(
-        const float *Q, const float *K, const float *V,
-        const float *alpha, const float *beta_raw,
-        const float *A_log, const float *dt_bias,
-        float *output, float *state,
-        int seq_len, int n_heads, int d_k, int d_v,
-        bool use_qk_l2norm,
-        const int *device_effective_seq_len,
-        float *state_snapshots,
-        int snapshot_stride_floats,
-        int max_snapshot_rows,
-        int device_idx, void *stream)
-    {
-        if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
-            !output || !state || !device_effective_seq_len ||
-            seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
-            (state_snapshots && max_snapshot_rows <= 0))
-        {
-            return false;
-        }
-
-        const int qk_stride = n_heads * d_k;
-        const int v_stride = n_heads * d_v;
-        const int state_floats = n_heads * d_k * d_v;
-        if (state_snapshots && snapshot_stride_floats < state_floats)
-            return false;
-
-        /*
-         * Padded grouped verifier graphs keep the effective length on device.
-         * Use the same serial decode recurrence per row, but make rows beyond
-         * the device-side effective length no-ops.  This is graph-capturable:
-         * no host readback, no default stream, and no prefill-style snapshot.
-         */
-        for (int row = 0; row < seq_len; ++row)
-        {
-            if (!cudaGDN_recurrent_step_effective_row(
-                    Q + static_cast<size_t>(row) * qk_stride,
-                    K + static_cast<size_t>(row) * qk_stride,
-                    V + static_cast<size_t>(row) * v_stride,
-                    alpha + static_cast<size_t>(row) * n_heads,
-                    beta_raw + static_cast<size_t>(row) * n_heads,
-                    A_log,
-                    dt_bias,
-                    output + static_cast<size_t>(row) * v_stride,
-                    state,
-                    n_heads, d_k, d_v, use_qk_l2norm,
-                    device_effective_seq_len,
-                    row,
-                    device_idx, stream))
-            {
-                return false;
-            }
-
-            if (state_snapshots && row < max_snapshot_rows)
-            {
-                const int threads = 256;
-                const int blocks = (state_floats + threads - 1) / threads;
-                cuda_gdn_copy_state_snapshot_if_active_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-                    state,
-                    state_snapshots,
-                    device_effective_seq_len,
-                    row,
-                    state_floats,
-                    snapshot_stride_floats);
-                const cudaError_t err = cudaGetLastError();
-                if (err != cudaSuccess)
-                {
-                    fprintf(stderr, "[cudaGDN_chunk_forward_effective_snapshot] %s\n",
-                            cudaGetErrorString(err));
-                    return false;
-                }
-            }
-        }
-
-        return true;
-    }
-
     bool cudaGDN_chunk_forward(
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
@@ -1645,18 +1444,12 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        if (seq_len > 0 && seq_len <= 4)
-        {
-            return cudaGDN_chunk_forward_via_single_row_chunks(
-                Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, state,
-                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-                state_snapshots,
-                snapshot_stride_floats,
-                max_snapshot_rows,
-                device_idx, stream);
-        }
-
+        /*
+         * Small MTP verifier chunks must use the grouped recurrence kernel as
+         * a first-class path.  It advances timesteps in the same mathematical
+         * order as serial decode, but does so inside one graph-capturable
+         * launch and publishes each post-row state snapshot directly.
+         */
         return cudaGDN_chunk_forward_kernel_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, state,
@@ -1683,19 +1476,6 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        if (seq_len > 0 && seq_len <= 4)
-        {
-            return cudaGDN_chunk_forward_effective_via_single_row_chunks(
-                Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, state,
-                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-                device_effective_seq_len,
-                state_snapshots,
-                snapshot_stride_floats,
-                max_snapshot_rows,
-                device_idx, stream);
-        }
-
         const bool ok = cudaGDN_chunk_forward_kernel_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, state,
@@ -1720,15 +1500,6 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        if (state_snapshots && seq_len > 0 && seq_len <= 4)
-        {
-            return cudaGDN_short_conv1d_via_single_row_chunks(
-                input, weight, bias, output, conv_state, nullptr,
-                seq_len, channels, kernel_size, apply_silu,
-                state_snapshots, snapshot_stride_floats, max_snapshot_rows,
-                stream);
-        }
-
         if (seq_len == 1)
         {
             int threads = 256;
@@ -1736,6 +1507,18 @@ extern "C"
             cuda_short_conv1d_decode_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                 input, weight, bias, output, conv_state,
                 channels, kernel_size, apply_silu);
+        }
+        else if (seq_len <= 4)
+        {
+            int threads = 256;
+            int blocks = (channels + threads - 1) / threads;
+            cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+                input, weight, bias, output, conv_state,
+                nullptr,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                seq_len, channels, kernel_size, apply_silu);
         }
         else
         {
@@ -1777,15 +1560,6 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        if (state_snapshots && seq_len > 0 && seq_len <= 4)
-        {
-            return cudaGDN_short_conv1d_via_single_row_chunks(
-                input, weight, bias, output, conv_state, device_effective_seq_len,
-                seq_len, channels, kernel_size, apply_silu,
-                state_snapshots, snapshot_stride_floats, max_snapshot_rows,
-                stream);
-        }
-
         if (seq_len == 1)
         {
             int threads = 256;
@@ -1793,6 +1567,18 @@ extern "C"
             cuda_short_conv1d_decode_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                 input, weight, bias, output, conv_state,
                 channels, kernel_size, apply_silu);
+        }
+        else if (seq_len <= 4)
+        {
+            int threads = 256;
+            int blocks = (channels + threads - 1) / threads;
+            cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+                input, weight, bias, output, conv_state,
+                device_effective_seq_len,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                seq_len, channels, kernel_size, apply_silu);
         }
         else
         {

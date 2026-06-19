@@ -178,7 +178,7 @@ namespace llaminar2
         int batch_size,
         int seq_len) const
     {
-        if (!params_.kv_cache || params_.device_id.is_gpu())
+        if (!params_.kv_cache)
         {
             return false;
         }
@@ -205,210 +205,6 @@ namespace llaminar2
         // existing prefix.  Tiny prompt prefills should not pay the serial row
         // cost, and they have no serial decode cache state to match.
         return params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx) > 0;
-    }
-
-    std::unique_ptr<TensorBase> KVCacheAppendStage::cloneHostRowForDecodeEquivalentAppend(
-        const ITensor *source,
-        int row,
-        const char *debug_name) const
-    {
-        if (!source)
-        {
-            LOG_ERROR("[KVCacheAppendStage] Cannot clone null " << debug_name << " verifier row");
-            return nullptr;
-        }
-        if (row < 0)
-        {
-            LOG_ERROR("[KVCacheAppendStage] Invalid " << debug_name << " verifier row " << row);
-            return nullptr;
-        }
-
-        const auto &shape = source->shape();
-        if (shape.size() < 2)
-        {
-            LOG_ERROR("[KVCacheAppendStage] " << debug_name << " verifier tensor must be at least 2D");
-            return nullptr;
-        }
-        const size_t rows = shape[0];
-        const size_t cols = shape[1];
-        if (static_cast<size_t>(row) >= rows)
-        {
-            LOG_ERROR("[KVCacheAppendStage] " << debug_name << " verifier row " << row
-                                              << " exceeds source rows=" << rows);
-            return nullptr;
-        }
-
-        const std::vector<size_t> row_shape{1, cols};
-        switch (source->native_type())
-        {
-        case TensorType::FP32:
-        {
-            const auto *src = dynamic_cast<const FP32Tensor *>(source);
-            if (!src || !src->fp32_data())
-            {
-                LOG_ERROR("[KVCacheAppendStage] " << debug_name << " FP32 verifier row has no host data");
-                return nullptr;
-            }
-            auto out = std::make_unique<FP32Tensor>(row_shape);
-            std::memcpy(out->mutable_data(),
-                        src->fp32_data() + static_cast<size_t>(row) * cols,
-                        cols * sizeof(float));
-            return out;
-        }
-        case TensorType::FP16:
-        {
-            const auto *src = dynamic_cast<const FP16Tensor *>(source);
-            if (!src || !src->fp16_data())
-            {
-                LOG_ERROR("[KVCacheAppendStage] " << debug_name << " FP16 verifier row has no host data");
-                return nullptr;
-            }
-            auto out = std::make_unique<FP16Tensor>(row_shape);
-            std::memcpy(out->mutable_fp16_data(),
-                        src->fp16_data() + static_cast<size_t>(row) * cols,
-                        cols * sizeof(uint16_t));
-            return out;
-        }
-        case TensorType::BF16:
-        {
-            const auto *src = dynamic_cast<const BF16Tensor *>(source);
-            if (!src || !src->bf16_data())
-            {
-                LOG_ERROR("[KVCacheAppendStage] " << debug_name << " BF16 verifier row has no host data");
-                return nullptr;
-            }
-            auto out = std::make_unique<BF16Tensor>(row_shape);
-            std::memcpy(out->mutable_bf16_data(),
-                        src->bf16_data() + static_cast<size_t>(row) * cols,
-                        cols * sizeof(uint16_t));
-            return out;
-        }
-        case TensorType::Q8_1:
-        {
-            const auto *src = dynamic_cast<const Q8_1Tensor *>(source);
-            if (!src || !src->blocks())
-            {
-                LOG_ERROR("[KVCacheAppendStage] " << debug_name << " Q8_1 verifier row has no host blocks");
-                return nullptr;
-            }
-            auto out = std::make_unique<Q8_1Tensor>(row_shape);
-            const size_t blocks_per_row = src->blocks_per_row();
-            std::memcpy(out->mutable_blocks(),
-                        src->blocks() + static_cast<size_t>(row) * blocks_per_row,
-                        blocks_per_row * sizeof(Q8_1Block));
-            return out;
-        }
-        case TensorType::Q16_1:
-        {
-            const auto *src = dynamic_cast<const Q16_1Tensor *>(source);
-            if (!src || !src->raw_data())
-            {
-                LOG_ERROR("[KVCacheAppendStage] " << debug_name << " Q16_1 verifier row has no host blocks");
-                return nullptr;
-            }
-            auto out = std::make_unique<Q16_1Tensor>(row_shape, src->q16_block_size());
-            const size_t row_bytes = src->blocks_per_row() *
-                                     q16_block_size_bytes(src->q16_block_size());
-            const auto *src_bytes = static_cast<const uint8_t *>(src->raw_data()) +
-                                    static_cast<size_t>(row) * row_bytes;
-            std::memcpy(out->raw_mutable_data(), src_bytes, row_bytes);
-            return out;
-        }
-        case TensorType::TQ4:
-        {
-            const auto *src = dynamic_cast<const TQ4Tensor *>(source);
-            if (!src || !src->raw_data())
-            {
-                LOG_ERROR("[KVCacheAppendStage] " << debug_name << " TQ4 verifier row has no host blocks");
-                return nullptr;
-            }
-            auto out = std::make_unique<TQ4Tensor>(row_shape, src->head_dim());
-            out->set_turboquant_context(src->turboquant_context());
-            const size_t row_bytes = src->blocks_per_row() * src->block_bytes();
-            const auto *src_bytes = static_cast<const uint8_t *>(src->raw_data()) +
-                                    static_cast<size_t>(row) * row_bytes;
-            std::memcpy(out->raw_mutable_data(), src_bytes, row_bytes);
-            return out;
-        }
-        case TensorType::TQ8:
-        {
-            const auto *src = dynamic_cast<const TQ8Tensor *>(source);
-            if (!src || !src->raw_data())
-            {
-                LOG_ERROR("[KVCacheAppendStage] " << debug_name << " TQ8 verifier row has no host blocks");
-                return nullptr;
-            }
-            auto out = std::make_unique<TQ8Tensor>(row_shape, src->head_dim());
-            out->set_turboquant_context(src->turboquant_context());
-            const size_t row_bytes = src->blocks_per_row() * src->block_bytes();
-            const auto *src_bytes = static_cast<const uint8_t *>(src->raw_data()) +
-                                    static_cast<size_t>(row) * row_bytes;
-            std::memcpy(out->raw_mutable_data(), src_bytes, row_bytes);
-            return out;
-        }
-        default:
-            LOG_ERROR("[KVCacheAppendStage] " << debug_name
-                                              << " verifier row clone does not support tensor type "
-                                              << source->dtype_name());
-            return nullptr;
-        }
-    }
-
-    bool KVCacheAppendStage::executeDecodeEquivalentVerifierAppend(
-        IDeviceContext *ctx,
-        int total_tokens)
-    {
-        if (isGraphCaptureActive())
-        {
-            LOG_ERROR("[KVCacheAppendStage] CPU decode-equivalent verifier append cannot run during graph capture");
-            return false;
-        }
-
-        struct ParamsRestore
-        {
-            KVCacheAppendStage &stage;
-            Params saved_params;
-            int saved_replay_advance_tokens = 0;
-
-            ~ParamsRestore()
-            {
-                stage.params_ = std::move(saved_params);
-                stage.replay_advance_tokens_ = saved_replay_advance_tokens;
-            }
-        } restore{*this, params_, replay_advance_tokens_};
-
-        const ITensor *grouped_k = params_.K;
-        const ITensor *grouped_v = params_.V;
-
-        LOG_DEBUG("[KVCacheAppendStage] Using decode-equivalent CPU verifier append for layer "
-                  << params_.layer_idx << " rows=" << total_tokens);
-
-        for (int row = 0; row < total_tokens; ++row)
-        {
-            auto k_row = cloneHostRowForDecodeEquivalentAppend(grouped_k, row, "K");
-            auto v_row = cloneHostRowForDecodeEquivalentAppend(grouped_v, row, "V");
-            if (!k_row || !v_row)
-            {
-                return false;
-            }
-
-            params_.K = k_row.get();
-            params_.V = v_row.get();
-            params_.num_tokens = 1;
-            params_.batch_size = 1;
-            params_.seq_len = 1;
-            params_.V_dequant_out = nullptr;
-            replay_advance_tokens_ = 0;
-
-            if (!execute(ctx))
-            {
-                LOG_ERROR("[KVCacheAppendStage] decode-equivalent verifier append failed at row "
-                          << row << " of " << total_tokens);
-                return false;
-            }
-        }
-
-        return true;
     }
 
     bool KVCacheAppendStage::execute(IDeviceContext *ctx)
@@ -498,7 +294,25 @@ namespace llaminar2
                 debug_append_source_v_cols_ = 0;
             }
 
-            if (stream || params_.device_id.is_gpu())
+            if (shouldUseDecodeEquivalentVerifierAppend(num_tokens, params_.batch_size, params_.seq_len))
+            {
+                success = params_.kv_cache->appendVerifierRowsDecodeEquivalent(
+                    params_.layer_idx,
+                    seq_idx,
+                    k_tensor,
+                    v_tensor,
+                    num_tokens,
+                    stream);
+                if (!success)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] KV cache does not support grouped decode-equivalent verifier append"
+                              << " for layer=" << params_.layer_idx
+                              << " rows=" << num_tokens
+                              << " K=" << k_tensor->dtype_name()
+                              << " V=" << v_tensor->dtype_name());
+                }
+            }
+            else if (stream || params_.device_id.is_gpu())
             {
                 // GPU path: fine-grained profiling handled inside appendWithStream
                 success = params_.kv_cache->appendWithStream(
@@ -566,11 +380,6 @@ namespace llaminar2
         // Determine batch handling mode
         const int batch_size = params_.batch_size;
         const int seq_len = params_.seq_len;
-
-        if (shouldUseDecodeEquivalentVerifierAppend(total_tokens, batch_size, seq_len))
-        {
-            return executeDecodeEquivalentVerifierAppend(ctx, total_tokens);
-        }
 
         // If batch_size > 1 and seq_len > 0, do per-sequence append
         // K/V layout: [batch_size * seq_len, kv_dim] - contiguous per-sequence

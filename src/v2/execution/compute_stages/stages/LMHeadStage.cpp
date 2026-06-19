@@ -210,105 +210,19 @@ namespace llaminar2
         void *stream = gpuStream();
         if (is_gpu && !stream)
         {
-            LOG_ERROR("[LMHeadStage] Decode-equivalent GPU verifier prefill requires an explicit stream");
+            LOG_ERROR("[LMHeadStage] Grouped verifier GPU LM-head requires an explicit stream");
             return false;
         }
 
-        if (!verifier_gemm_rows::ensureScratchFP32(
-                verifier_hidden_row_, 1, static_cast<size_t>(params_.d_model),
-                params_.device_id, stream, "LMHeadStage", "hidden_row") ||
-            !verifier_gemm_rows::ensureScratchFP32(
-                verifier_logits_row_, 1, static_cast<size_t>(params_.vocab_size),
-                params_.device_id, stream, "LMHeadStage", "logits_row"))
-        {
-            return false;
-        }
-
-        const float *hidden_data = is_gpu ? nullptr : hidden_states->data();
-        float *logits_data = is_gpu ? nullptr : logits->mutable_data();
-        if (!is_gpu && (!hidden_data || !logits_data))
-        {
-            LOG_ERROR("[LMHeadStage] Decode-equivalent verifier prefill requires host-visible FP32 tensors");
-            return false;
-        }
-        if (is_gpu)
-        {
-            if (!hidden_states->gpu_data_ptr())
-            {
-                LOG_ERROR("[LMHeadStage] Decode-equivalent verifier hidden input is not device-resident on "
-                          << params_.device_id.to_string());
-                return false;
-            }
-            if (!logits->allocateOnDevice(params_.device_id, stream))
-            {
-                LOG_ERROR("[LMHeadStage] Failed to prepare verifier logits tensor on "
-                          << params_.device_id.to_string());
-                return false;
-            }
-        }
-
-        bool success = true;
-        for (int row = 0; row < lm_m; ++row)
-        {
-            if (is_gpu)
-            {
-                success = verifier_gemm_rows::copyFP32DeviceRow(
-                    verifier_hidden_row_.get(), 0, params_.d_model,
-                    hidden_states, row, params_.d_model,
-                    params_.d_model, params_.device_id, stream,
-                    "LMHeadStage", "verifier_hidden_row");
-                if (!success)
-                    break;
-                verifier_gemm_rows::markDeviceOutputWritten(
-                    verifier_hidden_row_.get(), params_.device_id, stream);
-            }
-            else
-            {
-                std::copy(hidden_data + static_cast<size_t>(row) * params_.d_model,
-                          hidden_data + static_cast<size_t>(row + 1) * params_.d_model,
-                          verifier_hidden_row_->mutable_data());
-            }
-
-            const bool row_ok = lm_gemm->multiply_tensor(
-                verifier_hidden_row_.get(),
-                verifier_logits_row_.get(),
-                1,
-                params_.vocab_size,
-                params_.d_model,
-                true,
-                1.0f,
-                0.0f,
-                params_.bias_tensor,
-                params_.mpi_ctx,
-                params_.device_id.toKernelDeviceIndex(),
-                bound_workspace_);
-            if (!row_ok)
-            {
-                LOG_ERROR("[LMHeadStage] Decode-equivalent verifier LM-head row "
-                          << row << " failed");
-                success = false;
-                break;
-            }
-
-            if (is_gpu)
-            {
-                verifier_gemm_rows::markDeviceOutputWritten(
-                    verifier_logits_row_.get(), params_.device_id, stream);
-                success = verifier_gemm_rows::copyFP32DeviceRow(
-                    logits, row, params_.vocab_size,
-                    verifier_logits_row_.get(), 0, params_.vocab_size,
-                    params_.vocab_size, params_.device_id, stream,
-                    "LMHeadStage", "verifier_logits_row");
-                if (!success)
-                    break;
-            }
-            else
-            {
-                std::copy(verifier_logits_row_->data(),
-                          verifier_logits_row_->data() + params_.vocab_size,
-                          logits_data + static_cast<size_t>(row) * params_.vocab_size);
-            }
-        }
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {lm_gemm, logits, params_.vocab_size, params_.bias_tensor, "lm_head"}};
+        const bool success = lm_gemm->multiply_fused_verifier_rows_decode_equivalent(
+            hidden_states,
+            projections,
+            lm_m,
+            params_.d_model,
+            params_.mpi_ctx,
+            bound_workspace_);
 
         if (success)
         {
@@ -320,7 +234,16 @@ namespace llaminar2
                 "lm_head_decode_equivalent_verifier_prefill_rows",
                 static_cast<double>(lm_m),
                 {},
-                params_.device_id.to_string());
+                params_.device_id.to_string(),
+                {{"route", "grouped"}});
+        }
+        else
+        {
+            LOG_ERROR("[LMHeadStage] Grouped decode-equivalent verifier LM-head is unsupported or failed"
+                      << " device=" << params_.device_id.to_string()
+                      << " m=" << lm_m
+                      << " vocab=" << params_.vocab_size
+                      << " d_model=" << params_.d_model);
         }
         return success;
     }

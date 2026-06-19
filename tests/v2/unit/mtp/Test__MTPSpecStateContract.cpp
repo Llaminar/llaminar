@@ -565,6 +565,45 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedDeviceRejectionOu
     EXPECT_TRUE(second.requiresCorrectionReplay());
 }
 
+TEST(Test__MTPSpecStateContract, TransactionDriverMarksGroupedOutcomeReplayPublication)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+
+    MTPDeviceRejectionBatchOutcome outcome;
+    outcome.ok = true;
+    outcome.output_tokens[0] = 7;
+    outcome.output_tokens[1] = 9;
+    outcome.output_tokens[2] = 8;
+    outcome.output_token_count = 3;
+    outcome.accepted_speculative_prefix = 2;
+    outcome.target_verifier_state_commit_count = 3;
+    outcome.ready_token = 4;
+    outcome.all_speculative_accepted = true;
+    outcome.consumed_verifier_rows = 2;
+    outcome.sampled_terminal = true;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomesForReplayPublication(
+            shapeFor(/*requests=*/1, /*draft_tokens=*/3),
+            /*request_ids=*/{10},
+            /*vocab_size=*/100,
+            {request},
+            {outcome},
+            /*base_cached_tokens=*/{100});
+
+    ASSERT_TRUE(plan.ok) << plan.error;
+    EXPECT_TRUE(plan.requiresDecodeEquivalentReplayPublication());
+    EXPECT_EQ(plan.publication_contract,
+              MTPSpecTransactionPublicationContract::
+                  DecodeEquivalentReplayPublicationRequired);
+    EXPECT_THAT(plan.publication_contract_reason,
+                HasSubstr("replay_publication"));
+    ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
+    EXPECT_EQ(plan.step_plans.steps.front().accepted_count, 3);
+    EXPECT_EQ(plan.step_plans.steps.front().accepted_state_slot_index, 2);
+}
+
 TEST(Test__MTPSpecStateContract, TransactionDriverRejectsInvalidDeviceRejectionOutcome)
 {
     MTPDecodeCatchupGreedyRequest request;
@@ -700,6 +739,38 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedGreedyCatchupPlan
     EXPECT_EQ(second.correction_replay_start_index, 1);
     EXPECT_EQ(second.correction_replay_count, 1);
     EXPECT_TRUE(second.requiresCorrectionReplay());
+}
+
+TEST(Test__MTPSpecStateContract, TransactionDriverMarksGreedyGroupedOutcomeReplayPublication)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 8, 4});
+    ASSERT_TRUE(result.ok) << result.error;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromGreedyCatchupForReplayPublication(
+            shapeFor(/*requests=*/1, /*draft_tokens=*/3),
+            /*request_id=*/23,
+            /*vocab_size=*/100,
+            request,
+            result,
+            /*base_cached_tokens=*/64);
+
+    ASSERT_TRUE(plan.ok) << plan.error;
+    EXPECT_TRUE(plan.requiresDecodeEquivalentReplayPublication());
+    EXPECT_EQ(plan.publication_contract,
+              MTPSpecTransactionPublicationContract::
+                  DecodeEquivalentReplayPublicationRequired);
+    EXPECT_THAT(plan.publication_contract_reason,
+                HasSubstr("replay_publication"));
+    ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
+    EXPECT_EQ(plan.step_plans.steps.front().request_id, 23);
+    EXPECT_EQ(plan.step_plans.steps.front().accepted_count, 3);
+    EXPECT_EQ(plan.step_plans.steps.front().accepted_state_slot_index, 2);
 }
 
 TEST(Test__MTPSpecStateContract, RejectsPublicationThatDriftsFromMetadata)

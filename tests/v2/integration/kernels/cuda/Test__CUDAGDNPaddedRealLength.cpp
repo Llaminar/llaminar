@@ -299,6 +299,108 @@ namespace
         return {max_abs, rel_l2};
     }
 
+    /// @brief Strict row-distribution metrics for grouped verifier equivalence checks.
+    struct StrictVectorMetrics
+    {
+        float max_abs = 0.0f;         ///< Largest elementwise absolute difference.
+        double relative_l2 = 0.0;     ///< L2(actual-expected) normalized by expected.
+        double cosine = 1.0;          ///< Cosine similarity between the two vectors.
+        double symmetric_kl = 0.0;    ///< Symmetric KL after stable softmax normalization.
+    };
+
+    /**
+     * @brief Computes strict numerical metrics over one row or state slice.
+     *
+     * MTP verifier rows are only acceptable when they are decode-equivalent to
+     * serial one-token replay.  L2 alone can miss structured drift, so the
+     * stricter verifier tests assert L2, cosine, and a softmaxed symmetric-KL
+     * view of the same data.
+     */
+    StrictVectorMetrics strictVectorMetrics(
+        const std::vector<float> &actual,
+        const std::vector<float> &expected,
+        size_t offset,
+        size_t count)
+    {
+        StrictVectorMetrics metrics;
+        if (count == 0)
+            return metrics;
+
+        double dot = 0.0;
+        double sum_sq_actual = 0.0;
+        double sum_sq_expected = 0.0;
+        double sum_sq_diff = 0.0;
+        float max_actual = actual[offset];
+        float max_expected = expected[offset];
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double a = static_cast<double>(actual[offset + i]);
+            const double b = static_cast<double>(expected[offset + i]);
+            const float diff = actual[offset + i] - expected[offset + i];
+            metrics.max_abs = std::max(metrics.max_abs, std::abs(diff));
+            dot += a * b;
+            sum_sq_actual += a * a;
+            sum_sq_expected += b * b;
+            sum_sq_diff += static_cast<double>(diff) * static_cast<double>(diff);
+            max_actual = std::max(max_actual, actual[offset + i]);
+            max_expected = std::max(max_expected, expected[offset + i]);
+        }
+
+        metrics.relative_l2 = std::sqrt(sum_sq_diff / std::max(sum_sq_expected, 1e-30));
+        const double denom = std::sqrt(sum_sq_actual * sum_sq_expected);
+        metrics.cosine = denom > 0.0 ? dot / denom : (sum_sq_actual == sum_sq_expected ? 1.0 : 0.0);
+
+        std::vector<double> actual_prob(count);
+        std::vector<double> expected_prob(count);
+        double actual_sum = 0.0;
+        double expected_sum = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            actual_prob[i] = std::exp(static_cast<double>(actual[offset + i] - max_actual));
+            expected_prob[i] = std::exp(static_cast<double>(expected[offset + i] - max_expected));
+            actual_sum += actual_prob[i];
+            expected_sum += expected_prob[i];
+        }
+
+        constexpr double eps = 1e-30;
+        double actual_to_expected = 0.0;
+        double expected_to_actual = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double p = std::max(actual_prob[i] / actual_sum, eps);
+            const double q = std::max(expected_prob[i] / expected_sum, eps);
+            actual_to_expected += p * std::log(p / q);
+            expected_to_actual += q * std::log(q / p);
+        }
+        metrics.symmetric_kl = 0.5 * (actual_to_expected + expected_to_actual);
+        return metrics;
+    }
+
+    /// @brief Asserts strict decode-equivalence and prints all metrics on failure.
+    void expectStrictEquivalent(
+        const char *label,
+        const std::vector<float> &actual,
+        const std::vector<float> &expected,
+        size_t offset,
+        size_t count,
+        float max_abs_threshold = 1e-6f,
+        double relative_l2_threshold = 1e-7,
+        double min_cosine = 0.9999999,
+        double max_symmetric_kl = 1e-10)
+    {
+        const StrictVectorMetrics metrics =
+            strictVectorMetrics(actual, expected, offset, count);
+        EXPECT_LE(metrics.max_abs, max_abs_threshold)
+            << label << " max_abs=" << metrics.max_abs;
+        EXPECT_LE(metrics.relative_l2, relative_l2_threshold)
+            << label << " relative_l2=" << metrics.relative_l2;
+        EXPECT_GE(metrics.cosine, min_cosine)
+            << label << " cosine=" << metrics.cosine;
+        EXPECT_LE(metrics.symmetric_kl, max_symmetric_kl)
+            << label << " symmetric_kl=" << metrics.symmetric_kl;
+    }
+
     /**
      * @brief Verifies that verifier publication refreshed the host state mirror.
      *
@@ -1053,6 +1155,185 @@ TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay
         << "CUDA merged-QKV M=4 recurrence must leave the same state as four decode steps";
 }
 
+TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    /*
+     * The model graph feeds merged QKV rows into the GDN recurrence verifier.
+     * This test proves the grouped M=3 path, including deinterleave and
+     * per-row state snapshots, is decode-equivalent before MoE can amplify any
+     * upstream GDN drift.
+     */
+    constexpr int n_k_heads = 16;
+    constexpr int n_v_heads = 48;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int verifier_len = 3;
+    constexpr int q_src_dim = n_k_heads * d_k;
+    constexpr int k_src_dim = n_k_heads * d_k;
+    constexpr int v_dim = n_v_heads * d_v;
+    constexpr int qkv_stride = q_src_dim + k_src_dim + v_dim;
+    constexpr int qk_stride = n_v_heads * d_k;
+    constexpr int state_floats = n_v_heads * d_k * d_v;
+    constexpr size_t output_elems =
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(v_dim);
+    constexpr size_t deinterleave_elems =
+        static_cast<size_t>(verifier_len) *
+        static_cast<size_t>(qk_stride + qk_stride + v_dim);
+
+    const auto Q_src = makeSequenceRows(verifier_len, q_src_dim, verifier_len, verifier_len, 0.0067f, 0.0f, 0.0067f);
+    const auto K_src = makeSequenceRows(verifier_len, k_src_dim, verifier_len, verifier_len, -0.0059f, 0.0f, -0.0059f);
+    const auto V_src = makeSequenceRows(verifier_len, v_dim, verifier_len, verifier_len, 0.0073f, 0.0f, 0.0073f);
+
+    std::vector<float> merged(static_cast<size_t>(verifier_len) * static_cast<size_t>(qkv_stride));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *dst = merged.data() + static_cast<size_t>(row) * qkv_stride;
+        std::copy_n(Q_src.data() + static_cast<size_t>(row) * q_src_dim, q_src_dim, dst);
+        std::copy_n(K_src.data() + static_cast<size_t>(row) * k_src_dim, k_src_dim, dst + q_src_dim);
+        std::copy_n(V_src.data() + static_cast<size_t>(row) * v_dim, v_dim, dst + q_src_dim + k_src_dim);
+    }
+
+    const auto alpha = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, 0.087f, 0.0f, 0.087f);
+    const auto beta = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, -0.071f, 0.0f, -0.071f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.021f);
+    const std::vector<float> A_log(static_cast<size_t>(n_v_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_v_heads), 0.1f);
+
+    CudaFloatBuffer d_merged_grouped(merged);
+    CudaFloatBuffer d_merged_step(merged);
+    CudaFloatBuffer d_alpha_grouped(alpha);
+    CudaFloatBuffer d_beta_grouped(beta);
+    CudaFloatBuffer d_alpha_step(alpha);
+    CudaFloatBuffer d_beta_step(beta);
+    CudaFloatBuffer d_A_log(A_log);
+    CudaFloatBuffer d_dt_bias(dt_bias);
+    CudaFloatBuffer d_grouped_out(output_elems, 0.0f);
+    CudaFloatBuffer d_step_out(output_elems, 0.0f);
+    CudaFloatBuffer d_grouped_scratch(deinterleave_elems, 0.0f);
+    CudaFloatBuffer d_step_scratch(static_cast<size_t>(qk_stride + qk_stride + v_dim), 0.0f);
+    CudaFloatBuffer d_snapshots(
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats),
+        -99.0f);
+    CudaFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    CudaStreamHandle stream;
+
+    CUDAGatedDeltaNet grouped_kernel(cuda_ordinal_);
+    grouped_kernel.allocateGPUState(state_floats);
+    grouped_kernel.setGPUStream(stream.stream);
+    grouped_kernel.bindDeinterleaveWorkspace(d_grouped_scratch.ptr, d_grouped_scratch.count);
+    grouped_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    grouped_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
+    ASSERT_TRUE(grouped_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    float *grouped_q = nullptr;
+    float *grouped_k = nullptr;
+    float *grouped_v = nullptr;
+    ASSERT_TRUE(grouped_kernel.deinterleave_qkv_device(
+        d_merged_grouped.ptr,
+        grouped_q,
+        grouped_k,
+        grouped_v,
+        verifier_len,
+        n_k_heads,
+        n_v_heads,
+        d_k,
+        d_v,
+        /*global_v_head_offset=*/0));
+    ASSERT_TRUE(grouped_kernel.chunk_forward(
+        grouped_q, grouped_k, grouped_v,
+        d_alpha_grouped.ptr, d_beta_grouped.ptr,
+        d_A_log.ptr, d_dt_bias.ptr,
+        d_grouped_out.ptr, nullptr,
+        verifier_len, n_v_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(strict grouped CUDA GDN M3)");
+    std::vector<float> grouped_live_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(grouped_kernel.exportState(grouped_live_state.data(), nullptr, stream.stream));
+
+    CUDAGatedDeltaNet step_kernel(cuda_ordinal_);
+    step_kernel.allocateGPUState(state_floats);
+    step_kernel.setGPUStream(stream.stream);
+    step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    std::vector<float> step_state_snapshots(
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *step_q = nullptr;
+        float *step_k = nullptr;
+        float *step_v = nullptr;
+        ASSERT_TRUE(step_kernel.deinterleave_qkv_device(
+            d_merged_step.ptr + static_cast<size_t>(row) * qkv_stride,
+            step_q,
+            step_k,
+            step_v,
+            1,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
+            /*global_v_head_offset=*/0));
+        ASSERT_TRUE(step_kernel.recurrent_step(
+            step_q,
+            step_k,
+            step_v,
+            d_alpha_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_beta_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * v_dim,
+            nullptr,
+            n_v_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+        ASSERT_TRUE(step_kernel.exportState(
+            step_state_snapshots.data() +
+                static_cast<size_t>(row) * static_cast<size_t>(state_floats),
+            nullptr,
+            stream.stream));
+    }
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(strict stepwise CUDA GDN M3)");
+
+    const auto grouped_out = d_grouped_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto grouped_snapshots = d_snapshots.toHost();
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        const size_t output_offset = static_cast<size_t>(row) * static_cast<size_t>(v_dim);
+        const std::string output_label =
+            "CUDA GDN M3 row" + std::to_string(row) + " output";
+        expectStrictEquivalent(
+            output_label.c_str(),
+            grouped_out,
+            step_out,
+            output_offset,
+            static_cast<size_t>(v_dim));
+
+        const size_t state_offset =
+            static_cast<size_t>(row) * static_cast<size_t>(state_floats);
+        const std::string state_label =
+            "CUDA GDN M3 row" + std::to_string(row) + " state snapshot";
+        expectStrictEquivalent(
+            state_label.c_str(),
+            grouped_snapshots,
+            step_state_snapshots,
+            state_offset,
+            static_cast<size_t>(state_floats));
+    }
+
+    expectStrictEquivalent(
+        "CUDA GDN M3 grouped live state remains initial during verifier capture",
+        grouped_live_state,
+        initial_state,
+        0,
+        grouped_live_state.size(),
+        /*max_abs_threshold=*/1e-7f,
+        /*relative_l2_threshold=*/1e-7,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+}
+
 TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM2VerifierSnapshotsMatchStepwiseReplay)
 {
     SKIP_IF_NO_CUDA();
@@ -1166,21 +1447,186 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM2VerifierSnapshotsMatchStepwise
     const std::vector<float> snapshot_row1(
         snapshots.begin() + static_cast<std::ptrdiff_t>(state_floats),
         snapshots.begin() + static_cast<std::ptrdiff_t>(2 * state_floats));
-    const auto output_diff = diffStats(verifier_out, step_out, 0, output_elems);
-    const auto row0_state_diff = diffStats(snapshot_row0, one_state, 0, one_state.size());
-    const auto row1_state_diff = diffStats(snapshot_row1, step_state, 0, step_state.size());
-    const auto live_state_diff =
-        diffStats(verifier_live_state, initial_state, 0, initial_state.size());
+    expectStrictEquivalent(
+        "CUDA GDN M2 verifier output",
+        verifier_out,
+        step_out,
+        0,
+        output_elems,
+        /*max_abs_threshold=*/1e-8f,
+        /*relative_l2_threshold=*/1e-8,
+        /*min_cosine=*/0.999999999,
+        /*max_symmetric_kl=*/1e-12);
+    expectStrictEquivalent(
+        "CUDA GDN M2 row0 state snapshot",
+        snapshot_row0,
+        one_state,
+        0,
+        one_state.size(),
+        /*max_abs_threshold=*/1e-8f,
+        /*relative_l2_threshold=*/1e-8,
+        /*min_cosine=*/0.999999999,
+        /*max_symmetric_kl=*/1e-12);
+    expectStrictEquivalent(
+        "CUDA GDN M2 row1 state snapshot",
+        snapshot_row1,
+        step_state,
+        0,
+        step_state.size(),
+        /*max_abs_threshold=*/1e-8f,
+        /*relative_l2_threshold=*/1e-8,
+        /*min_cosine=*/0.999999999,
+        /*max_symmetric_kl=*/1e-12);
+    expectStrictEquivalent(
+        "CUDA GDN M2 live state remains initial during verifier capture",
+        verifier_live_state,
+        initial_state,
+        0,
+        initial_state.size(),
+        /*max_abs_threshold=*/1e-8f,
+        /*relative_l2_threshold=*/1e-8,
+        /*min_cosine=*/0.999999999,
+        /*max_symmetric_kl=*/1e-12);
+}
 
-    EXPECT_LT(output_diff.first, 1e-8f);
-    EXPECT_LT(output_diff.second, 1e-8);
-    EXPECT_LT(row0_state_diff.first, 1e-8f);
-    EXPECT_LT(row0_state_diff.second, 1e-8);
-    EXPECT_LT(row1_state_diff.first, 1e-8f);
-    EXPECT_LT(row1_state_diff.second, 1e-8);
-    EXPECT_LT(live_state_diff.first, 1e-8f)
-        << "CUDA verifier snapshot replay must not publish speculative state";
-    EXPECT_LT(live_state_diff.second, 1e-8);
+TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM4VerifierSnapshotsMatchStepwiseReplay)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    /*
+     * The vLLM-style all-position verifier publishes accepted GDN state from
+     * per-row snapshots, so final M=4 state equivalence alone is not enough.
+     * This test proves each captured row is decode-equivalent to the same row
+     * produced by four one-token recurrent steps at the Qwen3.6 dense shape.
+     */
+    constexpr int n_heads = 40;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int verifier_len = 4;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr size_t output_elems =
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(v_stride);
+
+    const auto Q = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, 0.0023f, 0.0f, 0.0023f);
+    const auto K = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, -0.0017f, 0.0f, -0.0017f);
+    const auto V = makeSequenceRows(verifier_len, v_stride, verifier_len, verifier_len, 0.0029f, 0.0f, 0.0029f);
+    const auto alpha = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, 0.019f, 0.0f, 0.019f);
+    const auto beta = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, -0.017f, 0.0f, -0.017f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.00073f);
+    const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    CudaFloatBuffer d_Q_verifier(Q);
+    CudaFloatBuffer d_K_verifier(K);
+    CudaFloatBuffer d_V_verifier(V);
+    CudaFloatBuffer d_alpha_verifier(alpha);
+    CudaFloatBuffer d_beta_verifier(beta);
+    CudaFloatBuffer d_Q_step(Q);
+    CudaFloatBuffer d_K_step(K);
+    CudaFloatBuffer d_V_step(V);
+    CudaFloatBuffer d_alpha_step(alpha);
+    CudaFloatBuffer d_beta_step(beta);
+    CudaFloatBuffer d_A_log(A_log);
+    CudaFloatBuffer d_dt_bias(dt_bias);
+    CudaFloatBuffer d_verifier_out(output_elems, 0.0f);
+    CudaFloatBuffer d_step_out(output_elems, 0.0f);
+    CudaFloatBuffer d_snapshots(
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats),
+        -99.0f);
+    CudaFloatBuffer d_speculative_state_work(static_cast<size_t>(state_floats), 0.0f);
+    CudaStreamHandle stream;
+
+    CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
+    verifier_kernel.allocateGPUState(state_floats);
+    verifier_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(verifier_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
+    ASSERT_TRUE(verifier_kernel.chunk_forward(
+        d_Q_verifier.ptr, d_K_verifier.ptr, d_V_verifier.ptr,
+        d_alpha_verifier.ptr, d_beta_verifier.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_verifier_out.ptr, nullptr,
+        verifier_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(verifier M4 recurrence)");
+    std::vector<float> verifier_live_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(verifier_live_state.data(), nullptr, stream.stream));
+
+    CUDAGatedDeltaNet step_kernel(cuda_ordinal_);
+    step_kernel.allocateGPUState(state_floats);
+    step_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+
+    std::vector<float> step_states(
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats),
+        0.0f);
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.recurrent_step(
+            d_Q_step.ptr + static_cast<size_t>(row) * qk_stride,
+            d_K_step.ptr + static_cast<size_t>(row) * qk_stride,
+            d_V_step.ptr + static_cast<size_t>(row) * v_stride,
+            d_alpha_step.ptr + static_cast<size_t>(row) * n_heads,
+            d_beta_step.ptr + static_cast<size_t>(row) * n_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+        ASSERT_TRUE(step_kernel.exportState(
+            step_states.data() +
+                static_cast<size_t>(row) * static_cast<size_t>(state_floats),
+            nullptr,
+            stream.stream));
+    }
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(stepwise M4 recurrence)");
+
+    const auto verifier_out = d_verifier_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto snapshots = d_snapshots.toHost();
+    expectStrictEquivalent(
+        "CUDA GDN M4 verifier output",
+        verifier_out,
+        step_out,
+        0,
+        output_elems,
+        /*max_abs_threshold=*/1e-8f,
+        /*relative_l2_threshold=*/1e-8,
+        /*min_cosine=*/0.999999999,
+        /*max_symmetric_kl=*/1e-12);
+
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        const size_t offset =
+            static_cast<size_t>(row) * static_cast<size_t>(state_floats);
+        const std::string row_label =
+            "CUDA GDN M4 state snapshot row " + std::to_string(row);
+        expectStrictEquivalent(
+            row_label.c_str(),
+            snapshots,
+            step_states,
+            offset,
+            static_cast<size_t>(state_floats),
+            /*max_abs_threshold=*/1e-8f,
+            /*relative_l2_threshold=*/1e-8,
+            /*min_cosine=*/0.999999999,
+            /*max_symmetric_kl=*/1e-12);
+    }
+
+    expectStrictEquivalent(
+        "CUDA GDN M4 live state remains initial during verifier capture",
+        verifier_live_state,
+        initial_state,
+        0,
+        initial_state.size(),
+        /*max_abs_threshold=*/1e-8f,
+        /*relative_l2_threshold=*/1e-8,
+        /*min_cosine=*/0.999999999,
+        /*max_symmetric_kl=*/1e-12);
 }
 
 TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceTwoRowVerifierRowZeroRestoreMatchesOneRowReplay)
@@ -1646,14 +2092,212 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M2InPlaceStateMatchesStepwi
 
     const auto m2_out = d_m2_inout.toHost();
     const auto step_out = d_step_inout.toHost();
-    const auto out_diff = diffStats(m2_out, step_out, 0, output_elems);
-    const auto state_diff = diffStats(m2_state, step_state, 0, m2_state.size());
-    EXPECT_LT(out_diff.first, 1e-5f);
-    EXPECT_LT(out_diff.second, 1e-5);
-    EXPECT_LT(state_diff.first, 1e-5f);
-    EXPECT_LT(state_diff.second, 1e-5)
-        << "CUDA Qwen3.6-shaped in-place M=2 short-conv must leave the same "
-           "kernel-owned state as two decode steps";
+    expectStrictEquivalent(
+        "CUDA Qwen3.6 short-conv M2 output",
+        m2_out,
+        step_out,
+        0,
+        output_elems,
+        /*max_abs_threshold=*/1e-5f,
+        /*relative_l2_threshold=*/1e-5,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+    expectStrictEquivalent(
+        "CUDA Qwen3.6 short-conv M2 state",
+        m2_state,
+        step_state,
+        0,
+        m2_state.size(),
+        /*max_abs_threshold=*/1e-5f,
+        /*relative_l2_threshold=*/1e-5,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+}
+
+TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    /*
+     * The production MTP verifier commonly executes exactly three rows when a
+     * depth-3 draft is checked.  M=2 and M=4 already had strict in-place
+     * coverage; this locks the actual failing continuation shape to serial
+     * decode equivalence before the full graph can amplify tiny GDN drift.
+     */
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    constexpr int verifier_len = 3;
+    constexpr int state_floats = channels * (kernel_size - 1);
+    constexpr size_t output_elems =
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(channels);
+
+    const auto input = makeSequenceRows(
+        verifier_len, channels, verifier_len, verifier_len,
+        0.0095f, 0.0f, 0.0095f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state =
+        makeInitialState(static_cast<size_t>(state_floats), 0.0027f);
+
+    CudaFloatBuffer d_m3_inout(input);
+    CudaFloatBuffer d_step_inout(input);
+    CudaFloatBuffer d_weight(weight);
+    CudaFloatBuffer d_bias(bias);
+    CudaStreamHandle stream;
+
+    CUDAShortConvolution m3_kernel(cuda_ordinal_);
+    m3_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(m3_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    m3_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(m3_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(m3_kernel.forward(
+        d_m3_inout.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_m3_inout.ptr,
+        nullptr,
+        verifier_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(Qwen36 M3 in-place short-conv)");
+    std::vector<float> m3_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m3_kernel.exportState(m3_state.data(), nullptr, stream.stream));
+
+    CUDAShortConvolution step_kernel(cuda_ordinal_);
+    step_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    step_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.forward(
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            d_weight.ptr,
+            d_bias.ptr,
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(Qwen36 stepwise M3 in-place short-conv)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, stream.stream));
+
+    const auto m3_out = d_m3_inout.toHost();
+    const auto step_out = d_step_inout.toHost();
+    expectStrictEquivalent(
+        "CUDA Qwen3.6 short-conv M3 output",
+        m3_out,
+        step_out,
+        0,
+        output_elems,
+        /*max_abs_threshold=*/1e-5f,
+        /*relative_l2_threshold=*/1e-5,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+    expectStrictEquivalent(
+        "CUDA Qwen3.6 short-conv M3 state",
+        m3_state,
+        step_state,
+        0,
+        m3_state.size(),
+        /*max_abs_threshold=*/1e-5f,
+        /*relative_l2_threshold=*/1e-5,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+}
+
+TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    /*
+     * Qwen3.6 dense uses a fused QKV short-conv width of 10240.  The MTP
+     * verifier runs up to four compact rows, and the graph uses the QKV buffer
+     * in-place, so the kernel must use scratch for the convolved output while
+     * preserving raw projection rows in its live history state.
+     */
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    constexpr int verifier_len = 4;
+    constexpr int state_floats = channels * (kernel_size - 1);
+    constexpr size_t output_elems =
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(channels);
+
+    const auto input = makeSequenceRows(
+        verifier_len, channels, verifier_len, verifier_len,
+        0.0095f, 0.0f, 0.0095f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state =
+        makeInitialState(static_cast<size_t>(state_floats), 0.0027f);
+
+    CudaFloatBuffer d_m4_inout(input);
+    CudaFloatBuffer d_step_inout(input);
+    CudaFloatBuffer d_weight(weight);
+    CudaFloatBuffer d_bias(bias);
+    CudaStreamHandle stream;
+
+    CUDAShortConvolution m4_kernel(cuda_ordinal_);
+    m4_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(m4_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    m4_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(m4_kernel.forward(
+        d_m4_inout.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_m4_inout.ptr,
+        nullptr,
+        verifier_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(Qwen36 M4 in-place short-conv)");
+    std::vector<float> m4_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, stream.stream));
+
+    CUDAShortConvolution step_kernel(cuda_ordinal_);
+    step_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    step_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.forward(
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            d_weight.ptr,
+            d_bias.ptr,
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(Qwen36 stepwise in-place short-conv)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, stream.stream));
+
+    const auto m4_out = d_m4_inout.toHost();
+    const auto step_out = d_step_inout.toHost();
+    expectStrictEquivalent(
+        "CUDA Qwen3.6 short-conv M4 output",
+        m4_out,
+        step_out,
+        0,
+        output_elems,
+        /*max_abs_threshold=*/1e-5f,
+        /*relative_l2_threshold=*/1e-5,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
+    expectStrictEquivalent(
+        "CUDA Qwen3.6 short-conv M4 state",
+        m4_state,
+        step_state,
+        0,
+        m4_state.size(),
+        /*max_abs_threshold=*/1e-5f,
+        /*relative_l2_threshold=*/1e-5,
+        /*min_cosine=*/0.9999999,
+        /*max_symmetric_kl=*/1e-10);
 }
 
 TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvTwoRowVerifierRowZeroRestoreMatchesOneRowReplay)

@@ -48,6 +48,8 @@ def main() -> int:
             "CB=7 (Q5_1)",
             "{4, 12}",
             "{8, 12}",
+            "rel_l2=2.500e-04",
+            "max_abs=1.750e-03",
             "Qwen36_GDN_Q4K_qkv_z",
             "Qwen36_GDN_Q5K_qkv_z",
         ]

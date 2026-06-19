@@ -895,6 +895,25 @@ namespace llaminar2
             return gpu_stream_ != nullptr;
         }
 
+        bool CUDAQuantisedGemmKernel::weights_converted() const
+        {
+            /*
+             * Prepared-weight CUDA kernels can be constructed directly from
+             * model-lifetime WeightVRAMPool native-VNNI descriptors.  The
+             * resident descriptor pointers are the execution contract for
+             * grouped MoE verifier kernels; weights_converted_ remains the
+             * legacy lazy-upload flag for host-weight constructors.
+             */
+            return weights_converted_ ||
+                   (impl_ &&
+                    impl_->d_weights_native_vnni &&
+                    impl_->d_weights_native_scales &&
+                    N_ > 0 &&
+                    K_ > 0 &&
+                    impl_->native_blocks_per_row > 0 &&
+                    nativeVNNIPrefillSupportsCodebook(impl_->native_codebook_id));
+        }
+
         bool CUDAQuantisedGemmKernel::exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)
         {
             out = {};
@@ -1644,6 +1663,22 @@ namespace llaminar2
                 return result;
             }
             return multiply_fused_tensor_impl(input, projections, m, k);
+        }
+
+        bool CUDAQuantisedGemmKernel::multiply_fused_verifier_rows_decode_equivalent(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const IMPIContext *mpi_ctx,
+            DeviceWorkspaceManager *workspace)
+        {
+            if (m <= 1 || m > 4)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier projection requires M=2..4, got M="
+                          << m);
+                return false;
+            }
+            return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
         }
 
         bool CUDAQuantisedGemmKernel::multiply_fused_tensor_impl(
@@ -2574,6 +2609,24 @@ namespace llaminar2
             }
 
             return multiply_with_fused_swiglu(d_gate, d_up, d_C, m, n, k, alpha, beta);
+        }
+
+        bool CUDAQuantisedGemmKernel::multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+            const TensorBase *gate, const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha,
+            float beta,
+            DeviceWorkspaceManager *workspace)
+        {
+            if (m <= 1 || m > 4)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier SwiGLU requires M=2..4, got M="
+                          << m);
+                return false;
+            }
+            return multiply_tensor_with_fused_swiglu(
+                gate, up, output, m, n, k, alpha, beta, workspace);
         }
 
         bool CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv(

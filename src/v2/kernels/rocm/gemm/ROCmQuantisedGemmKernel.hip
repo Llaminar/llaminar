@@ -425,8 +425,13 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
     {
         local_max = fmaxf(local_max, __shfl_down(local_max, offset));
     }
-    // Broadcast max from sub-group lane 0 to all 32 threads
-    local_max = __shfl(local_max, sub_group * QUANT_BLOCK);
+    // Broadcast from the lane-0 thread inside this 32-thread logical block.
+    // HIP shuffles address lanes within the current wavefront, not within the
+    // full 256-thread workgroup. BLOCKS_PER_WG=8 spans four wave64 wavefronts,
+    // so groups 2..7 must wrap their source lane back to 0 or 32 in their own
+    // wave. Using the block-global source lane corrupts scales for later groups.
+    const int source_lane_in_wave = (sub_group & 1) * QUANT_BLOCK;
+    local_max = __shfl(local_max, source_lane_in_wave);
 
     float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
     float inv_scale = 1.0f / scale;
@@ -489,7 +494,10 @@ void quantizeActivationsQ8_blockwise_v2_with_sums_kernel(
     {
         local_max = fmaxf(local_max, __shfl_down(local_max, offset));
     }
-    local_max = __shfl(local_max, sub_group * QUANT_BLOCK);
+    // See quantizeActivationsQ8_blockwise_v2_kernel: source lanes are
+    // wave-local, while sub_group is workgroup-local.
+    const int source_lane_in_wave = (sub_group & 1) * QUANT_BLOCK;
+    local_max = __shfl(local_max, source_lane_in_wave);
 
     float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
     float inv_scale = 1.0f / scale;
@@ -682,6 +690,84 @@ void quantizeActivationsQ8_blockwise_v4_kernel(
     {
         int q = max(-127, min(127, static_cast<int>(rintf(val * inv_scale))));
         dst[tid] = static_cast<int8_t>(q);
+    }
+}
+
+/**
+ * Variant V4 with activation sums.
+ *
+ * This is the decode-equivalent grouped-verifier quantizer.  Serial ROCm
+ * decode (`M=1`) uses `quantizeActivationsQ8_blockwise_v4_kernel`, then the
+ * native-VNNI GEMV recomputes the activation sum from the quantized int8
+ * block when an asymmetric codebook needs it.  Grouped verifier rows need the
+ * same sum, but precomputing it is cheaper than recomputing it for every
+ * projection.  Keeping the max/scale/rounding sequence byte-for-byte aligned
+ * with V4 prevents tiny activation-scale differences from growing through the
+ * recurrent verifier graph.
+ */
+__global__ __launch_bounds__(32, 8)
+void quantizeActivationsQ8_blockwise_v4_with_sums_kernel(
+    const float *__restrict__ d_A_fp32,
+    int8_t *__restrict__ d_A_int8,
+    float *__restrict__ d_scales,
+    int32_t *__restrict__ d_sums,
+    int M, int K, int blocks_per_row)
+{
+    constexpr int QUANT_BLOCK = 32;
+    const int global_block = blockIdx.x;
+    const int row = global_block / blocks_per_row;
+    const int block_idx = global_block % blocks_per_row;
+
+    if (row >= M)
+        return;
+
+    const int tid = threadIdx.x;
+    const int k_start = block_idx * QUANT_BLOCK;
+    const int k_end = min(k_start + QUANT_BLOCK, K);
+    const int block_len = k_end - k_start;
+
+    const float *src = d_A_fp32 + static_cast<size_t>(row) * K + k_start;
+    int8_t *dst = d_A_int8 + static_cast<size_t>(row) * K + k_start;
+
+    float val = 0.0f;
+    float local_max = 0.0f;
+    if (tid < block_len)
+    {
+        val = src[tid];
+        local_max = fabsf(val);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+    }
+    local_max = __shfl(local_max, 0);
+
+    const float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale;
+
+    int q = 0;
+    if (tid < block_len)
+    {
+        q = max(-127, min(127, static_cast<int>(rintf(val * inv_scale))));
+        dst[tid] = static_cast<int8_t>(q);
+    }
+
+    int q_sum = q;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        q_sum += __shfl_down(q_sum, offset);
+    }
+
+    if (tid == 0)
+    {
+        const size_t out_idx =
+            static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) +
+            static_cast<size_t>(block_idx);
+        d_scales[out_idx] = scale;
+        d_sums[out_idx] = q_sum;
     }
 }
 
@@ -1265,17 +1351,13 @@ extern "C"
         }
 
         constexpr int QUANT_BLOCK = 32;
-        constexpr int BLOCKS_PER_WG = 8;
         const int blocks_per_row = (K + QUANT_BLOCK - 1) / QUANT_BLOCK;
         const int total_blocks = M * blocks_per_row;
-        dim3 grid((total_blocks + BLOCKS_PER_WG - 1) / BLOCKS_PER_WG, 1, 1);
-        dim3 block(256, 1, 1);
-
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_v2_with_sums_kernel<BLOCKS_PER_WG>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
+            quantizeActivationsQ8_blockwise_v4_with_sums_kernel,
+            dim3(total_blocks, 1, 1), dim3(32, 1, 1), 0, static_cast<hipStream_t>(stream),
             d_A_fp32, d_A_int8, d_scales_blockwise, d_sums_blockwise,
-            M, K, blocks_per_row, total_blocks);
+            M, K, blocks_per_row);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)

@@ -6,9 +6,12 @@
 #include <gtest/gtest.h>
 
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
+#include "execution/compute_stages/stages/GEMMStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "loaders/ModelContext.h"
+#include "loaders/ModelContextConfig.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
@@ -17,15 +20,34 @@
 #include "../../../utils/TestTensorFactory.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cmath>
+#include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+
+extern "C" bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+    const float *d_A_fp32,
+    int8_t *d_A_int8,
+    float *d_scales_blockwise,
+    int32_t *d_sums_blockwise,
+    int M, int K,
+    int rocm_device_id, void *stream,
+    int block_size);
+
+extern "C" void rocmGemv_native_vnni_set_tuning_overrides(
+    int kb,
+    int target_waves_per_cu);
+
+extern "C" void rocmGemv_native_vnni_reset_tuning_overrides();
 #endif
 
 using namespace llaminar2;
@@ -85,6 +107,33 @@ namespace
         std::string old_value_;
     };
 
+#ifdef HAVE_ROCM
+    /**
+     * @brief Temporarily force the live ROCm native-VNNI dispatch policy.
+     *
+     * The environment parser clamps public KB values to its documented range,
+     * so tests that intentionally exercise an unsafe internal value must use the
+     * launcher override API.  This guard resets the override on destruction so a
+     * failed assertion cannot poison later kernel tests in the same process.
+     */
+    class ScopedNativeVNNITuningOverride
+    {
+    public:
+        ScopedNativeVNNITuningOverride(int kb, int target_waves_per_cu)
+        {
+            rocmGemv_native_vnni_set_tuning_overrides(kb, target_waves_per_cu);
+        }
+
+        ~ScopedNativeVNNITuningOverride()
+        {
+            rocmGemv_native_vnni_reset_tuning_overrides();
+        }
+
+        ScopedNativeVNNITuningOverride(const ScopedNativeVNNITuningOverride &) = delete;
+        ScopedNativeVNNITuningOverride &operator=(const ScopedNativeVNNITuningOverride &) = delete;
+    };
+#endif
+
     bool hasROCmDevice()
     {
 #ifdef HAVE_ROCM
@@ -127,6 +176,118 @@ namespace
         return static_cast<float>(dot / (std::sqrt(na) * std::sqrt(nb)));
     }
 
+    float relativeL2(const float *a, const float *b, size_t n)
+    {
+        double diff2 = 0.0;
+        double ref2 = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double diff = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+            diff2 += diff * diff;
+            ref2 += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+        }
+        return ref2 == 0.0 ? static_cast<float>(std::sqrt(diff2)) :
+                             static_cast<float>(std::sqrt(diff2 / ref2));
+    }
+
+    float maxAbsDiff(const float *a, const float *b, size_t n)
+    {
+        float max_diff = 0.0f;
+        for (size_t i = 0; i < n; ++i)
+            max_diff = std::max(max_diff, std::fabs(a[i] - b[i]));
+        return max_diff;
+    }
+
+    /**
+     * @brief Symmetric KL divergence after a numerically stable softmax.
+     *
+     * Grouped verifier rows are accepted only if they match serial decode as a
+     * distribution, not merely by top-token or raw L2.  GEMV integration tests
+     * use the same softmaxed-row view so kernel drift is caught before it
+     * amplifies through attention, GDN recurrence, and LM-head sampling.
+     */
+    double symmetricSoftmaxKL(const float *a, const float *b, size_t n)
+    {
+        if (n == 0)
+            return 0.0;
+
+        const auto max_a = *std::max_element(a, a + n);
+        const auto max_b = *std::max_element(b, b + n);
+        std::vector<double> pa(n);
+        std::vector<double> pb(n);
+        double sum_a = 0.0;
+        double sum_b = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            pa[i] = std::exp(static_cast<double>(a[i] - max_a));
+            pb[i] = std::exp(static_cast<double>(b[i] - max_b));
+            sum_a += pa[i];
+            sum_b += pb[i];
+        }
+
+        constexpr double eps = 1e-30;
+        double kl_ab = 0.0;
+        double kl_ba = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double p = std::max(pa[i] / sum_a, eps);
+            const double q = std::max(pb[i] / sum_b, eps);
+            kl_ab += p * std::log(p / q);
+            kl_ba += q * std::log(q / p);
+        }
+        return 0.5 * (kl_ab + kl_ba);
+    }
+
+    /**
+     * @brief CPU reference for ROCm Q8 blockwise activation quantization.
+     *
+     * The ROCm small-M NativeVNNI path uses per-32-value activation scales and
+     * quantized activation sums. This reference mirrors the GPU rounding and
+     * clamp rules so integration tests can catch workgroup/wavefront indexing
+     * errors before they become verifier-row numerical drift.
+     */
+    void cpuBlockwiseQuantizeWithSums(
+        const std::vector<float> &input,
+        int M,
+        int K,
+        std::vector<int8_t> &quantized,
+        std::vector<float> &scales,
+        std::vector<int32_t> &sums)
+    {
+        constexpr int block_size = 32;
+        const int blocks_per_row = (K + block_size - 1) / block_size;
+        quantized.assign(static_cast<size_t>(M) * static_cast<size_t>(K), 0);
+        scales.assign(static_cast<size_t>(M) * static_cast<size_t>(blocks_per_row), 1.0f);
+        sums.assign(static_cast<size_t>(M) * static_cast<size_t>(blocks_per_row), 0);
+
+        for (int row = 0; row < M; ++row)
+        {
+            for (int block = 0; block < blocks_per_row; ++block)
+            {
+                const int k_start = block * block_size;
+                const int k_end = std::min(k_start + block_size, K);
+                float max_abs = 0.0f;
+                for (int k = k_start; k < k_end; ++k)
+                    max_abs = std::max(max_abs, std::fabs(input[static_cast<size_t>(row) * K + k]));
+
+                const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+                const float inv_scale = 1.0f / scale;
+                int32_t sum = 0;
+                for (int k = k_start; k < k_end; ++k)
+                {
+                    int q = static_cast<int>(std::rint(input[static_cast<size_t>(row) * K + k] * inv_scale));
+                    q = std::max(-127, std::min(127, q));
+                    quantized[static_cast<size_t>(row) * K + k] = static_cast<int8_t>(q);
+                    sum += q;
+                }
+
+                const size_t out_idx = static_cast<size_t>(row) * blocks_per_row + block;
+                scales[out_idx] = scale;
+                sums[out_idx] = sum;
+            }
+        }
+    }
+
     void expectNearFP32(
         const std::vector<float> &actual,
         const std::vector<float> &expected,
@@ -160,10 +321,12 @@ namespace
         int N,
         int K)
     {
+        const WorkspaceRequirements requirements =
+            kernel.getWorkspaceRequirements(M, N, K);
         auto workspace = std::make_unique<DeviceWorkspaceManager>(
             DeviceId::rocm(0),
-            64 * 1024 * 1024);
-        if (!workspace->allocate(kernel.getWorkspaceRequirements(M, N, K)))
+            requirements.total_bytes_with_alignment() + 64 * 1024 * 1024);
+        if (!workspace->allocate(requirements))
             return nullptr;
         kernel.bindWorkspace(workspace.get());
         return workspace;
@@ -271,6 +434,330 @@ namespace
         EXPECT_GT(cos, min_cosine);
 
         kernel.unbindWorkspace();
+    }
+
+    /**
+     * @brief Prove grouped verifier GEMV is equivalent to serial decode GEMV.
+     *
+     * This intentionally compares ROCm NativeVNNI grouped M=2..4 output against
+     * independent M=1 executions using the same packed weights. It does not use
+     * a dequantized FP32 reference, because Phase 9.8 needs the grouped verifier
+     * path to publish exactly the state/logits serial decode would have produced
+     * for the same quantized model path.
+     */
+    template <typename CreateWeights>
+    void runGroupedSmallMMatchesSerialRows(
+        const char *label,
+        int M,
+        int N,
+        int K,
+        CreateWeights createWeights,
+        float min_cosine,
+        float max_relative_l2)
+    {
+        auto weights = createWeights(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            9898);
+
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+        expectPackedPath(packed, PackedPath::NativeVNNI);
+
+#ifdef HAVE_ROCM
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+#endif
+
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+#ifdef HAVE_ROCM
+        kernel.setGPUStream(stream);
+#endif
+        auto workspace = bindWorkspace(kernel, M, N, K);
+        ASSERT_NE(workspace, nullptr);
+
+        auto grouped_input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -0.35f,
+            0.35f,
+            424242);
+        std::vector<float> grouped_host(
+            grouped_input->data(),
+            grouped_input->data() + static_cast<size_t>(M) * static_cast<size_t>(K));
+
+        auto grouped_output = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        ASSERT_TRUE(grouped_input->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(grouped_output->allocateOnDevice(DeviceId::rocm(0)));
+#ifdef HAVE_ROCM
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+
+        ASSERT_TRUE(kernel.multiply_tensor(grouped_input.get(), grouped_output.get(), M, N, K));
+#ifdef HAVE_ROCM
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+        grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        std::vector<float> grouped_values(
+            grouped_output->data(),
+            grouped_output->data() + static_cast<size_t>(M) * static_cast<size_t>(N));
+
+        std::vector<float> serial_values(static_cast<size_t>(M) * static_cast<size_t>(N));
+        for (int row = 0; row < M; ++row)
+        {
+            auto row_input = TestTensorFactory::createFP32(
+                {1, static_cast<size_t>(K)});
+            std::copy_n(
+                grouped_host.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                K,
+                row_input->mutable_data());
+            auto row_output = TestTensorFactory::createFP32(
+                {1, static_cast<size_t>(N)});
+
+            ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(0)));
+            ASSERT_TRUE(row_output->allocateOnDevice(DeviceId::rocm(0)));
+#ifdef HAVE_ROCM
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+
+            ASSERT_TRUE(kernel.multiply_tensor(row_input.get(), row_output.get(), 1, N, K))
+                << "serial row=" << row;
+#ifdef HAVE_ROCM
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+            row_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            std::copy_n(
+                row_output->data(),
+                N,
+                serial_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N));
+        }
+
+        for (int row = 0; row < M; ++row)
+        {
+            const float *grouped_row = grouped_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N);
+            const float *serial_row = serial_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N);
+            const float cos = cosineSim(grouped_row, serial_row, static_cast<size_t>(N));
+            const float rel_l2 = relativeL2(grouped_row, serial_row, static_cast<size_t>(N));
+            const float max_abs = maxAbsDiff(grouped_row, serial_row, static_cast<size_t>(N));
+            LOG_INFO("[SmallM] " << label << " grouped-vs-serial M=" << M
+                                 << " row=" << row
+                                 << " cosine=" << cos
+                                 << " rel_l2=" << rel_l2
+                                 << " max_abs=" << max_abs);
+            EXPECT_GE(cos, min_cosine) << "row=" << row;
+            EXPECT_LE(rel_l2, max_relative_l2) << "row=" << row;
+            EXPECT_LE(max_abs, 0.5f) << "row=" << row;
+        }
+
+#ifdef HAVE_ROCM
+        kernel.setGPUStream(nullptr);
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+        kernel.unbindWorkspace();
+    }
+
+    std::filesystem::path qwen36DenseModelPath()
+    {
+        if (const char *env = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL"))
+            return std::filesystem::path(env);
+        return std::filesystem::path("/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf");
+    }
+
+    std::filesystem::path qwen36MoEModelPath()
+    {
+        if (const char *env = std::getenv("LLAMINAR_QWEN36_MOE_MODEL"))
+            return std::filesystem::path(env);
+        return std::filesystem::path("/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf");
+    }
+
+    std::shared_ptr<ModelContext> loadQwen36DenseModelForGpuWeights(
+        const std::filesystem::path &model_path)
+    {
+        ModelContextConfig config = ModelContextConfig::defaults();
+        config.strategy = WeightDistributionStrategy::REPLICATED;
+        config.weight_precision = WeightPrecision::NATIVE;
+        config.use_mmap = true;
+        config.target_is_gpu = true;
+        return ModelContext::create(model_path.string(), config);
+    }
+
+    std::optional<std::string> findFirstAvailableTensor(
+        ModelContext &model_ctx,
+        const std::vector<std::string> &candidates)
+    {
+        for (const std::string &name : candidates)
+        {
+            if (model_ctx.hasTensor(name))
+                return name;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<std::string> findFirstTensorWithSuffix(
+        ModelContext &model_ctx,
+        const std::string &suffix)
+    {
+        for (const auto &name : model_ctx.concreteLoader().tensorNames())
+        {
+            if (name.size() >= suffix.size() &&
+                name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+            {
+                return name;
+            }
+        }
+        return std::nullopt;
+    }
+
+    void runGemmStageRows(
+        TensorBase *weight,
+        const GpuPreparedGemm &prepared,
+        const std::vector<float> &input_values,
+        int M,
+        int N,
+        int K,
+        bool force_decode_equivalent,
+        void *stream,
+        bool graph_capture,
+        std::vector<float> &result)
+    {
+        auto input = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(K)});
+        std::copy_n(input_values.data(), static_cast<size_t>(M) * static_cast<size_t>(K),
+                    input->mutable_data());
+        auto output = TestTensorFactory::createFP32Zeros(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream));
+        ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0), stream));
+
+        GEMMStage::Params params;
+        params.device_id = DeviceId::rocm(0);
+        params.A = input.get();
+        params.B = weight;
+        params.C = output.get();
+        params.m = M;
+        params.n = N;
+        params.k = K;
+        params.alpha = 1.0f;
+        params.beta = 0.0f;
+        params.transpose_B = false;
+        params.gemm_context = GemmContext::ATTN;
+        params.force_decode_equivalent_verifier_prefill = force_decode_equivalent;
+        params.prepared_ref = prepared.ref;
+        params.prepared_store = prepared.store.get();
+
+        GEMMStage stage(params);
+        stage.setGPUStream(stream);
+
+        const WorkspaceRequirements requirements = stage.getWorkspaceRequirements(M, N, K);
+        const size_t budget = requirements.total_bytes_with_alignment() + 64 * 1024 * 1024;
+        DeviceWorkspaceManager workspace(DeviceId::rocm(0), budget);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        stage.bindWorkspace(&workspace);
+
+        ROCmDeviceContext ctx(DeviceId::rocm(0), 0);
+        if (graph_capture)
+        {
+#ifdef HAVE_ROCM
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t exec = nullptr;
+            ASSERT_EQ(hipStreamBeginCapture(static_cast<hipStream_t>(stream), hipStreamCaptureModeGlobal),
+                      hipSuccess);
+            ASSERT_TRUE(stage.execute(&ctx));
+            ASSERT_EQ(hipStreamEndCapture(static_cast<hipStream_t>(stream), &graph), hipSuccess);
+            ASSERT_NE(graph, nullptr);
+            ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
+            ASSERT_NE(exec, nullptr);
+            ASSERT_EQ(hipMemsetAsync(
+                          output->gpu_data_ptr(),
+                          0,
+                          static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(float),
+                          static_cast<hipStream_t>(stream)),
+                      hipSuccess);
+            ASSERT_EQ(hipGraphLaunch(exec, static_cast<hipStream_t>(stream)), hipSuccess);
+            ASSERT_EQ(hipGraphExecDestroy(exec), hipSuccess);
+            ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+#else
+            FAIL() << "graph_capture requested without HAVE_ROCM";
+#endif
+        }
+        else
+        {
+            ASSERT_TRUE(stage.execute(&ctx));
+        }
+#ifdef HAVE_ROCM
+        ASSERT_EQ(hipStreamSynchronize(static_cast<hipStream_t>(stream)), hipSuccess);
+#endif
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        result.assign(
+            output->data(),
+            output->data() + static_cast<size_t>(M) * static_cast<size_t>(N));
+
+        stage.unbindWorkspace();
+    }
+
+    void runRealWeightGemmStageGroupedRowsMatchSerial(
+        TensorBase *weight,
+        const GpuPreparedGemm &prepared,
+        int M,
+        int N,
+        int K,
+        float input_scale,
+        bool graph_capture,
+        void *stream)
+    {
+        auto grouped_input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -input_scale,
+            input_scale,
+            919191 + M + static_cast<int>(input_scale * 1000.0f));
+        std::vector<float> grouped_host(
+            grouped_input->data(),
+            grouped_input->data() + static_cast<size_t>(M) * static_cast<size_t>(K));
+
+        std::vector<float> grouped_values;
+        runGemmStageRows(
+            weight, prepared, grouped_host, M, N, K,
+            /*force_decode_equivalent=*/true, stream, graph_capture, grouped_values);
+        ASSERT_EQ(grouped_values.size(), static_cast<size_t>(M) * static_cast<size_t>(N));
+
+        std::vector<float> serial_values(static_cast<size_t>(M) * static_cast<size_t>(N));
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> row_input(static_cast<size_t>(K));
+            std::copy_n(
+                grouped_host.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                K,
+                row_input.data());
+            std::vector<float> row_values;
+            runGemmStageRows(
+                weight, prepared, row_input, 1, N, K,
+                /*force_decode_equivalent=*/false, stream, /*graph_capture=*/false, row_values);
+            ASSERT_EQ(row_values.size(), static_cast<size_t>(N));
+            std::copy_n(
+                row_values.data(),
+                N,
+                serial_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N));
+        }
+
+        for (int row = 0; row < M; ++row)
+        {
+            const float *grouped_row = grouped_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N);
+            const float *serial_row = serial_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N);
+            const float cos = cosineSim(grouped_row, serial_row, static_cast<size_t>(N));
+            const float rel_l2 = relativeL2(grouped_row, serial_row, static_cast<size_t>(N));
+            const float max_abs = maxAbsDiff(grouped_row, serial_row, static_cast<size_t>(N));
+            LOG_INFO("[SmallM] real Qwen3.6 output GEMMStage grouped-vs-serial M=" << M
+                                                                                   << " scale=" << input_scale
+                                                                                   << " graph_capture=" << graph_capture
+                                                                                   << " row=" << row
+                                                                                   << " cosine=" << cos
+                                                                                   << " rel_l2=" << rel_l2
+                                                                                   << " max_abs=" << max_abs);
+            EXPECT_GE(cos, 0.9999999f) << "row=" << row;
+            EXPECT_LE(rel_l2, 1.0e-8f) << "row=" << row;
+            EXPECT_EQ(max_abs, 0.0f) << "row=" << row;
+        }
     }
 
     inline float swigluRef(float gate, float up)
@@ -407,6 +894,197 @@ namespace
     }
 
     template <typename CreateWeights>
+    void runFusedSwiGLUDownSmallMMatchesSerialRows(
+        const char *label,
+        int M,
+        int N,
+        int K,
+        PackedPath expected_path,
+        CreateWeights createWeights,
+        bool graph_capture = true,
+        int graph_replays = 1)
+    {
+        ASSERT_GE(M, 2);
+        ASSERT_LE(M, 4);
+        ASSERT_GE(graph_replays, 1);
+
+        auto weights = createWeights(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            777331);
+
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+        expectPackedPath(packed, expected_path);
+
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        kernel.prepareWeights();
+        ASSERT_TRUE(kernel.weights_converted());
+
+#ifdef HAVE_ROCM
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        kernel.setGPUStream(stream);
+#else
+        void *stream = nullptr;
+#endif
+
+        auto grouped_workspace = bindWorkspace(kernel, M, N, K);
+        ASSERT_NE(grouped_workspace, nullptr);
+
+        auto gate = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -0.5f,
+            0.5f,
+            13579);
+        auto up = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -0.5f,
+            0.5f,
+            24680);
+        auto grouped_output = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        std::vector<float> gate_host(
+            gate->data(),
+            gate->data() + static_cast<size_t>(M) * static_cast<size_t>(K));
+        std::vector<float> up_host(
+            up->data(),
+            up->data() + static_cast<size_t>(M) * static_cast<size_t>(K));
+
+#ifdef HAVE_ROCM
+        ASSERT_TRUE(gate->ensureOnDevice(DeviceId::rocm(0), stream));
+        ASSERT_TRUE(up->ensureOnDevice(DeviceId::rocm(0), stream));
+        ASSERT_TRUE(grouped_output->allocateOnDevice(DeviceId::rocm(0), stream));
+
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t exec = nullptr;
+        if (graph_capture)
+        {
+            ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
+                gate.get(),
+                up.get(),
+                grouped_output.get(),
+                M,
+                N,
+                K));
+            ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+            ASSERT_NE(graph, nullptr);
+            ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
+            ASSERT_NE(exec, nullptr);
+
+            for (int replay = 0; replay < graph_replays; ++replay)
+            {
+                ASSERT_EQ(hipMemsetAsync(grouped_output->gpu_data_ptr(),
+                                         0,
+                                         static_cast<size_t>(M) * N * sizeof(float),
+                                         stream),
+                          hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess)
+                    << "replay=" << replay;
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess)
+                    << "replay=" << replay;
+            }
+        }
+        else
+        {
+            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
+                gate.get(),
+                up.get(),
+                grouped_output.get(),
+                M,
+                N,
+                K));
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        }
+#else
+        FAIL() << "ROCm serial-row oracle requested without HAVE_ROCM";
+#endif
+
+        grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        std::vector<float> grouped_values(
+            grouped_output->data(),
+            grouped_output->data() + static_cast<size_t>(M) * static_cast<size_t>(N));
+
+        kernel.unbindWorkspace();
+        grouped_workspace.reset();
+
+        std::vector<float> serial_values(static_cast<size_t>(M) * static_cast<size_t>(N));
+        for (int row = 0; row < M; ++row)
+        {
+            auto row_gate = TestTensorFactory::createFP32(
+                {1, static_cast<size_t>(K)});
+            auto row_up = TestTensorFactory::createFP32(
+                {1, static_cast<size_t>(K)});
+            std::copy_n(
+                gate_host.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                K,
+                row_gate->mutable_data());
+            std::copy_n(
+                up_host.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                K,
+                row_up->mutable_data());
+            auto row_output = TestTensorFactory::createFP32(
+                {1, static_cast<size_t>(N)});
+
+#ifdef HAVE_ROCM
+            ASSERT_TRUE(row_gate->ensureOnDevice(DeviceId::rocm(0), stream));
+            ASSERT_TRUE(row_up->ensureOnDevice(DeviceId::rocm(0), stream));
+            ASSERT_TRUE(row_output->allocateOnDevice(DeviceId::rocm(0), stream));
+#endif
+
+            auto row_workspace = bindWorkspace(kernel, 1, N, K);
+            ASSERT_NE(row_workspace, nullptr);
+            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
+                row_gate.get(),
+                row_up.get(),
+                row_output.get(),
+                1,
+                N,
+                K));
+#ifdef HAVE_ROCM
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+            row_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            std::copy_n(
+                row_output->data(),
+                N,
+                serial_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N));
+            kernel.unbindWorkspace();
+        }
+
+        for (int row = 0; row < M; ++row)
+        {
+            const float *grouped_row = grouped_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N);
+            const float *serial_row = serial_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N);
+            const float cos = cosineSim(grouped_row, serial_row, static_cast<size_t>(N));
+            const float rel_l2 = relativeL2(grouped_row, serial_row, static_cast<size_t>(N));
+            const float max_abs = maxAbsDiff(grouped_row, serial_row, static_cast<size_t>(N));
+            const double skl = symmetricSoftmaxKL(grouped_row, serial_row, static_cast<size_t>(N));
+            LOG_INFO("[SmallM] " << label << " fused SwiGLU/down grouped-vs-serial M=" << M
+                                 << " graph_capture=" << graph_capture
+                                 << " row=" << row
+                                 << " cosine=" << cos
+                                 << " rel_l2=" << rel_l2
+                                 << " symmetric_kl=" << skl
+                                 << " max_abs=" << max_abs);
+            EXPECT_GE(cos, 0.9999999f) << "row=" << row;
+            EXPECT_LE(rel_l2, 1.0e-8f) << "row=" << row;
+            EXPECT_LE(skl, 1.0e-10) << "row=" << row;
+            EXPECT_LE(max_abs, 1.0e-6f) << "row=" << row;
+        }
+
+#ifdef HAVE_ROCM
+        if (exec)
+            EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
+        if (graph)
+            EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        kernel.setGPUStream(nullptr);
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+    }
+
+    template <typename CreateWeights>
     void runFusedQKVSmallMMatchesSeparate(
         const char *label,
         int M,
@@ -488,7 +1166,8 @@ namespace
         projections.emplace_back(&k_kernel, fused_k.get(), Nk, bias_k.get(), "k_small_m");
         projections.emplace_back(&v_kernel, fused_v.get(), Nv, bias_v.get(), "v_small_m");
 
-        ASSERT_TRUE(q_kernel.multiply_fused_tensor(input.get(), projections, M, K));
+        ASSERT_TRUE(q_kernel.multiply_fused_verifier_rows_decode_equivalent(
+            input.get(), projections, M, K, nullptr, q_workspace.get()));
 #ifdef HAVE_ROCM
         ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 #endif
@@ -509,6 +1188,185 @@ namespace
         q_kernel.unbindWorkspace();
         k_kernel.unbindWorkspace();
         v_kernel.unbindWorkspace();
+    }
+
+    template <typename CreateWeights>
+    void runFusedQKVSmallMMatchesSerialM1DecodeRows(
+        const char *label,
+        int M,
+        int K,
+        PackedPath expected_path,
+        CreateWeights createWeights,
+        int Nq = 896,
+        int Nk = 128,
+        int Nv = 128)
+    {
+        ASSERT_GE(M, 2);
+        ASSERT_LE(M, 4);
+
+        auto wq = createWeights({static_cast<size_t>(Nq), static_cast<size_t>(K)}, 4101);
+        auto wk = createWeights({static_cast<size_t>(Nk), static_cast<size_t>(K)}, 4102);
+        auto wv = createWeights({static_cast<size_t>(Nv), static_cast<size_t>(K)}, 4103);
+
+        ROCmPackedWeights packed_q;
+        ROCmPackedWeights packed_k;
+        ROCmPackedWeights packed_v;
+        ASSERT_TRUE(packWeightsToROCm(wq.get(), packed_q));
+        ASSERT_TRUE(packWeightsToROCm(wk.get(), packed_k));
+        ASSERT_TRUE(packWeightsToROCm(wv.get(), packed_v));
+        expectPackedPath(packed_q, expected_path);
+        expectPackedPath(packed_k, expected_path);
+        expectPackedPath(packed_v, expected_path);
+
+        ROCmQuantisedGemmKernel q_kernel(&packed_q, 0);
+        ROCmQuantisedGemmKernel k_kernel(&packed_k, 0);
+        ROCmQuantisedGemmKernel v_kernel(&packed_v, 0);
+
+#ifdef HAVE_ROCM
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        ASSERT_NE(stream, nullptr);
+        q_kernel.setGPUStream(stream);
+        k_kernel.setGPUStream(stream);
+        v_kernel.setGPUStream(stream);
+#endif
+
+        auto q_workspace = bindWorkspace(q_kernel, M, Nq, K);
+        auto k_workspace = bindWorkspace(k_kernel, M, Nk, K);
+        auto v_workspace = bindWorkspace(v_kernel, M, Nv, K);
+        ASSERT_NE(q_workspace, nullptr);
+        ASSERT_NE(k_workspace, nullptr);
+        ASSERT_NE(v_workspace, nullptr);
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -0.75f,
+            0.75f,
+            9090u + static_cast<uint32_t>(M));
+        auto fused_q = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(Nq)});
+        auto fused_k = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(Nk)});
+        auto fused_v = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(Nv)});
+        auto bias_q = TestTensorFactory::createFP32({static_cast<size_t>(Nq)});
+        auto bias_k = TestTensorFactory::createFP32({static_cast<size_t>(Nk)});
+        auto bias_v = TestTensorFactory::createFP32({static_cast<size_t>(Nv)});
+
+        for (int col = 0; col < Nq; ++col)
+            bias_q->mutable_data()[col] = 0.015625f * static_cast<float>((col % 11) - 5);
+        for (int col = 0; col < Nk; ++col)
+        {
+            bias_k->mutable_data()[col] = 0.015625f * static_cast<float>((col % 7) - 3);
+            bias_v->mutable_data()[col] = 0.015625f * static_cast<float>((col % 5) - 2);
+        }
+
+#ifdef HAVE_ROCM
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream));
+        ASSERT_TRUE(fused_q->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(fused_k->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(fused_v->allocateOnDevice(DeviceId::rocm(0)));
+#else
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(fused_q->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(fused_k->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(fused_v->allocateOnDevice(DeviceId::rocm(0)));
+#endif
+
+        std::vector<ITensorGemm::TensorProjectionDesc> projections;
+        projections.emplace_back(&q_kernel, fused_q.get(), Nq, bias_q.get(), "q_serial_m1_oracle");
+        projections.emplace_back(&k_kernel, fused_k.get(), Nk, bias_k.get(), "k_serial_m1_oracle");
+        projections.emplace_back(&v_kernel, fused_v.get(), Nv, bias_v.get(), "v_serial_m1_oracle");
+
+        ASSERT_TRUE(q_kernel.multiply_fused_verifier_rows_decode_equivalent(
+            input.get(), projections, M, K, nullptr, q_workspace.get()));
+#ifdef HAVE_ROCM
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+        fused_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        fused_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        fused_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        const struct ProjectionCase
+        {
+            ROCmQuantisedGemmKernel *kernel;
+            FP32Tensor *fused;
+            TensorBase *bias;
+            int n;
+            const char *name;
+        } projection_cases[] = {
+            {&q_kernel, fused_q.get(), bias_q.get(), Nq, "q"},
+            {&k_kernel, fused_k.get(), bias_k.get(), Nk, "k"},
+            {&v_kernel, fused_v.get(), bias_v.get(), Nv, "v"},
+        };
+
+        for (int row = 0; row < M; ++row)
+        {
+            auto row_input = TestTensorFactory::createFP32({1u, static_cast<size_t>(K)});
+            std::copy(input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                      input->data() + static_cast<size_t>(row + 1) * static_cast<size_t>(K),
+                      row_input->mutable_data());
+#ifdef HAVE_ROCM
+            ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(0), stream));
+#else
+            ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(0)));
+#endif
+
+            for (const ProjectionCase &projection : projection_cases)
+            {
+                auto serial = TestTensorFactory::createFP32({1u, static_cast<size_t>(projection.n)});
+                ASSERT_TRUE(serial->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(projection.kernel->multiply_tensor(
+                    row_input.get(),
+                    serial.get(),
+                    1,
+                    projection.n,
+                    K,
+                    true,
+                    1.0f,
+                    0.0f,
+                    projection.bias))
+                    << label << " serial M=1 projection=" << projection.name
+                    << " row=" << row;
+#ifdef HAVE_ROCM
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+                serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+                const float *grouped_row =
+                    projection.fused->data() + static_cast<size_t>(row) * static_cast<size_t>(projection.n);
+                const float *serial_row = serial->data();
+                const size_t count = static_cast<size_t>(projection.n);
+                const float cos = cosineSim(grouped_row, serial_row, count);
+                const float rel_l2 = relativeL2(grouped_row, serial_row, count);
+                const float max_abs = maxAbsDiff(grouped_row, serial_row, count);
+                const double skl = symmetricSoftmaxKL(grouped_row, serial_row, count);
+
+                LOG_INFO("[SmallM] " << label
+                                     << " projection=" << projection.name
+                                     << " M=" << M
+                                     << " row=" << row
+                                     << " cosine=" << cos
+                                     << " rel_l2=" << rel_l2
+                                     << " symmetric_kl=" << skl
+                                     << " max_abs=" << max_abs);
+                EXPECT_GE(cos, 0.9999999f)
+                    << label << " projection=" << projection.name << " row=" << row;
+                EXPECT_LE(rel_l2, 1.0e-8f)
+                    << label << " projection=" << projection.name << " row=" << row;
+                EXPECT_LE(skl, 1.0e-10)
+                    << label << " projection=" << projection.name << " row=" << row;
+                EXPECT_LE(max_abs, 1.0e-6f)
+                    << label << " projection=" << projection.name << " row=" << row;
+            }
+        }
+
+        q_kernel.unbindWorkspace();
+        k_kernel.unbindWorkspace();
+        v_kernel.unbindWorkspace();
+#ifdef HAVE_ROCM
+        q_kernel.setGPUStream(nullptr);
+        k_kernel.setGPUStream(nullptr);
+        v_kernel.setGPUStream(nullptr);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
     }
 
     template <typename CreateWeights>
@@ -984,6 +1842,159 @@ namespace
             kernel->unbindWorkspace();
     }
 
+    void runMixedProjectionGroupSmallMMatchesSerialM1DecodeRows(
+        const char *label,
+        int M,
+        int K,
+        const std::vector<WeightCreator> &createWeights,
+        const std::vector<int> &Ns,
+        const std::vector<const char *> &projection_names)
+    {
+        ASSERT_GE(M, 2);
+        ASSERT_LE(M, 4);
+        ASSERT_FALSE(Ns.empty());
+        ASSERT_EQ(createWeights.size(), Ns.size());
+        ASSERT_EQ(projection_names.size(), Ns.size());
+
+#ifdef HAVE_ROCM
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        ASSERT_NE(stream, nullptr);
+#endif
+
+        std::vector<std::unique_ptr<TensorBase>> weights;
+        std::vector<ROCmPackedWeights> packed(Ns.size());
+        std::vector<std::unique_ptr<ROCmQuantisedGemmKernel>> kernels;
+        weights.reserve(Ns.size());
+        kernels.reserve(Ns.size());
+
+        WorkspaceRequirements combined;
+        for (size_t i = 0; i < Ns.size(); ++i)
+        {
+            weights.push_back(createWeights[i]({static_cast<size_t>(Ns[i]), static_cast<size_t>(K)},
+                                               static_cast<uint32_t>(8100 + i)));
+            ASSERT_TRUE(packWeightsToROCm(weights.back().get(), packed[i]));
+            expectPackedPath(packed[i], PackedPath::NativeVNNI);
+            kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
+#ifdef HAVE_ROCM
+            kernels.back()->setGPUStream(stream);
+#endif
+            combined.merge(kernels.back()->getWorkspaceRequirements(M, Ns[i], K));
+        }
+
+        auto shared_workspace = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(0),
+            combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
+        ASSERT_TRUE(shared_workspace->allocate(combined));
+        for (auto &kernel : kernels)
+            kernel->bindWorkspace(shared_workspace.get());
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -0.35f,
+            0.35f,
+            9190u + static_cast<uint32_t>(M));
+#ifdef HAVE_ROCM
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream));
+#else
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+#endif
+
+        std::vector<std::unique_ptr<FP32Tensor>> fused;
+        fused.reserve(Ns.size());
+        std::vector<ITensorGemm::TensorProjectionDesc> projections;
+        projections.reserve(Ns.size());
+        for (size_t i = 0; i < Ns.size(); ++i)
+        {
+            fused.push_back(TestTensorFactory::createFP32(
+                {static_cast<size_t>(M), static_cast<size_t>(Ns[i])}));
+            ASSERT_TRUE(fused.back()->allocateOnDevice(DeviceId::rocm(0)));
+            projections.emplace_back(kernels[i].get(),
+                                     fused.back().get(),
+                                     Ns[i],
+                                     nullptr,
+                                     projection_names[i]);
+        }
+
+        ASSERT_TRUE(kernels.front()->multiply_fused_verifier_rows_decode_equivalent(
+            input.get(), projections, M, K, nullptr, shared_workspace.get()));
+#ifdef HAVE_ROCM
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+        for (auto &output : fused)
+            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        for (int row = 0; row < M; ++row)
+        {
+            auto row_input = TestTensorFactory::createFP32({1u, static_cast<size_t>(K)});
+            std::copy(input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                      input->data() + static_cast<size_t>(row + 1) * static_cast<size_t>(K),
+                      row_input->mutable_data());
+#ifdef HAVE_ROCM
+            ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(0), stream));
+#else
+            ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(0)));
+#endif
+
+            for (size_t projection = 0; projection < Ns.size(); ++projection)
+            {
+                auto serial = TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(Ns[projection])});
+                ASSERT_TRUE(serial->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(kernels[projection]->multiply_tensor(
+                    row_input.get(),
+                    serial.get(),
+                    1,
+                    Ns[projection],
+                    K))
+                    << label << " projection=" << projection_names[projection]
+                    << " serial row=" << row;
+#ifdef HAVE_ROCM
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+                serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+                const float *grouped_row =
+                    fused[projection]->data() + static_cast<size_t>(row) * static_cast<size_t>(Ns[projection]);
+                const float *serial_row = serial->data();
+                const size_t count = static_cast<size_t>(Ns[projection]);
+                const float cos = cosineSim(grouped_row, serial_row, count);
+                const float rel_l2 = relativeL2(grouped_row, serial_row, count);
+                const float max_abs = maxAbsDiff(grouped_row, serial_row, count);
+                const double skl = symmetricSoftmaxKL(grouped_row, serial_row, count);
+
+                LOG_INFO("[SmallM] " << label
+                                     << " projection=" << projection_names[projection]
+                                     << " M=" << M
+                                     << " row=" << row
+                                     << " cosine=" << cos
+                                     << " rel_l2=" << rel_l2
+                                     << " symmetric_kl=" << skl
+                                     << " max_abs=" << max_abs);
+                EXPECT_GE(cos, 0.9999999f)
+                    << label << " projection=" << projection_names[projection]
+                    << " row=" << row;
+                EXPECT_LE(rel_l2, 1.0e-8f)
+                    << label << " projection=" << projection_names[projection]
+                    << " row=" << row;
+                EXPECT_LE(skl, 1.0e-10)
+                    << label << " projection=" << projection_names[projection]
+                    << " row=" << row;
+                EXPECT_LE(max_abs, 1.0e-6f)
+                    << label << " projection=" << projection_names[projection]
+                    << " row=" << row;
+            }
+        }
+
+#ifdef HAVE_ROCM
+        for (auto &kernel : kernels)
+            kernel->setGPUStream(nullptr);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+        for (auto &kernel : kernels)
+            kernel->unbindWorkspace();
+    }
+
 #ifdef HAVE_ROCM
     template <typename CreateWeights>
     void runGraphCapturedDispatchSmallMMatchesReference(
@@ -1090,6 +2101,240 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2MatchesReference)
         0.985f);
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KGroupedVerifierRowsMatchSerialDecode)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    /*
+     * Qwen3.6 attention output projection shape. This catches grouped verifier
+     * drift that loose FP32-reference checks can miss: grouped M=2..4 must agree
+     * with the same packed ROCm native-VNNI path replayed one row at a time.
+     */
+    constexpr int N = 5120;
+    constexpr int K = 5120;
+    for (int M : {2, 3, 4})
+    {
+        runGroupedSmallMMatchesSerialRows(
+            "Q4_K native-VNNI Qwen3.6 attention Wo",
+            M,
+            N,
+            K,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+            0.99995f,
+            0.01f);
+    }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ5KGroupedVerifierRowsMatchSerialDecode)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    /*
+     * Qwen3.6 GDN output projection shape. Dense verifier replay promotes this
+     * family through the same Wo helper as full-attention Q4_K, so it needs its
+     * own grouped-vs-serial proof instead of riding on the Q4_K regression.
+     */
+    constexpr int N = 5120;
+    constexpr int K = 6144;
+    for (int M : {2, 3, 4})
+    {
+        runGroupedSmallMMatchesSerialRows(
+            "Q5_K native-VNNI Qwen3.6 GDN output",
+            M,
+            N,
+            K,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createQ5_KRandom(shape, seed); },
+            0.99995f,
+            0.01f);
+    }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ6KGroupedVerifierRowsMatchSerialDecode)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    /*
+     * Qwen3.6's LM head is Q6_K with K=d_model.  The production vocab dimension
+     * is intentionally huge, so this regression keeps N bounded while still
+     * exercising the Q6_K grouped small-M NativeVNNI route with the real K.
+     */
+    constexpr int N = 16384;
+    constexpr int K = 5120;
+    for (int M : {2, 3, 4})
+    {
+        runGroupedSmallMMatchesSerialRows(
+            "Q6_K native-VNNI Qwen3.6 LM-head-like",
+            M,
+            N,
+            K,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createQ6_KRandom(shape, seed); },
+            0.99995f,
+            0.01f);
+    }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, RealQwen36OutputGEMMStageGroupedVerifierRowsMatchSerialDecode)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const std::filesystem::path model_path = qwen36DenseModelPath();
+    if (!std::filesystem::exists(model_path))
+        GTEST_SKIP() << "Qwen 3.6 dense model not found at " << model_path
+                     << "; set LLAMINAR_QWEN36_DENSE_MODEL to run this real-weight regression";
+
+    auto model_ctx = loadQwen36DenseModelForGpuWeights(model_path);
+    ASSERT_NE(model_ctx, nullptr);
+
+    std::optional<std::string> weight_name =
+        findFirstTensorWithSuffix(*model_ctx, ".attn_output.weight");
+    if (!weight_name)
+        weight_name = findFirstTensorWithSuffix(*model_ctx, ".self_attn.o_proj.weight");
+    if (!weight_name)
+    {
+        weight_name = findFirstAvailableTensor(
+            *model_ctx,
+            {"blk.0.ssm_out.weight",
+             "blk.1.ssm_out.weight"});
+    }
+    if (!weight_name)
+    {
+        std::ostringstream names;
+        for (const auto &name : model_ctx->concreteLoader().tensorNames())
+        {
+            if (name.rfind("blk.0.", 0) == 0)
+                names << name << "\n";
+        }
+        FAIL() << "Could not find a Qwen 3.6 output projection tensor. "
+               << "Layer-0 tensors:\n"
+               << names.str();
+    }
+
+    auto wo_weight = model_ctx->getWeightForDevice(*weight_name, DeviceId::cpu());
+    ASSERT_NE(wo_weight, nullptr);
+
+    const int N = static_cast<int>(wo_weight->rows());
+    const int K = static_cast<int>(wo_weight->cols());
+    ASSERT_GT(N, 0);
+    ASSERT_GT(K, 0);
+
+    auto prepared = makeGpuPreparedGemm(
+        wo_weight.get(),
+        DeviceId::rocm(0),
+        *weight_name,
+        ModelContextId{3636});
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+    for (float input_scale : {0.35f, 1.0f, 3.0f, 8.0f})
+    {
+        runRealWeightGemmStageGroupedRowsMatchSerial(
+            wo_weight.get(), prepared, 2, N, K, input_scale, /*graph_capture=*/false, stream);
+        runRealWeightGemmStageGroupedRowsMatchSerial(
+            wo_weight.get(), prepared, 3, N, K, input_scale, /*graph_capture=*/false, stream);
+        runRealWeightGemmStageGroupedRowsMatchSerial(
+            wo_weight.get(), prepared, 4, N, K, input_scale, /*graph_capture=*/false, stream);
+    }
+    for (float input_scale : {1.0f, 8.0f})
+    {
+        runRealWeightGemmStageGroupedRowsMatchSerial(
+            wo_weight.get(), prepared, 2, N, K, input_scale, /*graph_capture=*/true, stream);
+        runRealWeightGemmStageGroupedRowsMatchSerial(
+            wo_weight.get(), prepared, 3, N, K, input_scale, /*graph_capture=*/true, stream);
+        runRealWeightGemmStageGroupedRowsMatchSerial(
+            wo_weight.get(), prepared, 4, N, K, input_scale, /*graph_capture=*/true, stream);
+    }
+
+    prepared.kernel->setGPUStream(nullptr);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, RealQwen36MoELMHeadGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const std::filesystem::path model_path = qwen36MoEModelPath();
+    if (!std::filesystem::exists(model_path))
+        GTEST_SKIP() << "Qwen 3.6 MoE model not found at " << model_path
+                     << "; set LLAMINAR_QWEN36_MOE_MODEL to run this real-weight regression";
+
+    auto model_ctx = loadQwen36DenseModelForGpuWeights(model_path);
+    ASSERT_NE(model_ctx, nullptr);
+    ASSERT_TRUE(model_ctx->hasTensor("output.weight"))
+        << "Qwen 3.6 MoE test fixture must expose a concrete LM head";
+
+    auto lm_head = model_ctx->getWeightForDevice("output.weight", DeviceId::cpu());
+    ASSERT_NE(lm_head, nullptr);
+    ASSERT_EQ(lm_head->native_type(), TensorType::Q6_K)
+        << "This regression guards the Qwen 3.6 MoE Q6_K LM-head path";
+
+    const int N = static_cast<int>(lm_head->rows());
+    const int K = static_cast<int>(lm_head->cols());
+    ASSERT_EQ(N, 248320);
+    ASSERT_EQ(K, 2048);
+
+    auto prepared = makeGpuPreparedGemm(
+        lm_head.get(),
+        DeviceId::rocm(0),
+        "output.weight",
+        ModelContextId{36361});
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    ASSERT_NE(stream, nullptr);
+
+    /*
+     * This is the exact LM-head geometry used by Qwen3.6 MoE all-position
+     * verifier rows.  The model-level parity test can only tell us that logits
+     * drifted; this stage-level gate tells us whether the grouped M=2..4
+     * projection itself stayed decode-equivalent to serial M=1 GEMV.
+     */
+    for (const int M : {2, 3, 4})
+    {
+        runRealWeightGemmStageGroupedRowsMatchSerial(
+            lm_head.get(),
+            prepared,
+            M,
+            N,
+            K,
+            /*input_scale=*/0.35f,
+            /*graph_capture=*/false,
+            stream);
+    }
+    runRealWeightGemmStageGroupedRowsMatchSerial(
+        lm_head.get(),
+        prepared,
+        2,
+        N,
+        K,
+        /*input_scale=*/0.35f,
+        /*graph_capture=*/true,
+        stream);
+
+    prepared.kernel->setGPUStream(nullptr);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ80SmallMMatchesReference)
 {
     if (!hasROCmDevice())
@@ -1163,6 +2408,122 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchPlainAsymmetricNativeSmallMUsesFresh
             { return TestTensorFactory::createQ5_1Random(shape, seed); },
             0.985f);
     }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, BlockwiseQuantizeWithSumsUsesWaveLocalShuffleLanes)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support is not compiled in";
+#else
+    constexpr int M = 4;
+    constexpr int K = 64;
+    constexpr int block_size = 32;
+    constexpr int blocks_per_row = K / block_size;
+    const size_t value_count = static_cast<size_t>(M) * static_cast<size_t>(K);
+    const size_t block_count = static_cast<size_t>(M) * static_cast<size_t>(blocks_per_row);
+
+    /*
+     * This fixture fills all eight logical 32-thread groups in one v2
+     * quantizer workgroup. The last six groups live in later wave64 wavefronts,
+     * which used to expose the block-global shuffle-source bug.
+     */
+    std::vector<float> input(value_count);
+    for (int row = 0; row < M; ++row)
+    {
+        for (int block = 0; block < blocks_per_row; ++block)
+        {
+            const float block_scale = 0.125f + 0.0375f * static_cast<float>(row * blocks_per_row + block);
+            for (int lane = 0; lane < block_size; ++lane)
+            {
+                const int k = block * block_size + lane;
+                const float sign = ((lane + row + block) % 2 == 0) ? 1.0f : -1.0f;
+                input[static_cast<size_t>(row) * K + k] =
+                    sign * block_scale * static_cast<float>((lane % 17) + 1);
+            }
+        }
+    }
+
+    std::vector<int8_t> expected_q;
+    std::vector<float> expected_scales;
+    std::vector<int32_t> expected_sums;
+    cpuBlockwiseQuantizeWithSums(input, M, K, expected_q, expected_scales, expected_sums);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+    float *d_input = nullptr;
+    int8_t *d_quantized = nullptr;
+    float *d_scales = nullptr;
+    int32_t *d_sums = nullptr;
+    ASSERT_EQ(hipMalloc(&d_input, value_count * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_quantized, value_count * sizeof(int8_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_scales, block_count * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_sums, block_count * sizeof(int32_t)), hipSuccess);
+
+    ASSERT_EQ(hipMemcpyAsync(
+                  d_input,
+                  input.data(),
+                  value_count * sizeof(float),
+                  hipMemcpyHostToDevice,
+                  stream),
+              hipSuccess);
+
+    ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+        d_input,
+        d_quantized,
+        d_scales,
+        d_sums,
+        M,
+        K,
+        0,
+        stream,
+        block_size));
+
+    std::vector<int8_t> actual_q(value_count);
+    std::vector<float> actual_scales(block_count);
+    std::vector<int32_t> actual_sums(block_count);
+    ASSERT_EQ(hipMemcpyAsync(
+                  actual_q.data(),
+                  d_quantized,
+                  value_count * sizeof(int8_t),
+                  hipMemcpyDeviceToHost,
+                  stream),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  actual_scales.data(),
+                  d_scales,
+                  block_count * sizeof(float),
+                  hipMemcpyDeviceToHost,
+                  stream),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(
+                  actual_sums.data(),
+                  d_sums,
+                  block_count * sizeof(int32_t),
+                  hipMemcpyDeviceToHost,
+                  stream),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    for (size_t i = 0; i < value_count; ++i)
+        ASSERT_EQ(actual_q[i], expected_q[i]) << "quantized byte mismatch at element " << i;
+    for (size_t i = 0; i < block_count; ++i)
+    {
+        ASSERT_NEAR(actual_scales[i], expected_scales[i], 1.0e-7f)
+            << "scale mismatch at block " << i;
+        ASSERT_EQ(actual_sums[i], expected_sums[i])
+            << "sum mismatch at block " << i;
+    }
+
+    ASSERT_EQ(hipFree(d_sums), hipSuccess);
+    ASSERT_EQ(hipFree(d_scales), hipSuccess);
+    ASSERT_EQ(hipFree(d_quantized), hipSuccess);
+    ASSERT_EQ(hipFree(d_input), hipSuccess);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2RecordsNativeRouteCounter)
@@ -1459,6 +2820,56 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     PerfStatsCollector::reset();
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDownM2MatchesSerialM1RowsStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    constexpr int M = 2;
+    constexpr int N = 5120;
+    constexpr int K = 17408;
+    runFusedSwiGLUDownSmallMMatchesSerialRows(
+        "Q4_K native-VNNI Qwen3.6 FFN down verifier shape",
+        M,
+        N,
+        K,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        true,
+        4);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    auto route_record = std::find_if(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.count("source") != 0 &&
+                   record.tags.at("source") == "fused_swiglu" &&
+                   record.tags.count("m") != 0 &&
+                   record.tags.at("m") == "2" &&
+                   record.tags.count("n") != 0 &&
+                   record.tags.at("n") == "5120" &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == "17408";
+        });
+
+    ASSERT_NE(route_record, records.end())
+        << "Qwen3.6 MTP verifier FFN down must use graph-native ROCm fused SwiGLU/down small-M route";
+    EXPECT_GE(route_record->value, 1.0);
+    EXPECT_EQ(route_record->device, "rocm:0");
+    EXPECT_EQ(route_record->tags.at("codebook"), "5");
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDownM4MatchesReference)
 {
     if (!hasROCmDevice())
@@ -1604,6 +3015,24 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2MatchesSeparate)
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.9999f);
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVSmallMMatchesSerialM1DecodeRowsStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    constexpr int K = 1024;
+    for (int M : {2, 3, 4})
+    {
+        runFusedQKVSmallMMatchesSerialM1DecodeRows(
+            "Q4_K native-VNNI fused QKV strict serial decode",
+            M,
+            K,
+            PackedPath::NativeVNNI,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createQ4_KRandom(shape, seed); });
+    }
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMMatchesSeparate)
@@ -2247,6 +3676,208 @@ TEST(Test__ROCmQuantisedGemmSmallM, Qwen36GDNProjectionStageMixedQuantizedAndRaw
 #endif
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, Qwen36MoEGDNProjectionStageQ6KVerifierRowsMatchSerialDecodeStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    /*
+     * Qwen3.6 MoE GDN layers use a smaller hidden width than the dense model
+     * and Q6_K for both the fused QKV projection and the Z projection:
+     *
+     *   attn_qkv: 8192 x 2048
+     *   attn_gate: 4096 x 2048
+     *   ssm_alpha/beta: 32 x 2048, raw FP32
+     *
+     * The all-position MTP verifier publishes state from M=2..4 rows, so the
+     * grouped stage must match the row-by-row decode contract numerically before
+     * it is allowed into the model graph.
+     */
+    constexpr int K = 2048;
+    constexpr int N_QKV = 8192;
+    constexpr int N_Z = 4096;
+    constexpr int N_ALPHA = 32;
+    constexpr int N_BETA = 32;
+
+    auto w_qkv = TestTensorFactory::createQ6_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)}, 23802);
+    auto w_z = TestTensorFactory::createQ6_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)}, 23803);
+    auto w_a = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_ALPHA), static_cast<size_t>(K)},
+        -0.1f,
+        0.1f,
+        23804);
+    auto w_b = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_BETA), static_cast<size_t>(K)},
+        -0.1f,
+        0.1f,
+        23805);
+
+    auto qkv_prepared = makeGpuPreparedGemm(
+        w_qkv.get(), DeviceId::rocm(0), "blk.5.attn_qkv.weight", ModelContextId{2388});
+    auto z_prepared = makeGpuPreparedGemm(
+        w_z.get(), DeviceId::rocm(0), "blk.5.attn_gate.weight", ModelContextId{2388});
+    auto a_prepared = makeGpuPreparedFloatingPointGemm(
+        w_a.get(), DeviceId::rocm(0), "blk.5.ssm_alpha.weight", ModelContextId{2388});
+    auto b_prepared = makeGpuPreparedFloatingPointGemm(
+        w_b.get(), DeviceId::rocm(0), "blk.5.ssm_beta.weight", ModelContextId{2388});
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    ASSERT_NE(stream, nullptr);
+    qkv_prepared.kernel->setGPUStream(stream);
+    z_prepared.kernel->setGPUStream(stream);
+    a_prepared.kernel->setGPUStream(stream);
+    b_prepared.kernel->setGPUStream(stream);
+
+    for (const int M : {2, 3, 4})
+    {
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -0.35f,
+            0.35f,
+            23900u + static_cast<uint32_t>(M));
+        auto out_qkv = TestTensorFactory::createFP32Zeros(
+            {static_cast<size_t>(M), static_cast<size_t>(N_QKV)});
+        auto out_z = TestTensorFactory::createFP32Zeros(
+            {static_cast<size_t>(M), static_cast<size_t>(N_Z)});
+        auto out_a = TestTensorFactory::createFP32Zeros(
+            {static_cast<size_t>(M), static_cast<size_t>(N_ALPHA)});
+        auto out_b = TestTensorFactory::createFP32Zeros(
+            {static_cast<size_t>(M), static_cast<size_t>(N_BETA)});
+
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream));
+        ASSERT_TRUE(out_qkv->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(out_z->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(out_a->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(out_b->allocateOnDevice(DeviceId::rocm(0)));
+
+        GDNProjectionStage::Params params;
+        params.device_id = DeviceId::rocm(0);
+        params.input = input.get();
+        params.m = M;
+        params.k = K;
+        params.w_qkv = w_qkv.get();
+        params.output_qkv = out_qkv.get();
+        params.n_qkv = N_QKV;
+        params.w_z = w_z.get();
+        params.output_z = out_z.get();
+        params.n_z = N_Z;
+        params.w_a = w_a.get();
+        params.output_a = out_a.get();
+        params.n_a = N_ALPHA;
+        params.w_b = w_b.get();
+        params.output_b = out_b.get();
+        params.n_b = N_BETA;
+        params.gemm_qkv = qkv_prepared.kernel;
+        params.gemm_z = z_prepared.kernel;
+        params.gemm_a = a_prepared.kernel;
+        params.gemm_b = b_prepared.kernel;
+        params.force_decode_equivalent_verifier_prefill = true;
+
+        GDNProjectionStage stage(params);
+        stage.setGPUStream(stream);
+
+        DeviceWorkspaceManager workspace(DeviceId::rocm(0), 256 * 1024 * 1024);
+        ASSERT_TRUE(workspace.allocate(stage.getWorkspaceRequirements(M, 0, K)));
+        stage.bindWorkspace(&workspace);
+
+        ROCmDeviceContext ctx(DeviceId::rocm(0), 0);
+        ASSERT_TRUE(stage.execute(&ctx));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        out_qkv->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        out_z->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        out_a->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        out_b->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        const struct ProjectionCase
+        {
+            ITensorGemm *kernel;
+            FP32Tensor *grouped;
+            int n;
+            const char *name;
+        } cases[] = {
+            {qkv_prepared.kernel, out_qkv.get(), N_QKV, "qkv"},
+            {z_prepared.kernel, out_z.get(), N_Z, "z"},
+            {a_prepared.kernel, out_a.get(), N_ALPHA, "alpha"},
+            {b_prepared.kernel, out_b.get(), N_BETA, "beta"},
+        };
+
+        for (int row = 0; row < M; ++row)
+        {
+            auto row_input = TestTensorFactory::createFP32({1u, static_cast<size_t>(K)});
+            std::copy(input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                      input->data() + static_cast<size_t>(row + 1) * static_cast<size_t>(K),
+                      row_input->mutable_data());
+            ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(0), stream));
+
+            for (const ProjectionCase &projection : cases)
+            {
+                auto serial = TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(projection.n)});
+                ASSERT_TRUE(serial->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(projection.kernel->multiply_tensor(
+                    row_input.get(),
+                    serial.get(),
+                    1,
+                    projection.n,
+                    K,
+                    true,
+                    1.0f,
+                    0.0f,
+                    nullptr,
+                    nullptr,
+                    -1,
+                    &workspace))
+                    << "projection=" << projection.name << " row=" << row;
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+                const float *grouped_row =
+                    projection.grouped->data() + static_cast<size_t>(row) * static_cast<size_t>(projection.n);
+                const float *serial_row = serial->data();
+                const size_t count = static_cast<size_t>(projection.n);
+                const float cos = cosineSim(grouped_row, serial_row, count);
+                const float rel_l2 = relativeL2(grouped_row, serial_row, count);
+                const float max_abs = maxAbsDiff(grouped_row, serial_row, count);
+                const double skl = symmetricSoftmaxKL(grouped_row, serial_row, count);
+
+                LOG_INFO("[SmallM] Qwen3.6 MoE GDN projection=" << projection.name
+                                                                << " M=" << M
+                                                                << " row=" << row
+                                                                << " cosine=" << cos
+                                                                << " rel_l2=" << rel_l2
+                                                                << " symmetric_kl=" << skl
+                                                                << " max_abs=" << max_abs);
+                EXPECT_GE(cos, 0.9999999f)
+                    << "projection=" << projection.name << " row=" << row;
+                EXPECT_LE(rel_l2, 1.0e-8f)
+                    << "projection=" << projection.name << " row=" << row;
+                EXPECT_LE(skl, 1.0e-10)
+                    << "projection=" << projection.name << " row=" << row;
+                EXPECT_LE(max_abs, 1.0e-6f)
+                    << "projection=" << projection.name << " row=" << row;
+            }
+        }
+
+        stage.unbindWorkspace();
+    }
+
+    qkv_prepared.kernel->setGPUStream(nullptr);
+    z_prepared.kernel->setGPUStream(nullptr);
+    a_prepared.kernel->setGPUStream(nullptr);
+    b_prepared.kernel->setGPUStream(nullptr);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM2MatchesSeparate)
 {
     if (!hasROCmDevice())
@@ -2635,12 +4266,36 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedMixedCodebookQwen36GDNQkvZPairM
     PerfStatsCollector::reset();
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, MixedCodebookQwen36GDNQkvZPairSmallMMatchesSerialM1DecodeRowsStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    std::vector<WeightCreator> creators = {
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ5_KRandom(shape, seed); },
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); }};
+
+    constexpr int K = 5120;
+    for (int M : {2, 3, 4})
+    {
+        runMixedProjectionGroupSmallMMatchesSerialM1DecodeRows(
+            "mixed Q5_K/Q4_K native-VNNI Qwen3.6 GDN qkv/z strict serial decode",
+            M,
+            K,
+            creators,
+            {10240, 6144},
+            {"qkv", "z"});
+    }
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KGDNProjectionM2RejectsUnsafeKBOverride)
 {
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
 
-    ScopedEnv force_unsafe_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB", "32");
+    ScopedNativeVNNITuningOverride force_unsafe_kb(128, -1);
 
     constexpr int M = 2;
     constexpr int K = 5120;

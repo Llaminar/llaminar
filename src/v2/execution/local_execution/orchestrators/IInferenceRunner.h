@@ -572,6 +572,35 @@ namespace llaminar2
         }
 
         /**
+         * @brief Prepare a complete verifier input row on device from host-known tokens.
+         *
+         * This hook is intentionally for deterministic parity and diagnostic
+         * checks that already own the whole verifier token row as fixture data.
+         * Production MTP verification should prefer
+         * prepareMTPVerifierInputTokensOnDevice() or
+         * prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken() so the hot
+         * path stays device-owned after sampling. Implementations must still
+         * materialize this row on the verifier graph stream, not on the device
+         * default stream, because the embedding graph consumes the returned
+         * pointer during captured replay.
+         *
+         * @param verifier_tokens Host-known compact verifier row.
+         * @param total_verifier_input_tokens Number of valid entries in the row.
+         * @param draft_token_count Number of draft tokens represented by the row.
+         * @return Stable device pointer on success, nullptr if unsupported or invalid.
+         */
+        virtual const void *prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+            const int32_t *verifier_tokens,
+            int total_verifier_input_tokens,
+            int draft_token_count)
+        {
+            (void)verifier_tokens;
+            (void)total_verifier_input_tokens;
+            (void)draft_token_count;
+            return nullptr;
+        }
+
+        /**
          * @brief Whether this runner can execute a prepared bucketed prefill
          *        chunk schedule for the current request state.
          */
@@ -758,10 +787,12 @@ namespace llaminar2
          * @brief True when accepted-state publication can consume a compact
          *        stochastic verifier outcome without copying it to host first.
          *
-         * Runners that return true must still expose supportsMTPSpecStatePublication().
-         * The device-resident method is a stronger contract: the compact
-         * outcome metadata drives accepted-row selection, KV truncation, and
-         * terminal hidden/state restoration on an explicit device stream.
+         * This is intentionally independent of supportsMTPSpecStatePublication().
+         * The older method answers whether the runner may choose the direct
+         * all-position verifier policy.  This method answers whether an already
+         * proven grouped verifier outcome can be published without a host bridge:
+         * compact outcome metadata drives accepted-row selection, KV truncation,
+         * and terminal hidden/state restoration on an explicit device stream.
          */
         virtual bool supportsDeviceResidentMTPSpecStatePublication() const { return false; }
 
@@ -1963,6 +1994,22 @@ namespace llaminar2
             (void)row;
             (void)penalties;
             (void)vocab_size;
+            return false;
+        }
+
+        /**
+         * @brief True when all-position verifier rows can receive branch-local
+         *        sampler penalties before compact verifier outcome reduction.
+         *
+         * Greedy sampling with repetition/frequency/DRY penalties is still an
+         * argmax, but every verifier row observes a different speculative
+         * history: first emitted token, then only the previously accepted draft
+         * rows.  Backends should advertise this only when
+         * applyPenaltiesToAllPositionLogitsOnDeviceRow() mutates the producer
+         * row on an explicit stream without forcing a full logits readback.
+         */
+        virtual bool supportsRowLocalAllPositionPenaltyApplication() const
+        {
             return false;
         }
 

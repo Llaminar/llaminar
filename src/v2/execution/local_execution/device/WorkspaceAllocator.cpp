@@ -34,12 +34,12 @@ namespace llaminar2
             const size_t free_bytes = backend->deviceMemoryFree(ordinal);
             const size_t total_bytes = backend->deviceMemoryTotal(ordinal);
             const size_t used_bytes = total_bytes > free_bytes ? total_bytes - free_bytes : 0;
-            LOG_INFO("[VRAM_TRACE] " << label
-                                     << " device=" << device.toString()
-                                     << " used_mib=" << (used_bytes / (1024 * 1024))
-                                     << " free_mib=" << (free_bytes / (1024 * 1024))
-                                     << " total_mib=" << (total_bytes / (1024 * 1024))
-                                     << " bytes=" << bytes);
+            LOG_TRACE("[VRAM_TRACE] " << label
+                                      << " device=" << device.toString()
+                                      << " used_mib=" << (used_bytes / (1024 * 1024))
+                                      << " free_mib=" << (free_bytes / (1024 * 1024))
+                                      << " total_mib=" << (total_bytes / (1024 * 1024))
+                                      << " bytes=" << bytes);
         }
 
         bool synchronizeBeforeWorkspaceRelease(DeviceId device)
@@ -114,7 +114,7 @@ namespace llaminar2
         budget = std::max(budget, config.min_budget);
         budget = std::min(budget, config.max_budget);
 
-        LOG_DEBUG("[WorkspaceAllocator] " << device.toString()
+        LOG_TRACE("[WorkspaceAllocator] " << device.toString()
                                           << " available=" << (available / (1024 * 1024)) << "MB"
                                           << ", budget=" << (budget / (1024 * 1024)) << "MB"
                                           << " (fraction=" << fraction << ", headroom=" << (config.headroom / (1024 * 1024)) << "MB)");
@@ -449,7 +449,7 @@ namespace llaminar2
                     }
                 }
 
-                LOG_DEBUG("[WorkspaceAllocator] Reallocating workspace on "
+                LOG_TRACE("[WorkspaceAllocator] Reallocating workspace on "
                           << device.toString() << " with "
                           << combined.buffers.size() << " buffers ("
                           << (needed / (1024 * 1024)) << "MB needed, budget="
@@ -471,7 +471,7 @@ namespace llaminar2
                     consumer_binding.consumer->bindWorkspace(manager.get());
                 }
 
-                LOG_DEBUG("[WorkspaceAllocator] Reallocated " << (manager->used() / (1024 * 1024))
+                LOG_TRACE("[WorkspaceAllocator] Reallocated " << (manager->used() / (1024 * 1024))
                                                               << "MB workspace on " << device.toString()
                                                               << " (" << manager->bufferCount() << " buffers)");
                 logWorkspaceVramTrace(device, "workspace.after_reallocate", manager->used());
@@ -514,7 +514,7 @@ namespace llaminar2
                                                   : 0;
                 if (needed <= max_expandable)
                 {
-                    LOG_DEBUG("[WorkspaceAllocator] Expanding budget on "
+                    LOG_TRACE("[WorkspaceAllocator] Expanding budget on "
                               << device.toString() << " from "
                               << (budget / (1024 * 1024)) << "MB to "
                               << (needed / (1024 * 1024)) << "MB (available="
@@ -539,7 +539,7 @@ namespace llaminar2
                 consumer_binding.consumer->bindWorkspace(manager.get());
             }
 
-            LOG_DEBUG("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
+            LOG_TRACE("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
                                                         << "MB workspace on " << device.toString()
                                                         << " (" << manager->bufferCount() << " buffers, model-aware budget)");
             logWorkspaceVramTrace(device, "workspace.after_allocate", manager->used());
@@ -578,7 +578,7 @@ namespace llaminar2
             return true;
         }
 
-        LOG_DEBUG("[WorkspaceAllocator] Found " << device_consumers.size()
+        LOG_TRACE("[WorkspaceAllocator] Found " << device_consumers.size()
                                                 << " devices with workspace consumers");
 
         for (const auto &[device, consumers] : device_consumers)
@@ -611,7 +611,7 @@ namespace llaminar2
                 continue;
             }
 
-            LOG_DEBUG("[WorkspaceAllocator] Device " << device.toString()
+            LOG_TRACE("[WorkspaceAllocator] Device " << device.toString()
                                                      << ": " << consumers.size() << " consumers, "
                                                      << combined.buffers.size() << " buffers, "
                                                      << combined.total_bytes_with_alignment() << " bytes needed");
@@ -632,7 +632,7 @@ namespace llaminar2
                 consumer->bindWorkspace(manager.get());
             }
 
-            LOG_DEBUG("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
+            LOG_TRACE("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
                                                         << "MB workspace on " << device.toString()
                                                         << " (" << manager->bufferCount() << " buffers)");
             logWorkspaceVramTrace(device, "workspace.after_allocate_legacy", manager->used());
@@ -648,7 +648,7 @@ namespace llaminar2
     {
         if (!device_workspaces_.empty())
         {
-            LOG_DEBUG("[WorkspaceAllocator] Releasing " << device_workspaces_.size()
+            LOG_TRACE("[WorkspaceAllocator] Releasing " << device_workspaces_.size()
                                                         << " workspace managers");
         }
 

@@ -34,7 +34,9 @@
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../CPUKernelBase.h"
+#include "../primitives/SwiGLUPrimitives.h"
 #include "../primitives/SoftmaxPrimitives_New.h"
 
 namespace llaminar2
@@ -82,6 +84,112 @@ namespace llaminar2
                           << " C=" << static_cast<void *>(C)
                           << " M=" << M << " N=" << N << " K=" << K);
                 return false;
+            }
+
+            /*
+             * MTP verifier rows need decode-equivalent FP32 accumulation, so we
+             * keep the scalar kk order used by one-row decode.  The ordinary
+             * row/column loop below is correct, but for M=2..4 with transposed
+             * weights it reloads the same B row once per verifier row.  This
+             * grouped-column path reuses that B row while maintaining independent
+             * scalar accumulators for each output row.  It is intentionally not a
+             * vector reduction: changing reduction order here would risk recurrent
+             * state drift in GDN/short-conv publication.
+             */
+            if (transpose_B && M >= 2 && M <= 4 && N >= 128)
+            {
+                auto grouped_column_work = [&]()
+                {
+#pragma omp for schedule(static)
+                    for (int col = 0; col < N; ++col)
+                    {
+                        const float *b_row = B + static_cast<size_t>(col) * K;
+                        const float *a0 = A;
+                        const float *a1 = A + static_cast<size_t>(K);
+
+                        float acc0 = 0.0f;
+                        float acc1 = 0.0f;
+                        if (M == 2)
+                        {
+                            for (int kk = 0; kk < K; ++kk)
+                            {
+                                const float b = b_row[kk];
+                                acc0 += a0[kk] * b;
+                                acc1 += a1[kk] * b;
+                            }
+
+                            const float bias_value = bias ? bias[col] : 0.0f;
+                            float value0 = alpha * acc0 + bias_value;
+                            float value1 = alpha * acc1 + bias_value;
+                            if (beta != 0.0f)
+                            {
+                                value0 += beta * C[col];
+                                value1 += beta * C[static_cast<size_t>(N) + col];
+                            }
+                            C[col] = value0;
+                            C[static_cast<size_t>(N) + col] = value1;
+                            continue;
+                        }
+
+                        const float *a2 = A + static_cast<size_t>(2) * K;
+                        float acc2 = 0.0f;
+                        if (M == 3)
+                        {
+                            for (int kk = 0; kk < K; ++kk)
+                            {
+                                const float b = b_row[kk];
+                                acc0 += a0[kk] * b;
+                                acc1 += a1[kk] * b;
+                                acc2 += a2[kk] * b;
+                            }
+
+                            const float bias_value = bias ? bias[col] : 0.0f;
+                            float value0 = alpha * acc0 + bias_value;
+                            float value1 = alpha * acc1 + bias_value;
+                            float value2 = alpha * acc2 + bias_value;
+                            if (beta != 0.0f)
+                            {
+                                value0 += beta * C[col];
+                                value1 += beta * C[static_cast<size_t>(N) + col];
+                                value2 += beta * C[static_cast<size_t>(2) * N + col];
+                            }
+                            C[col] = value0;
+                            C[static_cast<size_t>(N) + col] = value1;
+                            C[static_cast<size_t>(2) * N + col] = value2;
+                            continue;
+                        }
+
+                        const float *a3 = A + static_cast<size_t>(3) * K;
+                        float acc3 = 0.0f;
+                        for (int kk = 0; kk < K; ++kk)
+                        {
+                            const float b = b_row[kk];
+                            acc0 += a0[kk] * b;
+                            acc1 += a1[kk] * b;
+                            acc2 += a2[kk] * b;
+                            acc3 += a3[kk] * b;
+                        }
+
+                        const float bias_value = bias ? bias[col] : 0.0f;
+                        float value0 = alpha * acc0 + bias_value;
+                        float value1 = alpha * acc1 + bias_value;
+                        float value2 = alpha * acc2 + bias_value;
+                        float value3 = alpha * acc3 + bias_value;
+                        if (beta != 0.0f)
+                        {
+                            value0 += beta * C[col];
+                            value1 += beta * C[static_cast<size_t>(N) + col];
+                            value2 += beta * C[static_cast<size_t>(2) * N + col];
+                            value3 += beta * C[static_cast<size_t>(3) * N + col];
+                        }
+                        C[col] = value0;
+                        C[static_cast<size_t>(N) + col] = value1;
+                        C[static_cast<size_t>(2) * N + col] = value2;
+                        C[static_cast<size_t>(3) * N + col] = value3;
+                    }
+                };
+                OMP_WORKSHARE_REGION(grouped_column_work);
+                return true;
             }
 
             auto work = [&]()
@@ -1181,6 +1289,286 @@ namespace llaminar2
                     LOG_ERROR("[FloatingPointGemmKernel] Unsupported weight type: " << static_cast<int>(weight_type_));
                     return false;
                 }
+            }
+
+            /**
+             * @brief Grouped verifier SwiGLU + FP32 down projection.
+             *
+             * The verifier graph may carry M=2..4 candidate rows, but state
+             * publication must remain equivalent to serial decode.  This path
+             * computes all SwiGLU rows with the shared CPU primitive, then uses
+             * run_fp32_skinny_matmul(): work is parallelized over rows/columns
+             * while each dot product walks K in the same order as one-token
+             * decode.  It is therefore grouped, but not a hidden row replay.
+             */
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override
+            {
+                (void)workspace;
+                if (!weight_tensor_ || !gate || !up || !output ||
+                    m <= 1 || m > 4 || n <= 0 || k <= 0)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU rejected: weight="
+                              << (weight_tensor_ != nullptr)
+                              << " gate=" << (gate != nullptr)
+                              << " up=" << (up != nullptr)
+                              << " output=" << (output != nullptr)
+                              << " m=" << m << " n=" << n << " k=" << k);
+                    return false;
+                }
+                if (alpha != 1.0f || beta != 0.0f)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU only supports alpha=1,beta=0; got alpha="
+                              << alpha << " beta=" << beta);
+                    return false;
+                }
+                if (weight_type_ != TensorType::FP32 ||
+                    gate->native_type() != TensorType::FP32 ||
+                    up->native_type() != TensorType::FP32)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU currently supports FP32 tensors only");
+                    return false;
+                }
+
+                const float *gate_data = gate->data();
+                const float *up_data = up->data();
+                const float *weights = weight_tensor_->data();
+                float *out_data = output->mutable_data();
+                if (!gate_data || !up_data || !weights || !out_data)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU requires host-visible FP32 tensors");
+                    return false;
+                }
+
+                thread_local std::vector<float> swiglu_scratch_tls;
+                const size_t elements =
+                    static_cast<size_t>(m) * static_cast<size_t>(k);
+                if (swiglu_scratch_tls.size() < elements)
+                    swiglu_scratch_tls.resize(elements);
+                const bool perf_enabled = PerfStatsCollector::isEnabled();
+                auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                               : PerfStatsCollector::Clock::time_point{};
+                primitives::compute_swiglu(
+                    gate_data,
+                    up_data,
+                    swiglu_scratch_tls.data(),
+                    static_cast<int>(elements));
+                recordVerifierTiming(
+                    "cpu_fp32_verifier_swiglu_compute",
+                    perf_start,
+                    m,
+                    n,
+                    k,
+                    1);
+
+                perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                          : PerfStatsCollector::Clock::time_point{};
+                if (!run_fp32_skinny_matmul(
+                        swiglu_scratch_tls.data(),
+                        weights,
+                        out_data,
+                        m,
+                        n,
+                        k,
+                        /*transpose_B=*/true,
+                        alpha,
+                        beta,
+                        nullptr))
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU down projection failed");
+                    return false;
+                }
+                recordVerifierTiming(
+                    "cpu_fp32_verifier_swiglu_down_matmul",
+                    perf_start,
+                    m,
+                    n,
+                    k,
+                    1);
+
+                if (PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cpu_fp32_grouped_verifier_swiglu_down_calls",
+                        1.0,
+                        "gemm",
+                        "cpu",
+                        PerfStatsCollector::Tags{
+                            {"m", std::to_string(m)},
+                            {"n", std::to_string(n)},
+                            {"k", std::to_string(k)}});
+                }
+                return true;
+            }
+
+            /**
+             * @brief Group verifier rows while preserving serial decode dot-product order.
+             *
+             * Phase 9.8 verifier graphs evaluate M=2..4 candidate rows together,
+             * but publication-capable recurrent state must match the row-by-row
+             * decode contract.  For FP32 weights this uses the skinny matmul
+             * primitive: it parallelizes over rows and output columns in one
+             * OpenMP region, while every dot product still walks K in the same
+             * order as the M=1 decode GEMV.  This is intentionally not a hidden
+             * serial row loop.
+             */
+            bool multiply_fused_verifier_rows_decode_equivalent(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override
+            {
+                (void)mpi_ctx;
+                (void)workspace;
+
+                if (!weight_tensor_ || !input || m <= 1 || m > 4 || k <= 0 || projections.empty())
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: weight="
+                              << (weight_tensor_ != nullptr) << " input=" << (input != nullptr)
+                              << " m=" << m << " k=" << k
+                              << " projections=" << projections.size());
+                    return false;
+                }
+
+                if (input->native_type() != weight_type_)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: activation type "
+                              << static_cast<int>(input->native_type())
+                              << " does not match weight type " << static_cast<int>(weight_type_));
+                    return false;
+                }
+
+                if (weight_type_ != TensorType::FP32)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection currently supports FP32 weights only; got "
+                              << static_cast<int>(weight_type_));
+                    return false;
+                }
+
+                const float *input_data = input->data();
+                if (!input_data)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host FP32 data");
+                    return false;
+                }
+
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &proj = projections[i];
+                    auto *fp = dynamic_cast<FloatingPointGemmKernel *>(proj.kernel);
+                    if (!fp || !fp->weight_tensor_ || fp->weight_type_ != weight_type_ ||
+                        !proj.output || proj.n <= 0)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected at projection "
+                                  << i << ": fp=" << (fp != nullptr)
+                                  << " weight=" << (fp && fp->weight_tensor_)
+                                  << " same_type=" << (fp && fp->weight_type_ == weight_type_)
+                                  << " output=" << (proj.output != nullptr)
+                                  << " n=" << proj.n);
+                        return false;
+                    }
+
+                    float *out_data = proj.output->mutable_data();
+                    if (!out_data)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected at projection "
+                                  << i << ": output has no host FP32 data");
+                        return false;
+                    }
+
+                    const float *bias_ptr = proj.bias ? proj.bias->data() : nullptr;
+                    if (proj.bias && !bias_ptr)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected at projection "
+                                  << i << ": bias has no host FP32 data");
+                        return false;
+                    }
+
+                    const bool perf_enabled = PerfStatsCollector::isEnabled();
+                    const auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                                         : PerfStatsCollector::Clock::time_point{};
+                    if (!run_fp32_skinny_matmul(
+                            input_data,
+                            fp->weight_tensor_->data(),
+                            out_data,
+                            m,
+                            proj.n,
+                            k,
+                            /*transpose_B=*/true,
+                            /*alpha=*/1.0f,
+                            /*beta=*/0.0f,
+                            bias_ptr))
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection failed at projection "
+                                  << i << " n=" << proj.n);
+                        return false;
+                    }
+                    recordVerifierTiming(
+                        "cpu_fp32_verifier_projection_matmul",
+                        perf_start,
+                        m,
+                        proj.n,
+                        k,
+                        static_cast<int>(projections.size()));
+                }
+
+                if (PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cpu_fp32_grouped_verifier_projection_calls",
+                        1.0,
+                        "gemm",
+                        "cpu",
+                        PerfStatsCollector::Tags{
+                            {"m", std::to_string(m)},
+                            {"k", std::to_string(k)},
+                            {"projections", std::to_string(projections.size())}});
+                }
+                return true;
+            }
+
+            /**
+             * @brief Record coarse CPU FP32 verifier timing samples.
+             *
+             * The timers sit around grouped verifier projection families rather
+             * than inside every dot product.  They are enabled only when the
+             * structured perf collector is active, and they preserve enough shape
+             * tags to compare FP32 GDN projection cost with NativeVNNI cost.
+             */
+            static void recordVerifierTiming(
+                const char *name,
+                PerfStatsCollector::Clock::time_point start,
+                int m,
+                int n,
+                int k,
+                int projections)
+            {
+                if (!PerfStatsCollector::isEnabled())
+                    return;
+
+                const auto end = PerfStatsCollector::Clock::now();
+                const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+                PerfStatsCollector::Tags tags{
+                    {"m", std::to_string(m)},
+                    {"k", std::to_string(k)},
+                    {"projections", std::to_string(projections)}};
+                if (n > 0)
+                    tags.emplace("n", std::to_string(n));
+                PerfStatsCollector::recordTimingNs(
+                    "kernel",
+                    name ? name : "cpu_fp32_verifier_unknown",
+                    ns > 0 ? static_cast<uint64_t>(ns) : 0,
+                    "gemm",
+                    "cpu",
+                    std::move(tags));
             }
 
             // ========== Typed Activation Interface ==========

@@ -222,7 +222,8 @@ namespace
         {"14B_TP4_FFN_Down", 5120, 3456},
         {"14B_TP4_LM_Head", 38016, 5120},
         // Qwen3.6 27B dense / hybrid GDN production shapes
-        // (d_model=5120, d_ff=17408, GDN qkv/z/time/output projections).
+        // (d_model=5120, d_ff=17408, fused attention QKV, and GDN projections).
+        {"Qwen36_Attn_QKVProjection", 12288, 5120},
         {"Qwen36_FFN_GateUp", 17408, 5120},
         {"Qwen36_FFN_DownProjection", 5120, 17408},
         {"Qwen36_GDN_InnerProjection", 10240, 5120},

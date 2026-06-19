@@ -26,6 +26,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #ifdef HAVE_CUDA
 #include "../../../kernels/cuda/ops/CUDARowSelectKernels.h"
@@ -269,8 +270,12 @@ namespace llaminar2
             capture_rows = std::min(speculative_slot_rows, max_rows);
             const size_t required_floats =
                 static_cast<size_t>(capture_rows) * static_cast<size_t>(capture_state_size);
-            host_verifier_state_slots_.resize(required_floats);
-            capture = host_verifier_state_slots_.empty() ? nullptr : host_verifier_state_slots_.data();
+            if (required_floats > host_verifier_state_slot_capacity_)
+            {
+                host_verifier_state_slots_.reset(new float[required_floats]);
+                host_verifier_state_slot_capacity_ = required_floats;
+            }
+            capture = required_floats == 0 ? nullptr : host_verifier_state_slots_.get();
         }
         verifier_capture_workspace_bound_ =
             capture != nullptr && capture_rows > 0 && capture_state_size > 0;
@@ -441,9 +446,9 @@ namespace llaminar2
                 bound_workspace_->getBuffer(speculativeStateSlotsBufferName()));
         }
 
-        return host_verifier_state_slots_.empty()
+        return !host_verifier_state_slots_
                    ? nullptr
-                   : host_verifier_state_slots_.data();
+                   : host_verifier_state_slots_.get();
     }
 
     bool GDNRecurrenceStage::restoreCPUVerifierStateCaptureRowDirect(int row)
@@ -825,9 +830,24 @@ namespace llaminar2
             return false;
         }
 
-        // Bind stage stream to kernel before execution
+        const PerfStatsCollector::Tags detail_tags{
+            {"layer", std::to_string(params_.layer_idx)},
+            {"seq_len", std::to_string(params_.seq_len)},
+            {"request_count", std::to_string(params_.request_count)},
+            {"capture_rows", std::to_string(requestedSpeculativeStateSlotRows())},
+        };
+
+        // Bind stage stream to kernel before execution.
         params_.kernel->setGPUStream(gpuStream());
-        bindKernelWorkspace();
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "gdn_recurrence_cpu_detail",
+                "bind_kernel_workspace",
+                "execute",
+                params_.device_id.toString(),
+                detail_tags);
+            bindKernelWorkspace();
+        }
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
 
@@ -1090,6 +1110,7 @@ namespace llaminar2
 
         // Effective key head count for QKV split (may be full count if Q/K replicated for TP)
         const int nkh = (params_.n_k_heads > 0) ? params_.n_k_heads : params_.n_heads;
+        bool ok = false;
 
         if (merged_qkv)
         {
@@ -1098,6 +1119,75 @@ namespace llaminar2
             const int k_src_dim = nkh * params_.d_k;
             const int v_dim = params_.n_heads * params_.d_v;
             const int qkv_stride = q_src_dim + k_src_dim + v_dim;
+
+            /*
+             * All-position verifier rows are tiny (M=2..4), and the hot path
+             * needs post-row state snapshots rather than a generic prefill
+             * layout.  Let CPU kernels that understand the merged layout read
+             * Q/K/V slices directly so we do not spend more time copying QKV
+             * than advancing the recurrence.
+             */
+            const bool direct_merged_verifier =
+                params_.seq_len > 1 &&
+                requestedSpeculativeStateSlotRows() > 0 &&
+                verifier_capture_workspace_bound_ &&
+                verifier_capture_state_size_bound_ > 0;
+            if (direct_merged_verifier)
+            {
+                if (!host_verifier_state_slots_ ||
+                    verifier_capture_rows_bound_ <= 0)
+                {
+                    LOG_ERROR("[GDNRecurrenceStage] CPU merged-QKV verifier requires bound host state slots");
+                    return false;
+                }
+
+                const int effective_seq_len = effectivePrefillSeqLen();
+                const int kernel_seq_len = std::min(effective_seq_len, params_.seq_len);
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "gdn_recurrence_cpu_detail",
+                        "direct_merged_verifier",
+                        "execute",
+                        params_.device_id.toString(),
+                        detail_tags);
+                    ok = params_.kernel->chunkForwardMergedQKVWithStateSnapshots(
+                        q_data,
+                        qkv_stride,
+                        alpha_data,
+                        beta_data,
+                        alog_data,
+                        dtbias_data,
+                        output_data,
+                        params_.recurrence_state,
+                        kernel_seq_len,
+                        nkh,
+                        params_.n_heads,
+                        params_.d_k,
+                        params_.d_v,
+                        params_.global_v_head_offset,
+                        params_.chunk_size,
+                        params_.use_qk_l2norm,
+                    host_verifier_state_slots_.get(),
+                    verifier_capture_state_size_bound_,
+                    verifier_capture_rows_bound_);
+                }
+                if (!ok)
+                {
+                    LOG_ERROR("[GDNRecurrenceStage] CPU merged-QKV verifier kernel failed");
+                    return false;
+                }
+                if (kernel_seq_len < params_.seq_len)
+                {
+                    const size_t first_pad =
+                        static_cast<size_t>(kernel_seq_len) *
+                        static_cast<size_t>(params_.n_heads * params_.d_v);
+                    const size_t pad_count =
+                        static_cast<size_t>(params_.seq_len - kernel_seq_len) *
+                        static_cast<size_t>(params_.n_heads * params_.d_v);
+                    std::memset(output_data + first_pad, 0, pad_count * sizeof(float));
+                }
+                return true;
+            }
 
             // Dimensions after deinterleave (what the kernel expects: n_v_local heads)
             const int q_dst_dim = params_.n_heads * params_.d_k;
@@ -1117,13 +1207,21 @@ namespace llaminar2
 
             const float *qkv = q_data; // merged buffer
 
-            deinterleaveMergedQKV(
-                qkv, T, qkv_stride,
-                nkh, params_.n_heads, params_.d_k, params_.d_v,
-                params_.global_v_head_offset,
-                q_deinterleave_.data(),
-                k_deinterleave_.data(),
-                v_deinterleave_.data());
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "gdn_recurrence_cpu_detail",
+                    "host_deinterleave",
+                    "execute",
+                    params_.device_id.toString(),
+                    detail_tags);
+                deinterleaveMergedQKV(
+                    qkv, T, qkv_stride,
+                    nkh, params_.n_heads, params_.d_k, params_.d_v,
+                    params_.global_v_head_offset,
+                    q_deinterleave_.data(),
+                    k_deinterleave_.data(),
+                    v_deinterleave_.data());
+            }
 
             q_data = q_deinterleave_.data();
             k_data = k_deinterleave_.data();
@@ -1136,16 +1234,21 @@ namespace llaminar2
                       << " global_v_offset=" << params_.global_v_head_offset);
         }
 
-        bool ok;
         if (params_.seq_len == 1)
         {
+            PerfStatsCollector::ScopedTimer timer(
+                "gdn_recurrence_cpu_detail",
+                "recurrent_step",
+                "execute",
+                params_.device_id.toString(),
+                detail_tags);
             ok = params_.kernel->recurrent_step(
-                q_data, k_data, v_data,
-                alpha_data, beta_data,
-                alog_data, dtbias_data,
-                output_data, params_.recurrence_state,
-                params_.n_heads, params_.d_k, params_.d_v,
-                params_.use_qk_l2norm);
+                    q_data, k_data, v_data,
+                    alpha_data, beta_data,
+                    alog_data, dtbias_data,
+                    output_data, params_.recurrence_state,
+                    params_.n_heads, params_.d_k, params_.d_v,
+                    params_.use_qk_l2norm);
         }
         else
         {
@@ -1159,13 +1262,21 @@ namespace llaminar2
                 return false;
             }
 
-            ok = params_.kernel->chunk_forward(
-                q_data, k_data, v_data,
-                alpha_data, beta_data,
-                alog_data, dtbias_data,
-                output_data, params_.recurrence_state,
-                kernel_seq_len, params_.n_heads, params_.d_k, params_.d_v,
-                params_.chunk_size, params_.use_qk_l2norm);
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "gdn_recurrence_cpu_detail",
+                    "chunk_forward",
+                    "execute",
+                    params_.device_id.toString(),
+                    detail_tags);
+                ok = params_.kernel->chunk_forward(
+                    q_data, k_data, v_data,
+                    alpha_data, beta_data,
+                    alog_data, dtbias_data,
+                    output_data, params_.recurrence_state,
+                    kernel_seq_len, params_.n_heads, params_.d_k, params_.d_v,
+                    params_.chunk_size, params_.use_qk_l2norm);
+            }
 
             if (ok && kernel_seq_len < params_.seq_len)
             {

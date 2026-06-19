@@ -249,6 +249,42 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       ConcurrentVerifierGemvPartials_M4HelperUsesLargestProjectionSlot)
+{
+    auto weights_small = TestTensorFactory::createQ8_0Random({512, 2048}, /*seed=*/155);
+    auto weights_large = TestTensorFactory::createQ8_0Random({8192, 2048}, /*seed=*/156);
+
+    CUDAQuantisedGemmKernel kernel_small(weights_small.get(), kFakeCudaDeviceId);
+    CUDAQuantisedGemmKernel kernel_large(weights_large.get(), kFakeCudaDeviceId);
+
+    constexpr int kM = 4;
+    auto reqs_small = kernel_small.getWorkspaceRequirements(kM, /*n=*/512, /*k=*/2048);
+    auto reqs_large = kernel_large.getWorkspaceRequirements(kM, /*n=*/8192, /*k=*/2048);
+
+    const auto *small_serial = reqs_small.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    const auto *large_serial = reqs_large.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    ASSERT_NE(small_serial, nullptr);
+    ASSERT_NE(large_serial, nullptr);
+    ASSERT_GT(large_serial->size_bytes, small_serial->size_bytes);
+
+    reqs_small.merge(reqs_large);
+    addCudaConcurrentDecodeGemvSideStreamWorkspace(
+        reqs_small,
+        DeviceId::cuda(kFakeCudaDeviceId),
+        kM,
+        /*projection_count=*/4);
+
+    const auto *merged =
+        reqs_small.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+    ASSERT_NE(merged, nullptr)
+        << "Grouped verifier rows M=2..4 use the same CUDA side-stream GEMV "
+           "partials as decode and must declare those slots structurally.";
+    EXPECT_EQ(merged->size_bytes, 3u * large_serial->size_bytes)
+        << "A four-projection CUDA fused verifier stage needs three side-stream "
+           "slots, each sized for the largest M=4 projection.";
+}
+
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        ConcurrentDecodeGemvPartials_MoETopKFanoutUsesActiveStreamSlots)
 {
     auto weights = TestTensorFactory::createQ8_0Random({4096, 2048}, /*seed=*/154);

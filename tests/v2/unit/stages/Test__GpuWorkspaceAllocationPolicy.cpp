@@ -713,50 +713,72 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPVerifierGDNStateSnapshotsUseDecodeEq
 
     /*
      * All-position MTP state publication restores a captured GDN state row and
-     * continues normal decode from it.  That captured row is only valid if it is
-     * produced by the same recurrent-step math as serial decode.  The optimized
-     * small-prefill route may use a different reduction geometry or in-place
-     * preprocessing, so keep it out of this publishable-row helper.
+     * continues normal decode from it.  The current verifier path is deliberately
+     * grouped, not a hidden host loop over one-row launches: it advances rows in
+     * serial recurrence order inside one graph-capturable kernel route and
+     * publishes post-row state snapshots from device memory.
      */
+    const auto cuda_route = stripCommentsAndStringLiterals(sliceBetween(
+        cuda_source,
+        "bool cudaGDN_chunk_forward_kernel_route(",
+        "bool cudaGDN_chunk_forward("));
+    EXPECT_NE(cuda_route.find("state_snapshots"), std::string::npos)
+        << "CUDA grouped verifier GDN must publish post-row state snapshots.";
+    EXPECT_NE(cuda_route.find("snapshot_stride_floats"), std::string::npos);
+    EXPECT_NE(cuda_route.find("device_effective_seq_len"), std::string::npos)
+        << "CUDA grouped verifier GDN must support padded verifier graphs.";
+    EXPECT_NE(cuda_route.find("(cudaStream_t)stream"), std::string::npos)
+        << "CUDA grouped verifier GDN must launch on the explicit capture stream.";
+    EXPECT_EQ(cuda_route.find("cudaDeviceSynchronize"), std::string::npos)
+        << "CUDA grouped verifier GDN must stay graph-capturable.";
+
     const auto cuda_body = stripCommentsAndStringLiterals(sliceBetween(
         cuda_source,
-        "bool cudaGDN_chunk_forward_via_single_row_chunks(",
-        "bool cudaGDN_chunk_forward("));
-    EXPECT_NE(cuda_body.find("cudaGDN_recurrent_step("), std::string::npos)
-        << "CUDA publishable verifier rows must use serial decode recurrent_step.";
-    EXPECT_EQ(cuda_body.find("cudaGDN_chunk_forward_kernel_route("), std::string::npos)
-        << "CUDA verifier state snapshots must not come from the optimized prefill route.";
-
+        "bool cudaGDN_chunk_forward(",
+        "bool cudaGDN_chunk_forward_effective("));
+    EXPECT_NE(cuda_body.find("cudaGDN_chunk_forward_kernel_route("), std::string::npos);
+    EXPECT_NE(cuda_body.find("state_snapshots"), std::string::npos);
+    EXPECT_NE(cuda_body.find("nullptr"), std::string::npos)
+        << "Non-padded CUDA verifier chunks should use the same grouped route "
+           "without an effective-length guard.";
     const auto cuda_effective_body = stripCommentsAndStringLiterals(sliceBetween(
         cuda_source,
-        "bool cudaGDN_chunk_forward_effective_via_single_row_chunks(",
-        "bool cudaGDN_chunk_forward("));
-    EXPECT_NE(cuda_effective_body.find("cudaGDN_recurrent_step_effective_row("), std::string::npos)
-        << "CUDA padded verifier rows must remain serial decode-equivalent under graph replay.";
-    EXPECT_NE(cuda_effective_body.find("cuda_gdn_copy_state_snapshot_if_active_kernel"), std::string::npos)
+        "bool cudaGDN_chunk_forward_effective(",
+        "bool cudaGDN_short_conv1d("));
+    EXPECT_NE(cuda_effective_body.find("cudaGDN_chunk_forward_kernel_route("), std::string::npos);
+    EXPECT_NE(cuda_effective_body.find("device_effective_seq_len"), std::string::npos)
         << "CUDA padded verifier snapshots must be guarded by the device effective length.";
-    EXPECT_EQ(cuda_effective_body.find("cudaGDN_chunk_forward_kernel_route("), std::string::npos)
-        << "CUDA effective verifier snapshots must not come from the optimized prefill route.";
+
+    const auto rocm_route = stripCommentsAndStringLiterals(sliceBetween(
+        rocm_source,
+        "bool rocmGDN_chunk_forward_kernel_route(",
+        "bool rocmGDN_chunk_forward("));
+    EXPECT_NE(rocm_route.find("state_snapshots"), std::string::npos)
+        << "ROCm grouped verifier GDN must publish post-row state snapshots.";
+    EXPECT_NE(rocm_route.find("snapshot_stride_floats"), std::string::npos);
+    EXPECT_NE(rocm_route.find("device_effective_seq_len"), std::string::npos)
+        << "ROCm grouped verifier GDN must support padded verifier graphs.";
+    EXPECT_NE(rocm_route.find("(hipStream_t)stream"), std::string::npos)
+        << "ROCm grouped verifier GDN must launch on the explicit capture stream.";
+    EXPECT_EQ(rocm_route.find("hipDeviceSynchronize"), std::string::npos)
+        << "ROCm grouped verifier GDN must stay graph-capturable.";
 
     const auto rocm_body = stripCommentsAndStringLiterals(sliceBetween(
         rocm_source,
-        "bool rocmGDN_chunk_forward_via_single_row_chunks(",
-        "bool rocmGDN_chunk_forward("));
-    EXPECT_NE(rocm_body.find("rocmGDN_recurrent_step("), std::string::npos)
-        << "ROCm publishable verifier rows must use serial decode recurrent_step.";
-    EXPECT_EQ(rocm_body.find("rocmGDN_chunk_forward_kernel_route("), std::string::npos)
-        << "ROCm verifier state snapshots must not come from the optimized prefill route.";
-
+        "bool rocmGDN_chunk_forward(",
+        "bool rocmGDN_chunk_forward_effective("));
+    EXPECT_NE(rocm_body.find("rocmGDN_chunk_forward_kernel_route("), std::string::npos);
+    EXPECT_NE(rocm_body.find("state_snapshots"), std::string::npos);
+    EXPECT_NE(rocm_body.find("nullptr"), std::string::npos)
+        << "Non-padded ROCm verifier chunks should use the same grouped route "
+           "without an effective-length guard.";
     const auto rocm_effective_body = stripCommentsAndStringLiterals(sliceBetween(
         rocm_source,
-        "bool rocmGDN_chunk_forward_effective_via_single_row_chunks(",
-        "bool rocmGDN_chunk_forward_effective("));
-    EXPECT_NE(rocm_effective_body.find("rocmGDN_recurrent_step_effective_row("), std::string::npos)
-        << "ROCm padded verifier rows must remain serial decode-equivalent under graph replay.";
-    EXPECT_NE(rocm_effective_body.find("rocm_gdn_copy_state_snapshot_if_active_kernel"), std::string::npos)
+        "bool rocmGDN_chunk_forward_effective(",
+        "bool rocmGDN_short_conv1d("));
+    EXPECT_NE(rocm_effective_body.find("rocmGDN_chunk_forward_kernel_route("), std::string::npos);
+    EXPECT_NE(rocm_effective_body.find("device_effective_seq_len"), std::string::npos)
         << "ROCm padded verifier snapshots must be guarded by the device effective length.";
-    EXPECT_EQ(rocm_effective_body.find("rocmGDN_chunk_forward_kernel_route("), std::string::npos)
-        << "ROCm effective verifier snapshots must not come from the optimized prefill route.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIDispatchSweepUsesExplicitStream)
@@ -913,11 +935,173 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTargetDistributionBuildPreservesDefe
         std::string::npos)
         << "Building a target distribution must preserve deferred first-token readiness.";
     EXPECT_NE(
-        executable_build_body.find("clearStochasticDraftSampleReadySlot(slot)"),
+        executable_build_body.find("clearStochasticDraftSampleReadySlot("),
         std::string::npos)
         << "Draft distribution builds still clear draft sample readiness because "
            "draft distribution slots and draft sampled-token slots share one "
            "step-local producer/consumer pair.";
+    EXPECT_NE(
+        executable_build_body.find("StochasticSampleReadyClearMode::Force"),
+        std::string::npos)
+        << "Draft distribution builds overwrite the sampled-token slot, so the clear must not preserve verifier-owned state.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPSidecarRestampsDeferredTargetTokenForVerifierConsumer)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto sidecar_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
+        "bool DeviceGraphOrchestrator::forwardMTP(");
+    const auto compact_sidecar =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sidecar_body));
+
+    /*
+     * The first generated token is intentionally kept device-resident in the
+     * vLLM-style greedy path. It is consumed once by the first sidecar and once
+     * by the verifier token-row materializer, so sidecar staging must publish a
+     * new ready event instead of treating the target sample slot as
+     * single-consumer scratch.
+     */
+    EXPECT_NE(compact_sidecar.find("draft_condition_ready_is_target"),
+              std::string::npos);
+    EXPECT_NE(
+        compact_sidecar.find(
+            "recordStochasticTargetSampleReady(draft_condition_ready_slot,sidecar_dynamic_stream)"),
+        std::string::npos)
+        << "Device-target sidecar staging must restamp the deferred first-token ready event for the verifier.";
+    EXPECT_EQ(
+        compact_sidecar.find(
+            "recordStochasticDraftSampleReady(draft_condition_ready_slot,sidecar_dynamic_stream)"),
+        std::string::npos)
+        << "Draft sample slots are still single-consumer for chained sidecars.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, DeferredSampleReadinessPreservesVerifierOwnedSlots)
+{
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto compact_header =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(header));
+    const auto compact_source =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+    const auto clear_target_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::clearStochasticTargetSampleReadySlot(",
+        "void DeviceGraphOrchestrator::clearStochasticTargetSampleReadySlots(")));
+    const auto clear_draft_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::clearStochasticDraftSampleReadySlot(",
+        "void DeviceGraphOrchestrator::clearStochasticDraftSampleReadySlots(")));
+    const auto sync_deferral_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled)",
+        "void DeviceGraphOrchestrator::setMTPMainDecodeSyncDeferralEnabled(bool enabled)")));
+    const auto greedy_first_token_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::sampleGreedyFromMainLogitsToDeviceTargetSlot(",
+        "int DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(")));
+    const auto greedy_outcome_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDeviceResident(",
+        "bool DeviceGraphOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDevice(")));
+    const auto set_verifier_plan_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::setMTPSpecVerifierInputPlan(",
+        "void DeviceGraphOrchestrator::clearMTPSpecVerifierInputPlan(")));
+    const auto clear_verifier_plan_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::clearMTPSpecVerifierInputPlan(",
+        "bool DeviceGraphOrchestrator::materializePendingMTPVerifierInputTokensOnDevice(")));
+    const auto device_first_plan_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "const void *DeviceGraphOrchestrator::prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(",
+        "const float *DeviceGraphOrchestrator::forwardImpl(")));
+
+    EXPECT_NE(compact_header.find("boolverifier_consumer_pending=false"),
+              std::string::npos)
+        << "Deferred sample readiness must encode verifier transaction ownership.";
+    EXPECT_NE(clear_target_body.find(
+                  "mode==StochasticSampleReadyClearMode::PreserveVerifierConsumer&&ready.verifier_consumer_pending"),
+              std::string::npos)
+        << "Generic target-slot cleanup must preserve verifier-owned first-token samples.";
+    EXPECT_NE(clear_draft_body.find(
+                  "mode==StochasticSampleReadyClearMode::PreserveVerifierConsumer&&ready.verifier_consumer_pending"),
+              std::string::npos)
+        << "Generic draft-slot cleanup must preserve verifier-owned draft samples.";
+    EXPECT_NE(sync_deferral_body.find("clearStochasticTargetSampleReadySlots()"),
+              std::string::npos)
+        << "All-position sync deferral cleanup should use preserving target-slot cleanup.";
+    EXPECT_NE(sync_deferral_body.find("clearStochasticDraftSampleReadySlots()"),
+              std::string::npos)
+        << "All-position sync deferral cleanup should use preserving draft-slot cleanup.";
+    EXPECT_NE(greedy_first_token_body.find(
+                  "recordStochasticTargetSampleReady(target_sample_slot,stream,out_token==nullptr)"),
+              std::string::npos)
+        << "Deferred greedy first-token sampling must mark the target slot as verifier-owned.";
+    EXPECT_NE(set_verifier_plan_body.find("pending_mtp_verifier_device_token_plan_.reset()"),
+              std::string::npos)
+        << "Installing a verifier row plan must drop any stale token-row copy plan.";
+    EXPECT_NE(device_first_plan_body.find("!first_token_ready.valid"),
+              std::string::npos)
+        << "A device-first verifier row must fail before graph replay if its target token slot is not ready.";
+    EXPECT_EQ(clear_verifier_plan_body.find("materialized_mtp_verifier_device_token_row_={}"),
+              std::string::npos)
+        << "Verifier metadata RAII cleanup runs before the compact outcome reducer, so it must not erase the materialized token row.";
+    EXPECT_NE(greedy_outcome_body.find(
+                  "clearStochasticTargetSampleReadySlot(materialized_first_target_sample_slot,StochasticSampleReadyClearMode::Force)"),
+              std::string::npos)
+        << "Device-resident greedy outcome consumption must force-clear the verifier-owned target slot.";
+    EXPECT_NE(greedy_outcome_body.find("materialized_mtp_verifier_device_token_row_={}"),
+              std::string::npos)
+        << "The greedy reducer owns the materialized token row lifetime after verifier graph replay.";
+    EXPECT_NE(compact_source.find(
+                  "ready.verifier_consumer_pending=ready.verifier_consumer_pending||verifier_consumer_pending"),
+              std::string::npos)
+        << "Restamping a ready event must preserve an existing verifier-owner bit.";
+    EXPECT_NE(compact_header.find("pending_mtp_verifier_device_token_plan_.reset()"),
+              std::string::npos)
+        << "Request-boundary clear_cache() must drop verifier token-row plans.";
+    EXPECT_NE(compact_header.find("materialized_mtp_verifier_device_token_row_={}"),
+              std::string::npos)
+        << "Request-boundary clear_cache() must drop materialized verifier token rows.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, DeviceResidentShiftedMTPHostAdoptionAllowsTruncation)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto compact_source =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+    const auto host_plan_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::adoptDeviceResidentMTPSpecPublishedHostState(",
+        "bool DeviceGraphOrchestrator::adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(")));
+    const auto metadata_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(",
+        "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(")));
+
+    EXPECT_EQ(compact_source.find("computedanegativeshiftedMTPKVdelta"),
+              std::string::npos)
+        << "Device-resident shifted MTP host adoption must allow truncation; "
+           "a lower target count is valid when the sidecar row was restored away.";
+    EXPECT_NE(host_plan_body.find("current_shifted=cache->get_cached_tokens("),
+              std::string::npos);
+    EXPECT_NE(host_plan_body.find("std::max(0,target_shifted-current_shifted)"),
+              std::string::npos)
+        << "Host-plan adoption should advance only positive shifted-cache deltas.";
+    EXPECT_NE(metadata_body.find("current_shifted=cache->get_cached_tokens("),
+              std::string::npos);
+    EXPECT_NE(metadata_body.find("std::max(0,target_shifted-current_shifted)"),
+              std::string::npos)
+        << "Metadata adoption should advance only positive shifted-cache deltas.";
+    EXPECT_NE(source.find("device_resident_shifted_mtp_kv_host_truncations"),
+              std::string::npos)
+        << "Valid shifted-cache truncations should remain visible in perf counters.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPStochasticTopKPartialScratchIsSplitByStreamDomain)
@@ -1533,9 +1717,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestoreClearsDiscardedTimelineTra
         << "A restored prefix checkpoint resumes as ordinary decode, not an all-position verifier.";
     EXPECT_EQ(compact_helper.find("&& !compute_all_position_logits_"), std::string::npos)
         << "Restore cleanup must clear verifier mode even when restore happens while all-position mode is active.";
-    EXPECT_NE(compact_helper.find("clearStochasticTargetSampleReadySlots()"),
+    EXPECT_NE(compact_helper.find(
+                  "clearStochasticTargetSampleReadySlots(StochasticSampleReadyClearMode::PreserveVerifierConsumer)"),
               std::string::npos);
-    EXPECT_NE(compact_helper.find("clearStochasticDraftSampleReadySlots()"),
+    EXPECT_NE(compact_helper.find(
+                  "clearStochasticDraftSampleReadySlots(StochasticSampleReadyClearMode::PreserveVerifierConsumer)"),
               std::string::npos);
     EXPECT_NE(compact_helper.find("clearDeviceResidentLogicalSequenceStateMailbox()"),
               std::string::npos);
@@ -1554,33 +1740,36 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ROCmGDNVerifierRowsUseSerialDecodeEquiv
     const auto source =
         readFile(repoRoot() / "src/v2/kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip");
     const auto compact = removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
-    const auto serial_helper = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+    const auto grouped_helper = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
         source,
-        "bool rocmGDN_chunk_forward_via_single_row_chunks(",
+        "bool rocmGDN_chunk_forward_kernel_route(",
         "bool rocmGDN_chunk_forward(")));
     const auto public_route = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
         source,
         "bool rocmGDN_chunk_forward(",
         "bool rocmGDN_chunk_forward_effective(")));
+    const auto effective_route = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool rocmGDN_chunk_forward_effective(",
+        "bool rocmGDN_short_conv1d(")));
 
     EXPECT_NE(compact.find("boolrocmGDN_chunk_forward_kernel_route("), std::string::npos)
         << "ROCm GDN should share one launch helper between normal and verifier-specific routes.";
-    EXPECT_NE(compact.find("boolrocmGDN_chunk_forward_via_single_row_chunks("), std::string::npos)
-        << "ROCm all-position verifier rows need the same serial-row path as CUDA.";
-    EXPECT_NE(public_route.find("seq_len>0&&seq_len<=4"), std::string::npos)
-        << "MTP verifier chunks are tiny and must publish serial-decode-equivalent GDN state.";
-    EXPECT_NE(public_route.find("rocmGDN_chunk_forward_via_single_row_chunks("), std::string::npos);
-    EXPECT_NE(public_route.find("rocmGDN_chunk_forward_effective_via_single_row_chunks("), std::string::npos)
-        << "The effective-length route used by graph replay must share the serial-row verifier path.";
-    EXPECT_NE(serial_helper.find("rocmGDN_recurrent_step("), std::string::npos)
-        << "Each verifier row should run through the ordinary serial decode recurrent step.";
-    EXPECT_EQ(serial_helper.find("rocmGDN_chunk_forward_kernel_route("), std::string::npos)
-        << "Verifier state snapshots must not be produced by the optimized prefill route.";
-    EXPECT_NE(serial_helper.find("hipMemcpyAsync("), std::string::npos);
-    EXPECT_NE(serial_helper.find("hipMemcpyDeviceToDevice"), std::string::npos)
-        << "Snapshot publication must stay device-resident and graph-capturable.";
-    EXPECT_NE(serial_helper.find("static_cast<hipStream_t>(stream)"), std::string::npos)
-        << "Snapshot copies must run on the caller's explicit capture stream.";
+    EXPECT_NE(public_route.find("rocmGDN_chunk_forward_kernel_route("), std::string::npos)
+        << "MTP verifier chunks must use the grouped route instead of a hidden "
+           "loop over single-row launches.";
+    EXPECT_NE(effective_route.find("rocmGDN_chunk_forward_kernel_route("), std::string::npos)
+        << "The effective-length route used by graph replay must share the grouped verifier path.";
+    EXPECT_NE(grouped_helper.find("state_snapshots"), std::string::npos)
+        << "Grouped verifier state snapshots must be produced inside the GPU route.";
+    EXPECT_NE(grouped_helper.find("snapshot_stride_floats"), std::string::npos);
+    EXPECT_NE(grouped_helper.find("device_effective_seq_len"), std::string::npos)
+        << "Snapshot publication must be guarded by device-resident row metadata.";
+    EXPECT_NE(grouped_helper.find("(hipStream_t)stream"), std::string::npos)
+        << "Grouped verifier GDN must run on the caller's explicit capture stream.";
+    EXPECT_EQ(grouped_helper.find("hipMemcpyAsync("), std::string::npos)
+        << "Grouped verifier GDN snapshots must be written by kernels, not by "
+           "ad hoc copy calls in the hot path.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, GDNVerifierCaptureWorkspacesAreGraphRoleScoped)
@@ -2037,6 +2226,77 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
               std::string::npos);
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchResidentOutcomePublishesBeforeHostBridge)
+{
+    const auto runner_source =
+        readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
+    const auto producer_body = sliceBetween(
+        runner_source,
+        "auto produce_stochastic_outcomes =",
+        "MTPOwnedDeviceOutcomeBatchTransactionResult tx;");
+    const auto resident_branch = sliceBetween(
+        runner_source,
+        "MTPOwnedDeviceOutcomeBatchTransactionResult tx;\n            if (use_device_resident_request_batch_publication)",
+        "else\n            {\n                tx =");
+    const auto compact_producer =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(producer_body));
+    const auto compact =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(resident_branch));
+
+    EXPECT_NE(compact_producer.find("verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident("),
+              std::string::npos)
+        << "Request-batched GPU stochastic verification must keep the compact "
+           "outcome in a typed device-resident handle.";
+    EXPECT_NE(compact_producer.find("outcomes->clear()"),
+              std::string::npos)
+        << "The resident producer must not fabricate a host plan before "
+           "device-state publication consumes the handle.";
+    EXPECT_NE(compact.find("produce_stochastic_outcomes("),
+              std::string::npos)
+        << "The resident branch should enter through the shared producer so "
+           "request admission and resident verification stay coupled.";
+    EXPECT_NE(compact.find("publishAcceptedMTPSpecStateBatchFromDeviceOutcome("),
+              std::string::npos)
+        << "Resident request batches must publish live state from the device "
+           "outcome before host response bookkeeping.";
+    EXPECT_NE(compact.find("adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata("),
+              std::string::npos)
+        << "After resident publication, DGO must adopt host mirrors from the "
+           "resident logical-state mailbox instead of rebuilding host plans.";
+    EXPECT_NE(compact.find("materializeDeviceSpeculativeOutcomesForHostResponse("),
+              std::string::npos)
+        << "The compact D2H bridge is allowed only for response tokens and "
+           "sampler bookkeeping after publication/adoption.";
+    EXPECT_EQ(compact.find("materializeDeviceSpeculativeOutcomesForHostPlan("),
+              std::string::npos)
+        << "Request-batched resident publication must not use the legacy "
+           "host-plan bridge.";
+    EXPECT_EQ(compact.find("copyDeviceSpeculativeOutcomesToHost("),
+              std::string::npos)
+        << "OrchestrationRunner should call the named response-only bridge, "
+           "not the low-level D2H hook directly.";
+
+    const size_t produce =
+        compact.find("produce_stochastic_outcomes(");
+    const size_t publish =
+        compact.find("publishAcceptedMTPSpecStateBatchFromDeviceOutcome(");
+    const size_t adopt =
+        compact.find("adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(");
+    const size_t response_bridge =
+        compact.find("materializeDeviceSpeculativeOutcomesForHostResponse(");
+    ASSERT_NE(produce, std::string::npos);
+    ASSERT_NE(publish, std::string::npos);
+    ASSERT_NE(adopt, std::string::npos);
+    ASSERT_NE(response_bridge, std::string::npos);
+    EXPECT_LT(produce, publish)
+        << "The producer handle must exist before resident state publication.";
+    EXPECT_LT(publish, adopt)
+        << "Host mirrors must be adopted only after resident state publication.";
+    EXPECT_LT(adopt, response_bridge)
+        << "Response materialization is a post-publication bridge, not part "
+           "of live-state mutation.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecDeviceIndexedPublicationNeverFallsBackToHostRow)
 {
     const auto publisher =
@@ -2276,12 +2536,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationRequiresAto
     const auto compact_publish =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(publish_body));
 
-    EXPECT_NE(compact_support.find("supportsMTPSpecStatePublication()"),
-              std::string::npos);
+    EXPECT_EQ(compact_support.find("supportsMTPSpecStatePublication()"),
+              std::string::npos)
+        << "Device-resident grouped-outcome publication is a resident handoff "
+           "capability, not permission to promote the older direct all-position "
+           "verifier policy.";
     EXPECT_NE(compact_support.find("supportsDeviceResidentLogicalSequenceStatePublication()"),
               std::string::npos)
-        << "DGO must advertise direct publication only when the normal MTP "
-           "state contract and resident logical-state handoff are both present.";
+        << "DGO must advertise resident publication only when the logical-state "
+           "mailbox can expose the same device-owned sequence state as KV.";
     EXPECT_NE(compact_publish.find("prepareDeviceResidentMTPSpecPublicationMetadata("),
               std::string::npos)
         << "The direct endpoint should exercise the device metadata preflight "
@@ -3050,21 +3313,24 @@ TEST(Test__GpuWorkspaceAllocationPolicy, KVCacheDevicePublicationPrimitiveIsWrap
             << "Invalid verifier outcomes must not mutate KV sequence metadata.";
         EXPECT_NE(compact->find("accepted_state_counts[request_idx]"),
                   std::string::npos)
-            << "Wrapped ring heads must advance by the committed verifier-row count.";
+            << "Accepted-row counts must remain visible for validation/accounting.";
         EXPECT_NE(compact->find("target_cached_tokens[request_idx]"),
                   std::string::npos)
-            << "The target cached-token count is only the valid-token count.";
-        EXPECT_NE(compact->find("(old_head+accepted_count)%max_seq_len"),
+            << "The target cached-token count must drive the published valid window.";
+        EXPECT_NE(compact->find("tail=old_head-old_count"),
                   std::string::npos)
-            << "A wrapped-ring head must be derived from the live device head plus accepted rows.";
+            << "A wrapped-ring publication must preserve the current ring tail.";
+        EXPECT_NE(compact->find("(tail+target_count)%max_seq_len"),
+                  std::string::npos)
+            << "A wrapped-ring publication must clamp the head to the accepted target length.";
         EXPECT_NE(compact->find("d_counts[entry_idx]=target_count"),
                   std::string::npos)
             << "Device publication must update the live count mirror for subsequent attention.";
         EXPECT_NE(compact->find("adoptSequenceStateFromHostMetadata("),
                   std::string::npos);
-        EXPECT_NE(compact->find("setEntryHead(layer,seq_idx,(old_head+accepted_count)%max_seq_len_)"),
+        EXPECT_NE(compact->find("setEntryHead(layer,seq_idx,(tail+target_count)%max_seq_len_)"),
                   std::string::npos)
-            << "Host adoption must mirror the wrapped-ring head advance.";
+            << "Host adoption must mirror the wrapped-ring prefix publication.";
         EXPECT_NE(compact->find("setEntryCount(layer,seq_idx,target_count)"),
                   std::string::npos)
             << "Host adoption must mirror the target valid-token count.";
@@ -3268,7 +3534,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMTPSidecarUsesPersistentDepthScopedM
     const auto spec_publication_support_body = sliceBetween(
         dgo_source,
         "bool DeviceGraphOrchestrator::supportsMTPSpecStatePublication() const",
-        "void DeviceGraphOrchestrator::clearDeviceResidentLogicalSequenceStateMailbox()");
+        "MTPVerifierRowCapability DeviceGraphOrchestrator::mtpVerifierRowCapability() const");
 
     const auto compact_ffn =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(ffn_body));
@@ -3304,18 +3570,42 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMTPSidecarUsesPersistentDepthScopedM
               std::string::npos)
         << "Sidecar replay safety must use the same robust MoE detection as "
            "main-state preservation.";
-    EXPECT_NE(compact_spec_publication_support.find("config.isMoE()||isPrefixCacheMoEModel()"),
+    EXPECT_NE(compact_spec_publication_support.find("supportsMoEDirectAllPositionRows("),
               std::string::npos)
-        << "MoE direct all-position publication must stay disabled until "
-           "verifier rows are serial-equivalent.";
-    EXPECT_NE(compact_spec_publication_support.find("returnfalse;"),
+        << "MoE spec-state publication support must remain gated by the "
+           "separate direct-row capability, not by the decode-equivalent fallback.";
+    EXPECT_EQ(compact_spec_publication_support.find("state_.device_id.is_gpu()"),
               std::string::npos)
-        << "MoE direct state publication should fail closed instead of using "
-           "the unproven all-position verifier shortcut.";
+        << "Backend identity alone must not promote MoE direct all-position "
+           "publication.";
+    EXPECT_EQ(compact_spec_publication_support.find("supportsDeviceResidentLogicalSequenceStatePublication"),
+              std::string::npos)
+        << "The direct publication support query should not quietly compose a "
+           "device-resident shortcut; the capability producer must earn and "
+           "advertise that state explicitly.";
     EXPECT_NE(sidecar_replay_body.find("supportsMTPSidecarPreservesMainState()"),
               std::string::npos)
         << "The sidecar replay contract must remain explicitly narrower than "
            "main-state preservation and shifted-row reuse.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, ProductionGpuMoERoutingRejectsHostTopKFallback)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/MoERoutingStage.cpp");
+    const auto executable_source =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+
+    EXPECT_NE(source.find("GPU single-row MoE routing requires"),
+              std::string::npos)
+        << "Production GPU decode must fail closed if runtime-table routing is "
+           "unavailable, instead of silently materializing top-k rows on host.";
+    EXPECT_NE(executable_source.find("!defined(ENABLE_PIPELINE_SNAPSHOTS)"),
+              std::string::npos);
+    EXPECT_NE(executable_source.find(
+                  "params_.device_id.is_gpu()&&params_.seq_len==1&&!isDeviceRoutedDecodeGraphCapturable()"),
+              std::string::npos)
+        << "The guard must cover every non-snapshot GPU single-row MoE route.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDARingKVCacheGatherHasNoRawAllocationFallback)
@@ -4002,7 +4292,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoECombineDoesNotForceFreshGraphS
         << "The no-shared-expert copy form must not reintroduce per-layer graph segmentation either.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierUsesDecodeEquivalentExpertPathOnAllBackends)
+TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPublicationGuards)
 {
     const auto graph_source = readFile(repoRoot() / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp");
     const auto predicate_section = sliceBetween(
@@ -4014,22 +4304,66 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierUsesDecodeEqui
 
     EXPECT_NE(compact.find("(candidate.is_cpu()||candidate.is_cuda()||candidate.is_rocm())"),
               std::string::npos)
-        << "Main-verifier MoE publication rows must reuse serial decode expert execution on CPU, CUDA, and ROCm. "
-           "The grouped small-M path is not a valid publication contract until row parity proves it.";
+        << "The decode-equivalent verifier lane must remain available for CPU "
+           "and any GPU topology that is not allowed to use the grouped "
+           "all-position publication path.";
     EXPECT_NE(compact.find("total_tokens>1&&total_tokens<=4"),
               std::string::npos)
-        << "Only multi-row verifier publication should force the decode-equivalent path; one-token correction replay "
-           "can keep the grouped verifier route.";
+        << "Only multi-row verifier publication should force the "
+           "decode-equivalent path; one-token correction replay can keep the "
+           "grouped verifier route.";
 
     const auto combined_shared_section = sliceBetween(
         graph_source,
         "const bool can_combine_shared_verifier =",
         "if (overlay_requested && !use_expert_overlay)");
     EXPECT_NE(removeAsciiWhitespace(stripCommentsAndStringLiterals(combined_shared_section))
-                  .find("!forceDecodeEquivalentMoEVerifier(device)"),
+                  .find("constboolcan_combine_shared_verifier=false;"),
               std::string::npos)
-        << "Combined shared+routed verifier prefill is a grouped small-M route; it must stay disabled whenever "
-           "the backend is publishing decode-equivalent all-position rows.";
+        << "The single-table combined shared+routed verifier shortcut failed the "
+           "full continuation proof. Keep it out of graph promotion until a future "
+           "strict proof re-enables it intentionally.";
+
+    const auto shared_stage_section = sliceBetween(
+        graph_source,
+        "SharedExpertFFNStage::Params shared_params;",
+        "graph.addNode(prefix + \"shared_expert_ffn\"");
+    const auto shared_policy_section = sliceBetween(
+        graph_source,
+        "auto forceGroupedSharedMoEVerifierPrefill = [&](DeviceId candidate)",
+        "/*\n         * MTP sidecars need their own persistent MoE metadata");
+    const std::string compact_shared =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(shared_stage_section));
+    const std::string compact_shared_policy =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(shared_policy_section));
+    EXPECT_FALSE(compact_shared_policy.empty())
+        << "Could not find the shared-expert verifier grouping policy.";
+    EXPECT_NE(compact_shared_policy.find("rocm_env.moe_grouped_prefill&&"),
+              std::string::npos)
+        << "If grouped prefill is disabled, the graph must choose the explicit "
+           "decode-equivalent path rather than quietly falling through.";
+    EXPECT_NE(compact_shared_policy.find("forceGroupedMoEVerifierPrefill(candidate)"),
+              std::string::npos)
+        << "The grouped shared-expert path may only be selected for the "
+           "speculative sidecar verifier-prefill lane until a full-model "
+           "M=2..4 proof re-promotes it.";
+    EXPECT_NE(compact_shared.find(
+                  "shared_params.force_grouped_verifier_prefill_for_decode="
+                  "shared_grouped_verifier_prefill;"),
+              std::string::npos)
+        << "The shared expert policy should still expose a named grouped route "
+           "for sidecar prefill and future re-promotion.";
+    EXPECT_NE(compact_shared.find(
+                  "shared_params.force_decode_equivalent_verifier_prefill="
+                  "!shared_grouped_verifier_prefill&&"
+                  "forceDecodeEquivalentMoEVerifier(shared_device);"),
+              std::string::npos)
+        << "Decode-equivalent MoE routing must not force the independent shared "
+           "expert back onto row-serial verifier replay.";
+    EXPECT_EQ(compact_shared.find("forceDecodeEquivalentMoERouting(shared_device)"),
+              std::string::npos)
+        << "Routing conservatism belongs to the router/routed-expert path only; "
+           "recoupling it here reintroduces a large shared-expert replay cost.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35GDNAllPositionVerifierBatchesCarryRequestShape)

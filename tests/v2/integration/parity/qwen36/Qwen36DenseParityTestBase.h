@@ -191,6 +191,24 @@ namespace llaminar2::test::parity::qwen36
             });
     }
 
+    inline bool denseHasMTPPerfRecordTag(
+        const std::vector<PerfStatRecord> &records,
+        const char *name,
+        const char *tag_key,
+        const char *tag_value)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                if (record.domain != "mtp" || record.name != name)
+                    return false;
+                const auto it = record.tags.find(tag_key);
+                return it != record.tags.end() && it->second == tag_value;
+            });
+    }
+
     inline void expectPhase138TransactionUsed(
         const DensePrefixRestoreParityCase &test_case,
         const PrefixRuntimeStateSnapshot &snapshot,
@@ -309,6 +327,40 @@ namespace llaminar2::test::parity::qwen36
             }
         }
         return fallback;
+    }
+
+    /**
+     * @brief Return true when a parity case will stage weights for a GPU backend.
+     *
+     * The distinction matters before any runner is built: GPU model loads should
+     * use the same demand-paged mmap policy as production so large GGUF files do
+     * not block on a whole-file host prefault before device upload starts.
+     */
+    inline bool isQwen36GpuParityDevice(const DeviceId &device)
+    {
+        return device.is_gpu();
+    }
+
+    /**
+     * @brief Create a Qwen 3.6 real-model parity context with backend-aware mmap.
+     *
+     * Most parity helpers build runners directly rather than through
+     * OrchestrationRunner, so they must explicitly pass ModelContextConfig here.
+     * This keeps GPU tests on the production GPU-target mmap path while leaving
+     * CPU tests on the NUMA/eager-prefault path used for CPU decode.
+     */
+    inline std::shared_ptr<ModelContext> createQwen36ParityModelContext(
+        const std::string &model_path,
+        const DeviceId &device,
+        WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
+        WeightPrecision weight_precision = WeightPrecision::NATIVE)
+    {
+        ModelContextConfig model_config;
+        model_config.strategy = strategy;
+        model_config.weight_precision = weight_precision;
+        model_config.use_mmap = true;
+        model_config.target_is_gpu = isQwen36GpuParityDevice(device);
+        return ModelContext::create(model_path, model_config);
     }
 
     inline std::string formatTokenWindow(
@@ -506,7 +558,8 @@ namespace llaminar2::test::parity::qwen36
         const std::string &label,
         double min_cosine = 0.99995,
         double max_rel_l2 = 0.005,
-        double max_symmetric_kl = 1.0e-4)
+        double max_symmetric_kl = 1.0e-4,
+        double max_abs_diff = 0.25)
     {
         const DenseVerifierLogitMetrics metrics =
             computeDenseVerifierLogitMetrics(
@@ -515,7 +568,8 @@ namespace llaminar2::test::parity::qwen36
                 vocab_size);
         if (metrics.cosine >= min_cosine &&
             metrics.rel_l2 <= max_rel_l2 &&
-            metrics.symmetric_kl <= max_symmetric_kl)
+            metrics.symmetric_kl <= max_symmetric_kl &&
+            metrics.max_abs_diff <= max_abs_diff)
         {
             return ::testing::AssertionSuccess();
         }
@@ -529,7 +583,8 @@ namespace llaminar2::test::parity::qwen36
                << " max_abs_index=" << metrics.max_abs_index
                << " thresholds(cosine>=" << min_cosine
                << ", rel_l2<=" << max_rel_l2
-               << ", symmetric_kl<=" << max_symmetric_kl << ")";
+               << ", symmetric_kl<=" << max_symmetric_kl
+               << ", max_abs_diff<=" << max_abs_diff << ")";
     }
 
     inline ::testing::AssertionResult tokenSequencesMatch(
@@ -2214,6 +2269,128 @@ namespace llaminar2::test::parity::qwen36
             test_case.name + " restored request");
     }
 
+    /**
+     * @brief Prove temperature-zero penalties stay on a safe dense MTP path.
+     *
+     * This is intentionally a one-runner model-level regression.  Unit tests
+     * own the exact no-MTP/MTP policy mechanics; this large-model row proves
+     * that non-zero repetition penalties do not bypass MTP and that dense
+     * Qwen3.6 still records the correct fail-closed verifier contract.  The
+     * penalties are deliberately small so the existing PyTorch greedy fixture
+     * remains a stable token oracle without doubling test time through a second
+     * no-MTP large-model runner.
+     */
+    inline void runDensePenaltyGreedyMTPMatchesPyTorch(
+        DensePrefixRestoreParityCase test_case,
+        int mtp_draft_tokens = 3)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        ASSERT_GE(mtp_draft_tokens, 1);
+        ASSERT_LE(mtp_draft_tokens, 3);
+
+        test_case.name += " penalty-greedy MTP parity";
+
+        ScopedEnvironmentValues perf_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size()) + test_case.decode_steps,
+            test_case.max_seq_len);
+
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams penalty_greedy;
+        penalty_greedy.temperature = 0.0f;
+        penalty_greedy.presence_penalty = 0.01f;
+        penalty_greedy.frequency_penalty = 0.005f;
+        penalty_greedy.seed = 42;
+        ASSERT_TRUE(penalty_greedy.has_penalties());
+
+        auto mtp = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(
+                test_case,
+                model_path,
+                false,
+                2,
+                true,
+                mtp_draft_tokens));
+        ASSERT_NE(mtp, nullptr);
+        ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+
+        PerfStatsCollector::reset();
+        auto mtp_result = mtp->generate(
+            prompt_tokens,
+            test_case.decode_steps,
+            penalty_greedy);
+        const auto mtp_state = mtp->prefixStateProbe();
+        const auto mtp_records = PerfStatsCollector::snapshot({"mtp"});
+        mtp->shutdown();
+        PerfStatsCollector::reset();
+
+        ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
+        ASSERT_EQ(mtp_result.tokens.size(), expected_tokens.size());
+        EXPECT_TRUE(tokenSequencesMatch(
+            mtp_result.tokens,
+            expected_tokens,
+            test_case.name + " MTP versus PyTorch fixture"))
+            << "The small penalty values should preserve the existing greedy "
+               "fixture while still exercising the penalty verifier policy.";
+        EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
+        EXPECT_GE(mtp_state.mtp_draft_steps, 1u);
+        EXPECT_GE(mtp_state.mtp_verifier_runs, 1u);
+        EXPECT_GE(mtp_state.mtp_verifier_token_count, 2u);
+
+        const bool used_decode_equivalent_greedy_verifier =
+            denseHasMTPPerfCounter(
+                mtp_records,
+                "decode_equivalent_sequential_verifier_runs");
+        const bool used_all_position_publication =
+            denseHasMTPPerfCounter(
+                mtp_records,
+                "all_position_state_publication_verifier_runs") &&
+            denseHasMTPPerfCounter(mtp_records, "spec_state_publications");
+        const bool selected_penalty_shared_verifier =
+            denseHasMTPPerfRecordTag(
+                mtp_records,
+                "verifier_policy_selections",
+                "reason",
+                "greedy_penalties_use_shared_decode_equivalent_verifier");
+
+        if (denseCaseExpectsAllPositionSpecPublication(test_case))
+        {
+            EXPECT_TRUE(used_all_position_publication)
+                << "Dense penalty-greedy MTP advertised all-position "
+                   "publication support but did not use it.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_decode_equivalent_greedy_verifier)
+                << "Dense penalty-greedy MTP should not use the shared "
+                   "verifier once direct publication is proven.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+        }
+        else
+        {
+            EXPECT_TRUE(used_decode_equivalent_greedy_verifier)
+                << "Dense penalty-greedy MTP must use the shared "
+                   "decode-equivalent verifier while direct publication is "
+                   "not advertised.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(selected_penalty_shared_verifier)
+                << "Penalty-greedy policy selection did not record the "
+                   "expected fail-closed verifier reason.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_all_position_publication)
+                << "Dense penalty-greedy MTP must not publish from an "
+                   "unproven all-position verifier.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+        }
+    }
+
     inline void runDenseMTPFirstTransactionLeavesSequentialState(
         DensePrefixRestoreParityCase test_case)
     {
@@ -2242,13 +2419,12 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_EQ(expected_tokens[3], 198);
         ASSERT_EQ(expected_tokens[4], 8160);
 
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+
         DeviceManager::instance().initialize(-1);
-        auto model_ctx = ModelContext::create(
-            model_path,
-            nullptr,
-            nullptr,
-            nullptr,
-            WeightDistributionStrategy::REPLICATED);
+        auto model_ctx = createQwen36ParityModelContext(model_path, device);
         ASSERT_NE(model_ctx, nullptr);
 
         InferenceRunnerConfig config;
@@ -2261,9 +2437,6 @@ namespace llaminar2::test::parity::qwen36
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 3;
 
-        const DeviceId device = test_case.devices.empty()
-                                    ? DeviceId::cuda(0)
-                                    : test_case.devices.front().toLocalDeviceId();
         auto runner = createInferenceRunner(
             model_ctx,
             nullptr,
@@ -2290,7 +2463,7 @@ namespace llaminar2::test::parity::qwen36
         request.verifier_path = "phase138_first_transaction_regression";
         request.verifier_base_checkpoint = &base_checkpoint;
 
-        auto sample_after_forward = [&]() -> int32_t
+        auto sample_after_forward = [&](int32_t) -> int32_t
         {
             return runner->sampleGreedyOnDevice();
         };
@@ -2468,13 +2641,12 @@ namespace llaminar2::test::parity::qwen36
         const std::filesystem::path snapshot_dir = metadata_path.parent_path();
         ensurePyTorchDecodeSnapshots(test_case, model_path, metadata_path);
 
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+
         DeviceManager::instance().initialize(-1);
-        auto model_ctx = ModelContext::create(
-            model_path,
-            nullptr,
-            nullptr,
-            nullptr,
-            WeightDistributionStrategy::REPLICATED);
+        auto model_ctx = createQwen36ParityModelContext(model_path, device);
         ASSERT_NE(model_ctx, nullptr);
 
         InferenceRunnerConfig config;
@@ -2486,9 +2658,6 @@ namespace llaminar2::test::parity::qwen36
         config.use_mapped_memory = false;
         config.mtp.enabled = false;
 
-        const DeviceId device = test_case.devices.empty()
-                                    ? DeviceId::cuda(0)
-                                    : test_case.devices.front().toLocalDeviceId();
         auto runner = createInferenceRunner(
             model_ctx,
             nullptr,
@@ -2662,7 +2831,12 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << test_case.name << " model not found: " << model_path;
         }
 
-        auto model_context = ModelContext::create(model_path);
+        const DeviceId tokenizer_device = test_case.devices.empty()
+                                              ? DeviceId::cpu()
+                                              : test_case.devices.front().toLocalDeviceId();
+        auto model_context = createQwen36ParityModelContext(
+            model_path,
+            tokenizer_device);
         ASSERT_NE(model_context, nullptr);
         auto tokenizer = createTokenizer(model_context);
         ASSERT_NE(tokenizer, nullptr);
@@ -2948,7 +3122,12 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << test_case.name << " model not found: " << model_path;
         }
 
-        auto model_context = ModelContext::create(model_path);
+        const DeviceId tokenizer_device = test_case.devices.empty()
+                                              ? DeviceId::cpu()
+                                              : test_case.devices.front().toLocalDeviceId();
+        auto model_context = createQwen36ParityModelContext(
+            model_path,
+            tokenizer_device);
         ASSERT_NE(model_context, nullptr);
         auto tokenizer = createTokenizer(model_context);
         ASSERT_NE(tokenizer, nullptr);
@@ -3424,13 +3603,12 @@ namespace llaminar2::test::parity::qwen36
             static_cast<int>(prompt_tokens.size() + first_token_index + 2),
             test_case.max_seq_len);
 
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+
         DeviceManager::instance().initialize(-1);
-        auto model_ctx = ModelContext::create(
-            model_path,
-            nullptr,
-            nullptr,
-            nullptr,
-            WeightDistributionStrategy::REPLICATED);
+        auto model_ctx = createQwen36ParityModelContext(model_path, device);
         ASSERT_NE(model_ctx, nullptr);
 
         InferenceRunnerConfig config;
@@ -3443,9 +3621,6 @@ namespace llaminar2::test::parity::qwen36
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 3;
 
-        const DeviceId device = test_case.devices.empty()
-                                    ? DeviceId::cuda(0)
-                                    : test_case.devices.front().toLocalDeviceId();
         auto runner = createInferenceRunner(
             model_ctx,
             nullptr,
@@ -3591,13 +3766,12 @@ namespace llaminar2::test::parity::qwen36
             static_cast<int>(prompt_tokens.size()) + kExpectedTokenIndex + 1,
             test_case.max_seq_len);
 
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cpu()
+                                    : test_case.devices.front().toLocalDeviceId();
+
         DeviceManager::instance().initialize(-1);
-        auto model_ctx = ModelContext::create(
-            model_path,
-            nullptr,
-            nullptr,
-            nullptr,
-            WeightDistributionStrategy::REPLICATED);
+        auto model_ctx = createQwen36ParityModelContext(model_path, device);
         ASSERT_NE(model_ctx, nullptr);
 
         InferenceRunnerConfig config;
@@ -3609,9 +3783,6 @@ namespace llaminar2::test::parity::qwen36
         config.use_mapped_memory = false;
         config.mtp.enabled = false;
 
-        const DeviceId device = test_case.devices.empty()
-                                    ? DeviceId::cpu()
-                                    : test_case.devices.front().toLocalDeviceId();
         auto runner = createInferenceRunner(
             model_ctx,
             nullptr,
@@ -3727,13 +3898,12 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << test_case.name << " model not found: " << model_path;
         }
 
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+
         DeviceManager::instance().initialize(-1);
-        auto model_ctx = ModelContext::create(
-            model_path,
-            nullptr,
-            nullptr,
-            nullptr,
-            WeightDistributionStrategy::REPLICATED);
+        auto model_ctx = createQwen36ParityModelContext(model_path, device);
         ASSERT_NE(model_ctx, nullptr);
 
         auto tokenizer = createTokenizer(model_ctx);
@@ -3745,10 +3915,6 @@ namespace llaminar2::test::parity::qwen36
             encoded_prompt.begin(),
             encoded_prompt.end());
         ASSERT_LT(static_cast<int>(prompt_tokens.size()) + decode_steps, test_case.max_seq_len);
-
-        const DeviceId device = test_case.devices.empty()
-                                    ? DeviceId::cuda(0)
-                                    : test_case.devices.front().toLocalDeviceId();
 
         auto make_config = [&](bool enable_mtp)
         {
@@ -3770,12 +3936,9 @@ namespace llaminar2::test::parity::qwen36
             -> std::vector<int32_t>
         {
             std::vector<int32_t> generated;
-            auto runner_model_ctx = ModelContext::create(
+            auto runner_model_ctx = createQwen36ParityModelContext(
                 model_path,
-                nullptr,
-                nullptr,
-                nullptr,
-                WeightDistributionStrategy::REPLICATED);
+                device);
             EXPECT_NE(runner_model_ctx, nullptr);
             if (!runner_model_ctx)
             {
@@ -3893,12 +4056,7 @@ namespace llaminar2::test::parity::qwen36
                                     : test_case.devices.front().toLocalDeviceId();
 
         DeviceManager::instance().initialize(-1);
-        auto model_ctx = ModelContext::create(
-            model_path,
-            nullptr,
-            nullptr,
-            nullptr,
-            WeightDistributionStrategy::REPLICATED);
+        auto model_ctx = createQwen36ParityModelContext(model_path, device);
         ASSERT_NE(model_ctx, nullptr);
 
         InferenceRunnerConfig config;
@@ -4006,7 +4164,7 @@ namespace llaminar2::test::parity::qwen36
         request.implementation_name = "shared_stepwise";
         request.verifier_base_checkpoint = &verifier_base;
 
-        auto sample_after_forward = [&]() -> int32_t
+        auto sample_after_forward = [&](int32_t) -> int32_t
         {
             const int32_t sampled =
                 sample_current("dense decode-equivalent catch-up row");
@@ -4185,12 +4343,7 @@ namespace llaminar2::test::parity::qwen36
                                     : test_case.devices.front().toLocalDeviceId();
 
         DeviceManager::instance().initialize(-1);
-        auto model_ctx = ModelContext::create(
-            model_path,
-            nullptr,
-            nullptr,
-            nullptr,
-            WeightDistributionStrategy::REPLICATED);
+        auto model_ctx = createQwen36ParityModelContext(model_path, device);
         ASSERT_NE(model_ctx, nullptr);
 
         InferenceRunnerConfig config;

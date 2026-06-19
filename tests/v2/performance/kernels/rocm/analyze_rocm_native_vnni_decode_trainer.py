@@ -43,6 +43,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Generated C++ include path")
     parser.add_argument("--summary", default=None, help="Human-readable summary path")
     parser.add_argument(
+        "--base-include",
+        default=None,
+        help=(
+            "Existing generated include to preserve while layering exact "
+            "shape winners from the input CSV. Use this for staged profiles "
+            "such as qwen36-moe so a partial refresh does not discard the "
+            "broader dispatch table."
+        ),
+    )
+    parser.add_argument(
         "--max-generated-kb",
         type=int,
         default=8,
@@ -177,6 +187,60 @@ def load_decode_rows(paths: list[str], max_generated_kb: int) -> list[DecodeRow]
     return sorted(best_by_key.values(), key=lambda item: (item.codebook, item.m, item.n, item.k, item.variant))
 
 
+OVERLAY_BEGIN = "    // BEGIN ROCM_NATIVE_VNNI_KNOWN_SHAPE_OVERLAY"
+OVERLAY_END = "    // END ROCM_NATIVE_VNNI_KNOWN_SHAPE_OVERLAY"
+
+
+def emit_overlay_block(rows: list[DecodeRow]) -> str:
+    """Return an exact-shape overlay block for a staged ROCm refresh.
+
+    The broad generated ROCm table is intentionally replaced only by full
+    qwen36/all refreshes.  Staged profiles add known shape winners before the
+    existing binary-search tables, preserving older entries while allowing the
+    verifier pipeline to learn newly added production buckets.
+    """
+
+    lines: list[str] = [OVERLAY_BEGIN]
+    for row in sorted(rows, key=lambda item: (item.codebook, item.m, item.n, item.k)):
+        label = canonical_label(row.codebook)
+        lines.append(
+            f"    if (codebook_id == {row.codebook} && key == "
+            f"0x{pack_shape_key(row.m, row.n, row.k):016x}ULL) "
+            f"{{ out = ROCmNativeVNNIDecodeDispatchConfig{{{row.kb}, {row.target_waves}}}; "
+            f"return true; }} // CB={row.codebook} ({label}) M={row.m} "
+            f"{row.n}x{row.k} {row.variant} {row.shape} {row.min_us:.3f}us"
+        )
+    lines.append(OVERLAY_END)
+    return "\n".join(lines)
+
+
+def strip_existing_overlay(text: str) -> str:
+    begin = text.find(OVERLAY_BEGIN)
+    if begin < 0:
+        return text
+    end = text.find(OVERLAY_END, begin)
+    if end < 0:
+        raise SystemExit("base include contains overlay begin marker without end marker")
+    end += len(OVERLAY_END)
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    return text[:begin] + text[end:]
+
+
+def emit_cpp_overlay(rows: list[DecodeRow], output: Path, base_include: Path) -> None:
+    if not base_include.is_file():
+        raise SystemExit(f"base include not found: {base_include}")
+    text = strip_existing_overlay(base_include.read_text())
+    marker = "    const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);\n"
+    marker_index = text.find(marker)
+    if marker_index < 0:
+        raise SystemExit("base include does not contain ROCm NativeVNNI selector key marker")
+    insert_at = marker_index + len(marker)
+    updated = text[:insert_at] + emit_overlay_block(rows) + "\n" + text[insert_at:]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(updated)
+
+
 def emit_cpp(rows: list[DecodeRow], output: Path) -> None:
     rows_by_codebook: dict[int, list[DecodeRow]] = {}
     for row in rows:
@@ -286,7 +350,10 @@ def main() -> int:
     if not rows:
         raise SystemExit("no generated ROCm NativeVNNI decode rows; no correct rows fit the generated KB cap")
     output = Path(args.output)
-    emit_cpp(rows, output)
+    if args.base_include:
+        emit_cpp_overlay(rows, output, Path(args.base_include))
+    else:
+        emit_cpp(rows, output)
     if args.summary:
         emit_summary(rows, Path(args.summary))
     print(f"generated {len(rows)} ROCm NativeVNNI decode dispatch entries -> {output}")

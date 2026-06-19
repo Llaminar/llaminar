@@ -30,6 +30,92 @@
 
 namespace llaminar2
 {
+#ifdef __AVX512F__
+    static inline __m512 avx512_silu(__m512 vx);
+#endif
+
+    /**
+     * @brief Compute one causal short-conv decode channel and publish its state.
+     *
+     * The grouped verifier path and ordinary one-token decode both call this
+     * helper so they share the exact same scalar accumulation and state-update
+     * order.  Qwen3.6 GDN layers are sensitive enough that a few ULPs in the
+     * short-conv output can be amplified by later recurrent/projection layers,
+     * so verifier chunks must not carry a near-duplicate arithmetic sequence.
+     */
+    static inline float shortconv_decode_sum_and_update_channel(
+        const float *input_row,
+        const float *weight,
+        const float *bias,
+        float *conv_state,
+        int channel,
+        int kernel_size)
+    {
+        const int state_len = kernel_size - 1;
+        const float *w = weight + static_cast<size_t>(channel) * kernel_size;
+        float *state = conv_state + static_cast<size_t>(channel) * state_len;
+        const float current_input = input_row[channel];
+
+        float sum = bias ? bias[channel] : 0.0f;
+        for (int k = 0; k < state_len; ++k)
+            sum += w[k] * state[k];
+        sum += w[state_len] * current_input;
+
+        for (int k = 0; k < state_len - 1; ++k)
+            state[k] = state[k + 1];
+        if (state_len > 0)
+            state[state_len - 1] = current_input;
+
+        return sum;
+    }
+
+    /**
+     * @brief Store a block of decode sums through the same SiLU path everywhere.
+     *
+     * The helper keeps grouped verifier rows concurrent over channel blocks but
+     * makes their publication numerically identical to serial decode.  Full
+     * AVX512/AVX2 blocks use the existing vector approximations; tails use the
+     * scalar reference form used by ordinary decode tails.
+     */
+    static inline void shortconv_store_decode_block(
+        const float *sums,
+        float *output,
+        int width,
+        bool apply_silu)
+    {
+        if (!apply_silu)
+        {
+            for (int lane = 0; lane < width; ++lane)
+                output[lane] = sums[lane];
+            return;
+        }
+
+#if defined(__AVX512F__)
+        if (width == 16)
+        {
+            __m512 vsum = _mm512_load_ps(sums);
+            vsum = avx512_silu(vsum);
+            _mm512_storeu_ps(output, vsum);
+            return;
+        }
+#endif
+#if defined(__AVX2__)
+        if (width == 8)
+        {
+            __m256 vsum = _mm256_load_ps(sums);
+            vsum = avx2::fast_silu(vsum);
+            _mm256_storeu_ps(output, vsum);
+            return;
+        }
+#endif
+
+        for (int lane = 0; lane < width; ++lane)
+        {
+            const float sum = sums[lane];
+            output[lane] = sum / (1.0f + std::exp(-sum));
+        }
+    }
+
     void CPUShortConvolution::bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
     {
         verifier_state_capture_ = workspace;
@@ -85,13 +171,21 @@ namespace llaminar2
     {
         const int state_len = kernel_size - 1;
         const int state_floats = channels * std::max(0, state_len);
-        const bool verifier_capture_active =
+        const bool grouped_verifier_capture_active =
+            seq_len > 1 &&
             verifier_state_capture_ &&
             verifier_state_capture_rows_ > 0 &&
             verifier_state_capture_size_ >= state_floats &&
             state_floats > 0;
-        if (verifier_capture_active)
+        if (grouped_verifier_capture_active)
         {
+            /*
+             * Capture slots mean "run this multi-row verifier chunk
+             * speculatively."  They must not change ordinary one-token decode:
+             * serial decode is the live-state oracle and must mutate
+             * conv_state in-place even when a verifier graph previously bound
+             * capture workspace on this shared kernel object.
+             */
             float *speculative_state = prepareSpeculativeState(conv_state, state_floats);
             if (!speculative_state)
                 return false;
@@ -158,42 +252,76 @@ namespace llaminar2
             raw_input = raw_input_copy.data();
         }
 
-        /*
-         * Publishable MTP verifier rows must be decode-equivalent.  The normal
-         * CPU prefill path computes the same row outputs, but publication cares
-         * about the hidden history buffer after each row.  Walk the tiny MTP
-         * verifier chunk through the same one-token decode helper used in live
-         * generation, then snapshot that post-row history.  This mirrors the
-         * CUDA/ROCm verifier-state contract and keeps future continuation tests
-         * sensitive to real state drift.
+        /**
+         * Publishable MTP verifier rows must be decode-equivalent, but calling
+         * the one-token decode helper once per row repeatedly opens OpenMP
+         * worksharing regions and is the wrong shape for M=2..4 verifier work.
+         *
+         * The causal dependency is per channel only.  This grouped path assigns
+         * channel blocks to worker threads and then walks all verifier rows for
+         * that block through the same mutable-state update order as ordinary
+         * decode: compute from the current state, shift the state, append the
+         * current input row, apply the ISA-specific SiLU path, then snapshot the
+         * post-row state.  Keeping the mutable update sequence matters because
+         * Qwen3.6 GDN layers can amplify even sub-ULP differences across later
+         * attention and FFN stages.
          */
-        for (int t = 0; t < seq_len; ++t)
+        int channel_block_width = 1;
+#if defined(__AVX512F__)
+        if (activeISALevel() == ISALevel::AVX512)
         {
-            const float *row_input =
-                raw_input + static_cast<size_t>(t) * static_cast<size_t>(channels);
-            float *row_output =
-                output + static_cast<size_t>(t) * static_cast<size_t>(channels);
-            if (!executeDecode(
-                    row_input,
-                    weight,
-                    bias,
-                    row_output,
-                    conv_state,
-                    channels,
-                    kernel_size,
-                    apply_silu))
-            {
-                return false;
-            }
-
-            if (t < max_snapshot_rows)
-            {
-                std::memcpy(
-                    state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats,
-                    conv_state,
-                    static_cast<size_t>(state_floats) * sizeof(float));
-            }
+            channel_block_width = 16;
         }
+        else
+#endif
+#if defined(__AVX2__)
+        if (activeISALevel() == ISALevel::AVX2)
+        {
+            channel_block_width = 8;
+        }
+#endif
+
+        auto grouped_decode_equivalent = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int block = 0; block < (channels + channel_block_width - 1) / channel_block_width; ++block)
+            {
+                const int c_start = block * channel_block_width;
+                const int c_width = std::min(channel_block_width, channels - c_start);
+                alignas(64) float sums[16];
+
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    const float *input_row =
+                        raw_input + static_cast<size_t>(t) * channels;
+                    for (int ci = 0; ci < c_width; ++ci)
+                    {
+                        const int c = c_start + ci;
+                        sums[ci] = shortconv_decode_sum_and_update_channel(
+                            input_row, weight, bias, conv_state, c, kernel_size);
+                    }
+
+                    float *output_row =
+                        output + static_cast<size_t>(t) * channels + c_start;
+                    shortconv_store_decode_block(
+                        sums, output_row, c_width, apply_silu);
+
+                    if (t < max_snapshot_rows)
+                    {
+                        for (int ci = 0; ci < c_width; ++ci)
+                        {
+                            const int c = c_start + ci;
+                            const float *state = conv_state + static_cast<size_t>(c) * state_len;
+                            float *snapshot =
+                                state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats +
+                                static_cast<size_t>(c) * state_len;
+                            std::memcpy(snapshot, state, static_cast<size_t>(state_len) * sizeof(float));
+                        }
+                    }
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(grouped_decode_equivalent);
         return true;
     }
 
@@ -634,36 +762,14 @@ namespace llaminar2
         int channels, int kernel_size,
         bool apply_silu)
     {
-        const int state_len = kernel_size - 1;
-
         auto do_work = [&]()
         {
 #pragma omp for schedule(static)
             for (int c = 0; c < channels; ++c)
             {
-                const float *w = weight + c * kernel_size;
-                float *state = conv_state + c * state_len;
-                const float b = bias ? bias[c] : 0.0f;
-
-                float sum = b;
-                for (int k = 0; k < state_len; ++k)
-                    sum += w[k] * state[k];
-                sum += w[state_len] * input[c];
-
-                for (int k = 0; k < state_len - 1; ++k)
-                    state[k] = state[k + 1];
-                if (state_len > 0)
-                    state[state_len - 1] = input[c];
-
-                if (apply_silu)
-                {
-                    const float sig = 1.0f / (1.0f + std::exp(-sum));
-                    output[c] = sum * sig;
-                }
-                else
-                {
-                    output[c] = sum;
-                }
+                const float sum = shortconv_decode_sum_and_update_channel(
+                    input, weight, bias, conv_state, c, kernel_size);
+                shortconv_store_decode_block(&sum, output + c, 1, apply_silu);
             }
         };
         OMP_WORKSHARE_REGION(do_work);
@@ -676,8 +782,6 @@ namespace llaminar2
         int channels, int kernel_size,
         bool apply_silu)
     {
-        const int state_len = kernel_size - 1;
-
         auto do_work = [&]()
         {
             const int n_blocks = (channels + 7) / 8;
@@ -693,43 +797,12 @@ namespace llaminar2
                 for (int ci = 0; ci < c_width; ++ci)
                 {
                     const int c = c_start + ci;
-                    const float *w = weight + c * kernel_size;
-                    float *state = conv_state + c * state_len;
-                    const float b = bias ? bias[c] : 0.0f;
-
-                    float sum = b;
-                    for (int k = 0; k < state_len; ++k)
-                        sum += w[k] * state[k];
-                    sum += w[state_len] * input[c];
-
-                    for (int k = 0; k < state_len - 1; ++k)
-                        state[k] = state[k + 1];
-                    if (state_len > 0)
-                        state[state_len - 1] = input[c];
-
-                    sums[ci] = sum;
+                    sums[ci] = shortconv_decode_sum_and_update_channel(
+                        input, weight, bias, conv_state, c, kernel_size);
                 }
 
-                if (apply_silu && c_width == 8)
-                {
-                    __m256 vsum = _mm256_load_ps(sums);
-                    vsum = avx2::fast_silu(vsum);
-                    _mm256_storeu_ps(&output[c_start], vsum);
-                }
-                else if (apply_silu)
-                {
-                    for (int ci = 0; ci < c_width; ++ci)
-                    {
-                        const float s = sums[ci];
-                        const float sig = 1.0f / (1.0f + std::exp(-s));
-                        output[c_start + ci] = s * sig;
-                    }
-                }
-                else
-                {
-                    for (int ci = 0; ci < c_width; ++ci)
-                        output[c_start + ci] = sums[ci];
-                }
+                shortconv_store_decode_block(
+                    sums, output + c_start, c_width, apply_silu);
             }
         };
         OMP_WORKSHARE_REGION(do_work);
@@ -743,8 +816,6 @@ namespace llaminar2
         int channels, int kernel_size,
         bool apply_silu)
     {
-        const int state_len = kernel_size - 1;
-
         auto do_work = [&]()
         {
             const int n_blocks = (channels + 15) / 16;
@@ -760,43 +831,12 @@ namespace llaminar2
                 for (int ci = 0; ci < c_width; ++ci)
                 {
                     const int c = c_start + ci;
-                    const float *w = weight + c * kernel_size;
-                    float *state = conv_state + c * state_len;
-                    const float b = bias ? bias[c] : 0.0f;
-
-                    float sum = b;
-                    for (int k = 0; k < state_len; ++k)
-                        sum += w[k] * state[k];
-                    sum += w[state_len] * input[c];
-
-                    for (int k = 0; k < state_len - 1; ++k)
-                        state[k] = state[k + 1];
-                    if (state_len > 0)
-                        state[state_len - 1] = input[c];
-
-                    sums[ci] = sum;
+                    sums[ci] = shortconv_decode_sum_and_update_channel(
+                        input, weight, bias, conv_state, c, kernel_size);
                 }
 
-                if (apply_silu && c_width == 16)
-                {
-                    __m512 vsum = _mm512_load_ps(sums);
-                    vsum = avx512_silu(vsum);
-                    _mm512_storeu_ps(&output[c_start], vsum);
-                }
-                else if (apply_silu)
-                {
-                    for (int ci = 0; ci < c_width; ++ci)
-                    {
-                        const float s = sums[ci];
-                        const float sig = 1.0f / (1.0f + std::exp(-s));
-                        output[c_start + ci] = s * sig;
-                    }
-                }
-                else
-                {
-                    for (int ci = 0; ci < c_width; ++ci)
-                        output[c_start + ci] = sums[ci];
-                }
+                shortconv_store_decode_block(
+                    sums, output + c_start, c_width, apply_silu);
             }
         };
         OMP_WORKSHARE_REGION(do_work);

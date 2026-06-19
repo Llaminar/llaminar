@@ -233,6 +233,29 @@ namespace llaminar2
             return Base::append(kv_idx, seq_idx, d_k, d_v, num_tokens, stream);
         }
 
+        /**
+         * @brief Publish grouped verifier K/V rows through the hybrid FA map.
+         *
+         * Qwen3.6 hybrid graphs address stages by global model layer, while the
+         * base GPU ring cache stores only full-attention layers in compressed
+         * FA-slot order.  Keeping this remap in the hybrid cache makes normal
+         * decode, grouped verifier decode, prefix restore, and graph-captured
+         * replay all use the same ownership rule.
+         */
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream = nullptr) override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return true; // GDN layer — no KV payload to publish.
+            return Base::appendVerifierRowsDecodeEquivalent(
+                kv_idx, seq_idx, K, V, verifier_rows, gpu_stream);
+        }
+
         bool get_kv_for_attention(int layer, int seq_idx,
                                   const void **d_k_out, const void **d_v_out,
                                   int *kv_len, hipStream_t stream) override

@@ -32,6 +32,7 @@
 #include "../../tensors/SIMDHelpers.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 
 namespace llaminar2
@@ -1075,6 +1076,198 @@ namespace llaminar2
             }
         }
 
+        return true;
+    }
+
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    bool CPURingKVCache<KPrecision, VPrecision>::appendVerifierRowsDecodeEquivalent(
+        int layer,
+        int seq_idx,
+        const ITensor *K,
+        const ITensor *V,
+        int verifier_rows,
+        void *gpu_stream)
+    {
+        (void)gpu_stream;
+        if (layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            verifier_rows < 2 || verifier_rows > 4 ||
+            !K || !V)
+        {
+            return false;
+        }
+
+        const auto *new_k = dynamic_cast<const KTensorT *>(K);
+        const auto *new_v = dynamic_cast<const VTensorT *>(V);
+        if (!new_k || !new_v)
+        {
+            LOG_ERROR("[CPURingKVCache] Grouped verifier append type mismatch: K="
+                      << K->dtype_name() << " V=" << V->dtype_name());
+            return false;
+        }
+
+        auto &entry = entries_[layer][seq_idx];
+        KTensorT *dst_k = entry.K.get();
+        VTensorT *dst_v = entry.V.get();
+        if (!dst_k || !dst_v || !new_k->raw_data() || !new_v->raw_data() ||
+            !dst_k->raw_mutable_data() || !dst_v->raw_mutable_data())
+        {
+            return false;
+        }
+
+        using KTrait = detail::CPUKVCacheTensor<KPrecision>;
+        using VTrait = detail::CPUKVCacheTensor<VPrecision>;
+        const size_t k_rb = KTrait::row_bytes(dst_k, kv_dim_, head_dim_);
+        const size_t v_rb = VTrait::row_bytes(dst_v, kv_dim_, head_dim_);
+        const size_t k_hb = KTrait::head_bytes(dst_k, kv_dim_, head_dim_);
+        const size_t v_hb = VTrait::head_bytes(dst_v, kv_dim_, head_dim_);
+
+        const auto source_layout = [&](const TensorBase *tensor,
+                                       size_t row_bytes,
+                                       size_t head_bytes,
+                                       const char *label,
+                                       bool *head_major_out) -> bool
+        {
+            if (!tensor || !head_major_out || tensor->shape().size() < 2)
+            {
+                return false;
+            }
+
+            const size_t rows = tensor->shape()[0];
+            const size_t cols = tensor->shape()[1];
+            const size_t row_major_cols = static_cast<size_t>(kv_dim_);
+            const size_t head_major_rows = static_cast<size_t>(local_n_kv_heads_) *
+                                           static_cast<size_t>(verifier_rows);
+            const bool row_major = rows >= static_cast<size_t>(verifier_rows) &&
+                                   cols == row_major_cols &&
+                                   row_bytes > 0;
+            const bool head_major = rows == head_major_rows &&
+                                    cols == static_cast<size_t>(head_dim_) &&
+                                    head_bytes > 0;
+            if (!row_major && !head_major)
+            {
+                LOG_ERROR("[CPURingKVCache] Unsupported grouped verifier " << label
+                                                                           << " source shape ["
+                                                                           << rows << "," << cols
+                                                                           << "] for rows=" << verifier_rows
+                                                                           << " local_heads="
+                                                                           << local_n_kv_heads_
+                                                                           << " head_dim="
+                                                                           << head_dim_);
+                return false;
+            }
+
+            // Prefer head-major for the exact verifier source shape.  This is
+            // what Qwen3.6 emits after grouped RoPE for Q16 KV rows.
+            *head_major_out = head_major && !row_major;
+            return true;
+        };
+
+        bool k_source_head_major = false;
+        bool v_source_head_major = false;
+        if (!source_layout(new_k, k_rb, k_hb, "K", &k_source_head_major) ||
+            !source_layout(new_v, v_rb, v_hb, "V", &v_source_head_major))
+        {
+            return false;
+        }
+
+        const auto *src_k = reinterpret_cast<const uint8_t *>(new_k->raw_data());
+        const auto *src_v = reinterpret_cast<const uint8_t *>(new_v->raw_data());
+        auto *out_k = reinterpret_cast<uint8_t *>(dst_k->raw_mutable_data());
+        auto *out_v = reinterpret_cast<uint8_t *>(dst_v->raw_mutable_data());
+
+        auto source_head_ptr = [](const uint8_t *base,
+                                  bool head_major,
+                                  int token,
+                                  int head,
+                                  int verifier_rows,
+                                  size_t row_bytes,
+                                  size_t head_bytes) -> const uint8_t *
+        {
+            if (head_major)
+            {
+                const size_t src_row = static_cast<size_t>(head) *
+                                           static_cast<size_t>(verifier_rows) +
+                                       static_cast<size_t>(token);
+                return base + src_row * head_bytes;
+            }
+
+            return base + static_cast<size_t>(token) * row_bytes +
+                   static_cast<size_t>(head) * head_bytes;
+        };
+
+        // Calculate the destination positions up front from the same state
+        // transition as serial decode.  Data copies use the original positions;
+        // metadata is committed only after every row copy has succeeded.
+        int next_head = entry.head;
+        int next_size = entry.size;
+        std::array<int, 4> dst_positions{};
+        for (int row = 0; row < verifier_rows; ++row)
+        {
+            if (next_size < max_seq_len_)
+            {
+                dst_positions[static_cast<size_t>(row)] =
+                    (next_head + next_size) % max_seq_len_;
+                ++next_size;
+            }
+            else
+            {
+                if (!wrap_warned_)
+                {
+                    LOG_WARN("Context window full (" << max_seq_len_
+                                                     << " tokens). Sliding window is now overwriting oldest tokens. "
+                                                     << "Use -c <size> to increase context length.");
+                    wrap_warned_ = true;
+                }
+                dst_positions[static_cast<size_t>(row)] = next_head;
+                next_head = (next_head + 1) % max_seq_len_;
+            }
+        }
+
+        for (int row = 0; row < verifier_rows; ++row)
+        {
+            const int dst_pos = dst_positions[static_cast<size_t>(row)];
+            if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+            {
+                for (int h = 0; h < local_n_kv_heads_; ++h)
+                {
+                    const uint8_t *src_k_head = source_head_ptr(
+                        src_k, k_source_head_major, row, h, verifier_rows, k_rb, k_hb);
+                    const uint8_t *src_v_head = source_head_ptr(
+                        src_v, v_source_head_major, row, h, verifier_rows, v_rb, v_hb);
+                    uint8_t *dst_k_head = out_k +
+                                          (static_cast<size_t>(h) * max_seq_len_ +
+                                           static_cast<size_t>(dst_pos)) *
+                                              k_hb;
+                    uint8_t *dst_v_head = out_v +
+                                          (static_cast<size_t>(h) * max_seq_len_ +
+                                           static_cast<size_t>(dst_pos)) *
+                                              v_hb;
+                    std::memcpy(dst_k_head, src_k_head, k_hb);
+                    std::memcpy(dst_v_head, src_v_head, v_hb);
+                }
+            }
+            else
+            {
+                uint8_t *dst_k_row = out_k + static_cast<size_t>(dst_pos) * k_rb;
+                uint8_t *dst_v_row = out_v + static_cast<size_t>(dst_pos) * v_rb;
+                for (int h = 0; h < local_n_kv_heads_; ++h)
+                {
+                    const uint8_t *src_k_head = source_head_ptr(
+                        src_k, k_source_head_major, row, h, verifier_rows, k_rb, k_hb);
+                    const uint8_t *src_v_head = source_head_ptr(
+                        src_v, v_source_head_major, row, h, verifier_rows, v_rb, v_hb);
+                    std::memcpy(dst_k_row + static_cast<size_t>(h) * k_hb,
+                                src_k_head, k_hb);
+                    std::memcpy(dst_v_row + static_cast<size_t>(h) * v_hb,
+                                src_v_head, v_hb);
+                }
+            }
+        }
+
+        entry.head = next_head;
+        entry.size = next_size;
+        invalidateFP32Shadow(layer, seq_idx);
         return true;
     }
 

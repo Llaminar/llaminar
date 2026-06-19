@@ -403,7 +403,7 @@ namespace llaminar2
                     "decode",
                     {},
                     {{"implementation", implementation}});
-                sampled = sample_after_forward();
+                sampled = sample_after_forward(token);
             }
             return sampled;
         };

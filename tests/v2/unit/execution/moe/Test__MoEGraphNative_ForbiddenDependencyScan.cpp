@@ -577,14 +577,14 @@ namespace llaminar2::test
 
         const size_t dgo_prefill_start = dgo_contents.find("void DeviceGraphOrchestrator::adviseMmapDontneedAfterFirstPrefill()");
         ASSERT_NE(dgo_prefill_start, std::string::npos);
-        const size_t dgo_prefill_sync = dgo_contents.find("synchronizeGpuBackendsBeforeMmapRelease()", dgo_prefill_start);
+        const size_t dgo_prefill_sync = dgo_contents.find("synchronizeDeviceBackendBeforeMmapRelease(state_.device_id)", dgo_prefill_start);
         const size_t dgo_prefill_advise = dgo_contents.find("weight_manager_->adviseMmapDontneed()", dgo_prefill_start);
         ASSERT_NE(dgo_prefill_sync, std::string::npos);
         ASSERT_NE(dgo_prefill_advise, std::string::npos);
         EXPECT_LT(dgo_prefill_sync, dgo_prefill_advise);
 
         const size_t rank_release = rank_contents.find("releaseHostResidentWeightData();");
-        const size_t rank_sync = rank_contents.find("synchronizeGpuBackendsBeforeRankMmapRelease()", rank_release);
+        const size_t rank_sync = rank_contents.find("synchronizeGpuBackendsBeforeRankMmapRelease(config_)", rank_release);
         const size_t rank_advise = rank_contents.find("wm->adviseMmapDontneed()", rank_release);
         ASSERT_NE(rank_release, std::string::npos);
         ASSERT_NE(rank_sync, std::string::npos);
@@ -729,43 +729,29 @@ namespace llaminar2::test
         EXPECT_LT(publish, return_true);
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, MoEExpertDecodeRechecksRuntimeBankAfterReset)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, Qwen35MoEResetPreservesRuntimePlacementBanks)
     {
         const fs::path root = findRepoRoot();
-        const fs::path stage_path = root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
-        ASSERT_TRUE(fs::exists(stage_path)) << stage_path;
+        const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+        ASSERT_TRUE(fs::exists(graph_path)) << graph_path;
 
-        const std::string contents = readFile(stage_path);
-        ASSERT_FALSE(contents.empty()) << stage_path;
+        const std::string contents = readFile(graph_path);
+        ASSERT_FALSE(contents.empty()) << graph_path;
 
-        const size_t execute_start = contents.find("bool MoEExpertComputeStage::executeSingleToken(");
-        ASSERT_NE(execute_start, std::string::npos);
-        const size_t execute_end = contents.find("// Snapshot-enabled builds keep legacy routing tensors authoritative",
-                                                 execute_start);
-        ASSERT_NE(execute_end, std::string::npos);
-        const std::string warmup_body = contents.substr(execute_start, execute_end - execute_start);
+        const size_t reset_start = contents.find("void Qwen35MoEGraph::resetState()");
+        ASSERT_NE(reset_start, std::string::npos);
+        const size_t reset_end = contents.find("void Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial",
+                                               reset_start);
+        ASSERT_NE(reset_end, std::string::npos);
+        const std::string reset_body = contents.substr(reset_start, reset_end - reset_start);
 
-        const size_t guard = warmup_body.find("!moe_runtime_table_initialized_ || !runtime_decode_bank_was_active_before_expert_stage");
-        const size_t pre_stage_bank =
-            warmup_body.find("runtime_decode_bank_was_active_before_expert_stage");
-        const size_t initialize = warmup_body.find("initializeMoERuntimeTableForGroupedDecode()");
-        const size_t can_try = contents.find("const bool can_try_device_routed_decode", execute_start);
-        ASSERT_NE(pre_stage_bank, std::string::npos)
-            << "Device-routed decode may consume runtime top-k only when the "
-               "runtime bank was already active before this expert stage. If the "
-               "expert stage initializes the bank itself, MoERoutingStage could "
-               "not have populated runtime top-k for the current pass.";
-        ASSERT_NE(guard, std::string::npos)
-            << "Cached MoEExpertComputeStage objects must recheck the active runtime bank; "
-               "request reset clears MoERuntimeTable after stage reset.";
-        ASSERT_NE(initialize, std::string::npos);
-        ASSERT_NE(can_try, std::string::npos);
-        EXPECT_LT(pre_stage_bank, initialize);
-        EXPECT_LT(guard, initialize);
-        EXPECT_NE(contents.find("runtime_decode_bank_was_active_before_expert_stage", can_try),
-                  std::string::npos)
-            << "The runtime-table decode path must be gated by pre-stage bank "
-               "availability, not by a bank initialized after routing.";
+        EXPECT_NE(reset_body.find("resetDecodeHistogramCounts()"), std::string::npos)
+            << "Session reset should clear per-session decode counters without "
+               "dropping persistent device placement metadata.";
+        EXPECT_EQ(reset_body.find("resetDecodeRuntimeState()"), std::string::npos)
+            << "Clearing runtime placement banks during session reset makes "
+               "the next GPU decode route fall back to host/top-k state or fail "
+               "before graph-captured MoE decode can run.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefixTerminalRestoreUsesStreamfulTransfers)

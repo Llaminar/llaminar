@@ -286,6 +286,43 @@ TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceRejectsGDNHashDrift)
     EXPECT_NE(result.reason.find("GDN recurrence hash"), std::string::npos);
 }
 
+TEST(Test__MTPStateTransaction, RuntimeSnapshotPrefersDeviceOwnedGDNHashesWhenAvailable)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+
+    auto &oracle_gdn = oracle.gdn_layers.front();
+    auto &candidate_gdn = candidate.gdn_layers.front();
+    oracle_gdn.device_state_hash_available = true;
+    candidate_gdn.device_state_hash_available = true;
+    oracle_gdn.recurrence_device_bytes = 256;
+    candidate_gdn.recurrence_device_bytes = 256;
+    oracle_gdn.conv_device_bytes = 64;
+    candidate_gdn.conv_device_bytes = 64;
+    oracle_gdn.recurrence_device_hash = 0xaaaa1111;
+    candidate_gdn.recurrence_device_hash = 0xaaaa1111;
+    oracle_gdn.conv_device_hash = 0xbbbb2222;
+    candidate_gdn.conv_device_hash = 0xbbbb2222;
+
+    /*
+     * GPU GDN/short-conv publication is device-owned.  The hybrid cache host
+     * mirror can legitimately lag the device state, so stale host hashes and
+     * zero flags must not make a device-owned snapshot look invalid.
+     */
+    candidate_gdn.recurrence_hash ^= 0x1;
+    candidate_gdn.conv_hash ^= 0x2;
+    candidate_gdn.recurrence_all_zero = !oracle_gdn.recurrence_all_zero;
+    candidate_gdn.conv_all_zero = !oracle_gdn.conv_all_zero;
+
+    auto result = compareMTPRuntimeStateSnapshots(oracle, candidate);
+    EXPECT_TRUE(result) << result.reason;
+
+    candidate_gdn.recurrence_device_hash ^= 0x4;
+    result = compareMTPRuntimeStateSnapshots(oracle, candidate);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("GDN recurrence device hash"), std::string::npos);
+}
+
 TEST(Test__MTPStateTransaction, RuntimeSnapshotCanUseToleranceAwareGDNValues)
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);

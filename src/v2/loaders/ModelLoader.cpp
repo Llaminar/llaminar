@@ -444,18 +444,27 @@ namespace llaminar2
         // Memory-map the file for zero-syscall tensor loading.
         // Pass NUMA node so mmap pages are bound to the correct socket,
         // avoiding cross-NUMA bandwidth penalties during GEMV decode.
-        // For GPU targets, skip NUMA binding entirely — weights go to VRAM anyway,
-        // and MAP_POPULATE gives the fastest sequential I/O (no page cache eviction).
+        // For GPU targets, skip NUMA binding and whole-file MAP_POPULATE:
+        // weights are uploaded to VRAM, so the host mapping is only staging.
+        // Demand paging avoids pathological cold-load stalls where the process
+        // blocks faulting the entire GGUF before the first upload starts.
         const int mmap_numa_node = target_is_gpu_ ? -1 : (factory_ ? factory_->getNumaNode() : -1);
+        const MmapRegion::PrefaultPolicy mmap_prefault_policy =
+            target_is_gpu_ ? MmapRegion::PrefaultPolicy::DemandPaged
+                           : MmapRegion::PrefaultPolicy::Auto;
         if (use_mmap_)
         {
-            mmap_region_ = MmapRegion::create(file_path, mmap_numa_node, skip_mmap_cache_eviction_);
+            mmap_region_ = MmapRegion::create(
+                file_path,
+                mmap_numa_node,
+                skip_mmap_cache_eviction_,
+                mmap_prefault_policy);
             if (mmap_region_)
             {
                 LOG_DEBUG("[ModelLoader] mmap enabled: " << file_path
                                                          << " (" << (mmap_region_->size() / (1024 * 1024)) << " MB)"
                                                          << (skip_mmap_cache_eviction_ ? " [cache-warm]" : "")
-                                                         << (target_is_gpu_ ? " [gpu-target, no NUMA bind]" : ""));
+                                                         << (target_is_gpu_ ? " [gpu-target, demand-paged]" : ""));
 
                 // If multi-part, also mmap the split files
                 if (model_.split_count > 1)
@@ -463,7 +472,11 @@ namespace llaminar2
                     split_mmap_regions_.resize(model_.split_count - 1);
                     for (uint16_t idx = 1; idx < model_.split_count; ++idx)
                     {
-                        split_mmap_regions_[idx - 1] = MmapRegion::create(model_.split_paths[idx], mmap_numa_node, skip_mmap_cache_eviction_);
+                        split_mmap_regions_[idx - 1] = MmapRegion::create(
+                            model_.split_paths[idx],
+                            mmap_numa_node,
+                            skip_mmap_cache_eviction_,
+                            mmap_prefault_policy);
                         if (!split_mmap_regions_[idx - 1])
                         {
                             LOG_WARN("[ModelLoader] Failed to mmap split file " << idx

@@ -2107,6 +2107,160 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotsRestoreAcceptedVe
     EXPECT_EQ(maxAbsDiff(restored_state, accepted_replay_state), 0.0f);
 }
 
+TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialDecodeAtQwen36ShapeM2ToM4)
+{
+    constexpr int kChannels = 6144;
+    constexpr int kKernelSize = 4;
+    constexpr int kStateLen = kKernelSize - 1;
+    constexpr int kStateFloats = kChannels * kStateLen;
+
+    std::mt19937 rng(170031);
+    std::normal_distribution<float> activation_dist(0.0f, 0.12f);
+    std::normal_distribution<float> weight_dist(0.0f, 0.025f);
+    std::uniform_real_distribution<float> state_dist(-0.04f, 0.04f);
+
+    std::vector<float> weight(static_cast<size_t>(kChannels) * kKernelSize);
+    std::vector<float> bias(kChannels);
+    std::vector<float> initial_state(kStateFloats);
+    for (auto &x : weight)
+        x = weight_dist(rng);
+    for (auto &x : bias)
+        x = weight_dist(rng);
+    for (auto &x : initial_state)
+        x = state_dist(rng);
+
+    for (int rows = 2; rows <= 4; ++rows)
+    {
+        std::vector<float> input(static_cast<size_t>(rows) * kChannels);
+        for (auto &x : input)
+            x = activation_dist(rng);
+
+        CPUShortConvolution grouped_kernel;
+        std::vector<float> grouped_state = initial_state;
+        std::vector<float> grouped_output(static_cast<size_t>(rows) * kChannels);
+        std::vector<float> snapshots(static_cast<size_t>(rows) * kStateFloats);
+        ASSERT_TRUE(grouped_kernel.forwardWithStateSnapshots(
+            input.data(),
+            weight.data(),
+            bias.data(),
+            grouped_output.data(),
+            grouped_state.data(),
+            rows,
+            kChannels,
+            kKernelSize,
+            snapshots.data(),
+            kStateFloats,
+            rows,
+            /*apply_silu=*/true))
+            << "rows=" << rows;
+
+        CPUShortConvolution serial_kernel;
+        std::vector<float> serial_state = initial_state;
+        std::vector<float> serial_output(static_cast<size_t>(rows) * kChannels);
+        for (int row = 0; row < rows; ++row)
+        {
+            ASSERT_TRUE(serial_kernel.forward(
+                input.data() + static_cast<size_t>(row) * kChannels,
+                weight.data(),
+                bias.data(),
+                serial_output.data() + static_cast<size_t>(row) * kChannels,
+                serial_state.data(),
+                /*seq_len=*/1,
+                kChannels,
+                kKernelSize,
+                /*apply_silu=*/true))
+                << "rows=" << rows << " row=" << row;
+
+            const float *snapshot = snapshots.data() + static_cast<size_t>(row) * kStateFloats;
+            std::vector<float> grouped_snapshot(snapshot, snapshot + kStateFloats);
+            EXPECT_EQ(maxAbsDiff(grouped_snapshot, serial_state), 0.0f)
+                << "rows=" << rows << " row=" << row
+                << " verifier state publication must be serial-decode exact";
+        }
+
+        EXPECT_EQ(maxAbsDiff(grouped_output, serial_output), 0.0f)
+            << "rows=" << rows
+            << " grouped short-conv verifier output must be serial-decode exact";
+        EXPECT_EQ(maxAbsDiff(grouped_state, serial_state), 0.0f)
+            << "rows=" << rows
+            << " grouped short-conv final state must be serial-decode exact";
+    }
+}
+
+TEST(Test__GDNMathematicalCorrectness, ShortConv_BoundVerifierSlotsDoNotHijackSingleRowDecode)
+{
+    const int channels = 11;
+    const int kernel_size = 4;
+    const int state_len = kernel_size - 1;
+    const int state_floats = channels * state_len;
+
+    std::mt19937 rng(101337);
+    std::normal_distribution<float> activation_dist(0.0f, 0.08f);
+    std::normal_distribution<float> weight_dist(0.0f, 0.03f);
+    std::uniform_real_distribution<float> state_dist(-0.05f, 0.05f);
+
+    std::vector<float> input(channels);
+    std::vector<float> weight(static_cast<size_t>(channels) * kernel_size);
+    std::vector<float> bias(channels);
+    std::vector<float> initial_state(state_floats);
+    for (auto &x : input)
+        x = activation_dist(rng);
+    for (auto &x : weight)
+        x = weight_dist(rng);
+    for (auto &x : bias)
+        x = weight_dist(rng);
+    for (auto &x : initial_state)
+        x = state_dist(rng);
+
+    CPUShortConvolution verifier_bound_kernel;
+    std::vector<float> decode_state = initial_state;
+    std::vector<float> decode_output(channels);
+    std::vector<float> snapshots(static_cast<size_t>(2) * state_floats, -777.0f);
+    std::vector<float> speculative_work(state_floats, 0.0f);
+    verifier_bound_kernel.bindVerifierStateCaptureWorkspace(
+        snapshots.data(),
+        /*rows=*/2,
+        state_floats);
+    verifier_bound_kernel.bindSpeculativeStateWorkspace(
+        speculative_work.data(),
+        state_floats);
+
+    CPUShortConvolution reference_kernel;
+    std::vector<float> reference_state = initial_state;
+    std::vector<float> reference_output(channels);
+
+    ASSERT_TRUE(verifier_bound_kernel.forward(
+        input.data(),
+        weight.data(),
+        bias.data(),
+        decode_output.data(),
+        decode_state.data(),
+        /*seq_len=*/1,
+        channels,
+        kernel_size,
+        /*apply_silu=*/true));
+    ASSERT_TRUE(reference_kernel.forward(
+        input.data(),
+        weight.data(),
+        bias.data(),
+        reference_output.data(),
+        reference_state.data(),
+        /*seq_len=*/1,
+        channels,
+        kernel_size,
+        /*apply_silu=*/true));
+
+    EXPECT_EQ(maxAbsDiff(decode_output, reference_output), 0.0f);
+    EXPECT_EQ(maxAbsDiff(decode_state, reference_state), 0.0f)
+        << "single-row decode must update the live conv_state even when "
+           "verifier capture slots are bound on the shared kernel";
+    EXPECT_TRUE(std::all_of(
+        snapshots.begin(),
+        snapshots.end(),
+        [](float x) { return x == -777.0f; }))
+        << "ordinary decode must not publish speculative verifier snapshots";
+}
+
 TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotRestoreContinuesLikeReplay)
 {
     const int accepted_rows = 2;

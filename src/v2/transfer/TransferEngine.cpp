@@ -761,10 +761,10 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_DEBUG("[TransferEngine::uploadFull] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
+                LOG_TRACE("[TransferEngine::uploadFull] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
             }
 
-            LOG_DEBUG("[GPU_ALLOC] tensor=" << static_cast<void *>(tensor)
+            LOG_TRACE("[GPU_ALLOC] tensor=" << static_cast<void *>(tensor)
                                             << " name=" << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
                                             << " gpu_ptr=" << tensor->gpu_data_ptr_ << " bytes=" << bytes
                                             << " device=" << target_device.toString()

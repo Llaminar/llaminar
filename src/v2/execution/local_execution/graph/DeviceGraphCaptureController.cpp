@@ -1502,11 +1502,12 @@ namespace llaminar2
         DeviceGraphExecutor::GraphSegment &segment,
         IDeviceContext *ctx,
         IWorkerGPUContext *gpu_ctx,
+        void *capture_stream,
         bool has_collective_nodes,
         uint64_t current_step,
         const std::function<bool(ComputeNode &)> &execute_node_cb)
     {
-        if (!ctx || !gpu_ctx)
+        if (!ctx || !gpu_ctx || !capture_stream)
         {
             LOG_ERROR("[DeviceGraphCaptureController] Capture manual segment missing context");
             return false;
@@ -1519,25 +1520,19 @@ namespace llaminar2
                    t == ComputeStageType::ALLGATHER_V;
         };
 
-        // Use the real default stream, not nullptr. AMDDeviceContext creates a
-        // real hipStream_t via hipStreamCreateWithFlags, so defaultStream() is
-        // a distinct object from hipStream_t(0). The RCCL coordinator's
-        // compute_events are recorded on this same stream (registered via
-        // setComputeStreams()), so stages must target the same stream identity
-        // for event-based allreduce synchronization to chain correctly.
+        /*
+         * Phase-2 capture runs after cached dynamic parameters have already
+         * uploaded token/position metadata to the capture stream. Non-collective
+         * manual stages must therefore execute on that same stream; rebinding
+         * them to the worker stream can make CUDA read stale per-step metadata.
+         *
+         * Collective stages are the exception. NCCL/RCCL stages use the worker
+         * stream registered with the collective coordinator, so we bridge with
+         * GPU-side stream dependencies instead of falling back to the null stream
+         * or a host-wide device synchronize.
+         */
         void *compute_stream = gpu_ctx->defaultStream();
-
-        // Use stream-level sync (not device-wide hipDeviceSynchronize) to avoid
-        // conflict with hipStreamCaptureModeGlobal. In multi-device TP, the other
-        // device may have already started graph capture by the time we reach this
-        // sync. hipDeviceSynchronize() is always illegal during global capture mode
-        // (returns hipErrorStreamCaptureUnsupported), but hipStreamSynchronize()
-        // on a non-captured stream is safe.
-        if (!gpu_ctx->synchronizeStreamChecked(compute_stream))
-        {
-            LOG_ERROR("[DeviceGraphCaptureController] Capture manual pre-sync failed");
-            return false;
-        }
+        bool manual_had_collective = false;
 
         for (const auto &stage_name : segment.stage_names)
         {
@@ -1548,9 +1543,18 @@ namespace llaminar2
                 return false;
             }
 
-            node->stage->setGPUStream(compute_stream);
+            const bool is_collective = is_collective_stage(node->stage->type());
+            void *stage_stream = capture_stream;
+            if (is_collective)
+            {
+                manual_had_collective = true;
+                stage_stream = compute_stream;
+                gpu_ctx->insertStreamDependency(compute_stream, capture_stream);
+            }
 
-            const bool needs_execute_node = has_collective_nodes || is_collective_stage(node->stage->type());
+            node->stage->setGPUStream(stage_stream);
+
+            const bool needs_execute_node = has_collective_nodes || is_collective;
             if (needs_execute_node)
             {
                 if (!execute_node_cb(*node))
@@ -1574,12 +1578,26 @@ namespace llaminar2
             }
 
             graph.markCompleted(stage_name);
+
+            if (is_collective)
+            {
+                gpu_ctx->insertStreamDependency(capture_stream, compute_stream);
+            }
         }
 
         segment.last_executed_step = current_step;
-        if (!gpu_ctx->synchronizeStreamChecked(compute_stream))
+        if (manual_had_collective)
         {
-            LOG_ERROR("[DeviceGraphCaptureController] Capture manual post-sync failed after segment starting at "
+            if (!gpu_ctx->synchronizeStreamChecked(compute_stream))
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Capture manual default-stream sync failed after segment starting at "
+                          << (segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front()));
+                return false;
+            }
+        }
+        if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Capture manual capture-stream sync failed after segment starting at "
                       << (segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front()));
             return false;
         }
@@ -1786,6 +1804,40 @@ namespace llaminar2
         // count mismatch between devices → deadlock. Instead, we abandon capture
         // and continue executing the remaining segments normally.
         bool capture_abandoned = false;
+
+        /*
+         * Some MoE stages only know whether their graph-capturable fast path is
+         * available after the warmup pass has prepared backend resources.  Make
+         * that decision before recording any Phase-2 segment.  The old behavior
+         * discovered this inside the segment loop after earlier captured
+         * segments had already mutated activation buffers, then restarted the
+         * whole decode graph from those dirty buffers.  That is not a valid
+         * replay/restore boundary.  A failed warmup-dependent preflight now
+         * turns this entire Phase-2 call into stream execution and resets the
+         * segment cache afterward.
+         */
+        for (const auto &seg : segment_cache.segments)
+        {
+            if (!seg.capturable)
+                continue;
+            for (const auto &stage_name : seg.stage_names)
+            {
+                auto *node = graph.getNode(stage_name);
+                if (!node || !node->stage)
+                    continue;
+                if (node->stage->supportsWarmupDependentGraphCapture() &&
+                    !node->stage->isGraphCapturable())
+                {
+                    LOG_WARN("[DeviceGraphCaptureController] Warmup-dependent stage '"
+                             << stage_name
+                             << "' is not graph-capturable after warmup; executing this Phase-2 pass without capture");
+                    capture_abandoned = true;
+                    break;
+                }
+            }
+            if (capture_abandoned)
+                break;
+        }
 
         for (auto &seg : segment_cache.segments)
         {
@@ -1995,6 +2047,7 @@ namespace llaminar2
                     seg,
                     ctx,
                     gpu_ctx,
+                    capture_stream,
                     has_collective_nodes,
                     current_step,
                     hooks.execute_node);

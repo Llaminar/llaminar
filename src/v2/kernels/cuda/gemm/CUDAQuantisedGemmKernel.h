@@ -256,6 +256,13 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override;
 
+            bool multiply_fused_verifier_rows_decode_equivalent(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
             bool supports_fused_projection() const override { return true; }
 
             /**
@@ -351,7 +358,7 @@ namespace llaminar2
 
             size_t weight_rows() const { return N_; }
             size_t weight_cols() const { return K_; }
-            bool weights_converted() const { return weights_converted_; }
+            bool weights_converted() const override;
 
             /// @brief Export native-VNNI device pointers for grouped MoE CUDA prefill.
             bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
@@ -409,6 +416,13 @@ namespace llaminar2
              * @return true on success
              */
             bool multiply_tensor_with_fused_swiglu(
+                const TensorBase *gate, const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                 const TensorBase *gate, const TensorBase *up,
                 TensorBase *output,
                 int m, int n, int k,

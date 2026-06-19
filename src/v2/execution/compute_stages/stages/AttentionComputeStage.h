@@ -227,28 +227,6 @@ namespace llaminar2
          */
         int dynamicAttentionParamRows(int logical_seq_len, int kv_len) const;
 
-        /**
-         * @brief Run small MTP verifier continuations as serial-equivalent rows.
-         *
-         * Verifier publication is only valid when every "all position" row
-         * matches the state that would have been produced by ordinary one-token
-         * decode.  This helper reuses the production M=1 attention kernel while
-         * keeping row copies on the stage's explicit device stream.
-         */
-        bool executeDecodeEquivalentVerifierRows(
-            ITensorAttention *kernel,
-            ITensor *effective_K,
-            ITensor *effective_V,
-            int effective_kv_len,
-            int device_idx,
-            bool kernel_causal,
-            const IMPIContext *mpi_ctx);
-
-        /// One-row Q scratch used by executeDecodeEquivalentVerifierRows().
-        mutable std::shared_ptr<FP32Tensor> verifier_q_row_;
-
-        /// One-row attention output scratch used by executeDecodeEquivalentVerifierRows().
-        mutable std::shared_ptr<FP32Tensor> verifier_output_row_;
     };
 
 } // namespace llaminar2

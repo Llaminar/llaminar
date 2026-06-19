@@ -33,6 +33,16 @@ FIELDS = (
     "publish_avg_ms",
     "sidecar_ms",
     "sidecar_depth0_decode_ms",
+    "sidecar_resident_decode_ms",
+    "sidecar_resident_decode_count",
+    "sidecar_resident_decode_avg_ms",
+    "sidecar_resident_segmented_replay_ms",
+    "sidecar_resident_segmented_replay_count",
+    "sidecar_resident_segmented_count",
+    "sidecar_resident_plain_after_build_count",
+    "sidecar_chain_decode_ms",
+    "sidecar_chain_decode_count",
+    "sidecar_chain_decode_avg_ms",
     "shifted_initial_ms",
     "shifted_initial_commits",
     "shifted_initial_reused",
@@ -311,17 +321,21 @@ def _sum_stage_timeline_gpu_ms(
 
 def summarize(path: Path | None) -> dict[str, float | int | str]:
     records = _records(path)
-    publish_ms = _sum_total_ms(
+    publish_ms = _sum_total_ms_many(
         records,
         "mtp",
-        "all_position_publish_accepted_state",
+        (
+            "all_position_publish_accepted_state",
+            "grouped_outcome_publish_accepted_state_device_resident",
+        ),
         phase="decode",
     )
-    publish_count = _sum_count(
-        records,
-        "mtp",
-        "all_position_publish_accepted_state",
-        phase="decode",
+    publish_count = sum(
+        _sum_count(records, "mtp", name, phase="decode")
+        for name in (
+            "all_position_publish_accepted_state",
+            "grouped_outcome_publish_accepted_state_device_resident",
+        )
     )
     shifted_row_ms = _sum_total_ms_many(
         records,
@@ -390,16 +404,22 @@ def summarize(path: Path | None) -> dict[str, float | int | str]:
         "all_position_stochastic_device_batch_outcome",
         phase="decode",
     )
-    resident_outcome_enqueue_ms = _sum_total_ms(
+    resident_outcome_enqueue_ms = _sum_total_ms_many(
         records,
         "mtp",
-        "all_position_stochastic_device_resident_outcome_enqueue",
+        (
+            "all_position_stochastic_device_resident_outcome_enqueue",
+            "grouped_outcome_stochastic_device_resident_outcome_enqueue",
+        ),
         phase="decode",
     )
-    resident_outcome_host_bridge_ms = _sum_total_ms(
+    resident_outcome_host_bridge_ms = _sum_total_ms_many(
         records,
         "mtp",
-        "all_position_stochastic_device_outcome_host_bridge",
+        (
+            "all_position_stochastic_device_outcome_host_bridge",
+            "grouped_outcome_stochastic_device_outcome_host_bridge",
+        ),
         phase="decode",
     )
     stochastic_batch_gpu_reducer_ms = _sum_total_ms(
@@ -420,16 +440,22 @@ def summarize(path: Path | None) -> dict[str, float | int | str]:
         "all_position_stochastic_device_outcome_catchup_plan",
         phase="decode",
     )
-    transaction_plan_ms = _sum_total_ms(
+    transaction_plan_ms = _sum_total_ms_many(
         records,
         "mtp",
-        "all_position_transaction_plan_build",
+        (
+            "all_position_transaction_plan_build",
+            "grouped_outcome_transaction_plan_build",
+        ),
         phase="decode",
     )
-    host_state_adoption_ms = _sum_total_ms(
+    host_state_adoption_ms = _sum_total_ms_many(
         records,
         "mtp",
-        "device_resident_publication_host_adoption",
+        (
+            "device_resident_publication_host_adoption",
+            "grouped_outcome_device_resident_host_adoption",
+        ),
         phase="decode",
     )
     transaction_output_commit_ms = _sum_total_ms(
@@ -471,6 +497,48 @@ def summarize(path: Path | None) -> dict[str, float | int | str]:
         "stochastic_request_batch_summary_bridge_stream_create",
         phase="decode",
     )
+    sidecar_resident_decode_ms = _sum_total_ms(
+        records,
+        "mtp",
+        "sidecar_depth0_total",
+        phase="decode",
+        tags={"context": "mtp_decode_sidecar_resident_logical_state"},
+    )
+    sidecar_resident_decode_count = _sum_count(
+        records,
+        "mtp",
+        "sidecar_depth0_total",
+        phase="decode",
+        tags={"context": "mtp_decode_sidecar_resident_logical_state"},
+    )
+    sidecar_resident_segmented_replay_ms = _sum_total_ms(
+        records,
+        "forward_graph",
+        "segmented_replay_total",
+        phase="decode",
+        tags={"context": "mtp_decode_sidecar_resident_logical_state"},
+    )
+    sidecar_resident_segmented_replay_count = _sum_count(
+        records,
+        "forward_graph",
+        "segmented_replay_total",
+        phase="decode",
+        tags={"context": "mtp_decode_sidecar_resident_logical_state"},
+    )
+    sidecar_chain_decode_ms = _sum_total_ms(
+        records,
+        "mtp",
+        "sidecar_depth0_total",
+        phase="decode",
+        tags={"context": "mtp_decode_sidecar_chain_device_token"},
+    )
+    sidecar_chain_decode_count = _sum_count(
+        records,
+        "mtp",
+        "sidecar_depth0_total",
+        phase="decode",
+        tags={"context": "mtp_decode_sidecar_chain_device_token"},
+    )
     greedy_summary_ms = _sum_total_ms(
         records,
         "mtp",
@@ -492,7 +560,15 @@ def summarize(path: Path | None) -> dict[str, float | int | str]:
     )
     return {
         "decode_step_ms": _sum_total_ms(records, "mtp", "decode_step_total"),
-        "verifier_ms": _sum_total_ms(records, "mtp", "verifier_forward"),
+        "verifier_ms": _sum_total_ms_many(
+            records,
+            "mtp",
+            (
+                "verifier_forward",
+                "request_batch_stochastic_verifier_forward",
+                "grouped_outcome_stochastic_verifier_forward",
+            ),
+        ),
         "stochastic_physical_verify_rows": _sum_value(
             records,
             "mtp",
@@ -574,6 +650,42 @@ def summarize(path: Path | None) -> dict[str, float | int | str]:
             "mtp",
             "sidecar_depth0_total",
             phase="decode",
+        ),
+        "sidecar_resident_decode_ms": sidecar_resident_decode_ms,
+        "sidecar_resident_decode_count": sidecar_resident_decode_count,
+        "sidecar_resident_decode_avg_ms": (
+            sidecar_resident_decode_ms / sidecar_resident_decode_count
+            if sidecar_resident_decode_count
+            else 0.0
+        ),
+        "sidecar_resident_segmented_replay_ms": sidecar_resident_segmented_replay_ms,
+        "sidecar_resident_segmented_replay_count": sidecar_resident_segmented_replay_count,
+        "sidecar_resident_segmented_count": _sum_count(
+            records,
+            "mtp",
+            "sidecar_graph_capture_path",
+            phase="decode",
+            tags={
+                "context": "mtp_decode_sidecar_resident_logical_state",
+                "path": "segmented",
+            },
+        ),
+        "sidecar_resident_plain_after_build_count": _sum_count(
+            records,
+            "mtp",
+            "sidecar_graph_capture_path",
+            phase="decode",
+            tags={
+                "context": "mtp_decode_sidecar_resident_logical_state",
+                "path": "plain_after_build",
+            },
+        ),
+        "sidecar_chain_decode_ms": sidecar_chain_decode_ms,
+        "sidecar_chain_decode_count": sidecar_chain_decode_count,
+        "sidecar_chain_decode_avg_ms": (
+            sidecar_chain_decode_ms / sidecar_chain_decode_count
+            if sidecar_chain_decode_count
+            else 0.0
         ),
         "shifted_initial_ms": _sum_total_ms(
             records,

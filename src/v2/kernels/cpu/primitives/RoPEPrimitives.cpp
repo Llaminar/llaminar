@@ -739,6 +739,78 @@ namespace llaminar2::primitives
         OMP_WORKSHARE_REGION(do_partial_rope);
     }
 
+    void apply_rope_decode_equivalent_rows(
+        float *q, float *k,
+        const int *position_ids,
+        int verifier_rows,
+        int head_dim, int rotary_dim,
+        int q_heads, int k_heads,
+        int pos_offset, float freq_base,
+        RoPEPersistentState *persistent_state)
+    {
+        if (!q || verifier_rows <= 0 || head_dim <= 0 || (head_dim % 2) != 0)
+            return;
+
+        const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+        if (eff_rotary <= 0 || (eff_rotary % 2) != 0)
+            return;
+
+        /*
+         * Full RoPE has a real decode recurrence state.  Use the same
+         * persistent cache that a one-token decode call would use, so row 1..M
+         * inherit the exact recurrence rounding from row 0 instead of taking
+         * the normal prefill recurrence path.
+         */
+        if (eff_rotary == head_dim)
+        {
+            for (int row = 0; row < verifier_rows; ++row)
+            {
+                const int position = position_ids ? position_ids[row] : (pos_offset + row);
+                if (position < 0)
+                    continue;
+
+                float *q_row = q + static_cast<size_t>(row) * q_heads * head_dim;
+                float *k_row = k ? (k + static_cast<size_t>(row) * k_heads * head_dim) : nullptr;
+                apply_rope_vectorized(
+                    q_row,
+                    k_row,
+                    1,
+                    head_dim,
+                    q_heads,
+                    k_heads,
+                    position,
+                    freq_base,
+                    persistent_state);
+            }
+            return;
+        }
+
+        /*
+         * Partial RoPE's one-row path computes the row's sin/cos table directly
+         * from the absolute position.  Group rows under one primitive API while
+         * keeping that exact per-row math.
+         */
+        for (int row = 0; row < verifier_rows; ++row)
+        {
+            const int position = position_ids ? position_ids[row] : (pos_offset + row);
+            if (position < 0)
+                continue;
+
+            float *q_row = q + static_cast<size_t>(row) * q_heads * head_dim;
+            float *k_row = k ? (k + static_cast<size_t>(row) * k_heads * head_dim) : nullptr;
+            apply_rope_partial(
+                q_row,
+                k_row,
+                1,
+                head_dim,
+                eff_rotary,
+                q_heads,
+                k_heads,
+                position,
+                freq_base);
+        }
+    }
+
     // ============================================================================
     // BF16 Native Precision Implementations
     // ============================================================================

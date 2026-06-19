@@ -28,7 +28,7 @@ namespace llaminar2
             const size_t free_bytes = backend->deviceMemoryFree(device_id);
             const size_t total_bytes = backend->deviceMemoryTotal(device_id);
             const size_t used_bytes = total_bytes > free_bytes ? total_bytes - free_bytes : 0;
-            LOG_INFO("[VRAM_TRACE] " << label
+            LOG_TRACE("[VRAM_TRACE] " << label
                                      << " device=" << device_id
                                      << " used_mib=" << (used_bytes / (1024 * 1024))
                                      << " free_mib=" << (free_bytes / (1024 * 1024))

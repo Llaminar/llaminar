@@ -374,6 +374,22 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
     EXPECT_FALSE(moe_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
         << "MoE must publish the first shifted MTP row from the target verifier "
            "accepted row, not reuse sidecar-local routed expert state.";
+    const auto cpu_moe_capability = moe_orchestrator.mtpVerifierRowCapability();
+    EXPECT_TRUE(cpu_moe_capability.supportsMoEDecodeEquivalentRows(4, true))
+        << "CPU MoE keeps the shared decode-equivalent verifier proof.";
+    EXPECT_FALSE(cpu_moe_capability.supportsMoEDirectAllPositionRows(4, true))
+        << "CPU MoE direct publication is not proven by the GPU resident-mailbox "
+           "continuation gate.";
+    EXPECT_FALSE(moe_orchestrator.supportsMTPSpecStatePublication())
+        << "CPU MoE must remain replay-published until it has a resident-state "
+           "publication proof of its own.";
+    const auto cpu_moe_economy =
+        moe_orchestrator.mtpVerifierEconomyCapability();
+    EXPECT_TRUE(cpu_moe_economy.supportsMoERows(4, true));
+    EXPECT_TRUE(cpu_moe_economy.moe.serial_decode_equivalent_fallback)
+        << "CPU MoE remains on serial replay until it has a grouped full-model proof.";
+    EXPECT_FALSE(cpu_moe_economy.moe.grouped_decode_equivalent);
+    EXPECT_FALSE(cpu_moe_economy.hasEconomicalMoEPath(4, true));
 
     DeviceId gpu_device = DeviceId::invalid();
     if (DeviceManager::instance().cuda_device_count() > 0)
@@ -392,25 +408,53 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
             std::make_shared<Qwen35MoEGraph>(gpu_moe_config, nullptr),
             nullptr);
         ASSERT_TRUE(gpu_moe_orchestrator.initializeInferenceStateFromArena(1, 16, gpu_device));
-        EXPECT_FALSE(gpu_moe_orchestrator.supportsMTPSidecarPreservesMainState())
-            << "GPU MoE sidecar preservation must stay disabled until a dedicated "
-               "preservation test covers KV, GDN/conv, routed scratch, and overlay state.";
+        EXPECT_TRUE(gpu_moe_orchestrator.supportsMTPSidecarPreservesMainState())
+            << "Full-owner GPU MoE sidecars are now covered by the runtime-state "
+               "preservation gate: main KV, GDN/conv, positions, and sequence "
+               "lengths must match the verifier base after sidecar execution.";
         EXPECT_FALSE(gpu_moe_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
-            << "MoE shifted-row reuse requires the stronger sidecar-preservation capability.";
+            << "MoE may skip the verifier-base restore, but its first shifted MTP "
+               "row is still published from accepted verifier rows rather than "
+               "reusing the sidecar-local draft row.";
         const auto gpu_moe_capability =
             gpu_moe_orchestrator.mtpVerifierRowCapability();
         EXPECT_TRUE(gpu_moe_capability.supportsMoEDecodeEquivalentRows(4, true))
             << "Phase 9.7 proves MoE shared decode-equivalent verifier rows "
                "for M=1..4 on every backend.";
-        EXPECT_FALSE(gpu_moe_capability.supportsMoEDirectAllPositionRows(1, false))
-            << "MoE direct all-position publication remains fail-closed.";
+        EXPECT_FALSE(gpu_moe_capability.supportsMoEDirectAllPositionRows(4, true))
+            << "Grouped verifier-row math does not prove live-state publication; "
+               "KV, GDN/conv, shifted MTP KV, and logical state still need the "
+               "stronger transaction gate.";
+        EXPECT_FALSE(gpu_moe_capability.device_resident_direct_publication)
+            << "The old all-position publication capability remains disabled "
+               "for MoE; compact grouped outcomes publish through the separate "
+               "device-resident handoff.";
+        EXPECT_FALSE(gpu_moe_orchestrator.supportsMTPSpecStatePublication());
+        EXPECT_TRUE(gpu_moe_orchestrator.supportsDeviceResidentMTPSpecStatePublication())
+            << "Grouped MoE outcomes now have a resident accepted-state "
+               "publication handoff even though the stronger all-position "
+               "state-publication policy remains disabled.";
         const auto gpu_moe_economy =
             gpu_moe_orchestrator.mtpVerifierEconomyCapability();
         EXPECT_TRUE(gpu_moe_economy.supportsMoERows(4, true));
-        EXPECT_TRUE(gpu_moe_economy.moe.serial_decode_equivalent_fallback);
+        EXPECT_TRUE(gpu_moe_economy.moe.serial_decode_equivalent_fallback)
+            << "Serial replay remains the correctness oracle and fallback "
+               "contract, but the promoted grouped lane must not use it.";
+        EXPECT_TRUE(gpu_moe_economy.moe.grouped_decode_equivalent)
+            << "GPU MoE exposes the strict grouped verifier outcome proof.";
+        EXPECT_TRUE(gpu_moe_economy.moe.row_indexed_lm_head);
+        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_input);
+        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_outcome);
+        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_publication);
+        EXPECT_FALSE(gpu_moe_economy.moe.host_bridge_free_hot_path);
+        EXPECT_TRUE(gpu_moe_economy.moe.graph_capturable);
+        EXPECT_STREQ(
+            gpu_moe_economy.moe.perf_gate_status.c_str(),
+            "grouped_outcome_economics_pending");
         EXPECT_FALSE(gpu_moe_economy.hasEconomicalMoEPath(4, true))
-            << "Phase 9.8 must not treat the correct serial fallback as a "
-               "grouped verifier fast path.";
+            << "The grouped outcome lane is a middle contract; it cannot be "
+               "counted as economical until the grouped verifier graph and "
+               "host-bridge-free hot path are speed-accepted.";
     }
 
     auto dense_config = config_;
@@ -474,6 +518,23 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
         const auto gpu_dense_economy =
             gpu_dense_orchestrator.mtpVerifierEconomyCapability();
         EXPECT_TRUE(gpu_dense_economy.supportsDenseRows(4, true));
+        EXPECT_TRUE(gpu_dense_economy.dense.serial_decode_equivalent_fallback)
+            << "The serial replay contract remains the correctness fallback "
+               "while the grouped GPU lane is still economy-pending.";
+        EXPECT_TRUE(gpu_dense_economy.dense.grouped_decode_equivalent)
+            << "GPU dense must expose the M=1..4 grouped verifier-row proof "
+               "so SingleDevice stochastic MTP can use the resident outcome path.";
+        EXPECT_TRUE(gpu_dense_economy.dense.row_indexed_lm_head);
+        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_input);
+        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_outcome);
+        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_publication);
+        EXPECT_FALSE(gpu_dense_economy.dense.host_bridge_free_hot_path)
+            << "Grouped dense publication is not fully economical until the "
+               "whole transaction is benchmark-accepted.";
+        EXPECT_TRUE(gpu_dense_economy.dense.graph_capturable);
+        EXPECT_STREQ(
+            gpu_dense_economy.dense.perf_gate_status.c_str(),
+            "grouped_outcome_economics_pending");
         EXPECT_FALSE(gpu_dense_economy.hasEconomicalDensePath(4, true))
             << "Grouped/resident verifier promotion is Phase 9.8 work, even "
                "when Phase 9.7 row correctness is green.";

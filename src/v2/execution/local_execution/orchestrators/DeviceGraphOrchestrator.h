@@ -1712,6 +1712,10 @@ namespace llaminar2
             int first_draft_slot,
             int draft_token_count,
             int total_verifier_input_tokens) override;
+        const void *prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+            const int32_t *verifier_tokens,
+            int total_verifier_input_tokens,
+            int draft_token_count) override;
 
         /**
          * @brief Get logits from last forward pass
@@ -2233,6 +2237,7 @@ namespace llaminar2
             int row,
             const std::vector<LogitPenalty> &penalties,
             int vocab_size) override;
+        bool supportsRowLocalAllPositionPenaltyApplication() const override;
         bool supportsDeviceStochasticMTPVerification() const override;
         bool buildStochasticDistributionOnDevice(
             DeviceLogitsSource source,
@@ -2376,6 +2381,21 @@ namespace llaminar2
         int vocab_size() const override { return graph_builder_ ? graph_builder_->config().vocab_size : 0; }
 
         /**
+         * @brief Policy for clearing deferred sampled-token readiness markers.
+         *
+         * Verifier-owned sample slots are part of the active MTP transaction:
+         * a GPU sidecar, verifier input materializer, and outcome reducer may
+         * all consume the same device token without a host read. Generic
+         * stream-handoff cleanup must preserve those slots, while request
+         * resets, new samples, and final outcome consumption force-clear them.
+         */
+        enum class StochasticSampleReadyClearMode
+        {
+            PreserveVerifierConsumer,
+            Force,
+        };
+
+        /**
          * @brief IInferenceRunner request-boundary reset.
          *
          * Resets live sequence state (KV cache, positions, model recurrence,
@@ -2420,8 +2440,16 @@ namespace llaminar2
             std::fill(stochastic_draft_distribution_streams_.begin(),
                       stochastic_draft_distribution_streams_.end(),
                       nullptr);
-            clearStochasticTargetSampleReadySlots();
-            clearStochasticDraftSampleReadySlots();
+            std::fill(stochastic_target_row_formats_.begin(),
+                      stochastic_target_row_formats_.end(),
+                      StochasticRowFormat::Empty);
+            std::fill(stochastic_draft_row_formats_.begin(),
+                      stochastic_draft_row_formats_.end(),
+                      StochasticRowFormat::Empty);
+            clearStochasticTargetSampleReadySlots(StochasticSampleReadyClearMode::Force);
+            clearStochasticDraftSampleReadySlots(StochasticSampleReadyClearMode::Force);
+            pending_mtp_verifier_device_token_plan_.reset();
+            materialized_mtp_verifier_device_token_row_ = {};
             shifted_mtp_kv_ready_.valid = false;
             shifted_mtp_kv_ready_.producer_stream = nullptr;
             clearPendingAllPositionVerifierStateReady();
@@ -2767,8 +2795,18 @@ namespace llaminar2
         /** Get device contexts for all PP pipeline devices. */
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override;
 
-        /** Access the logits tensor for mapped-memory sync checks. */
+        /** Access the ordinary terminal logits tensor. */
         TensorBase *logitsTensor() override;
+
+        /**
+         * @brief Access the active logits tensor published by the current forward.
+         *
+         * All-position verifier forwards publish their own row tensor instead of
+         * the ordinary terminal logits tensor.  Keeping this accessor explicit
+         * prevents boundary sync and host publication code from accidentally
+         * marking or reading a stale logits buffer.
+         */
+        TensorBase *logitsPublicationTensor() override;
 
         /** Resolve PP copy info for cache-miss builds. */
         PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const override;
@@ -2822,10 +2860,15 @@ namespace llaminar2
          * the marker before a new distribution build prevents later verifier or
          * sidecar stages from accidentally waiting on a previous sample's event.
          */
-        void clearStochasticDraftSampleReadySlot(int slot);
+        void clearStochasticDraftSampleReadySlot(
+            int slot,
+            StochasticSampleReadyClearMode mode =
+                StochasticSampleReadyClearMode::PreserveVerifierConsumer);
 
         /** @brief Clear every draft sample readiness marker for request reset paths. */
-        void clearStochasticDraftSampleReadySlots();
+        void clearStochasticDraftSampleReadySlots(
+            StochasticSampleReadyClearMode mode =
+                StochasticSampleReadyClearMode::PreserveVerifierConsumer);
 
         /**
          * @brief Clear the device-side "sample token is ready" marker for one target slot.
@@ -2838,10 +2881,15 @@ namespace llaminar2
          * Only request-reset paths and actual target-token sampling should
          * clear this marker.
          */
-        void clearStochasticTargetSampleReadySlot(int slot);
+        void clearStochasticTargetSampleReadySlot(
+            int slot,
+            StochasticSampleReadyClearMode mode =
+                StochasticSampleReadyClearMode::PreserveVerifierConsumer);
 
         /** @brief Clear every target sample readiness marker for request reset paths. */
-        void clearStochasticTargetSampleReadySlots();
+        void clearStochasticTargetSampleReadySlots(
+            StochasticSampleReadyClearMode mode =
+                StochasticSampleReadyClearMode::PreserveVerifierConsumer);
 
         /**
          * @brief Record that a GPU sampler has written a draft token slot.
@@ -2853,7 +2901,10 @@ namespace llaminar2
          * after the sample kernel so later GPU consumers can wait without using
          * the device-default stream or synchronizing the CPU.
          */
-        bool recordStochasticDraftSampleReady(int slot, void *producer_stream);
+        bool recordStochasticDraftSampleReady(
+            int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = false);
 
         /**
          * @brief Record that a GPU sampler has written a target token slot.
@@ -2864,7 +2915,10 @@ namespace llaminar2
          * and a host read of the first token remains independent from device
          * summary-kernel ownership.
          */
-        bool recordStochasticTargetSampleReady(int slot, void *producer_stream);
+        bool recordStochasticTargetSampleReady(
+            int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = false);
 
         /**
          * @brief Make a consumer stream wait for deferred draft sample tokens.
@@ -3085,7 +3139,8 @@ namespace llaminar2
             const SamplingParams &params,
             int vocab_size,
             float threshold,
-            int32_t *out_token_host);
+            int32_t *out_token_host,
+            bool verifier_consumer_pending);
 
         /**
          * @brief Sample batched MTP logits into contiguous stochastic draft slots.
@@ -3853,8 +3908,26 @@ namespace llaminar2
         void *stochastic_batch_output_tokens_dev_ = nullptr; ///< INT32 [request, 5]
         void *stochastic_batch_output_meta_dev_ = nullptr;   ///< INT32 [request, 10]
         std::unique_ptr<PinnedHostScratch> stochastic_batch_output_host_scratch_;
+
+        /**
+         * @brief Device representation stored in a stochastic verifier row slot.
+         *
+         * CompactDistribution rows own `(token_id, probability)` top-k tables.
+         * ProcessedLogits rows own full-vocab logits after temperature/top-k/top-p
+         * processing. Keeping this explicit prevents the verifier from silently
+         * interpreting stale compact buffers as processed rows, or vice versa.
+         */
+        enum class StochasticRowFormat
+        {
+            Empty,
+            CompactDistribution,
+            ProcessedLogits,
+        };
+
         std::vector<int> stochastic_target_top_k_;
         std::vector<int> stochastic_draft_top_k_;
+        std::vector<StochasticRowFormat> stochastic_target_row_formats_;
+        std::vector<StochasticRowFormat> stochastic_draft_row_formats_;
 
         /**
          * @brief Producer stream for each compact stochastic distribution slot.
@@ -3892,6 +3965,7 @@ namespace llaminar2
             std::shared_ptr<void> event;
             void *producer_stream = nullptr;
             bool valid = false;
+            bool verifier_consumer_pending = false;
         };
 
         /**
@@ -4001,15 +4075,20 @@ namespace llaminar2
             int32_t first_token = -1;
             int first_target_sample_slot = -1;
             bool first_token_from_device = false;
+            bool all_tokens_from_host = false;
             int first_draft_slot = 0;
             int draft_token_count = 0;
             int total_verifier_input_tokens = 0;
+            std::array<int32_t, sampling_math::kSpeculativeBatchMaxRows + 1>
+                host_tokens{};
         };
         std::optional<PendingMTPVerifierDeviceTokenPlan>
             pending_mtp_verifier_device_token_plan_;
         struct MaterializedMTPVerifierDeviceTokenRow
         {
             bool valid = false;
+            bool first_token_from_device = false;
+            int first_target_sample_slot = -1;
             int total_verifier_input_tokens = 0;
             int draft_token_count = 0;
         };

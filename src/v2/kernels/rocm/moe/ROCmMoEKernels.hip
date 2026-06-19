@@ -1471,6 +1471,35 @@ __global__ void rocm_moe_gather_tokens_kernel(
     }
 }
 
+/**
+ * @brief Copy one row using a by-value row index.
+ *
+ * Verifier replay uses this instead of the general gather kernel so graph and
+ * stream replay do not depend on an async H2D copy from a stack-owned host row
+ * index.  The row width is normally a multiple of four, but the scalar tail
+ * keeps the helper valid for routing rows such as top_k=8 as well.
+ */
+__global__ void rocm_moe_copy_row_kernel(
+    const float *__restrict__ source,
+    float *__restrict__ row_buffer,
+    int row_index,
+    int row_width)
+{
+    if (row_index < 0 || row_width <= 0)
+        return;
+
+    const float *src = source + static_cast<size_t>(row_index) * row_width;
+    const int row_width4 = row_width >> 2;
+    const float4 *src4 = reinterpret_cast<const float4 *>(src);
+    float4 *dst4 = reinterpret_cast<float4 *>(row_buffer);
+    for (int i = threadIdx.x; i < row_width4; i += blockDim.x)
+        dst4[i] = src4[i];
+
+    const int tail_start = row_width4 << 2;
+    for (int i = tail_start + threadIdx.x; i < row_width; i += blockDim.x)
+        row_buffer[i] = src[i];
+}
+
 // =========================================================================
 // Kernel 4: Scatter-Add Weighted
 //
@@ -1497,6 +1526,34 @@ __global__ void rocm_moe_scatter_add_kernel(
     {
         atomicAdd(&dst[i], w * src[i]);
     }
+}
+
+/**
+ * @brief Store one scratch row into a destination row selected by value.
+ *
+ * The operation is an overwrite, not an add.  Decode-equivalent verifier replay
+ * owns each destination row exactly once, so direct store avoids atomics and
+ * avoids staging a `{row, weight}` pair through host memory.
+ */
+__global__ void rocm_moe_write_row_kernel(
+    float *__restrict__ destination,
+    const float *__restrict__ row_buffer,
+    int row_index,
+    int row_width)
+{
+    if (row_index < 0 || row_width <= 0)
+        return;
+
+    float *dst = destination + static_cast<size_t>(row_index) * row_width;
+    const int row_width4 = row_width >> 2;
+    const float4 *src4 = reinterpret_cast<const float4 *>(row_buffer);
+    float4 *dst4 = reinterpret_cast<float4 *>(dst);
+    for (int i = threadIdx.x; i < row_width4; i += blockDim.x)
+        dst4[i] = src4[i];
+
+    const int tail_start = row_width4 << 2;
+    for (int i = tail_start + threadIdx.x; i < row_width; i += blockDim.x)
+        dst[i] = row_buffer[i];
 }
 
 // =========================================================================
@@ -2331,6 +2388,31 @@ bool hipMoE_gather_tokens(
     return true;
 }
 
+bool hipMoE_copy_token_row(
+    const float *source, float *row_buffer,
+    int row_index, int row_width,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!source || !row_buffer || row_index < 0 || row_width <= 0 || !stream)
+        return false;
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_copy_row_kernel,
+        dim3(1), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        source, row_buffer, row_index, row_width);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE copy_token_row kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 bool hipMoE_scatter_add(
     float *output, const float *expert_output,
     const int *token_indices, const float *weights,
@@ -2349,6 +2431,31 @@ bool hipMoE_scatter_add(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE scatter_add kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_write_token_row(
+    float *destination, const float *row_buffer,
+    int row_index, int row_width,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!destination || !row_buffer || row_index < 0 || row_width <= 0 || !stream)
+        return false;
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_write_row_kernel,
+        dim3(1), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        destination, row_buffer, row_index, row_width);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE write_token_row kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
     return true;
@@ -2910,6 +3017,7 @@ __global__ void rocm_moe_group_tokens_with_shared_gate_kernel(
     int max_active_experts)
 {
     const int tid = threadIdx.x;
+    const int row_block = blockIdx.x;
     const int shared_expert = num_routed_experts;
     const int combined_experts = num_routed_experts + 1;
     const int routed_slots = seq_len * routed_top_k;
@@ -2920,79 +3028,105 @@ __global__ void rocm_moe_group_tokens_with_shared_gate_kernel(
     __shared__ int offsets[kDeviceMoEMaxExperts + 1];
     __shared__ float partial[256];
 
-    for (int expert = tid; expert < combined_experts; expert += blockDim.x)
-    {
-        counts[expert] = 0;
-        offsets[expert] = 0;
-    }
-    if (tid < max_active_experts)
-        active_expert_ids[tid] = -1;
-    if (tid == 0)
-        single_expert_ids[0] = shared_expert;
-    for (int slot = tid; slot < combined_slots; slot += blockDim.x)
-        original_to_grouped[slot] = -1;
-    __syncthreads();
-
-    if (tid < routed_slots)
-    {
-        const int expert = static_cast<int>(routing_indices[tid]);
-        if (expert >= 0 && expert < num_routed_experts)
-            atomicAdd(&counts[expert], 1);
-    }
-    if (tid == 0)
-        counts[shared_expert] = seq_len;
-    __syncthreads();
-
-    if (tid == 0)
-    {
-        int running = 0;
-        int active_count = 0;
-        for (int expert = 0; expert < combined_experts; ++expert)
-        {
-            offsets[expert] = running;
-            const int count = counts[expert];
-            if (count > 0 && active_count < max_active_experts)
-                active_expert_ids[active_count++] = expert;
-            running += count;
-        }
-    }
-    __syncthreads();
-
     /*
-     * Qwen3.6 MoE has 256 routed experts plus one logical shared expert.
-     * A 256-thread block therefore cannot use a single `tid < combined_experts`
-     * copy without dropping expert 256.  Use the same strided form as the
-     * initialization so the shared expert count/offset is always published.
+     * Block 0 owns routed metadata and count publication.  The remaining
+     * blocks only compute the per-row shared-expert sigmoid weight below.  We
+     * deliberately keep the shared expert out of the routed active-expert list
+     * so mixed routed/shared codebooks cannot be decoded through one lane.
      */
-    for (int expert = tid; expert < combined_experts; expert += blockDim.x)
+    if (row_block == 0)
     {
-        expert_counts[expert] = counts[expert];
-        expert_offsets[expert] = offsets[expert];
-    }
-
-    if (tid < routed_slots)
-    {
-        const int expert = static_cast<int>(routing_indices[tid]);
-        if (expert >= 0 && expert < num_routed_experts)
+        for (int expert = tid; expert < combined_experts; expert += blockDim.x)
         {
-            int local = 0;
-            for (int prev = 0; prev < tid; ++prev)
+            counts[expert] = 0;
+            offsets[expert] = 0;
+        }
+        if (tid < max_active_experts)
+            active_expert_ids[tid] = -1;
+        if (tid == 0)
+            single_expert_ids[0] = shared_expert;
+        for (int slot = tid; slot < routed_slots; slot += blockDim.x)
+        {
+            const int row = slot / routed_top_k;
+            const int route = slot - row * routed_top_k;
+            original_to_grouped[row * combined_top_k + route] = -1;
+        }
+        __syncthreads();
+
+        if (tid < routed_slots)
+        {
+            const int expert = static_cast<int>(routing_indices[tid]);
+            if (expert >= 0 && expert < num_routed_experts)
+                atomicAdd(&counts[expert], 1);
+        }
+        if (tid == 0)
+            counts[shared_expert] = seq_len;
+        __syncthreads();
+
+        if (tid == 0)
+        {
+            int running = 0;
+            int active_count = 0;
+            for (int expert = 0; expert < combined_experts; ++expert)
             {
-                if (static_cast<int>(routing_indices[prev]) == expert)
-                    ++local;
+                const int count = counts[expert];
+                if (expert == shared_expert)
+                {
+                    /*
+                     * The shared rows are written by per-row blocks at the
+                     * fixed tail position.  Valid router output makes this
+                     * equal to the routed prefix length and avoids any
+                     * inter-block dependency on block 0's prefix scan.
+                     */
+                    offsets[expert] = routed_slots;
+                }
+                else
+                {
+                    offsets[expert] = running;
+                    if (count > 0 && active_count < max_active_experts)
+                        active_expert_ids[active_count++] = expert;
+                    running += count;
+                }
             }
-            const int row = tid / routed_top_k;
-            const int route = tid - row * routed_top_k;
-            const int grouped = offsets[expert] + local;
-            const int original_slot = row * combined_top_k + route;
-            grouped_token_indices[grouped] = row;
-            original_to_grouped[original_slot] = grouped;
-            grouped_weights[grouped] = routing_weights[tid];
+        }
+        __syncthreads();
+
+        /*
+         * Qwen3.6 MoE has 256 routed experts plus one logical shared expert.
+         * A 256-thread block therefore cannot use a single `tid < combined_experts`
+         * copy without dropping expert 256.  Use the same strided form as the
+         * initialization so the shared expert count/offset is always published.
+         */
+        for (int expert = tid; expert < combined_experts; expert += blockDim.x)
+        {
+            expert_counts[expert] = counts[expert];
+            expert_offsets[expert] = offsets[expert];
+        }
+
+        if (tid < routed_slots)
+        {
+            const int expert = static_cast<int>(routing_indices[tid]);
+            if (expert >= 0 && expert < num_routed_experts)
+            {
+                int local = 0;
+                for (int prev = 0; prev < tid; ++prev)
+                {
+                    if (static_cast<int>(routing_indices[prev]) == expert)
+                        ++local;
+                }
+                const int row = tid / routed_top_k;
+                const int route = tid - row * routed_top_k;
+                const int grouped = offsets[expert] + local;
+                const int original_slot = row * combined_top_k + route;
+                grouped_token_indices[grouped] = row;
+                original_to_grouped[original_slot] = grouped;
+                grouped_weights[grouped] = routing_weights[tid];
+            }
         }
     }
-    __syncthreads();
 
-    for (int row = 0; row < seq_len; ++row)
+    const int row = row_block;
+    if (row < seq_len)
     {
         float dot = 0.0f;
         const float *x = hidden + static_cast<size_t>(row) * d_model;
@@ -3010,13 +3144,12 @@ __global__ void rocm_moe_group_tokens_with_shared_gate_kernel(
 
         if (tid == 0)
         {
-            const int grouped = offsets[shared_expert] + row;
+            const int grouped = routed_slots + row;
             const int original_slot = row * combined_top_k + routed_top_k;
             grouped_token_indices[grouped] = row;
             original_to_grouped[original_slot] = grouped;
             grouped_weights[grouped] = 1.0f / (1.0f + expf(-partial[0]));
         }
-        __syncthreads();
     }
 }
 
@@ -3355,8 +3488,14 @@ bool hipMoE_group_tokens_small_float_with_shared_gate(
         return false;
     }
 
+    /*
+     * Keep four wavefronts for the verifier-sized shared-gate dot. A two-wave
+     * launch is numerically correct, but measured slower on gfx906 once graph
+     * replay overhead and the metadata block are included.
+     */
+    constexpr int kSharedGateThreads = 256;
     hipLaunchKernelGGL(rocm_moe_group_tokens_with_shared_gate_kernel,
-        dim3(1), dim3(256), 0, static_cast<hipStream_t>(stream),
+        dim3(seq_len), dim3(kSharedGateThreads), 0, static_cast<hipStream_t>(stream),
         routing_indices, routing_weights, hidden, shared_gate_inp,
         expert_counts, expert_offsets, grouped_token_indices, original_to_grouped,
         single_expert_ids, active_expert_ids, grouped_weights,

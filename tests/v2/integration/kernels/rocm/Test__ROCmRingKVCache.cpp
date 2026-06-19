@@ -187,7 +187,10 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP32)
  * metadata and only later adopts host mirrors for diagnostics and graph
  * signatures.  This regression locks down that ordering for ROCm: device
  * count/head pointers change first, and get_cached_tokens()/ring_head() do not
- * catch up until adoptSequenceStateFromHostMetadata() is called.
+ * catch up until adoptSequenceStateFromHostMetadata() is called.  Publication
+ * must preserve the ring tail and clamp to the accepted target length; it must
+ * not advance the head by accepted_state_count, because the verifier may have
+ * already appended rejected rows.
  */
 TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirrorStaleUntilAdoption)
 {
@@ -265,8 +268,10 @@ TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirro
         << device_error;
     stream.synchronize();
 
+    const int host_tail_before =
+        (host_head_before - host_count_before + max_seq_len) % max_seq_len;
     const int expected_device_head =
-        (host_head_before + accepted_state_count) % max_seq_len;
+        (host_tail_before + target_cached_tokens) % max_seq_len;
     int device_count = -1;
     int device_head = -1;
     ASSERT_NE(cache->deviceCachedTokenCountPtr(0, 0), nullptr);

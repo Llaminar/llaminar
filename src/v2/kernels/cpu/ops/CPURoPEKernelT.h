@@ -210,6 +210,27 @@ namespace llaminar2
             int device_idx = -1,
             int pos_offset = 0,
             int rotary_dim = 0) override;
+
+        /**
+         * @brief Apply MTP verifier RoPE rows with serial-decode-equivalent math.
+         *
+         * This grouped entry point keeps the verifier contract in the kernel
+         * layer.  It avoids RoPEStage-owned one-row scratch tensors while using
+         * the same persistent decode recurrence as the live one-token path.
+         */
+        bool apply_verifier_rows_decode_equivalent(
+            TensorBase *Q,
+            TensorBase *K,
+            const int *position_ids,
+            int verifier_rows,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int pos_offset = 0,
+            int rotary_dim = 0) override;
     };
 
     // =========================================================================

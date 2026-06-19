@@ -1,98 +1,90 @@
 # vLLM-Style MTP Tuning Dashboard
 
 Scope: Qwen3.6 dense/MoE MTP on CUDA, ROCm, CPU across SingleDevice,
-LocalTP, LocalPP, NodeLocalTP, and ExpertOverlay. Keep this file near 6KB.
+LocalTP, LocalPP, NodeLocalTP, and ExpertOverlay. Keep this file under 6 KB.
 
-RAG: **G** = correct and speed-positive. **A** = correct but slow,
-partial, policy-sensitive, or stale. **R** = failing, speed-negative, or
-unproven. Every iteration refreshes no-MTP, fixed d1/d2/d3, and dynamic for the
-active lane; broad units plus touched parity pass before a WiP commit.
+RAG: **G** = correct and speed-positive. **A** = correct but slow/stale.
+**R** = failing, speed-negative, or unproven. Fresh speed rows are bounded
+`--decode-tokens 16 --perfstats`.
 
-## Phase 10 Snapshot
+## Current Snapshot
 
-Active blocker: MoE stochastic fixed-depth throughput. Dense lanes are
-accepted or close; ROCm d3 now beats baseline after the replay-safety split,
-but the win is small and CUDA MoE stochastic remains short of target.
+Dense SingleDevice is the active focus. CUDA dense greedy now uses grouped
+device-resident publication and is speed-positive; ROCm dense greedy is correct
+and positive but lags CUDA by speedup factor. ROCm stochastic is still blocked
+by the compact outcome host bridge/wait path. MoE remains next after dense
+SingleDevice is green on both GPU backends.
 
-Fresh audits: `20260614T012855Z`, `20260614T035626Z`, `20260614T041420Z`.
-Correctness checkpoint: Phase 9.5/9.6 are green. CPU/CUDA/ROCm
-state-publication parity passes; CUDA/ROCm depth-3 guards prove Qwen3.6 MoE
-M=2/3/4 verifier rows stay grouped; ROCm keeps M=3/4 on tuned tile-M=2 K-part.
-
-Phase 9.7 MoE shared decode-equivalent verifier rows are green on CPU/CUDA/ROCm
-for M=1..4 with strict raw-logit cosine, relative L2, symmetric KL,
-sampled-token, and four-token continuation checks. Dense CPU/CUDA/ROCm grouped
-row proofs are green for M=2..4 with strict cosine, relative L2, symmetric KL,
-and sampled-token checks; the latest CPU grouped gate took 135.31s real time,
-so Phase 9.8 still keeps CPU perf suspect. MoE direct all-position publication stays disabled after the rejected
-CUDA M=2 candidate (`row0 cos=0.9826 rel_l2=0.1855`). Phase 9.8 kernel slice:
-NativeVNNI static gates, CPU/CUDA/ROCm M=2..4 serial-equivalence, and focused
-trainer CSV smoke all pass. MoE verifier-prefill perf now hard-gates
-graph replay faster than serial/split reference; sprint rows: CUDA combined
-M2/3/4 0.118/0.150/0.176 ms vs 0.301/0.162/0.183, ROCm
-0.259/0.312/0.355 vs 0.304/0.339/0.375. Greedy GPU all-position now keeps first+draft
-tokens in device slots, removes the resident verifier token-row H2D fallback,
-snapshots base-cache counts D2D, keeps scalar GDN/short-conv device-index
-publication device-only, lets dense request batches pass the hybrid guard, and
-names remaining D2H as response materialization. GDN/short-conv request-batch
-restore now has a hard-fail API plus CUDA/ROCm request-owned live-state banks.
-GPU request-batch resident publication/adoption now consumes the logical-state
-mailbox directly; host outcome bridging is response/sampler-only.
-
-| Lane | Baseline | Best MTP | RAG | Evidence |
-|---|---:|---:|:---:|---|
-| CUDA MoE stochastic | 129.0 | d3 124.4 (0.96x) | R | d3 76.9% acc, verifier/producer limited |
-| ROCm MoE stochastic | 78.6 | d3 82.0 (1.04x) | A | d3 74.3% acc after MoE sidecar recapture |
-
-Latest signal: compact one-hot draft verification is accepted; response D2H is
-not the floor. ROCm d3 recapture reaches 82.0 tok/s vs 78.6 baseline, while
-`main_verifier_graph_replay_gpu_ms=1503`; sampled verifier time is led by MoE
-expert FFN at 151 ms and router at 21 ms. Phase 10 needs vLLM-style MoE
-metadata/fusion, not more bridge plumbing.
+Strict correctness gate update: dense CUDA/ROCm grouped verifier rows M=1..4
+now pass full-distribution checks with cosine, relative L2, symmetric KLD,
+max-abs error, and sampled-token equality. Token equality alone is not accepted
+as parity for verifier row promotion.
 
 ## Device And Topology Matrix
 
 | Mode | Device / degree | Dense greedy | Dense stochastic | MoE greedy | MoE stochastic | Status |
 |---|---|:---:|:---:|:---:|:---:|---|
-| SingleDevice | CPU d1 | G | G | A | A | Correct; CPU verifier still costly |
-| SingleDevice | CUDA d1 | G | G | A | R | MoE M=1..4 verifier proof green; stochastic not speed-positive |
-| SingleDevice | ROCm d1 | G | G | A | A | MoE M=1..4 verifier proof green; M3/M4 proof slow |
-| LocalTP | CUDA deg2 | A | R | R | R | Fresh parity/bench matrix needed |
-| LocalTP | ROCm deg2 | G | A | R | R | Dense greedy d3 55.4 vs 34.1 tok/s |
-| LocalTP | ROCm deg4 | A | R | R | R | Hardware expected; fresh matrix pending |
+| SingleDevice | CPU d1 | R | R | A | A | CPU refresh paused; keep correctness gates symmetric |
+| SingleDevice | CUDA d1 | G | G | R | A | Dense green; MoE speed still pending |
+| SingleDevice | ROCm d1 | A | A | R | R | Dense correct but ROCm bridge/wait hurts speed |
+| LocalTP | CUDA deg2 | R | R | R | R | Dense greedy accepts 0; stochastic unsupported |
+| LocalTP | ROCm deg2 | R | R | R | R | Fixed d1 segfaults in LocalTP allreduce |
+| LocalTP | ROCm deg4 | A | R | R | R | Preset/bench refresh pending |
 | LocalPP | CUDA stages | A | R | R | R | Correctness/bench refresh pending |
-| LocalPP | ROCm deg2 stages | G | A | R | R | Dense dynamic 62.9 vs 30.3 tok/s |
-| NodeLocalTP | CPU sockets | A | A | R | R | Dense parity green; benchmark pending |
-| ExpertOverlay | ROCm2TP + CPU2LocalTP | A | R | A | R | MoE parity green; speed unaccepted |
-| ExpertOverlay | GPU hot + remote CPU cold | R | R | R | R | Missing matched MPI sparse participant graph; fail-closed |
+| LocalPP | ROCm deg2 stages | R | R | R | R | Prior dense run speed-negative |
+| NodeLocalTP | CPU sockets | A | A | R | R | Skipped in latest refresh per CPU pause |
+| ExpertOverlay | GPU hot + CPU cold | A | R | A | R | Skipped in latest refresh per CPU pause |
 
-## SingleDevice Numbers
+## Fresh Dense SingleDevice Numbers
 
-| Backend | Model | Sampling | Latest same-run decode tok/s | RAG | Blocker |
-|---|---|---|---:|:---:|---|
-| CUDA | Dense 27B | greedy | base 44.0; d1/d2/d3/dyn 63.9/76.1/91.4/87.8 | G | dynamic trails fixed d3 |
-| CUDA | Dense 27B | stochastic | base 44.7; 52.6/52.6/47.7/47.7 | G | d3 short-lane regression |
-| ROCm | Dense 27B | greedy | base 30.3; 42.3/48.1/65.0/52.9 | G | absolute CUDA gap |
-| ROCm | Dense 27B | stochastic | base 31.3; 37.0/28.7/27.0/36.9 | G | d2/d3 |
-| CPU | Dense 27B | greedy | base 4.7; 5.9/6.0/9.3/6.1 | G | dynamic shallow |
-| CPU | Dense 27B | stochastic | base 4.46; 5.06/5.78/4.85/5.41 | G | verifier/condition |
-| CUDA | MoE 35B | greedy | base 139.2; 129.6/136.6/139.1/146.1 | A | weak win, repeat needed |
-| CUDA | MoE 35B | stochastic | base 128.8; d1/d2/d3 124.5/114.4/128.7 | R | break-even only |
-| ROCm | MoE 35B | greedy | base 77.0; 79.0/91.5/90.3/86.1 | A | below dense-class win |
-| ROCm | MoE 35B | stochastic | base 78.6; d3 82.0 | A | recapture restores acc; win small |
-| CPU | MoE 35B | greedy | base 17.7; 13.5/13.9/12.4/13.3 | A | host verifier |
-| CPU | MoE 35B | stochastic | base 17.6; 14.5/13.3/14.1/14.0 | A | host verifier |
+Evidence:
+`benchmark_results/mtp_vllm_style/20260619T_dense_grouped_greedy_refresh/single_dense_gpu`.
 
-Target anchors from `ggml-org/llama.cpp@6ddc943`: CUDA dense no-MTP 41.83, d1
-54.9, d3 52.5 tok/s; CUDA MoE no-MTP 118.26, d1 142.0, d3 132.8 tok/s.
+Values are `baseline; d1/d2/d3/dyn tok/s`, with best MTP speedup.
+
+| Lane | Greedy | Stochastic | RAG |
+|---|---:|---:|:---:|
+| CUDA dense single | `44.46; 58.82/70.61/74.92/72.05` (`1.69x`) | `44.47; 57.07/55.44/53.08/53.29` (`1.28x`) | G |
+| ROCm dense single | `31.30; 33.78/34.08/39.74/39.79` (`1.27x`) | `31.79; 32.22/25.51/23.50/32.16` (`1.01x`) | A |
+
+Dense greedy acceptance is healthy: CUDA d3 accepts `31/40` with zero rollbacks;
+ROCm d3 accepts `30/39` with zero rollbacks. CUDA d3 publish cost is about
+`11.0 ms` and compact D2H wait is negligible. ROCm d3 publish cost is about
+`16.2 ms`, but the request-summary/outcome wait still drains about `586 ms`
+over the short run. ROCm stochastic d1/dyn both spend about `895 ms` in the
+host bridge and are only break-even despite 66.7% acceptance.
+
+## Stale Broader Numbers
+
+Old full-dashboard rows remain useful as blockers, not as green evidence:
+
+| Lane | Best recent speed | RAG |
+|---|---:|:---:|
+| CPU dense single | `0.84x greedy`, `0.81x stochastic d1` | R |
+| CUDA MoE single | `0.38x greedy`, `0.93x stochastic` | R |
+| ROCm MoE single | `0.47x greedy`, `0.79x stochastic` | R |
+| CUDA2 LocalTP dense | `0.42x greedy`, 0% accept | R |
+| ROCm2 LocalTP dense | fixed d1 segfault | R |
+| ROCm2 LocalPP dense | `0.67x greedy`, `0.60x stochastic` | R |
+
+## Correctness Evidence
+
+- `V2_Unit_PrefillDecodeTransition` passed after grouped greedy resident publication.
+- Dense CUDA/ROCm actual MTP parity subset passed: fixed d1/d3, dynamic,
+  benchmark prompt, and first-transaction state.
+- Dense CUDA/ROCm grouped verifier rows passed:
+  `VerifierRowsGroupedDecodeEquivalentM[1-4]` with strict cosine, relative L2,
+  symmetric KLD, max-abs, and token gates.
+- `V2_Perf_DenseVerifierRows_(CUDA|ROCm)` passed.
 
 ## Next Phase 10 Moves
 
-1. Close Phase 9.8 dense economy: prove grouped verifier perf beats serial on
-   CPU/CUDA/ROCm.
-2. Reduce full MoE verifier replay beyond isolated expert-prefill; align
-   routed/shared work with vLLM fused-MoE semantics.
-3. Keep response D2H as output flush only.
-4. Promote and smoke hybrid request-batched GDN publication end-to-end.
-5. Refresh LocalTP CUDA2, LocalTP ROCm4, NodeLocalTP CPU, and ExpertOverlay
-   matrices before rollout claims.
+1. Catch ROCm dense up to CUDA: remove or overlap the compact outcome/request
+   summary host wait on greedy and stochastic lanes.
+2. Re-run the bounded dense GPU matrix after the ROCm bridge work; keep CUDA
+   dense as the ratchet.
+3. Move to SingleDevice MoE only after dense CUDA/ROCm are both green.
+4. Fix LocalTP/LocalPP correctness after SingleDevice dense/MoE economics are
+   healthy.
+5. Keep routed/shared MoE fusion separate unless strict parity proves L2, KLD,
+   cosine, max-abs, and token equivalence.

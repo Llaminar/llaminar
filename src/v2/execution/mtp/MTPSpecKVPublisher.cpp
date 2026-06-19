@@ -68,23 +68,17 @@ namespace llaminar2
             return 0;
 
         const int shift = mtp_depth + 1;
-        if (plan.reuse_initial_mtp_shifted_kv_row)
-        {
-            return std::max(0, plan.target_cached_tokens - shift);
-        }
-
         /*
-         * Without a reusable sidecar row, the verifier-base restore has also
-         * discarded the row that a just-run sidecar would have appended.  The
-         * live shifted cache therefore starts one row behind the ordinary
-         * depth shift, and only verifier rows after the shift boundary may
-         * extend it.
+         * Shifted MTP KV is a cache-shape invariant, not a sidecar-reuse
+         * policy: once a transaction commits to main logical token count N,
+         * depth d must expose N - (d + 1) rows.  Paths that cannot safely
+         * publish the first shifted row must repair it before calling the
+         * publisher, or fail hard.  Keeping the host mirror on this same rule
+         * is especially important for device-resident publication, where the
+         * GPU metadata kernel already publishes this target and the host mirror
+         * is adopted later for planning and validation.
          */
-        const int base_shifted =
-            std::max(0, plan.base_cached_tokens - shift - 1);
-        const int verifier_shifted_delta =
-            std::max(0, plan.accepted_count - shift);
-        return base_shifted + verifier_shifted_delta;
+        return std::max(0, plan.target_cached_tokens - shift);
     }
 
     MTPSpecKVPublicationResult publishAcceptedMTPSpecKVState(

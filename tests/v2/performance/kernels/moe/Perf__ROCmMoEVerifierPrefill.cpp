@@ -188,6 +188,63 @@ namespace
     }
 
     /**
+     * @brief Return sorted unique routed expert IDs present in a route table.
+     *
+     * The speedometer keeps production-sized descriptor tables but should not
+     * spend minutes preparing inactive expert payloads before the timed GPU work.
+     * Active slots still get real prepared descriptors and therefore hard-fail on
+     * unsupported formats or broken prepared-weight wiring.
+     */
+    std::vector<int> uniqueExpertIdsFromRoutes(
+        const std::vector<float> &routing_indices,
+        int num_experts)
+    {
+        std::vector<int> ids;
+        ids.reserve(routing_indices.size());
+        for (float value : routing_indices)
+        {
+            const int id = static_cast<int>(value);
+            EXPECT_GE(id, 0);
+            EXPECT_LT(id, num_experts);
+            if (id >= 0 && id < num_experts)
+                ids.push_back(id);
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        if (ids.empty())
+            ids.push_back(0);
+        return ids;
+    }
+
+    /**
+     * @brief Normalize the explicit expert materialization set.
+     *
+     * Inactive descriptor slots are filled by aliasing a valid routed descriptor
+     * after materialization. They remain valid table entries, but the synthetic
+     * route tensors never select them.
+     */
+    std::vector<int> sanitizeMaterializedExperts(
+        std::vector<int> ids,
+        int num_experts)
+    {
+        ids.erase(
+            std::remove_if(
+                ids.begin(), ids.end(),
+                [num_experts](int id)
+                {
+                    EXPECT_GE(id, 0);
+                    EXPECT_LT(id, num_experts);
+                    return id < 0 || id >= num_experts;
+                }),
+            ids.end());
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        if (ids.empty())
+            ids.push_back(0);
+        return ids;
+    }
+
+    /**
      * @brief KL(reference || actual) after stable row-wise softmax.
      *
      * This performance harness doubles as a drift detector for verifier-sized
@@ -342,11 +399,14 @@ namespace
         {
             std::cout
                 << "backend,case,m,top_k,num_experts,d_model,intermediate,"
-                   "eager_ms,graph_ms,rowwise_ms,cosine,relative_l2,max_abs,"
+                   "eager_ms,graph_ms,rowwise_ms,speedup_vs_reference,"
+                   "cosine,relative_l2,max_abs,"
                    "min_row_cosine,max_row_relative_l2,max_row_kl,worst_row\n";
             printed_header = true;
         }
 
+        const double speedup =
+            result.graph_ms > 0.0 ? (result.rowwise_ms / result.graph_ms) : 0.0;
         std::cout << std::fixed << std::setprecision(4)
                   << result.backend << ','
                   << result.case_name << ','
@@ -358,6 +418,7 @@ namespace
                   << result.eager_ms << ','
                   << result.graph_ms << ','
                   << result.rowwise_ms << ','
+                  << speedup << ','
                   << std::setprecision(8) << result.metrics.cosine << ','
                   << result.metrics.relative_l2 << ','
                   << result.metrics.max_abs << ','
@@ -427,14 +488,18 @@ namespace
         llaminar2::DeviceId device,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        std::vector<int> materialized_experts)
     {
         PreparedExpertTables tables;
-        tables.weights.reserve(static_cast<size_t>(num_experts) * 3);
-        tables.prepared.reserve(static_cast<size_t>(num_experts) * 3);
-        tables.gate_descs.reserve(num_experts);
-        tables.up_descs.reserve(num_experts);
-        tables.down_descs.reserve(num_experts);
+        materialized_experts =
+            sanitizeMaterializedExperts(std::move(materialized_experts), num_experts);
+        tables.weights.reserve(materialized_experts.size() * 3);
+        tables.prepared.reserve(materialized_experts.size() * 3);
+        tables.gate_descs.resize(num_experts);
+        tables.up_descs.resize(num_experts);
+        tables.down_descs.resize(num_experts);
+        std::vector<bool> has_desc(static_cast<size_t>(num_experts), false);
 
         auto add_desc = [&](int rows, int cols, int seed, const char *role, int expected_codebook)
         {
@@ -468,11 +533,28 @@ namespace
             return desc;
         };
 
+        for (int expert : materialized_experts)
+        {
+            tables.gate_descs[static_cast<size_t>(expert)] =
+                add_desc(intermediate, d_model, 4100 + expert, "gate", 13);
+            tables.up_descs[static_cast<size_t>(expert)] =
+                add_desc(intermediate, d_model, 4200 + expert, "up", 13);
+            tables.down_descs[static_cast<size_t>(expert)] =
+                add_desc(d_model, intermediate, 4300 + expert, "down", 4);
+            has_desc[static_cast<size_t>(expert)] = true;
+        }
+
+        const int alias = materialized_experts.front();
         for (int expert = 0; expert < num_experts; ++expert)
         {
-            tables.gate_descs.push_back(add_desc(intermediate, d_model, 4100 + expert, "gate", 13));
-            tables.up_descs.push_back(add_desc(intermediate, d_model, 4200 + expert, "up", 13));
-            tables.down_descs.push_back(add_desc(d_model, intermediate, 4300 + expert, "down", 4));
+            if (has_desc[static_cast<size_t>(expert)])
+                continue;
+            tables.gate_descs[static_cast<size_t>(expert)] =
+                tables.gate_descs[static_cast<size_t>(alias)];
+            tables.up_descs[static_cast<size_t>(expert)] =
+                tables.up_descs[static_cast<size_t>(alias)];
+            tables.down_descs[static_cast<size_t>(expert)] =
+                tables.down_descs[static_cast<size_t>(alias)];
         }
 
         tables.gateup_table_id = moe->uploadGroupedExpertGateUpDescriptorTables(
@@ -489,19 +571,25 @@ namespace
         llaminar2::DeviceId device,
         int routed_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        std::vector<int> routed_materialized_experts)
     {
         constexpr int shared_experts = 1;
         const int combined_experts = routed_experts + shared_experts;
         const int shared_slot = routed_experts;
+        routed_materialized_experts =
+            sanitizeMaterializedExperts(std::move(routed_materialized_experts), routed_experts);
+        std::vector<int> materialized_experts = routed_materialized_experts;
+        materialized_experts.push_back(shared_slot);
 
         PreparedCombinedSharedTables tables;
         tables.shared_slot = shared_slot;
-        tables.weights.reserve(static_cast<size_t>(combined_experts) * 3);
-        tables.prepared.reserve(static_cast<size_t>(combined_experts) * 3);
-        tables.gate_descs.reserve(combined_experts);
-        tables.up_descs.reserve(combined_experts);
-        tables.down_descs.reserve(combined_experts);
+        tables.weights.reserve(materialized_experts.size() * 3);
+        tables.prepared.reserve(materialized_experts.size() * 3);
+        tables.gate_descs.resize(combined_experts);
+        tables.up_descs.resize(combined_experts);
+        tables.down_descs.resize(combined_experts);
+        std::vector<bool> has_desc(static_cast<size_t>(combined_experts), false);
 
         auto add_desc = [&](int rows, int cols, int seed, const char *role, int expected_codebook)
         {
@@ -536,14 +624,31 @@ namespace
             return desc;
         };
 
-        for (int expert = 0; expert < combined_experts; ++expert)
+        for (int expert : materialized_experts)
         {
             const bool is_shared = expert == shared_slot;
             const int gateup_codebook = is_shared ? 4 : 13;
             const int down_codebook = is_shared ? 13 : 4;
-            tables.gate_descs.push_back(add_desc(intermediate, d_model, 5100 + expert, "gate", gateup_codebook));
-            tables.up_descs.push_back(add_desc(intermediate, d_model, 5200 + expert, "up", gateup_codebook));
-            tables.down_descs.push_back(add_desc(d_model, intermediate, 5300 + expert, "down", down_codebook));
+            tables.gate_descs[static_cast<size_t>(expert)] =
+                add_desc(intermediate, d_model, 5100 + expert, "gate", gateup_codebook);
+            tables.up_descs[static_cast<size_t>(expert)] =
+                add_desc(intermediate, d_model, 5200 + expert, "up", gateup_codebook);
+            tables.down_descs[static_cast<size_t>(expert)] =
+                add_desc(d_model, intermediate, 5300 + expert, "down", down_codebook);
+            has_desc[static_cast<size_t>(expert)] = true;
+        }
+
+        const int routed_alias = routed_materialized_experts.front();
+        for (int expert = 0; expert < routed_experts; ++expert)
+        {
+            if (has_desc[static_cast<size_t>(expert)])
+                continue;
+            tables.gate_descs[static_cast<size_t>(expert)] =
+                tables.gate_descs[static_cast<size_t>(routed_alias)];
+            tables.up_descs[static_cast<size_t>(expert)] =
+                tables.up_descs[static_cast<size_t>(routed_alias)];
+            tables.down_descs[static_cast<size_t>(expert)] =
+                tables.down_descs[static_cast<size_t>(routed_alias)];
         }
 
         tables.gateup_table_id = moe->uploadGroupedExpertGateUpDescriptorTables(
@@ -734,7 +839,14 @@ namespace
         constexpr int intermediate = 512;
         const int top_k = shared ? shared_top_k : routed_top_k;
         const int num_experts = shared ? shared_num_experts : routed_num_experts;
-        const int iterations = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", 30);
+        /*
+         * This mirrors the CUDA production speedometer: the combined path and
+         * split reference are both sub-millisecond graph-captured paths, so a
+         * robust default timing window is required for CTest to reject only
+         * real verifier-economy regressions.  Sweeps may still override it
+         * with LLAMINAR_MOE_VERIFIER_PREFILL_ITERS.
+         */
+        const int iterations = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", 120);
         const int warmups = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS", 5);
         const auto device = llaminar2::DeviceId::rocm(0);
 
@@ -759,12 +871,14 @@ namespace
         EXPECT_TRUE(workspace->allocate(reqs));
         workspace_consumer->bindWorkspace(workspace.get());
 
-        auto tables = prepareExpertTables(moe, device, num_experts, d_model, intermediate);
         const auto hidden_values = makeHiddenValues(rows, d_model);
         const auto routing_indices = unique_routes
                                          ? makeUniqueRoutingIndices(rows, top_k, num_experts)
                                          : makeRoutingIndices(rows, top_k, num_experts);
         const auto routing_weights = makeRoutingWeights(rows, top_k);
+        auto tables = prepareExpertTables(
+            moe, device, num_experts, d_model, intermediate,
+            uniqueExpertIdsFromRoutes(routing_indices, num_experts));
         auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
         auto route_indices_tensor = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(top_k)}, routing_indices);
         auto route_weights_tensor = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(top_k)}, routing_weights);
@@ -887,13 +1001,14 @@ namespace
         EXPECT_TRUE(workspace->allocate(reqs));
         workspace_consumer->bindWorkspace(workspace.get());
 
-        auto tables = prepareQwen36CombinedSharedTables(
-            moe, device, routed_experts, d_model, intermediate);
         const auto hidden_values = makeHiddenValues(rows, d_model);
         const auto shared_gate_values = makeSharedGateValues(d_model);
         const auto routing_indices =
             makeUniqueRoutingIndices(rows, routed_top_k, routed_experts);
         const auto routing_weights = makeRoutingWeights(rows, routed_top_k);
+        auto tables = prepareQwen36CombinedSharedTables(
+            moe, device, routed_experts, d_model, intermediate,
+            uniqueExpertIdsFromRoutes(routing_indices, routed_experts));
 
         auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
         auto shared_gate = makeTensor({static_cast<size_t>(d_model)}, shared_gate_values);
@@ -976,7 +1091,7 @@ namespace
             });
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        const double split_ms = timeHipEvents(stream, std::max(1, iterations / 3), run_split_reference);
+        const double split_ms = timeHipEvents(stream, iterations, run_split_reference);
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
         combined_output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);

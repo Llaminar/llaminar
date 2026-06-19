@@ -257,6 +257,53 @@ namespace
 
         return true;
     }
+
+    bool ensureOutputOnDevice(llaminar2::ITensor *tensor,
+                              llaminar2::DeviceId device,
+                              void *stream,
+                              const char *name,
+                              const char *context)
+    {
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " requires an explicit HIP stream for " << name);
+            return false;
+        }
+
+        auto *base = dynamic_cast<llaminar2::TensorBase *>(tensor);
+        if (!base)
+        {
+            if (tensor && tensor->gpu_data_ptr())
+                return true;
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " has no device pointer for non-TensorBase output " << name);
+            return false;
+        }
+
+        /*
+         * Output-only verifier row buffers are about to be overwritten by a
+         * HIP kernel.  Allocating is correct; uploading the stale host mirror
+         * is not.  This mirrors the CUDA MoE helper and keeps row handoff
+         * semantics explicit.
+         */
+        if (!base->gpu_data_ptr() && !base->allocateOnDevice(device, stream))
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " failed to allocate output " << name
+                                         << " on " << device.to_string());
+            return false;
+        }
+
+        if (!base->gpu_data_ptr())
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " has null output device pointer for " << name);
+            return false;
+        }
+
+        return true;
+    }
 }
 
 // Forward-declare extern "C" bridge functions (defined in ROCmMoEKernels.hip)
@@ -380,10 +427,20 @@ extern "C"
         int num_tokens, int d_model,
         int device_idx, void *stream);
 
+    bool hipMoE_copy_token_row(
+        const float *source, float *row_buffer,
+        int row_index, int row_width,
+        int device_idx, void *stream);
+
     bool hipMoE_scatter_add(
         float *output, const float *expert_output,
         const int *token_indices, const float *weights,
         int num_tokens, int d_model,
+        int device_idx, void *stream);
+
+    bool hipMoE_write_token_row(
+        float *destination, const float *row_buffer,
+        int row_index, int row_width,
         int device_idx, void *stream);
 
     bool hipMoE_shared_expert_gate(
@@ -1616,11 +1673,34 @@ namespace llaminar2
         }
         else if (seq_len >= 2 && seq_len <= 4)
         {
+            /*
+             * All-position MTP verifier routing must be row-for-row equivalent
+             * to ordinary decode.  The optimized small-M router is useful for
+             * throughput sweeps, but it changes the dot-product reduction order
+             * versus decode and can perturb near-tie top-k weights enough for
+             * downstream MoE/GDN state to diverge.  Use the same single-token
+             * router logits implementation that decode uses, one row at a time,
+             * while leaving softmax/top-k and all outputs device-resident.
+             */
             void *stream = getStream();
-            if (!launchSmallMGateLogits(
-                    hidden, gate_weights, gate_type, bufs.d_logits,
-                    seq_len, d_model, num_experts,
-                    device_ordinal_, stream))
+            bool rows_ready = true;
+            for (int row = 0; row < seq_len; ++row)
+            {
+                const float *row_hidden =
+                    hidden + static_cast<size_t>(row) * static_cast<size_t>(d_model);
+                float *row_logits =
+                    bufs.d_logits + static_cast<size_t>(row) * static_cast<size_t>(num_experts);
+                if (!launchDecodeGateLogitsForGateType(
+                        row_hidden, gate_weights, gate_type, row_logits,
+                        d_model, num_experts,
+                        device_ordinal_, stream,
+                        "ROCmMoEKernel::routeCore.decode_equivalent_small_m"))
+                {
+                    rows_ready = false;
+                    break;
+                }
+            }
+            if (!rows_ready)
             {
                 bufs = {};
                 return false;
@@ -1630,7 +1710,7 @@ namespace llaminar2
             {
                 PerfStatsCollector::addCounter(
                     "kernel",
-                    "rocm_moe_small_m_fused_router_calls",
+                    "rocm_moe_decode_equivalent_small_m_router_calls",
                     1.0,
                     "moe",
                     DeviceId::rocm(device_ordinal_).to_string(),
@@ -3008,8 +3088,9 @@ namespace llaminar2
 
         if (write_legacy_outputs)
         {
-            output_indices->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            output_weights->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            const DeviceId device = DeviceId::rocm(device_ordinal_);
+            markDeviceWritten(output_indices, device, getStream());
+            markDeviceWritten(output_weights, device, getStream());
         }
 
         return true;
@@ -3076,6 +3157,34 @@ namespace llaminar2
                                    DeviceId::rocm(device_ordinal_));
     }
 
+    bool ROCmMoEKernel::copyTokenRowFromTensor(
+        ITensor *source, ITensor *row_buffer,
+        int row_index, int row_width)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_GATHER, static_cast<hipStream_t>(getStream()));
+
+        if (row_index < 0 || row_width <= 0)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "copyTokenRowFromTensor"))
+            return false;
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!ensureTensorOnDevice(source, device, stream, "source", "copyTokenRowFromTensor") ||
+            !ensureOutputOnDevice(row_buffer, device, stream, "row_buffer", "copyTokenRowFromTensor"))
+        {
+            return false;
+        }
+
+        const auto *src = static_cast<const float *>(source->gpu_data_ptr());
+        auto *dst = static_cast<float *>(row_buffer->gpu_data_ptr());
+        if (!hipMoE_copy_token_row(src, dst, row_index, row_width, device_ordinal_, stream))
+            return false;
+
+        markDeviceWritten(row_buffer, device, stream);
+        return true;
+    }
+
     void ROCmMoEKernel::scatterAddWeightedFromTensors(
         ITensor *output, ITensor *expert_output,
         const int *host_token_indices, const float *host_weights,
@@ -3127,6 +3236,34 @@ namespace llaminar2
                            num_tokens, d_model);
         output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
                              DeviceId::rocm(device_ordinal_));
+    }
+
+    bool ROCmMoEKernel::writeTokenRowToTensor(
+        ITensor *destination, ITensor *row_buffer,
+        int row_index, int row_width)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SCATTER, static_cast<hipStream_t>(getStream()));
+
+        if (row_index < 0 || row_width <= 0)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "writeTokenRowToTensor"))
+            return false;
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!ensureOutputOnDevice(destination, device, stream, "destination", "writeTokenRowToTensor") ||
+            !ensureTensorOnDevice(row_buffer, device, stream, "row_buffer", "writeTokenRowToTensor"))
+        {
+            return false;
+        }
+
+        auto *dst = static_cast<float *>(destination->gpu_data_ptr());
+        const auto *src = static_cast<const float *>(row_buffer->gpu_data_ptr());
+        if (!hipMoE_write_token_row(dst, src, row_index, row_width, device_ordinal_, stream))
+            return false;
+
+        markDeviceWritten(destination, device, stream);
+        return true;
     }
 
     void ROCmMoEKernel::sharedExpertGateFromTensors(
@@ -3577,13 +3714,15 @@ namespace llaminar2
                 return false;
             d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
         const float *d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
-        if (!d_routing_indices)
+        if (!d_routing_indices &&
+            !ensureTensorOnDevice(routing_indices, device, getStream(),
+                                  "routing_indices", "groupedExpertGateUpDecodeFromRouting"))
         {
-            if (!routing_indices->ensureOnDevice(DeviceId::rocm(device_ordinal_)))
-                return false;
-            d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+            return false;
         }
+        d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
         if (!d_hidden || !d_routing_indices)
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting] Missing input/routing device pointer");
@@ -3594,6 +3733,13 @@ namespace llaminar2
         host_grouped_up_output_ptrs_.assign(static_cast<size_t>(top_k), nullptr);
         for (int i = 0; i < top_k; ++i)
         {
+            if (!ensureOutputOnDevice(gate_outputs[i], device, getStream(),
+                                      "gate_output", "groupedExpertGateUpDecodeFromRouting") ||
+                !ensureOutputOnDevice(up_outputs[i], device, getStream(),
+                                      "up_output", "groupedExpertGateUpDecodeFromRouting"))
+            {
+                return false;
+            }
             host_grouped_gate_output_ptrs_[i] = static_cast<float *>(gate_outputs[i]->gpu_data_ptr());
             host_grouped_up_output_ptrs_[i] = static_cast<float *>(up_outputs[i]->gpu_data_ptr());
             if (!host_grouped_gate_output_ptrs_[i] || !host_grouped_up_output_ptrs_[i])
@@ -3646,8 +3792,8 @@ namespace llaminar2
         {
             for (int i = 0; i < top_k; ++i)
             {
-                gate_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                up_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                markDeviceWritten(gate_outputs[i], device, getStream());
+                markDeviceWritten(up_outputs[i], device, getStream());
             }
         }
         return ok;
@@ -4153,6 +4299,7 @@ namespace llaminar2
         if (!ensureGroupedDecodeCapacity(top_k, intermediate))
             return false;
 
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
         const float *host_gate_ptrs[16] = {};
         const float *host_up_ptrs[16] = {};
         for (int i = 0; i < top_k; ++i)
@@ -4168,21 +4315,30 @@ namespace llaminar2
         }
 
         const float *d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
-        if (!d_routing_indices)
+        if (!d_routing_indices &&
+            !ensureTensorOnDevice(routing_indices, device, getStream(),
+                                  "routing_indices", "groupedExpertDownDecodeFromRouting"))
         {
-            if (!routing_indices->ensureOnDevice(DeviceId::rocm(device_ordinal_)))
-                return false;
-            d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+            return false;
         }
+        d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
         const float *d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
-        if (!d_weights)
+        if (!d_weights &&
+            !ensureTensorOnDevice(routing_weights, device, getStream(),
+                                  "routing_weights", "groupedExpertDownDecodeFromRouting"))
         {
-            if (!routing_weights->ensureOnDevice(DeviceId::rocm(device_ordinal_)))
-                return false;
-            d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
+            return false;
         }
+        d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
 
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        if (!d_output &&
+            !ensureOutputOnDevice(output, device, getStream(),
+                                  "moe_output", "groupedExpertDownDecodeFromRouting"))
+        {
+            return false;
+        }
+        d_output = static_cast<float *>(output->gpu_data_ptr());
         if (!d_routing_indices || !d_weights || !d_output)
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRouting] Missing routing/output device pointer");
@@ -4228,7 +4384,7 @@ namespace llaminar2
             getStream());
 
         if (ok)
-            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            markDeviceWritten(output, device, getStream());
         return ok;
     }
 
@@ -5088,7 +5244,12 @@ namespace llaminar2
         const int combined_experts = num_experts + 1;
         const int combined_top_k = top_k + 1;
         const int combined_slots = seq_len * combined_top_k;
-        const int active_expert_slots = std::min(combined_slots, combined_experts);
+        /*
+         * Active expert slots are routed experts only.  The appended shared
+         * expert uses d_group_single_expert_ids_ so the grouped GEMM path can
+         * launch it under its own codebook without cross-decoding routed slots.
+         */
+        const int active_expert_slots = std::min(seq_len * top_k, num_experts);
 
         if (combined_slots > group_slots_cap_ ||
             !d_group_token_indices_ ||
@@ -5106,7 +5267,7 @@ namespace llaminar2
                                      static_cast<size_t>(combined_slots) * sizeof(int),
                                      "prepareExpertGroupsWithSharedGateAsync(group_original_to_grouped)") ||
                 !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_single_expert_ids_),
-                                     MoEWorkspaceBuffers::GROUP_ORIGINAL_EXPERT_IDS,
+                                     MoEWorkspaceBuffers::GROUP_SINGLE_EXPERT_IDS,
                                      sizeof(int),
                                      "prepareExpertGroupsWithSharedGateAsync(group_single_expert_ids)") ||
                 !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_weights_),
@@ -5324,26 +5485,39 @@ namespace llaminar2
             down_table.host_descs.size() == static_cast<size_t>(num_experts);
         const int *d_single_expert_ids =
             appended_single_expert ? d_group_single_expert_ids_ : nullptr;
-        auto singleton_codebook_if_unique = [](const auto &descs) -> uint8_t
+        auto singleton_codebook = [](const auto &descs) -> uint8_t
         {
             if (descs.empty())
                 return 0xffu;
-            const uint8_t singleton_codebook = descs.back().codebook_id;
+            return descs.back().codebook_id;
+        };
+        auto routed_codebook_mask = [](const auto &descs) -> uint32_t
+        {
+            uint32_t mask = 0;
             for (size_t i = 0; i + 1 < descs.size(); ++i)
             {
-                if (descs[i].codebook_id == singleton_codebook)
-                    return 0xffu;
+                const uint8_t codebook = descs[i].codebook_id;
+                if (codebook < 32)
+                    mask |= uint32_t{1} << codebook;
             }
-            return singleton_codebook;
+            return mask;
         };
         const uint8_t single_gateup_codebook_id =
             appended_single_expert
-                ? singleton_codebook_if_unique(gateup_table.host_gate_descs)
+                ? singleton_codebook(gateup_table.host_gate_descs)
                 : 0xffu;
         const uint8_t single_down_codebook_id =
             appended_single_expert
-                ? singleton_codebook_if_unique(down_table.host_descs)
+                ? singleton_codebook(down_table.host_descs)
                 : 0xffu;
+        const uint32_t gateup_codebook_mask =
+            appended_single_expert
+                ? routed_codebook_mask(gateup_table.host_gate_descs)
+                : gateup_table.codebook_mask;
+        const uint32_t down_codebook_mask =
+            appended_single_expert
+                ? routed_codebook_mask(down_table.host_descs)
+                : down_table.codebook_mask;
         if (active_expert_slots > 0 && !d_active_expert_ids)
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] compact active expert list missing");
@@ -5419,8 +5593,8 @@ namespace llaminar2
             active_expert_slots,
             gateup_table.codebook_id,
             down_table.codebook_id,
-            gateup_table.codebook_mask,
-            down_table.codebook_mask,
+            gateup_codebook_mask,
+            down_codebook_mask,
             single_gateup_codebook_id,
             single_down_codebook_id,
             debugEnv().rocm.moe_prefill_tile_m,

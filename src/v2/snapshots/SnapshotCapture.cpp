@@ -292,6 +292,27 @@ namespace llaminar2
             return;
         }
 
+        /*
+         * The Qwen3.6 MoE combined shared-verifier path can fuse routed expert
+         * and shared expert output inside MoEExpertComputeStage.  The stage name
+         * is still `_moe_expert_ffn`, so route by output name before the generic
+         * suffix map labels it as routed-only expert output.
+         */
+        if (name.find("_moe_expert_ffn") != std::string::npos)
+        {
+            size_t pos = name.find("_moe_expert_ffn");
+            std::string prefix = name.substr(0, pos);
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name = output.name ? output.name : "";
+                if (output_name == "combined_output" && output.data)
+                {
+                    storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
+                    return;
+                }
+            }
+        }
+
         // Handle shared-expert gate. In the ordinary path the stage has one
         // output, the gated shared contribution. In the fused gate-add path it
         // publishes both that gated contribution and the final routed+shared

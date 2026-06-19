@@ -133,7 +133,7 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseAcceptsMultiRowDraftAndReturnsReadyTo
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
 
     ASSERT_TRUE(result.ok) << result.error;
     EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9, 8, 6));
@@ -153,6 +153,34 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseAcceptsMultiRowDraftAndReturnsReadyTo
         [](bool v) { return v; }));
 }
 
+TEST(Test__MTPDecodeCatchup, SharedStepwiseSamplerReceivesForwardedTokenHistory)
+{
+    FakeCatchupRunner runner;
+    ScriptedSampler sampler({9, 8, 4});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.base_sidecar_position = 11;
+
+    std::vector<int32_t> forwarded_tokens_seen_by_sampler;
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&](int32_t forwarded_token)
+            {
+                forwarded_tokens_seen_by_sampler.push_back(forwarded_token);
+                return sampler();
+            });
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9, 8));
+    EXPECT_EQ(result.ready_token, 4);
+    EXPECT_THAT(forwarded_tokens_seen_by_sampler, ElementsAre(7, 9, 8))
+        << "Penalty-aware samplers must observe each just-forwarded token "
+           "before sampling the corresponding verifier logits row.";
+}
+
 TEST(Test__MTPDecodeCatchup, SharedStepwiseUsesRequestImplementationNameForCounters)
 {
     ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
@@ -168,7 +196,7 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseUsesRequestImplementationNameForCount
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
 
     ASSERT_TRUE(result.ok) << result.error;
 
@@ -202,7 +230,7 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseRejectsAndForwardsCorrectionForReadyT
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
 
     ASSERT_TRUE(result.ok) << result.error;
     EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9, 3));
@@ -229,7 +257,7 @@ TEST(Test__MTPDecodeCatchup, AllPositionVerifierAcceptsAllAndMatchesStepwiseOrac
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
     ASSERT_TRUE(oracle.ok) << oracle.error;
 
     MTPDecodeCatchupGreedyResult candidate =
@@ -283,7 +311,7 @@ TEST(Test__MTPDecodeCatchup, AllPositionVerifierWithCorrectionReplayMatchesStepw
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
     ASSERT_TRUE(oracle.ok) << oracle.error;
 
     MTPDecodeCatchupGreedyResult candidate =
@@ -509,7 +537,7 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseStopTokenDiscardsReadyToken)
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
 
     ASSERT_TRUE(result.ok) << result.error;
     EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9));
@@ -532,7 +560,7 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWithoutDraftTokens)
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
 
     EXPECT_FALSE(result.ok);
     EXPECT_THAT(result.error, HasSubstr("no draft tokens"));
@@ -573,7 +601,7 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWhenInitialShiftedCommitFail
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
 
     EXPECT_FALSE(result.ok);
     EXPECT_THAT(result.error, HasSubstr("initial shifted-cache commit failed"));
@@ -595,7 +623,7 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWhenForwardFails)
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
 
     EXPECT_FALSE(result.ok);
     EXPECT_THAT(result.error, HasSubstr("failed to forward/sample first token"));
@@ -616,7 +644,7 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWhenSamplerFails)
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
 
     EXPECT_FALSE(result.ok);
     EXPECT_THAT(result.error, HasSubstr("failed to forward/sample first token"));
@@ -656,7 +684,7 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWhenLaterShiftedCommitFails)
         runSharedStepwiseMTPDecodeCatchupGreedy(
             runner,
             request,
-            [&]() { return sampler(); });
+            [&](int32_t) { return sampler(); });
 
     EXPECT_FALSE(result.ok);
     EXPECT_THAT(result.error, HasSubstr("shifted-cache commit failed"));

@@ -90,7 +90,7 @@ namespace llaminar2
         std::string error;
     };
 
-    using MTPDecodeCatchupGreedySampler = std::function<int32_t()>;
+    using MTPDecodeCatchupGreedySampler = std::function<int32_t(int32_t forwarded_token)>;
 
     /**
      * @brief Numeric proof contract for one verifier-row implementation.
@@ -270,6 +270,40 @@ namespace llaminar2
             return lane;
         }
 
+        /**
+         * @brief Report a grouped verifier outcome proof with resident
+         *        publication, but without accepting the full hot-path economy.
+         *
+         * This is the important Phase 10 middle state for GPU MoE: focused
+         * routed/shared verifier kernels prove strict M=2..4 row equivalence,
+         * the runner can publish accepted rows from device-resident outcome
+         * metadata, but the full verifier graph has not yet met the MTP speed
+         * target. Keeping this state first-class stops future policy code from
+         * conflating "batched verifier math and publication are correct" with
+         * "the whole MTP transaction is economical".
+         */
+        static MTPVerifierEconomyLane groupedOutcomeDevicePublicationEconomicsPending(
+            int rows)
+        {
+            MTPVerifierEconomyLane lane;
+            lane.correct = rows > 0;
+            lane.serial_decode_equivalent_fallback = lane.correct;
+            lane.grouped_decode_equivalent = lane.correct;
+            lane.row_indexed_lm_head = lane.correct;
+            lane.device_resident_input = lane.correct;
+            lane.device_resident_outcome = lane.correct;
+            lane.device_resident_publication = lane.correct;
+            lane.host_bridge_free_hot_path = false;
+            lane.graph_capturable = lane.correct;
+            lane.greedy = lane.correct;
+            lane.stochastic = lane.correct;
+            lane.max_rows = lane.correct ? rows : 0;
+            lane.perf_gate_status = lane.correct
+                                        ? "grouped_outcome_economics_pending"
+                                        : "unproven";
+            return lane;
+        }
+
         bool supportsRows(
             int rows,
             bool stochastic_requested = false) const
@@ -416,6 +450,10 @@ namespace llaminar2
      * KV/GDN/decode state equal to stepwise decode. CUDA and ROCm optimized
      * catch-up implementations must prove equivalence against this contract
      * before they are promoted.
+     *
+     * The sampler callback receives the token that was just forwarded.  Penalty
+     * aware callers use that value to update their branch-local sampler history
+     * before sampling the row's verifier logits.
      */
     MTPDecodeCatchupGreedyResult runSharedStepwiseMTPDecodeCatchupGreedy(
         IInferenceRunner &runner,

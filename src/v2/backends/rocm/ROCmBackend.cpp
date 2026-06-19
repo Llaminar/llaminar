@@ -2333,7 +2333,14 @@ namespace llaminar2
         }
 
         hipEvent_t event;
-        err = hipEventCreate(&event);
+        /*
+         * Match CUDA's event contract: ordinary events are used as cheap
+         * stream-ordering tokens and must not collect elapsed-time data.  HIP
+         * timing events can introduce extra dependency cost on hot paths such
+         * as stochastic MTP response bridging, so callers that need elapsed
+         * time must request createTimingEvent() explicitly.
+         */
+        err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmBackend::createEvent] hipEventCreate failed: " << hipGetErrorString(err));
@@ -2345,12 +2352,26 @@ namespace llaminar2
 
     void *ROCmBackend::createTimingEvent(int device_id)
     {
-        /*
-         * HIP events are timing-capable by default. Keep a separate method so
-         * call sites can declare profiling intent without depending on that
-         * backend-specific detail.
-         */
-        return createEvent(device_id);
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            return nullptr;
+        }
+
+        HipDeviceSaveRestore device_guard;
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            return nullptr;
+        }
+
+        hipEvent_t event;
+        err = hipEventCreate(&event);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::createTimingEvent] hipEventCreate failed: " << hipGetErrorString(err));
+            return nullptr;
+        }
+        return reinterpret_cast<void *>(event);
     }
 
     void ROCmBackend::destroyEvent(void *event, int device_id)
@@ -2577,7 +2598,7 @@ namespace llaminar2
             recordPointerEvent("alloc", ptr, bytes, device_id, true);
         }
 
-        LOG_DEBUG("[ROCM_PTR_ALLOC] ptr=" << ptr
+        LOG_TRACE("[ROCM_PTR_ALLOC] ptr=" << ptr
                                           << " bytes=" << bytes
                                           << " device=" << device_id);
 
@@ -2743,7 +2764,7 @@ namespace llaminar2
         }
         else
         {
-            LOG_DEBUG("[ROCM_PTR_FREE] ptr=" << ptr
+            LOG_TRACE("[ROCM_PTR_FREE] ptr=" << ptr
                                              << " bytes=" << recorded_size
                                              << " device=" << device_id);
         }

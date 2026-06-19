@@ -650,12 +650,16 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
                 const int32_t sa_g3 = __builtin_amdgcn_sdot4(
                     a4[7], ones, __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
 
-                float delta_corr = 0.0f;
-                delta_corr += static_cast<float>(sa_g0) * ((qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA);
-                delta_corr += static_cast<float>(sa_g1) * ((qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA);
-                delta_corr += static_cast<float>(sa_g2) * ((qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA);
-                delta_corr += static_cast<float>(sa_g3) * ((qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA);
-                acc += delta_corr * s_lo * scale_ab;
+                const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                // IQ1_M has two dequant scales. Groups 0/1 use the low scale,
+                // groups 2/3 use the high scale. This matches ROCm GEMV and
+                // CUDA MoE; using s_lo for all groups drifts verifier rows.
+                acc += ((d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * s_lo +
+                        (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * s_hi) *
+                       scale_ab;
             }
         }
         else
@@ -992,21 +996,27 @@ void moe_grouped_gate_up_swiglu_prefill_gemm_kernel(
                         int32_t sa_g3 = __builtin_amdgcn_sdot4(a4[7], ones,
                                         __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
 
-                        float gate_delta_corr = 0.0f;
-                        gate_delta_corr += static_cast<float>(sa_g0) * ((gate_qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        gate_delta_corr += static_cast<float>(sa_g1) * ((gate_qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        gate_delta_corr += static_cast<float>(sa_g2) * ((gate_qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        gate_delta_corr += static_cast<float>(sa_g3) * ((gate_qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        gate_acc[m] += gate_delta_corr * gate_s_lo * scale_ab;
+                        const float gate_d0 = (gate_qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        const float gate_d1 = (gate_qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        const float gate_d2 = (gate_qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        const float gate_d3 = (gate_qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        gate_acc[m] += ((gate_d0 * static_cast<float>(sa_g0) +
+                                         gate_d1 * static_cast<float>(sa_g1)) * gate_s_lo +
+                                        (gate_d2 * static_cast<float>(sa_g2) +
+                                         gate_d3 * static_cast<float>(sa_g3)) * gate_s_hi) *
+                                       scale_ab;
 
                         const uint8_t* up_pay = up_payload_base + linear * PB;
                         const uint8_t up_qh0 = up_pay[4], up_qh1 = up_pay[5];
-                        float up_delta_corr = 0.0f;
-                        up_delta_corr += static_cast<float>(sa_g0) * ((up_qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        up_delta_corr += static_cast<float>(sa_g1) * ((up_qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        up_delta_corr += static_cast<float>(sa_g2) * ((up_qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        up_delta_corr += static_cast<float>(sa_g3) * ((up_qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        up_acc[m] += up_delta_corr * up_s_lo * scale_ab;
+                        const float up_d0 = (up_qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        const float up_d1 = (up_qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        const float up_d2 = (up_qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        const float up_d3 = (up_qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        up_acc[m] += ((up_d0 * static_cast<float>(sa_g0) +
+                                       up_d1 * static_cast<float>(sa_g1)) * up_s_lo +
+                                      (up_d2 * static_cast<float>(sa_g2) +
+                                       up_d3 * static_cast<float>(sa_g3)) * up_s_hi) *
+                                     scale_ab;
                     }
                 }
                 else {
@@ -1145,7 +1155,7 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
 // Block: 64 threads
 // ============================================================================
 
-template <NativeVNNIFormatPrefill FMT, int TILE_M>
+template <NativeVNNIFormatPrefill FMT, int TILE_M, int TILE_N>
 __global__ __launch_bounds__(128)
 void moe_grouped_down_prefill_gemm_kernel(
     const int8_t*  __restrict__ A_int8,              // [total_slots, intermediate] (from SwiGLU output)
@@ -1160,7 +1170,8 @@ void moe_grouped_down_prefill_gemm_kernel(
 {
     static_assert(TILE_M == 2 || TILE_M == 4 || TILE_M == 8,
                   "ROCm grouped MoE prefill only instantiates verifier-sized TILE_M buckets");
-    constexpr int TILE_N = 128;
+    static_assert(TILE_N == 64 || TILE_N == 128,
+                  "ROCm grouped MoE down prefill only supports 64- or 128-column tiles");
     const int n = blockIdx.x * TILE_N + threadIdx.x;
     const int token_group = blockIdx.y;
     const int expert_id = d_active_expert_ids ? d_active_expert_ids[blockIdx.z] : static_cast<int>(blockIdx.z);
@@ -1186,9 +1197,10 @@ void moe_grouped_down_prefill_gemm_kernel(
 
     /*
      * The down projection consumes the quantized SwiGLU rows produced by the
-     * previous kernel.  Stage those TILE_Mx32 rows once per block before all
-     * output-column lanes reuse them, matching the CUDA verifier prefill
-     * kernel and avoiding 128-way redundant global loads.
+     * previous kernel. Stage those TILE_Mx32 rows once per block before all
+     * output-column lanes reuse them. Tiny verifier batches use TILE_N=64 to
+     * match CUDA's active-verifier geometry and reduce the per-block lane
+     * footprint when the grouped path has only M=2..4 rows to amortize work.
      */
     __shared__ __align__(16) int32_t s_a[TILE_M * 8];
     __shared__ float s_scale[TILE_M];
@@ -1289,12 +1301,15 @@ void moe_grouped_down_prefill_gemm_kernel(
                         int32_t sa_g3 = __builtin_amdgcn_sdot4(a4[7], ones,
                                         __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
 
-                        float delta_corr = 0.0f;
-                        delta_corr += static_cast<float>(sa_g0) * ((qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        delta_corr += static_cast<float>(sa_g1) * ((qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        delta_corr += static_cast<float>(sa_g2) * ((qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        delta_corr += static_cast<float>(sa_g3) * ((qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA);
-                        acc[m] += delta_corr * s_lo * scale_ab;
+                        const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        acc[m] += ((d0 * static_cast<float>(sa_g0) +
+                                    d1 * static_cast<float>(sa_g1)) * s_lo +
+                                   (d2 * static_cast<float>(sa_g2) +
+                                    d3 * static_cast<float>(sa_g3)) * s_hi) *
+                                  scale_ab;
                     }
                 }
                 else {
@@ -1514,7 +1529,6 @@ bool rocmMoE_grouped_prefill_pipeline(
                            ? 2
                            : rocm_moe_select_grouped_prefill_tile_m(requested_tile_m,
                                                                     max_tokens_per_expert);
-
     // =========================================================================
     // Kernel 2: Gate+Up GEMM.  Ordinary prefill keeps the fused SwiGLU path.
     // Tiny verifier batches can instead split K to expose more parallelism,
@@ -1533,33 +1547,55 @@ bool rocmMoE_grouped_prefill_pipeline(
 
         #define LAUNCH_GATEUP_PREFILL_TM(FMT, TM) \
             do { \
-                const bool use_single = \
-                    d_single_expert_ids && \
-                    static_cast<uint8_t>(FMT) == single_gateup_codebook_id; \
-                const int* active_ids_for_fmt = use_single ? d_single_expert_ids : d_active_expert_ids; \
-                const int expert_grid_for_fmt = use_single ? 1 : expert_grid; \
-                dim3 grid(n_tiles, m_tiles, expert_grid_for_fmt); \
+                dim3 grid(n_tiles, m_tiles, expert_grid); \
                 hipLaunchKernelGGL( \
                     HIP_KERNEL_NAME(moe_grouped_gate_up_swiglu_prefill_gemm_kernel<FMT, TM>), \
                     grid, block, 0, hip_stream, \
                     d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
-                    d_group_counts, d_group_offsets, active_ids_for_fmt, \
+                    d_group_counts, d_group_offsets, d_active_expert_ids, \
                     d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model); \
             } while (0)
         #define LAUNCH_GATEUP_KPART_PREFILL_TM(FMT, TM) \
             do { \
-                const bool use_single = \
-                    d_single_expert_ids && \
-                    static_cast<uint8_t>(FMT) == single_gateup_codebook_id; \
-                const int* active_ids_for_fmt = use_single ? d_single_expert_ids : d_active_expert_ids; \
-                const int expert_grid_for_fmt = use_single ? 1 : expert_grid; \
-                dim3 grid(n_tiles, m_tiles, expert_grid_for_fmt * gateup_k_partitions); \
+                dim3 grid(n_tiles, m_tiles, expert_grid * gateup_k_partitions); \
                 hipLaunchKernelGGL( \
                     HIP_KERNEL_NAME(moe_grouped_gate_up_prefill_kpart_kernel<FMT, TM>), \
                     grid, block, 0, hip_stream, \
                     d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
-                    d_group_counts, d_group_offsets, active_ids_for_fmt, \
+                    d_group_counts, d_group_offsets, d_active_expert_ids, \
                     d_gate_partials, d_up_partials, intermediate, d_model, gateup_k_partitions); \
+            } while (0)
+        #define LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, TM) \
+            do { \
+                if (use_gateup_kpart) { \
+                    dim3 single_grid(n_tiles, m_tiles, gateup_k_partitions); \
+                    hipLaunchKernelGGL( \
+                        HIP_KERNEL_NAME(moe_grouped_gate_up_prefill_kpart_kernel<FMT, TM>), \
+                        single_grid, block, 0, hip_stream, \
+                        d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
+                        d_group_counts, d_group_offsets, d_single_expert_ids, \
+                        d_gate_partials, d_up_partials, intermediate, d_model, gateup_k_partitions); \
+                } else { \
+                    dim3 single_grid(n_tiles, m_tiles, 1); \
+                    hipLaunchKernelGGL( \
+                        HIP_KERNEL_NAME(moe_grouped_gate_up_swiglu_prefill_gemm_kernel<FMT, TM>), \
+                        single_grid, block, 0, hip_stream, \
+                        d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
+                        d_group_counts, d_group_offsets, d_single_expert_ids, \
+                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model); \
+                } \
+            } while (0)
+        #define LAUNCH_GATEUP_SINGLE_PREFILL(FMT) \
+            do { \
+                if (use_gateup_kpart) { \
+                    if (tile_m <= 2)      LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 2); \
+                    else if (tile_m <= 4) LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 4); \
+                    else                  LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 8); \
+                } else { \
+                    if (tile_m <= 2)      LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 2); \
+                    else if (tile_m <= 4) LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 4); \
+                    else                  LAUNCH_GATEUP_SINGLE_PREFILL_TM(FMT, 8); \
+                } \
             } while (0)
         #define LAUNCH_GATEUP_PREFILL(FMT) \
             do { \
@@ -1599,6 +1635,33 @@ bool rocmMoE_grouped_prefill_pipeline(
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ1_S);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ1_M);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q8_0);
+        if (d_single_expert_ids)
+        {
+            #define LAUNCH_GATEUP_SINGLE_IF(FMT) \
+                do { \
+                    if (static_cast<uint8_t>(FMT) == single_gateup_codebook_id) { \
+                        LAUNCH_GATEUP_SINGLE_PREFILL(FMT); \
+                        launched_gateup = true; \
+                    } \
+                } while (0)
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q4_0);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ4_NL);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q4_1);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q5_0);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q5_1);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q6_K);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q3_K);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q2_K);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ3_S);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ3_XXS);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ2_S);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ2_XS);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ2_XXS);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ1_S);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_IQ1_M);
+            LAUNCH_GATEUP_SINGLE_IF(NVNNI_PF_Q8_0);
+            #undef LAUNCH_GATEUP_SINGLE_IF
+        }
         if (!launched_gateup)
         {
                 fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported gate/up codebook_id=%d mask=0x%x\n",
@@ -1606,6 +1669,8 @@ bool rocmMoE_grouped_prefill_pipeline(
                 return false;
         }
         #undef LAUNCH_GATEUP_IF_PRESENT
+        #undef LAUNCH_GATEUP_SINGLE_PREFILL
+        #undef LAUNCH_GATEUP_SINGLE_PREFILL_TM
         #undef LAUNCH_GATEUP_PREFILL
         #undef LAUNCH_GATEUP_KPART_PREFILL_TM
         #undef LAUNCH_GATEUP_PREFILL_TM
@@ -1637,27 +1702,57 @@ bool rocmMoE_grouped_prefill_pipeline(
     // Kernel 3: Down GEMM (same TILE_M bucket as gate/up)
     // =========================================================================
     {
-        constexpr int TILE_N = 128;
-        dim3 block(TILE_N);
-        const int n_tiles = (d_model + TILE_N - 1) / TILE_N;
+        /*
+         * CUDA's verifier path uses narrower down tiles for tiny active-expert
+         * batches. Mirror that geometry on ROCm so M=2..4 rows do not pay a
+         * full 128-lane column tile when there are too few rows to amortize it.
+         */
+        const bool tiny_active_verifier =
+            use_active_expert_grid && max_tokens_per_expert <= 4;
+        const int down_tile_n = tiny_active_verifier ? 64 : 128;
+        dim3 block(down_tile_n);
+        const int n_tiles = (d_model + down_tile_n - 1) / down_tile_n;
         const int m_tiles = (max_tokens_per_expert + tile_m - 1) / tile_m;
 
         const auto* down_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
 
         #define LAUNCH_DOWN_PREFILL_TM(FMT, TM) \
             do { \
-                const bool use_single = \
-                    d_single_expert_ids && \
-                    static_cast<uint8_t>(FMT) == single_down_codebook_id; \
-                const int* active_ids_for_fmt = use_single ? d_single_expert_ids : d_active_expert_ids; \
-                const int expert_grid_for_fmt = use_single ? 1 : expert_grid; \
-                dim3 grid(n_tiles, m_tiles, expert_grid_for_fmt); \
-                hipLaunchKernelGGL( \
-                    HIP_KERNEL_NAME(moe_grouped_down_prefill_gemm_kernel<FMT, TM>), \
-                    grid, block, 0, hip_stream, \
-                    d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
-                    d_group_counts, d_group_offsets, active_ids_for_fmt, \
-                    d_scratch_down_out, d_model, intermediate); \
+                dim3 grid(n_tiles, m_tiles, expert_grid); \
+                if (down_tile_n == 64) { \
+                    hipLaunchKernelGGL( \
+                        HIP_KERNEL_NAME(moe_grouped_down_prefill_gemm_kernel<FMT, TM, 64>), \
+                        grid, block, 0, hip_stream, \
+                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
+                        d_group_counts, d_group_offsets, d_active_expert_ids, \
+                        d_scratch_down_out, d_model, intermediate); \
+                } else { \
+                    hipLaunchKernelGGL( \
+                        HIP_KERNEL_NAME(moe_grouped_down_prefill_gemm_kernel<FMT, TM, 128>), \
+                        grid, block, 0, hip_stream, \
+                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
+                        d_group_counts, d_group_offsets, d_active_expert_ids, \
+                        d_scratch_down_out, d_model, intermediate); \
+                } \
+            } while (0)
+        #define LAUNCH_DOWN_SINGLE_PREFILL_TM(FMT, TM) \
+            do { \
+                dim3 single_grid(n_tiles, m_tiles, 1); \
+                if (down_tile_n == 64) { \
+                    hipLaunchKernelGGL( \
+                        HIP_KERNEL_NAME(moe_grouped_down_prefill_gemm_kernel<FMT, TM, 64>), \
+                        single_grid, block, 0, hip_stream, \
+                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
+                        d_group_counts, d_group_offsets, d_single_expert_ids, \
+                        d_scratch_down_out, d_model, intermediate); \
+                } else { \
+                    hipLaunchKernelGGL( \
+                        HIP_KERNEL_NAME(moe_grouped_down_prefill_gemm_kernel<FMT, TM, 128>), \
+                        single_grid, block, 0, hip_stream, \
+                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
+                        d_group_counts, d_group_offsets, d_single_expert_ids, \
+                        d_scratch_down_out, d_model, intermediate); \
+                } \
             } while (0)
         #define LAUNCH_DOWN_PREFILL(FMT) \
             do { \
@@ -1691,6 +1786,35 @@ bool rocmMoE_grouped_prefill_pipeline(
         LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_S);
         LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_M);
         LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q8_0);
+        if (d_single_expert_ids)
+        {
+            #define LAUNCH_DOWN_SINGLE_IF(FMT) \
+                do { \
+                    if (static_cast<uint8_t>(FMT) == single_down_codebook_id) { \
+                        if (tile_m <= 2)      LAUNCH_DOWN_SINGLE_PREFILL_TM(FMT, 2); \
+                        else if (tile_m <= 4) LAUNCH_DOWN_SINGLE_PREFILL_TM(FMT, 4); \
+                        else                  LAUNCH_DOWN_SINGLE_PREFILL_TM(FMT, 8); \
+                        launched_down = true; \
+                    } \
+                } while (0)
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q4_0);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ4_NL);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q4_1);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q5_0);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q5_1);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q6_K);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q3_K);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q2_K);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ3_S);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ3_XXS);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ2_S);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ2_XS);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ2_XXS);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ1_S);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_IQ1_M);
+            LAUNCH_DOWN_SINGLE_IF(NVNNI_PF_Q8_0);
+            #undef LAUNCH_DOWN_SINGLE_IF
+        }
         if (!launched_down)
         {
                 fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported down codebook_id=%d mask=0x%x\n",
@@ -1699,6 +1823,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         }
         #undef LAUNCH_DOWN_IF_PRESENT
         #undef LAUNCH_DOWN_PREFILL
+        #undef LAUNCH_DOWN_SINGLE_PREFILL_TM
         #undef LAUNCH_DOWN_PREFILL_TM
     }
 

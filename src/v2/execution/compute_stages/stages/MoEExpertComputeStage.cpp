@@ -30,8 +30,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -145,6 +147,36 @@ namespace llaminar2
         bool supportsDeviceRoutedDecodeGraphCaptureBackend(DeviceId device)
         {
 #if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+            (void)device;
+            return false;
+#else
+            const auto &rocm = debugEnv().rocm;
+            if (!rocm.moe_grouped_decode || !rocm.moe_device_routed_decode)
+                return false;
+#if defined(HAVE_ROCM)
+            if (device.is_rocm())
+                return true;
+#endif
+#if defined(HAVE_CUDA)
+            if (device.is_cuda())
+                return true;
+#endif
+            return false;
+#endif
+        }
+
+        /**
+         * @brief True when GPU kernels can consume explicit routing tensors.
+         *
+         * Integration builds define ENABLE_PIPELINE_SNAPSHOTS, which disables
+         * graph-capture capability helpers so parity can keep richer dumps.
+         * The underlying CUDA/ROCm grouped `FromRouting` kernels are still the
+         * correct execution path for verifier row replay because the routing
+         * row is device-owned and has no reliable host mirror.
+         */
+        bool supportsDeviceRoutingTensorDecodeExecutionBackend(DeviceId device)
+        {
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
             (void)device;
             return false;
 #else
@@ -421,7 +453,7 @@ namespace llaminar2
         if (params_.device_id.is_gpu() && !params_.output_registered_in_arena)
         {
             auto *output_tensor = dynamic_cast<TensorBase *>(params_.output);
-            if (!output_tensor || !output_tensor->ensureOnDevice(params_.device_id))
+            if (!output_tensor || !output_tensor->ensureOnDevice(params_.device_id, gpuStream()))
             {
                 LOG_ERROR("[MoEExpertComputeStage] Failed to allocate standalone output on "
                           << params_.device_id.to_string() << " for layer " << params_.layer_idx);
@@ -1130,6 +1162,142 @@ namespace llaminar2
             kernel->zeroBuffer(params_.output, static_cast<size_t>(d_model) * sizeof(float));
         }
 
+        const bool require_device_routing_tensor_decode =
+            params_.require_device_routing_tensor_decode;
+        const bool can_try_device_routing_tensor_decode =
+            is_gpu &&
+            supportsDeviceRoutingTensorDecodeExecutionBackend(params_.device_id) &&
+            params_.routing_indices &&
+            params_.routing_weights &&
+            top_k > 0 && top_k <= 16 &&
+            params_.replica_set.num_replicated == 0 &&
+            hasFullLocalExpertOwnership() &&
+            expertMaskAllEnabled();
+
+        if (can_try_device_routing_tensor_decode)
+        {
+            bool device_routing_done = false;
+            const bool have_grouped_tables =
+                grouped_gateup_desc_table_id_ >= 0 &&
+                grouped_gateup_desc_table_num_experts_ == num_experts &&
+                grouped_gateup_desc_table_d_model_ == d_model &&
+                grouped_gateup_desc_table_intermediate_ == intermediate &&
+                grouped_down_desc_table_id_ >= 0 &&
+                grouped_down_desc_table_num_experts_ == num_experts &&
+                grouped_down_desc_table_d_model_ == d_model &&
+                grouped_down_desc_table_intermediate_ == intermediate;
+
+            bool grouped_tables_ready = have_grouped_tables;
+            if (!grouped_tables_ready)
+            {
+                if (static_cast<int>(all_expert_ids_.size()) != num_experts)
+                {
+                    all_expert_ids_.resize(static_cast<size_t>(num_experts));
+                    std::iota(all_expert_ids_.begin(), all_expert_ids_.end(), 0);
+                }
+
+                grouped_tables_ready = ensureGemmEnginesForExperts(all_expert_ids_) &&
+                                       ensureGroupedGateUpDescriptorTable(kernel, d_model, intermediate) &&
+                                       ensureGroupedDownDescriptorTable(kernel, d_model, intermediate);
+            }
+
+            if (grouped_tables_ready)
+            {
+                ITensor *gate_outputs[16] = {};
+                ITensor *up_outputs[16] = {};
+                for (int k = 0; k < top_k; ++k)
+                {
+                    gate_outputs[k] = scratch_gate_batch_[k].get();
+                    up_outputs[k] = scratch_up_batch_[k].get();
+                }
+
+                const bool gateup_done = kernel->groupedExpertGateUpDecodeFromRouting(
+                    input_tensor,
+                    params_.routing_indices,
+                    grouped_gateup_desc_table_id_,
+                    top_k,
+                    gate_outputs,
+                    up_outputs,
+                    d_model,
+                    intermediate);
+
+                if (gateup_done)
+                {
+                    device_routing_done = kernel->groupedExpertDownDecodeFromRouting(
+                        gate_outputs,
+                        up_outputs,
+                        params_.routing_indices,
+                        params_.routing_weights,
+                        grouped_down_desc_table_id_,
+                        top_k,
+                        params_.output,
+                        d_model,
+                        intermediate);
+                }
+            }
+
+            if (device_routing_done)
+            {
+                markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
+                return true;
+            }
+
+            if (require_device_routing_tensor_decode || isGraphCaptureActive())
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Device routing tensor decode failed for layer "
+                          << params_.layer_idx
+                          << " (tables_ready=" << grouped_tables_ready
+                          << ", top_k=" << top_k
+                          << ", full_ownership=" << hasFullLocalExpertOwnership()
+                          << ", expert_mask_all_enabled=" << expertMaskAllEnabled()
+                          << ", replicas=" << params_.replica_set.num_replicated << ")");
+                return false;
+            }
+
+            kernel->zeroBuffer(params_.output, static_cast<size_t>(d_model) * sizeof(float));
+        }
+        else if (require_device_routing_tensor_decode)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Device routing tensor decode required but unavailable for layer "
+                      << params_.layer_idx
+                      << " (device=" << params_.device_id.toString()
+                      << ", grouped_decode=" << debugEnv().rocm.moe_grouped_decode
+                      << ", device_routed_decode=" << debugEnv().rocm.moe_device_routed_decode
+                      << ", top_k=" << top_k
+                      << ", has_indices=" << (params_.routing_indices != nullptr)
+                      << ", has_weights=" << (params_.routing_weights != nullptr)
+                      << ", full_ownership=" << hasFullLocalExpertOwnership()
+                      << ", expert_mask_all_enabled=" << expertMaskAllEnabled()
+                      << ", replicas=" << params_.replica_set.num_replicated << ")");
+            return false;
+        }
+
+#if !defined(ENABLE_PIPELINE_SNAPSHOTS)
+        if (is_gpu && isGraphCaptureActive())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] GPU MoE decode entered graph capture without "
+                      "a usable device-routed runtime table; refusing host-routed fallback for layer "
+                      << params_.layer_idx);
+            return false;
+        }
+
+        if (is_gpu &&
+            supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+            params_.moe_runtime_table &&
+            !can_try_device_routed_decode)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] GPU MoE decode has a runtime table but cannot "
+                      "use the device-owned route/expert path; refusing host-routed fallback for layer "
+                      << params_.layer_idx
+                      << " (initialized=" << moe_runtime_table_initialized_
+                      << ", runtime_layer=" << (moe_runtime_layer_ != nullptr)
+                      << ", full_ownership=" << hasFullLocalExpertOwnership()
+                      << ", expert_mask_all_enabled=" << expertMaskAllEnabled()
+                      << ", replicas=" << params_.replica_set.num_replicated << ")");
+            return false;
+        }
+#endif
+
         if (!params_.routing_indices || !params_.routing_weights)
         {
             LOG_ERROR("[MoEExpertComputeStage] Null routing_indices or routing_weights (single-token)");
@@ -1537,9 +1705,9 @@ namespace llaminar2
             return false;
         }
 
-        const float *routing_idx_data = params_.routing_indices->data();
-        const float *routing_wt_data = params_.routing_weights->data();
-        if (!routing_idx_data || !routing_wt_data)
+        const float *routing_idx_data = is_gpu ? nullptr : params_.routing_indices->data();
+        const float *routing_wt_data = is_gpu ? nullptr : params_.routing_weights->data();
+        if (!is_gpu && (!routing_idx_data || !routing_wt_data))
         {
             LOG_ERROR("[MoEExpertComputeStage] Decode-equivalent verifier prefill could not access routing tensors");
             return false;
@@ -1555,9 +1723,11 @@ namespace llaminar2
          * tensor.  Do not force the grouped verifier-prefill route here: it is
          * a useful performance target, but it is not the serial decode contract
          * until a backend proves row-equivalence for the active codebooks.
-         */
+        */
         TensorBase *full_input = params_.input;
         TensorBase *full_output = params_.output;
+        TensorBase *full_routing_indices = params_.routing_indices;
+        TensorBase *full_routing_weights = params_.routing_weights;
         IMoEKernel *kernel = is_gpu ? ensureMoEKernel() : nullptr;
         if (is_gpu)
         {
@@ -1574,6 +1744,12 @@ namespace llaminar2
             if (!verifier_output_row_ ||
                 verifier_output_row_->shape() != std::vector<size_t>{1u, static_cast<size_t>(d_model)})
                 verifier_output_row_ = makeScratchFP32(1, d_model, params_.device_id);
+            if (!verifier_routing_indices_row_ ||
+                verifier_routing_indices_row_->shape() != std::vector<size_t>{1u, static_cast<size_t>(top_k)})
+                verifier_routing_indices_row_ = makeScratchFP32(1, top_k, params_.device_id);
+            if (!verifier_routing_weights_row_ ||
+                verifier_routing_weights_row_->shape() != std::vector<size_t>{1u, static_cast<size_t>(top_k)})
+                verifier_routing_weights_row_ = makeScratchFP32(1, top_k, params_.device_id);
         }
 
         FP32Tensor row_input({1u, static_cast<size_t>(d_model)});
@@ -1599,6 +1775,7 @@ namespace llaminar2
             IMoERuntimeTable *moe_runtime_table;
             bool force_grouped_verifier_prefill_for_decode;
             bool force_decode_equivalent_verifier_prefill;
+            bool require_device_routing_tensor_decode;
             int seq_len;
 
             ~ScopedRowParams()
@@ -1610,6 +1787,7 @@ namespace llaminar2
                 params.moe_runtime_table = moe_runtime_table;
                 params.force_grouped_verifier_prefill_for_decode = force_grouped_verifier_prefill_for_decode;
                 params.force_decode_equivalent_verifier_prefill = force_decode_equivalent_verifier_prefill;
+                params.require_device_routing_tensor_decode = require_device_routing_tensor_decode;
                 params.seq_len = seq_len;
             }
         } restore{
@@ -1621,6 +1799,7 @@ namespace llaminar2
             params_.moe_runtime_table,
             params_.force_grouped_verifier_prefill_for_decode,
             params_.force_decode_equivalent_verifier_prefill,
+            params_.require_device_routing_tensor_decode,
             params_.seq_len};
 
         for (int row = 0; row < seq_len; ++row)
@@ -1628,9 +1807,64 @@ namespace llaminar2
             const int row_index = row;
             if (is_gpu)
             {
-                kernel->gatherTokenBatchFromTensors(
-                    full_input, scratch_batch_.get(),
-                    &row_index, 1, d_model);
+                if (!kernel->copyTokenRowFromTensor(
+                        full_input, scratch_batch_.get(), row_index, d_model))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Failed to copy verifier input row "
+                              << row << " for layer " << params_.layer_idx);
+                    return false;
+                }
+                /*
+                 * Routing is produced by MoERoutingStage as device-owned
+                 * all-position tensors.  Gather the row on device and feed it
+                 * to routing-aware kernels; do not read params_.routing_* on
+                 * host, because those mirrors can be intentionally stale after
+                 * D2D route publication.
+                 *
+                 * Keep using the immutable full_routing_* tensors here. The
+                 * scoped one-token replay below temporarily points params_ at
+                 * verifier_routing_*_row_; using params_ as the source on the
+                 * next loop iteration would copy row 1 from a one-row scratch
+                 * tensor and corrupt the verifier route stream.
+                 */
+                if (!kernel->copyTokenRowFromTensor(
+                        full_routing_indices, verifier_routing_indices_row_.get(),
+                        row_index, top_k) ||
+                    !kernel->copyTokenRowFromTensor(
+                        full_routing_weights, verifier_routing_weights_row_.get(),
+                        row_index, top_k))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Failed to copy verifier routing row "
+                              << row << " for layer " << params_.layer_idx);
+                    return false;
+                }
+                if (std::getenv("LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC"))
+                {
+                    if (!verifier_routing_indices_row_->ensureOnHost(gpuStream()) ||
+                        !verifier_routing_weights_row_->ensureOnHost(gpuStream()))
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage] Failed to synchronize diagnostic verifier routing row "
+                                  << row << " for layer " << params_.layer_idx);
+                        return false;
+                    }
+                    const float *row_indices = verifier_routing_indices_row_->data();
+                    const float *row_weights = verifier_routing_weights_row_->data();
+                    for (int slot = 0; slot < top_k; ++slot)
+                    {
+                        const int expert_id = row_indices ? static_cast<int>(row_indices[slot]) : -1;
+                        const float weight = row_weights ? row_weights[slot] : std::numeric_limits<float>::quiet_NaN();
+                        if (expert_id < 0 || expert_id >= num_experts || !std::isfinite(weight))
+                        {
+                            LOG_ERROR("[MoEExpertComputeStage] Invalid diagnostic verifier routing row "
+                                      << row << " slot " << slot
+                                      << " expert=" << expert_id
+                                      << " weight=" << weight
+                                      << " layer=" << params_.layer_idx
+                                      << " num_experts=" << num_experts);
+                            return false;
+                        }
+                    }
+                }
                 params_.input = scratch_batch_.get();
                 params_.output = verifier_output_row_.get();
             }
@@ -1643,20 +1877,43 @@ namespace llaminar2
                 params_.output = &row_output;
             }
 
-            std::copy_n(routing_idx_data + static_cast<size_t>(row) * top_k,
-                        top_k,
-                        row_routing_indices.mutable_data());
-            std::copy_n(routing_wt_data + static_cast<size_t>(row) * top_k,
-                        top_k,
-                        row_routing_weights.mutable_data());
+            if (is_gpu)
+            {
+                /*
+                 * Decode-equivalent publication must use the same one-token
+                 * stage contract as serial decode.  DeviceMoELayerRuntime
+                 * currently stores only one top-k row, so after the separate
+                 * routing stage finishes it contains the last verifier row.
+                 * Bind explicit row routing tensors here and disable the
+                 * runtime table for this scoped replay; a future Phase 9.8
+                 * runtime-row bank can replace this with a fully device-owned
+                 * economical path once it is proven against this contract.
+                 */
+                params_.routing_indices = verifier_routing_indices_row_.get();
+                params_.routing_weights = verifier_routing_weights_row_.get();
+                params_.moe_runtime_table = nullptr;
+                params_.seq_len = 1;
+                params_.force_decode_equivalent_verifier_prefill = false;
+                params_.force_grouped_verifier_prefill_for_decode = false;
+                params_.require_device_routing_tensor_decode = true;
+            }
+            else
+            {
+                std::copy_n(routing_idx_data + static_cast<size_t>(row) * top_k,
+                            top_k,
+                            row_routing_indices.mutable_data());
+                std::copy_n(routing_wt_data + static_cast<size_t>(row) * top_k,
+                            top_k,
+                            row_routing_weights.mutable_data());
 
-            params_.routing_indices = &row_routing_indices;
-            params_.routing_weights = &row_routing_weights;
-            params_.moe_runtime_table = nullptr;
-            params_.seq_len = 1;
-            params_.force_decode_equivalent_verifier_prefill = false;
-            params_.force_grouped_verifier_prefill_for_decode = false;
-
+                params_.routing_indices = &row_routing_indices;
+                params_.routing_weights = &row_routing_weights;
+                params_.moe_runtime_table = nullptr;
+                params_.seq_len = 1;
+                params_.force_decode_equivalent_verifier_prefill = false;
+                params_.force_grouped_verifier_prefill_for_decode = false;
+                params_.require_device_routing_tensor_decode = false;
+            }
             const bool row_ok = executeSingleToken(ctx);
             if (!row_ok)
             {
@@ -1667,15 +1924,13 @@ namespace llaminar2
 
             if (is_gpu)
             {
-                const int row_index = row;
-                const float one = 1.0f;
-                kernel->scatterAddWeightedFromTensors(
-                    full_output,
-                    verifier_output_row_.get(),
-                    &row_index,
-                    &one,
-                    1,
-                    d_model);
+                if (!kernel->writeTokenRowToTensor(
+                        full_output, verifier_output_row_.get(), row, d_model))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Failed to write verifier output row "
+                              << row << " for layer " << params_.layer_idx);
+                    return false;
+                }
             }
             else
             {
@@ -2717,7 +2972,20 @@ namespace llaminar2
         if (params_.down_exps)
             info.addWeight("down_exps", params_.down_exps);
         if (params_.output)
-            info.addOutput("output", params_.output, params_.seq_len, params_.d_model);
+        {
+            /*
+             * The combined shared-verifier path writes the final routed+shared
+             * row into this stage's output buffer.  Give snapshots the semantic
+             * name so parity CSVs do not report a combined row as routed-only
+             * expert output.
+             */
+            info.addOutput(params_.combine_shared_expert_in_verifier
+                               ? "combined_output"
+                               : "output",
+                           params_.output,
+                           params_.seq_len,
+                           params_.d_model);
+        }
 
         info.addScalarInt("num_experts", params_.num_experts);
         info.addScalarInt("top_k", params_.top_k);
@@ -3114,10 +3382,13 @@ namespace llaminar2
         {
             if (is_gpu)
             {
-                const int row_index = row;
-                kernel->gatherTokenBatchFromTensors(
-                    full_input, scratch_input_row_.get(),
-                    &row_index, 1, d_model);
+                if (!kernel->copyTokenRowFromTensor(
+                        full_input, scratch_input_row_.get(), row, d_model))
+                {
+                    LOG_ERROR("[SharedExpertFFNStage] Failed to copy verifier input row "
+                              << row << " for shared expert replay");
+                    return false;
+                }
             }
             else
             {
@@ -3173,14 +3444,13 @@ namespace llaminar2
 
             if (is_gpu)
             {
-                const float one = 1.0f;
-                kernel->scatterAddWeightedFromTensors(
-                    full_output,
-                    scratch_output_row_.get(),
-                    &row,
-                    &one,
-                    1,
-                    d_model);
+                if (!kernel->writeTokenRowToTensor(
+                        full_output, scratch_output_row_.get(), row, d_model))
+                {
+                    LOG_ERROR("[SharedExpertFFNStage] Failed to write verifier output row "
+                              << row << " for shared expert replay");
+                    return false;
+                }
             }
             else
             {
@@ -3198,32 +3468,75 @@ namespace llaminar2
     bool SharedExpertFFNStage::tryGroupedVerifierPrefill(
         IMoEKernel *kernel, int d_model, int intermediate) const
     {
+        (void)kernel;
         if (!shouldUseGroupedVerifierPrefillRoute())
             return false;
 
-        if (!ensureSharedGroupedGateUpDescriptorTable(kernel, d_model, intermediate) ||
-            !ensureSharedGroupedDownDescriptorTable(kernel, d_model, intermediate))
+        if (params_.device_id.is_gpu() && !gpuStream())
         {
-            LOG_ERROR("[SharedExpertFFNStage] CUDA verifier-sized shared expert requires native grouped descriptor tables");
+            LOG_ERROR("[SharedExpertFFNStage] Grouped verifier shared expert requires an explicit GPU stream");
             return false;
         }
 
-        if (!kernel->prepareSharedExpertPrefillGroup(params_.seq_len))
+        /*
+         * The shared expert is mathematically a dense FFN, not a routed MoE
+         * dispatch.  Running it through IMoEKernel::executeGroupedPrefillPipeline
+         * reused expert-group metadata and prefill-tuned kernels that are close
+         * but not guaranteed to match serial decode for the verifier rows.  The
+         * MTP publication contract is stricter: every verifier row may become
+         * live state.  Use the dedicated M=2..4 decode-equivalent GEMV hooks so
+         * gate/up input quantization and SwiGLU/down accumulation follow the
+         * same contract as normal one-token decode while still batching the rows.
+         */
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {cached_gate_gemm_, scratch_gate_.get(), intermediate, nullptr, "shared_gate"},
+            {cached_up_gemm_, scratch_up_.get(), intermediate, nullptr, "shared_up"}};
+        if (!cached_gate_gemm_->multiply_fused_verifier_rows_decode_equivalent(
+                params_.input,
+                projections,
+                params_.seq_len,
+                d_model,
+                nullptr,
+                getWorkspace()))
         {
-            LOG_ERROR("[SharedExpertFFNStage] CUDA shared expert grouped prefill setup failed");
+            LOG_ERROR("[SharedExpertFFNStage] Decode-equivalent grouped shared gate/up failed"
+                      << " device=" << params_.device_id.to_string()
+                      << " m=" << params_.seq_len
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate);
             return false;
         }
+        for (const auto &projection : projections)
+            markGpuTensorWritten(projection.output, params_.device_id, gpuStream());
 
-        return kernel->executeGroupedPrefillPipeline(
-            params_.input,
-            params_.output,
-            shared_grouped_gateup_desc_table_id_,
-            shared_grouped_down_desc_table_id_,
+        if (!cached_down_gemm_->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                scratch_gate_.get(),
+                scratch_up_.get(),
+                params_.output,
             params_.seq_len,
             d_model,
             intermediate,
-            /*num_experts=*/1,
-            /*top_k=*/1);
+                1.0f,
+                0.0f,
+                getWorkspace()))
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Decode-equivalent grouped shared SwiGLU/down failed"
+                      << " device=" << params_.device_id.to_string()
+                      << " m=" << params_.seq_len
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate);
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "moe_shared_grouped_decode_equivalent_verifier_prefill_rows",
+            static_cast<double>(params_.seq_len),
+            "verifier",
+            params_.device_id.toString(),
+            {{"stage", "shared_expert"},
+             {"route", "gemv_many"}});
+        return true;
     }
 
     bool SharedExpertFFNStage::tryGroupedDecode(

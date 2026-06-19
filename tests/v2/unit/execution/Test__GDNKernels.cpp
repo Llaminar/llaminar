@@ -1519,6 +1519,129 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
         << "Verifier capture must not mutate the live state buffer";
 }
 
+TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQwenSizeM2ToM4)
+{
+    static constexpr int max_rows = 4;
+    static constexpr int n_heads = 32;
+    static constexpr int d_k = 128;
+    static constexpr int d_v = 128;
+    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int qk_stride = n_heads * d_k;
+    static constexpr int v_stride = n_heads * d_v;
+
+    /*
+     * The verifier can run M=2,3,4 rows.  The grouped CPU kernel may parallelize
+     * across heads, but for each head it must advance the recurrent state in the
+     * same order as serial decode and publish each post-row snapshot exactly.
+     */
+    std::vector<float> q(static_cast<size_t>(max_rows) * qk_stride);
+    std::vector<float> k(q.size());
+    std::vector<float> v(static_cast<size_t>(max_rows) * v_stride);
+    std::vector<float> alpha(static_cast<size_t>(max_rows) * n_heads);
+    std::vector<float> beta(static_cast<size_t>(max_rows) * n_heads);
+    std::vector<float> a_log(n_heads);
+    std::vector<float> dt_bias(n_heads);
+    std::vector<float> initial_state(state_floats);
+
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        q[i] = 0.002f * static_cast<float>((i % 29) - 14);
+        k[i] = 0.0015f * static_cast<float>((i % 31) - 15);
+    }
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = 0.001f * static_cast<float>((i % 23) - 11);
+    for (size_t i = 0; i < alpha.size(); ++i)
+    {
+        alpha[i] = -0.2f + 0.004f * static_cast<float>(i % 37);
+        beta[i] = 0.1f - 0.003f * static_cast<float>(i % 41);
+    }
+    for (int h = 0; h < n_heads; ++h)
+    {
+        a_log[static_cast<size_t>(h)] = -0.35f - 0.002f * static_cast<float>(h);
+        dt_bias[static_cast<size_t>(h)] = 0.01f * static_cast<float>((h % 7) - 3);
+    }
+    for (int i = 0; i < state_floats; ++i)
+        initial_state[static_cast<size_t>(i)] =
+            0.0001f * static_cast<float>((i % 43) - 21);
+
+    for (int rows = 2; rows <= max_rows; ++rows)
+    {
+        CPUGatedDeltaNet verifier_kernel;
+        CPUGatedDeltaNet serial_kernel;
+        std::vector<float> verifier_state = initial_state;
+        std::vector<float> serial_state = initial_state;
+        std::vector<float> verifier_output(static_cast<size_t>(rows) * v_stride, 0.0f);
+        std::vector<float> serial_output(verifier_output.size(), 0.0f);
+        std::vector<float> capture(static_cast<size_t>(rows) * state_floats, 0.0f);
+        std::vector<float> work(state_floats, 0.0f);
+
+        verifier_kernel.bindVerifierStateCaptureWorkspace(
+            capture.data(),
+            rows,
+            state_floats);
+        verifier_kernel.bindSpeculativeStateWorkspace(work.data(), state_floats);
+        ASSERT_TRUE(verifier_kernel.chunk_forward(
+            q.data(),
+            k.data(),
+            v.data(),
+            alpha.data(),
+            beta.data(),
+            a_log.data(),
+            dt_bias.data(),
+            verifier_output.data(),
+            verifier_state.data(),
+            rows,
+            n_heads,
+            d_k,
+            d_v,
+            /*chunk_size=*/64,
+            /*use_qk_l2norm=*/true))
+            << "rows=" << rows;
+
+        for (int t = 0; t < rows; ++t)
+        {
+            ASSERT_TRUE(serial_kernel.recurrent_step(
+                q.data() + static_cast<size_t>(t) * qk_stride,
+                k.data() + static_cast<size_t>(t) * qk_stride,
+                v.data() + static_cast<size_t>(t) * v_stride,
+                alpha.data() + static_cast<size_t>(t) * n_heads,
+                beta.data() + static_cast<size_t>(t) * n_heads,
+                a_log.data(),
+                dt_bias.data(),
+                serial_output.data() + static_cast<size_t>(t) * v_stride,
+                serial_state.data(),
+                n_heads,
+                d_k,
+                d_v,
+                /*use_qk_l2norm=*/true))
+                << "rows=" << rows << " row=" << t;
+
+            double max_state_diff = 0.0;
+            for (int i = 0; i < state_floats; ++i)
+            {
+                max_state_diff = std::max(
+                    max_state_diff,
+                    static_cast<double>(std::abs(
+                        capture[static_cast<size_t>(t) * state_floats + i] -
+                        serial_state[static_cast<size_t>(i)])));
+            }
+            EXPECT_LE(max_state_diff, 1e-7)
+                << "rows=" << rows << " row=" << t;
+        }
+
+        double max_output_diff = 0.0;
+        for (size_t i = 0; i < serial_output.size(); ++i)
+        {
+            max_output_diff = std::max(
+                max_output_diff,
+                static_cast<double>(std::abs(verifier_output[i] - serial_output[i])));
+        }
+        EXPECT_LE(max_output_diff, 1e-7) << "rows=" << rows;
+        EXPECT_EQ(verifier_state, initial_state)
+            << "Verifier capture must not mutate the live state buffer, rows=" << rows;
+    }
+}
+
 TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDecode)
 {
     static constexpr int seq_len = 2;

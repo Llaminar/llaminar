@@ -475,7 +475,7 @@ namespace llaminar2
 
         allocated_ = true;
 
-        LOG_DEBUG("[BufferArena] Allocated " << stats_.total_buffers << " buffers, "
+        LOG_TRACE("[BufferArena] Allocated " << stats_.total_buffers << " buffers, "
                                              << (stats_.total_bytes / 1024.0 / 1024.0) << " MB total");
         return true;
     }
@@ -547,7 +547,7 @@ namespace llaminar2
                     << "\n";
         }
 
-        LOG_DEBUG("[BufferArena] " << summary.str());
+        LOG_TRACE("[BufferArena] " << summary.str());
     }
 
     // =========================================================================

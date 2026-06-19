@@ -214,7 +214,8 @@ namespace llaminar2
         bool speculative_state_work_bound_ = false;
         int verifier_capture_rows_bound_ = 0;
         int verifier_capture_state_size_bound_ = 0;
-        std::vector<float> host_verifier_state_slots_;
+        std::unique_ptr<float[]> host_verifier_state_slots_;
+        size_t host_verifier_state_slot_capacity_ = 0;
 
         // Reusable scratch for QKV deinterleaving (grow-only)
         mutable std::vector<float> q_deinterleave_;

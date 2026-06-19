@@ -49,6 +49,16 @@ namespace llaminar2
             float *state_snapshots, int snapshot_stride_floats,
             int max_snapshot_rows) override;
 
+        bool chunkForwardMergedQKVWithStateSnapshots(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, int chunk_size, bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows) override;
+
         bool restoreStateFromSnapshot(
             float *state, const float *state_snapshots,
             int snapshot_row, int snapshot_stride_floats,
@@ -92,11 +102,34 @@ namespace llaminar2
          * MTP verifier publication restores one of the intermediate rows as
          * live decode state. For those rows, "close enough" chunk-prefill math
          * is not enough: a small FP-order drift can change later greedy ties.
-         * This helper intentionally mirrors recurrent_step() row by row while
-         * still parallelizing each row across heads.
+         * This helper intentionally mirrors recurrent_step() row by row for
+         * each head, while parallelizing across heads for the whole verifier
+         * chunk.  Keeping the row loop inside the head-owned work item avoids
+         * repeated OpenMP launches without changing the per-head recurrence
+         * order.
          */
         bool chunkForwardVerifierDecodeEquivalent(
             const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows);
+
+        /**
+         * @brief Shared exact M=2..4 verifier recurrence over strided rows.
+         *
+         * This is the implementation behind both contiguous Q/K/V verifier
+         * chunks and merged-QKV verifier chunks.  The row accessor supplies the
+         * Q, K, and V head slices for row t/head h, allowing the stage to avoid
+         * materializing separate Q/K/V buffers when the graph already has merged
+         * QKV rows.
+         */
+        template <typename RowAccessor>
+        bool chunkForwardVerifierDecodeEquivalentRows(
+            RowAccessor &&row_accessor,
             const float *alpha, const float *beta_raw,
             const float *A_log, const float *dt_bias,
             float *output, float *state,

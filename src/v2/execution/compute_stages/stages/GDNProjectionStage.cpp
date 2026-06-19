@@ -4,7 +4,6 @@
  */
 
 #include "GDNProjectionStage.h"
-#include "VerifierDecodeEquivalentGemmRows.h"
 #include "../ComputeStageUtils.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../tensors/Tensors.h"
@@ -300,11 +299,90 @@ namespace llaminar2
 
         if (params_.force_decode_equivalent_verifier_prefill && M > 1)
         {
-            return executeDecodeEquivalentVerifierPrefill(
-                A_base,
-                projections,
-                M,
-                K);
+            auto try_grouped_verifier_projections =
+                [&](const std::vector<ITensorGemm::TensorProjectionDesc> &all_projections) -> bool
+            {
+                std::vector<bool> completed(all_projections.size(), false);
+
+                for (size_t i = 0; i < all_projections.size(); ++i)
+                {
+                    if (completed[i] || !all_projections[i].kernel)
+                        continue;
+
+                    std::vector<size_t> group_indices;
+                    group_indices.push_back(i);
+                    for (size_t j = i + 1; j < all_projections.size(); ++j)
+                    {
+                        if (!completed[j] && all_projections[j].kernel &&
+                            sameKernelType(all_projections[i].kernel, all_projections[j].kernel))
+                        {
+                            group_indices.push_back(j);
+                        }
+                    }
+
+                    auto group = selectProjections(all_projections, group_indices);
+                    if (!group.front().kernel->multiply_fused_verifier_rows_decode_equivalent(
+                            A_base,
+                            group,
+                            M,
+                            K,
+                            nullptr,
+                            bound_workspace_))
+                    {
+                        LOG_ERROR("[GDNProjectionStage] Grouped decode-equivalent verifier projection "
+                                  "subgroup failed for "
+                                  << (group.front().name ? group.front().name : "unnamed")
+                                  << " group_size=" << group.size());
+                        return false;
+                    }
+
+                    recordGDNProjectionRoute(
+                        "grouped_decode_equivalent_verifier_subgroup",
+                        M,
+                        K,
+                        all_projections,
+                        group_indices,
+                        native_codebooks);
+
+                    for (size_t index : group_indices)
+                        completed[index] = true;
+                }
+
+                return std::all_of(completed.begin(), completed.end(), [](bool done) { return done; });
+            };
+
+            const bool homogeneous_projection_kernels =
+                sameKernelType(gemm_qkv, gemm_z) &&
+                sameKernelType(gemm_qkv, gemm_a) &&
+                sameKernelType(gemm_qkv, gemm_b);
+
+            if ((homogeneous_projection_kernels &&
+                 gemm_qkv->multiply_fused_verifier_rows_decode_equivalent(
+                     A_base,
+                     projections,
+                     M,
+                     K,
+                     nullptr,
+                     bound_workspace_)) ||
+                try_grouped_verifier_projections(projections))
+            {
+                recordGDNProjectionRoute(
+                    homogeneous_projection_kernels
+                        ? "grouped_decode_equivalent_verifier"
+                        : "grouped_decode_equivalent_verifier_mixed",
+                    M,
+                    K,
+                    projections,
+                    {0, 1, 2, 3},
+                    native_codebooks);
+                return true;
+            }
+
+            LOG_ERROR("[GDNProjectionStage] Verifier projection requires grouped "
+                      "decode-equivalent kernels for every backend; serial row replay "
+                      "is no longer an accepted Phase 9.8 path on "
+                      << params_.device_id.toString());
+            return false;
         }
 
         const bool homogeneous_projection_kernels =
@@ -431,329 +509,6 @@ namespace llaminar2
                                                       << " n_b=" << params_.n_b);
 
         return true;
-    }
-
-    bool GDNProjectionStage::executeDecodeEquivalentVerifierPrefill(
-        const TensorBase *input,
-        const std::vector<ITensorGemm::TensorProjectionDesc> &projections,
-        int m,
-        int k)
-    {
-        if (!input || projections.empty())
-            return false;
-        if (m > 4)
-        {
-            LOG_ERROR("[GDNProjectionStage] Decode-equivalent verifier prefill is only supported "
-                      << "for tiny MTP verifier batches, got m=" << m);
-            return false;
-        }
-
-        const bool is_gpu = params_.device_id.is_gpu();
-        void *stream = gpuStream();
-        if (is_gpu && !stream)
-        {
-            LOG_ERROR("[GDNProjectionStage] Decode-equivalent GPU verifier prefill requires an explicit stream");
-            return false;
-        }
-
-        if (!verifier_gemm_rows::ensureScratchFP32(
-                verifier_input_row_, 1, static_cast<size_t>(k),
-                params_.device_id, stream, "GDNProjectionStage", "input_row"))
-        {
-            return false;
-        }
-
-        std::array<std::shared_ptr<FP32Tensor> *, 4> output_scratch = {
-            &verifier_qkv_row_,
-            &verifier_z_row_,
-            &verifier_a_row_,
-            &verifier_b_row_};
-        if (projections.size() > output_scratch.size())
-        {
-            LOG_ERROR("[GDNProjectionStage] Too many verifier projections: "
-                      << projections.size());
-            return false;
-        }
-
-        for (size_t i = 0; i < projections.size(); ++i)
-        {
-            if (!projections[i].kernel || !projections[i].output ||
-                projections[i].n <= 0)
-            {
-                LOG_ERROR("[GDNProjectionStage] Invalid verifier projection at index " << i);
-                return false;
-            }
-            if (!verifier_gemm_rows::ensureScratchFP32(
-                    *output_scratch[i], 1, static_cast<size_t>(projections[i].n),
-                    params_.device_id, stream, "GDNProjectionStage",
-                    projections[i].name ? projections[i].name : "projection_row"))
-            {
-                return false;
-            }
-        }
-
-        const float *input_data = is_gpu ? nullptr : input->data();
-        if (!is_gpu && !input_data)
-        {
-            LOG_ERROR("[GDNProjectionStage] Decode-equivalent verifier prefill requires host-visible FP32 input");
-            return false;
-        }
-        if (is_gpu && !input->gpu_data_ptr())
-        {
-            LOG_ERROR("[GDNProjectionStage] Decode-equivalent verifier input is not device-resident on "
-                      << params_.device_id.to_string());
-            return false;
-        }
-
-        std::array<std::optional<uint8_t>, 4> native_codebooks{};
-        for (size_t i = 0; i < projections.size() && i < native_codebooks.size(); ++i)
-            native_codebooks[i] = nativeVNNICodebook(projections[i].kernel);
-
-        /**
-         * Run one verifier row through the same projection grouping policy used
-         * by ordinary M=1 decode.  This matters for quantized fused projection
-         * kernels: serial decode quantizes the activation row once and shares
-         * it across compatible projections, so the verifier row proof must not
-         * silently switch to four separately-quantized GEMVs.
-         */
-        auto run_decode_equivalent_row =
-            [&](const std::vector<ITensorGemm::TensorProjectionDesc> &row_projections) -> bool
-        {
-            if (row_projections.size() != projections.size() ||
-                row_projections.size() > native_codebooks.size())
-            {
-                LOG_ERROR("[GDNProjectionStage] Invalid decode-equivalent row projection count: "
-                          << row_projections.size());
-                return false;
-            }
-
-            const bool homogeneous_projection_kernels =
-                row_projections.size() == 4 &&
-                fusedProjectionCompatible(row_projections[0].kernel,
-                                          row_projections[1].kernel,
-                                          native_codebooks[0],
-                                          native_codebooks[1]) &&
-                fusedProjectionCompatible(row_projections[0].kernel,
-                                          row_projections[2].kernel,
-                                          native_codebooks[0],
-                                          native_codebooks[2]) &&
-                fusedProjectionCompatible(row_projections[0].kernel,
-                                          row_projections[3].kernel,
-                                          native_codebooks[0],
-                                          native_codebooks[3]);
-
-            if (homogeneous_projection_kernels)
-            {
-                recordGDNProjectionRoute(
-                    "decode_equivalent_homogeneous_full",
-                    1,
-                    k,
-                    row_projections,
-                    {0, 1, 2, 3},
-                    native_codebooks);
-                return row_projections.front().kernel->multiply_fused_tensor(
-                    verifier_input_row_.get(),
-                    row_projections,
-                    1,
-                    k,
-                    nullptr,
-                    bound_workspace_);
-            }
-
-            std::vector<bool> completed(row_projections.size(), false);
-            auto run_fused_subgroups = [&](bool require_native_compatibility) -> bool
-            {
-                for (size_t i = 0; i < row_projections.size(); ++i)
-                {
-                    if (completed[i] || !row_projections[i].kernel ||
-                        !row_projections[i].kernel->supports_fused_projection())
-                    {
-                        continue;
-                    }
-
-                    std::vector<size_t> group_indices;
-                    group_indices.push_back(i);
-                    for (size_t j = i + 1; j < row_projections.size(); ++j)
-                    {
-                        if (!completed[j] && row_projections[j].kernel &&
-                            row_projections[j].kernel->supports_fused_projection())
-                        {
-                            const bool compatible =
-                                require_native_compatibility
-                                    ? (native_codebooks[i].has_value() &&
-                                       native_codebooks[j].has_value() &&
-                                       fusedProjectionCompatible(
-                                           row_projections[i].kernel,
-                                           row_projections[j].kernel,
-                                           native_codebooks[i],
-                                           native_codebooks[j]))
-                                    : sameKernelType(row_projections[i].kernel,
-                                                     row_projections[j].kernel);
-                            if (compatible)
-                                group_indices.push_back(j);
-                        }
-                    }
-
-                    if (group_indices.size() < 2)
-                        continue;
-
-                    auto group = selectProjections(row_projections, group_indices);
-                    recordGDNProjectionRoute(
-                        require_native_compatibility
-                            ? "decode_equivalent_native_subgroup"
-                            : "decode_equivalent_same_kernel_mixed_codebook_subgroup",
-                        1,
-                        k,
-                        row_projections,
-                        group_indices,
-                        native_codebooks);
-                    if (!group.front().kernel->multiply_fused_tensor(
-                            verifier_input_row_.get(),
-                            group,
-                            1,
-                            k,
-                            nullptr,
-                            bound_workspace_))
-                    {
-                        LOG_ERROR("[GDNProjectionStage] Decode-equivalent fused subgroup failed for "
-                                  << (group.front().name ? group.front().name : "unnamed")
-                                  << " group_size=" << group.size());
-                        return false;
-                    }
-
-                    for (size_t index : group_indices)
-                        completed[index] = true;
-                }
-                return true;
-            };
-
-            if (!run_fused_subgroups(/*require_native_compatibility=*/true))
-                return false;
-            if (!run_fused_subgroups(/*require_native_compatibility=*/false))
-                return false;
-
-            std::vector<ITensorGemm::TensorProjectionDesc> remaining;
-            remaining.reserve(row_projections.size());
-            for (size_t i = 0; i < row_projections.size(); ++i)
-            {
-                if (!completed[i])
-                {
-                    recordGDNProjectionRoute(
-                        "decode_equivalent_fallback_single",
-                        1,
-                        k,
-                        row_projections,
-                        {i},
-                        native_codebooks);
-                    remaining.push_back(row_projections[i]);
-                }
-            }
-
-            return remaining.empty() ||
-                   multiplyProjectionFallback(
-                       verifier_input_row_.get(),
-                       remaining,
-                       1,
-                       k,
-                       bound_workspace_);
-        };
-
-        bool success = true;
-        for (int row = 0; row < m && success; ++row)
-        {
-            if (is_gpu)
-            {
-                success = verifier_gemm_rows::copyFP32DeviceRow(
-                    verifier_input_row_.get(), 0, k,
-                    input, row, k,
-                    k, params_.device_id, stream,
-                    "GDNProjectionStage", "verifier_input_row");
-                if (!success)
-                    break;
-                verifier_gemm_rows::markDeviceOutputWritten(
-                    verifier_input_row_.get(), params_.device_id, stream);
-            }
-            else
-            {
-                std::copy(input_data + static_cast<size_t>(row) * k,
-                          input_data + static_cast<size_t>(row + 1) * k,
-                          verifier_input_row_->mutable_data());
-            }
-
-            std::vector<ITensorGemm::TensorProjectionDesc> row_projections;
-            row_projections.reserve(projections.size());
-            for (size_t i = 0; i < projections.size(); ++i)
-            {
-                const auto &projection = projections[i];
-                auto *scratch = output_scratch[i]->get();
-                row_projections.push_back({
-                    projection.kernel,
-                    scratch,
-                    projection.n,
-                    projection.bias,
-                    projection.name});
-            }
-
-            if (!run_decode_equivalent_row(row_projections))
-            {
-                LOG_ERROR("[GDNProjectionStage] Decode-equivalent verifier projection row "
-                          << row << " failed");
-                success = false;
-                break;
-            }
-
-            for (size_t i = 0; i < projections.size(); ++i)
-            {
-                const auto &projection = projections[i];
-                auto *scratch = output_scratch[i]->get();
-                if (is_gpu)
-                {
-                    verifier_gemm_rows::markDeviceOutputWritten(
-                        scratch, params_.device_id, stream);
-                    success = verifier_gemm_rows::copyFP32DeviceRow(
-                        projection.output, row, projection.n,
-                        scratch, 0, projection.n,
-                        projection.n, params_.device_id, stream,
-                        "GDNProjectionStage",
-                        projection.name ? projection.name : "projection_output_row");
-                    if (!success)
-                        break;
-                }
-                else
-                {
-                    float *output_data = projection.output->mutable_data();
-                    if (!output_data)
-                    {
-                        LOG_ERROR("[GDNProjectionStage] Projection output is not host-visible for "
-                                  << (projection.name ? projection.name : "unnamed"));
-                        success = false;
-                        break;
-                    }
-                    std::copy(scratch->data(),
-                              scratch->data() + projection.n,
-                              output_data + static_cast<size_t>(row) * projection.n);
-                }
-            }
-        }
-
-        if (success)
-        {
-            if (is_gpu)
-            {
-                for (const auto &projection : projections)
-                {
-                    verifier_gemm_rows::markDeviceOutputWritten(
-                        projection.output, params_.device_id, stream);
-                }
-            }
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "gdn_projection_decode_equivalent_verifier_prefill_rows",
-                static_cast<double>(m),
-                {},
-                params_.device_id.to_string());
-        }
-        return success;
     }
 
     size_t GDNProjectionStage::estimatedFlops() const

@@ -1822,7 +1822,7 @@ namespace llaminar2
                 if (!all_position_verifier_sync_deferred &&
                     !main_decode_sync_deferred)
                 {
-                    TensorBase *logits = host.logitsTensor();
+                    TensorBase *logits = host.logitsPublicationTensor();
                     if (logits && logits->isMapped())
                     {
                         logits->markMappedSynced();

@@ -107,6 +107,12 @@ namespace llaminar2::test::native_vnni_gemm_perf
         // the grouped MoE kernel, so this is a valid A/B harness for decode tuning.
         {"35BMoE_Expert_GateUp", 512, 2048},
         {"35BMoE_Expert_Down", 2048, 512},
+        // Qwen3.6 MoE hybrid GDN verifier projections (hidden=2048).
+        // These buckets are distinct from the dense 27B GDN shapes and must be
+        // trained explicitly so M=2..4 verifier rows do not inherit dense-only
+        // dispatch decisions.
+        {"Qwen36MoE_GDN_QKVProjection", 8192, 2048},
+        {"Qwen36MoE_GDN_ZProjection", 4096, 2048},
         {"0.5B_Attn", 896, 896},
         {"0.5B_FFN_Up", 4864, 896},
         {"0.5B_FFN_Down", 896, 4864},

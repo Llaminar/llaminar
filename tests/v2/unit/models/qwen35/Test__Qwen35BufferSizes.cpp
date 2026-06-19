@@ -293,6 +293,50 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPRequestBatchVerifierRowsScale)
     EXPECT_EQ(lm_head_input_rows->shape[1], 2560u);
 }
 
+TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPAttnOutputUsesHybridAttnOutputDim)
+{
+    Qwen35SchemaFactory factory;
+    GraphSchema schema = factory.createSchema();
+
+    /*
+     * Qwen3.6-style hybrid layers can have a wider GDN value stream than the
+     * FA local QKV stream. MTP sidecar attention output must match the main
+     * attn_output row width, otherwise GDN verifier rows can overflow or use
+     * inconsistent row strides before the output projection.
+     */
+    GraphResolverConfig config{};
+    config.d_model = 5120;
+    config.n_heads = 40;
+    config.n_kv_heads = 8;
+    config.head_dim = 128;
+    config.vocab_size = 152064;
+    config.seq_len = 256;
+    config.batch_size = 1;
+    config.local_n_heads = 40;     // local_qkv_dim = 5120
+    config.local_n_kv_heads = 8;
+    config.local_d_ff = 27648;
+    config.local_vocab = 152064;
+    config.custom_formulas["gdn_inner_size"] = 6144;
+    config.custom_formulas["gdn_qkv_dim"] = 10240;
+    config.custom_formulas["gdn_time_step_rank"] = 48;
+    config.custom_formulas["fa_q_full_dim"] = 10240;
+    config.custom_formulas["attn_output_dim"] = 6144;
+
+    auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
+
+    auto *attn_output = findBuf(reqs, "attn_output");
+    ASSERT_NE(attn_output, nullptr);
+    ASSERT_EQ(attn_output->shape.size(), 2u);
+    EXPECT_EQ(attn_output->shape[0], 256u);
+    EXPECT_EQ(attn_output->shape[1], 6144u);
+
+    auto *mtp_attn_output = findBuf(reqs, "mtp_attn_output");
+    ASSERT_NE(mtp_attn_output, nullptr);
+    ASSERT_EQ(mtp_attn_output->shape.size(), 2u);
+    EXPECT_EQ(mtp_attn_output->shape[0], 4u);
+    EXPECT_EQ(mtp_attn_output->shape[1], 6144u);
+}
+
 // ============================================================================
 // Model Buffer Size Lock-in
 // ============================================================================

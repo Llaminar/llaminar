@@ -132,7 +132,7 @@ TEST(Test__MTPSpecKVPublisher, TruncatesMainAndShiftedMTPCachesToAcceptedPrefix)
     EXPECT_THAT(mtp1.truncate_calls, ElementsAre(std::make_tuple(0, 10, &explicit_stream)));
 }
 
-TEST(Test__MTPSpecKVPublisher, NonReusableSidecarPublishesOnlyVerifierShiftedRows)
+TEST(Test__MTPSpecKVPublisher, NonReusableSidecarKeepsHostMirrorOnShiftedInvariant)
 {
     FakeKVCache main_cache;
     FakeKVCache mtp0;
@@ -150,17 +150,22 @@ TEST(Test__MTPSpecKVPublisher, NonReusableSidecarPublishesOnlyVerifierShiftedRow
 
     ASSERT_TRUE(result.ok) << result.error;
     EXPECT_EQ(result.main_truncated_tokens, 11);
-    EXPECT_THAT(result.mtp_truncated_tokens, ElementsAre(8))
-        << "Verifier row zero advances main state only; without a reusable "
-           "sidecar row the restored shifted MTP KV cache remains one extra "
-           "row behind.";
-    EXPECT_EQ(computeMTPShiftedKVTargetCachedTokens(plan, 0), 8);
+    EXPECT_THAT(result.mtp_truncated_tokens, ElementsAre(10))
+        << "Committed logical token count 11 requires depth-0 shifted MTP KV "
+           "to expose 10 rows. Non-reusable sidecar paths must repair the "
+           "initial shifted row before publication rather than under-advance "
+           "the host mirror.";
+    EXPECT_EQ(computeMTPShiftedKVTargetCachedTokens(plan, 0), 10);
+
+    plan.accepted_count = 0;
+    plan.target_cached_tokens = 10;
+    EXPECT_EQ(computeMTPShiftedKVTargetCachedTokens(plan, 0), 9)
+        << "A rejection that leaves main state at the base must also leave "
+           "depth-0 shifted MTP KV at base - 1.";
 
     plan.accepted_count = 2;
     plan.target_cached_tokens = 12;
-    EXPECT_EQ(computeMTPShiftedKVTargetCachedTokens(plan, 0), 9)
-        << "The first draft verifier row is the first shifted sidecar row "
-           "that a non-reuse publication can safely expose.";
+    EXPECT_EQ(computeMTPShiftedKVTargetCachedTokens(plan, 0), 11);
 }
 
 TEST(Test__MTPSpecKVPublisher, ZeroAcceptedTruncatesBackToBase)

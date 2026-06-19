@@ -1917,13 +1917,20 @@ namespace llaminar2
             lm_head_compute_all_positions);
         lm_params.compute_all_positions = lm_head_compute_all_positions;
         lm_params.use_prefill_replay_row_offset = lm_head_use_prefill_row_offset;
+        /*
+         * Phase 9.8 promotes compact verifier LM-head rows to the same small-M
+         * quantized GEMV/GEMM dispatch used by the rest of the grouped verifier
+         * path.  The previous GPU-only M=1 row loop was numerically safe, but it
+         * made M=2 verifier replay slower than serial decode.  Strict
+         * DenseVerifierRows and Qwen3.6 parity gates now own equivalence.
+         */
         lm_params.force_decode_equivalent_verifier_prefill =
-            (device.is_cuda() || device.is_rocm()) &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled &&
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             lm_head_compute_all_positions &&
             lm_head_seq_len > 1 &&
-            lm_head_seq_len <= 4;
+            lm_head_seq_len <= 4 &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
@@ -1979,7 +1986,7 @@ namespace llaminar2
         // Compute total tokens for GEMM m parameter
         int total_tokens = batch_size * seq_len;
         const bool force_decode_equivalent_ffn_verifier_prefill =
-            (device.is_cuda() || device.is_rocm()) &&
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4 &&
             config_.compute_all_position_logits &&
@@ -2945,8 +2952,16 @@ namespace llaminar2
 
         int wo_n = static_cast<int>(wo_weight->shape()[0]);
         int wo_k = static_cast<int>(wo_weight->shape()[1]);
+        /*
+         * Grouped verifier rows are promoted through the attention output
+         * projection as a normal small-M GEMM.  The serial M=1 verifier loop is
+         * kept available inside GEMMStage for explicit diagnostics, but the
+         * production graph relies on the Phase 9.8 dense verifier proof
+         * (cosine/relative-L2/KL/sample equality for M=2..4) instead of paying a
+         * row-copy loop in every attention block.
+         */
         const bool force_decode_equivalent_wo_verifier_prefill =
-            (device.is_cuda() || device.is_rocm()) &&
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4 &&
             config_.compute_all_position_logits &&

@@ -459,16 +459,19 @@ namespace llaminar2
             for (int layer = 0; layer < n_layers_; ++layer)
             {
                 const int old_count = entryCount(layer, seq_idx);
-                const int evicted =
-                    std::max(0, old_count + accepted_count - target_count);
+                const int evicted = std::max(0, old_count - target_count);
                 if (evicted > 0)
                     onEviction(layer, seq_idx, evicted);
 
                 const int old_head = entryHead(layer, seq_idx);
+                int tail = old_head - old_count;
+                tail %= max_seq_len_;
+                if (tail < 0)
+                    tail += max_seq_len_;
                 setEntryHead(
                     layer,
                     seq_idx,
-                    (old_head + accepted_count) % max_seq_len_);
+                    (tail + target_count) % max_seq_len_);
                 setEntryCount(layer, seq_idx, target_count);
                 refreshHostDeviceParamMirror(layer, seq_idx);
                 onAdvanceComplete(layer, seq_idx);

@@ -141,6 +141,178 @@ namespace llaminar2
             return participants;
         }
 
+        bool allExpertsEnabled(const std::vector<bool> &expert_mask, int num_experts)
+        {
+            return expert_mask.empty() ||
+                   (expert_mask.size() == static_cast<size_t>(num_experts) &&
+                    std::all_of(expert_mask.begin(), expert_mask.end(),
+                                [](bool enabled)
+                                { return enabled; }));
+        }
+
+        bool runtimeTableHasUsableDecodeBank(
+            IMoERuntimeTable *runtime_table,
+            int layer_idx,
+            int num_experts,
+            int top_k,
+            bool require_full_local_descriptors)
+        {
+            if (!runtime_table || layer_idx < 0)
+                return false;
+
+            const auto &state = runtime_table->hostLayerState(layer_idx);
+            if (state.active_bank > 1 ||
+                state.active_epoch == 0 ||
+                state.expert_count != static_cast<uint32_t>(num_experts) ||
+                state.top_k != static_cast<uint32_t>(top_k))
+            {
+                return false;
+            }
+
+            const auto &bank = state.banks[state.active_bank];
+            if (bank.epoch != state.active_epoch ||
+                bank.expert_count != static_cast<uint32_t>(num_experts))
+            {
+                return false;
+            }
+
+            if (!require_full_local_descriptors)
+                return true;
+
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                const auto &desc = bank.experts[static_cast<size_t>(expert)];
+                if (bank.local_compute_mask[static_cast<size_t>(expert)] != 1u ||
+                    desc.logical_expert_id != expert ||
+                    desc.local_slot < 0 ||
+                    !desc.gate.valid() ||
+                    !desc.up.valid() ||
+                    !desc.down.valid() ||
+                    !hasMoEExpertFlag(desc.flags, DeviceMoEExpertFlags::Valid) ||
+                    !hasMoEExpertFlag(desc.flags, DeviceMoEExpertFlags::Resident) ||
+                    !hasMoEExpertFlag(desc.flags, DeviceMoEExpertFlags::LocalCompute))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool initializeFullLocalDecodeRuntimeTable(
+            IMoERuntimeTable *runtime_table,
+            int layer_idx,
+            int num_experts,
+            int top_k,
+            int d_model,
+            int expert_intermediate,
+            const std::vector<ITensorGemm *> &gate_gemms,
+            const std::vector<ITensorGemm *> &up_gemms,
+            const std::vector<ITensorGemm *> &down_gemms,
+            void *stream,
+            const std::string &context)
+        {
+            if (!runtime_table || layer_idx < 0)
+                return false;
+
+            if (runtimeTableHasUsableDecodeBank(
+                    runtime_table, layer_idx, num_experts, top_k,
+                    /*require_full_local_descriptors=*/true))
+            {
+                return true;
+            }
+
+            const auto &state = runtime_table->hostLayerState(layer_idx);
+            if (state.active_epoch != 0)
+            {
+                LOG_ERROR("[Qwen35MoEGraph] " << context
+                                              << ": refusing to replace active MoE decode runtime bank for layer "
+                                              << layer_idx << " epoch " << state.active_epoch);
+                return false;
+            }
+
+            if (gate_gemms.size() != static_cast<size_t>(num_experts) ||
+                up_gemms.size() != static_cast<size_t>(num_experts) ||
+                down_gemms.size() != static_cast<size_t>(num_experts))
+            {
+                LOG_ERROR("[Qwen35MoEGraph] " << context
+                                              << ": prepared expert GEMM vector sizes do not match num_experts="
+                                              << num_experts);
+                return false;
+            }
+
+            MoEPlacementUpdate update;
+            update.epoch = 1;
+            update.expert_count = static_cast<uint32_t>(num_experts);
+            update.experts.resize(static_cast<size_t>(num_experts));
+            update.local_compute_mask.assign(static_cast<size_t>(num_experts), 1u);
+            update.replica_role.assign(static_cast<size_t>(num_experts),
+                                       static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+
+            const uint32_t flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                                    DeviceMoEExpertFlags::Resident |
+                                                    DeviceMoEExpertFlags::PreferredOwner |
+                                                    DeviceMoEExpertFlags::LocalCompute);
+
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                auto *gate = gate_gemms[static_cast<size_t>(expert)];
+                auto *up = up_gemms[static_cast<size_t>(expert)];
+                auto *down = down_gemms[static_cast<size_t>(expert)];
+                if (!gate || !up || !down)
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] " << context
+                                                  << ": missing prepared GEMM engine for expert "
+                                                  << expert << " layer " << layer_idx);
+                    return false;
+                }
+
+                DeviceMoEExpertDescriptor desc;
+                if (!gate->exportNativeVNNIMatrixDesc(desc.gate) ||
+                    !up->exportNativeVNNIMatrixDesc(desc.up) ||
+                    !down->exportNativeVNNIMatrixDesc(desc.down))
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] " << context
+                                                  << ": prepared GEMM engines for expert "
+                                                  << expert << " layer " << layer_idx
+                                                  << " cannot export native-VNNI descriptors");
+                    return false;
+                }
+
+                if (desc.gate.n != expert_intermediate || desc.gate.k != d_model ||
+                    desc.up.n != expert_intermediate || desc.up.k != d_model ||
+                    desc.down.n != d_model || desc.down.k != expert_intermediate)
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] " << context
+                                                  << ": native-VNNI descriptor shape mismatch for expert "
+                                                  << expert << " layer " << layer_idx);
+                    return false;
+                }
+
+                desc.logical_expert_id = expert;
+                desc.owner_participant = 0;
+                desc.local_slot = expert;
+                desc.flags = flags;
+                update.experts[static_cast<size_t>(expert)] = desc;
+            }
+
+            try
+            {
+                runtime_table->prepareInactiveBank(layer_idx, update);
+                runtime_table->flipActiveBank(layer_idx, update.epoch, stream);
+            }
+            catch (const std::exception &ex)
+            {
+                LOG_ERROR("[Qwen35MoEGraph] " << context
+                                              << ": failed to publish MoE decode runtime bank for layer "
+                                              << layer_idx << ": " << ex.what());
+                return false;
+            }
+
+            return runtimeTableHasUsableDecodeBank(
+                runtime_table, layer_idx, num_experts, top_k,
+                /*require_full_local_descriptors=*/true);
+        }
+
         MoEOverlayCollectiveKey graphNativeMoEKey(
             int layer_idx,
             int tier_idx,
@@ -487,7 +659,7 @@ namespace llaminar2
         {
             (void)key;
             if (table)
-                table->resetDecodeRuntimeState();
+                table->resetDecodeHistogramCounts();
         }
     }
 
@@ -682,30 +854,6 @@ namespace llaminar2
                                  : "layer" + std::to_string(layer_idx) + "_";
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
-        // Verifier batches are tiny (draft depth + 1 rows).  Published rows are
-        // later committed as if they came from ordinary one-token decode, so the
-        // verifier MoE FFN must reuse the same expert execution contract as
-        // serial decode on every backend.  The grouped small-M path remains valid
-        // for one-token correction replay and MTP sidecars, but multi-row main
-        // verifier publication takes the decode-equivalent path until the
-        // grouped kernels are proven bit-for-contract equivalent per row.
-        auto forceCudaSmallMMoEPrefill = [&](DeviceId candidate)
-        {
-            return (candidate.is_cuda() || candidate.is_rocm()) &&
-                   total_tokens >= 1 &&
-                   total_tokens <= 4 &&
-                   (config_.compute_all_position_logits || mtp_sidecar_context);
-        };
-        auto forceDecodeEquivalentMoEVerifier = [&](DeviceId candidate)
-        {
-            return (candidate.is_cpu() || candidate.is_cuda() || candidate.is_rocm()) &&
-                   total_tokens > 1 &&
-                   total_tokens <= 4 &&
-                   config_.compute_all_position_logits &&
-                   !mtp_sidecar_context;
-        };
-        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
-
         auto overlay_runtime_plan = runtimePlanForGraph(config_);
         const auto &overlay_plan = overlay_runtime_plan
                                        ? overlay_runtime_plan->sourcePlanPtr()
@@ -734,8 +882,80 @@ namespace llaminar2
             }
         }
 
+        const bool overlay_requested = overlay_plan && overlay_plan->isTieredOverlay();
+        const ExpertLayerPlacement *overlay_placement = overlay_requested
+                                                            ? findExpertOverlayPlacement(*overlay_plan, layer_idx)
+                                                            : nullptr;
+        const bool use_expert_overlay = overlay_requested && overlay_placement &&
+                                        isUsableExpertOverlayPlacement(*overlay_placement,
+                                                                       *overlay_plan,
+                                                                       config_.moe.num_experts,
+                                                                       layer_idx);
+
+        /*
+         * Verifier batches are tiny (draft depth + bonus row), but the main-model
+         * verifier is stateful: its row logits must match serial decode and the
+         * accepted row may later publish KV/GDN/conv state.  Phase 9.8 therefore
+         * only permits grouped verifier execution through decode-equivalent
+         * M=2..4 stage/kernel contracts.  The router still emits serial-decode
+         * top-k rows, and the shared expert uses GEMV verifier-row hooks rather
+         * than the older MoE grouped prefill helper.
+         */
+        auto forceGpuSmallMMoESidecarPrefill = [&](DeviceId candidate)
+        {
+            return (candidate.is_cuda() || candidate.is_rocm()) &&
+                   total_tokens > 1 &&
+                   total_tokens <= 4 &&
+                   mtp_sidecar_context;
+        };
+        auto forceGpuSmallMMainVerifierPrefill = [&](DeviceId candidate)
+        {
+            return (candidate.is_cuda() || candidate.is_rocm()) &&
+                   total_tokens > 1 &&
+                   total_tokens <= 4 &&
+                   config_.compute_all_position_logits &&
+                   !mtp_sidecar_context;
+        };
+        auto forceGroupedMoEVerifierPrefill = [&](DeviceId candidate)
+        {
+            return forceGpuSmallMMoESidecarPrefill(candidate) ||
+                   forceGpuSmallMMainVerifierPrefill(candidate);
+        };
+        auto forceDecodeEquivalentMoERouting = [&](DeviceId candidate)
+        {
+            /*
+             * The main verifier compares grouped all-position rows against
+             * serial decode rows.  The expert FFN may still use the economical
+             * grouped M=2..4 path, but the router must publish the same top-k
+             * ids and weights that serial decode would have produced.  Keeping
+             * routing and expert execution as separate decisions avoids the
+             * previous ROCm drift where a correct grouped expert kernel was fed
+             * slightly different all-position prefill routes.
+             */
+            return (candidate.is_cpu() || candidate.is_cuda() || candidate.is_rocm()) &&
+                   total_tokens > 1 &&
+                   total_tokens <= 4 &&
+                   config_.compute_all_position_logits &&
+                   !mtp_sidecar_context;
+        };
+        auto forceDecodeEquivalentMoEVerifier = [&](DeviceId candidate)
+        {
+            return (candidate.is_cpu() || candidate.is_cuda() || candidate.is_rocm()) &&
+                   total_tokens > 1 &&
+                   total_tokens <= 4 &&
+                   config_.compute_all_position_logits &&
+                   !mtp_sidecar_context &&
+                   !forceGpuSmallMMainVerifierPrefill(candidate);
+        };
+        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
+
         IMoERuntimeTable *moe_runtime_table = nullptr;
         const auto &rocm_env = debugEnv().rocm;
+        auto forceGroupedSharedMoEVerifierPrefill = [&](DeviceId candidate)
+        {
+            return rocm_env.moe_grouped_prefill &&
+                   forceGroupedMoEVerifierPrefill(candidate);
+        };
         /*
          * MTP sidecars need their own persistent MoE metadata even when their
          * logical layer index aliases a main-model layer.  The runtime table
@@ -764,12 +984,15 @@ namespace llaminar2
                 runtime_table_layers,
                 register_runtime_histogram);
         }
-        else if (total_tokens > 1 && rocm_env.moe_grouped_prefill)
+        else if (total_tokens > 1 &&
+                 (rocm_env.moe_grouped_prefill ||
+                  forceDecodeEquivalentMoERouting(device)))
         {
-            // Fixed-topology grouped prefill consumes the routing tensors
-            // directly and does not read DeviceMoELayerRuntime prefill scratch.
-            // Keep the mirrored table available for decode/histogram users, but
-            // avoid preallocating per-layer prefill route buffers here.
+            // Fixed-topology grouped prefill consumes routing tensors directly.
+            // Decode-equivalent verifier routing instead uses the same
+            // runtime-table router as serial decode, so build the table even
+            // when grouped prefill is disabled; otherwise the strict verifier
+            // row proof would fail closed before reaching the rows under test.
             moe_runtime_table = moeRuntimeTableForDevice(
                 device,
                 0,
@@ -821,9 +1044,9 @@ namespace llaminar2
             route_params.decode_histogram = mtp_sidecar_context ? nullptr : config_.moe.decode_histogram;
             route_params.moe_runtime_table = moe_runtime_table;
             route_params.force_grouped_verifier_prefill_for_decode =
-                forceCudaSmallMMoEPrefill(device) && total_tokens == 1;
+                forceGroupedMoEVerifierPrefill(device);
             route_params.force_decode_equivalent_verifier_prefill =
-                forceDecodeEquivalentMoEVerifier(device);
+                forceDecodeEquivalentMoERouting(device);
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
             route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
@@ -880,7 +1103,7 @@ namespace llaminar2
                 expert_params.expert_mask = std::move(expert_mask);
                 expert_params.moe_runtime_table = moe_runtime_table;
                 expert_params.force_grouped_verifier_prefill_for_decode =
-                    forceCudaSmallMMoEPrefill(stage_device) && total_tokens == 1;
+                    forceGroupedMoEVerifierPrefill(stage_device);
                 expert_params.force_decode_equivalent_verifier_prefill =
                     forceDecodeEquivalentMoEVerifier(stage_device);
 
@@ -1045,29 +1268,15 @@ namespace llaminar2
                 return true;
             };
 
-            const bool overlay_requested = overlay_plan && overlay_plan->isTieredOverlay();
-            const ExpertLayerPlacement *overlay_placement = overlay_requested
-                                                                ? findExpertOverlayPlacement(*overlay_plan, layer_idx)
-                                                                : nullptr;
-            const bool use_expert_overlay = overlay_requested && overlay_placement &&
-                                            isUsableExpertOverlayPlacement(*overlay_placement,
-                                                                           *overlay_plan,
-                                                                           config_.moe.num_experts,
-                                                                           layer_idx);
-
-            const bool can_combine_shared_verifier =
-                !use_expert_overlay &&
-                !overlay_runtime_plan &&
-                !needsTPAllreduce() &&
-                forceCudaSmallMMoEPrefill(device) &&
-                !forceDecodeEquivalentMoEVerifier(device) &&
-                total_tokens > 1 &&
-                total_tokens <= 4 &&
-                layer.shared_expert_gate &&
-                layer.shared_expert_up &&
-                layer.shared_expert_down &&
-                layer.shared_expert_gate_inp &&
-                buffers.attn_proj;
+            /*
+             * Phase 9.8 rejected the single-table routed+shared verifier
+             * shortcut for production graph promotion.  The isolated CUDA/ROCm
+             * kernel microbench is economical, but full Qwen3.6 continuation
+             * parity still drifts when the graph skips the standalone shared
+             * branch.  Keep the explicit routed-plus-shared branch structure
+             * until a future strict full-model proof re-enables this flag.
+             */
+            const bool can_combine_shared_verifier = false;
 
             if (overlay_requested && !use_expert_overlay)
             {
@@ -1468,7 +1677,52 @@ namespace llaminar2
                     expert_params.prepared_shared_ref_down = preparedRefForGraphWeight(
                         layer_bindings.shared_expert_down, device);
                 }
-                (void)prepareExpertParams(expert_params, device);
+                if (!prepareExpertParams(expert_params, device))
+                {
+                    throw std::runtime_error(
+                        "Qwen35 MoE graph failed to prepare expert parameters for layer " +
+                        std::to_string(layer_idx) + " on " + device.to_string());
+                }
+
+                if (device.is_gpu() &&
+                    total_tokens == 1 &&
+                    moe_runtime_table &&
+                    debugEnv().rocm.moe_grouped_decode &&
+                    debugEnv().rocm.moe_device_routed_decode)
+                {
+                    const bool full_local_decode =
+                        expert_params.local_expert_start == 0 &&
+                        (expert_params.local_expert_count < 0 ||
+                         expert_params.local_expert_count == config_.moe.num_experts) &&
+                        expert_params.replica_set.num_replicated == 0 &&
+                        allExpertsEnabled(expert_params.expert_mask, config_.moe.num_experts);
+                    if (!full_local_decode)
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE GPU decode runtime table requires full local expert "
+                            "ownership for layer " +
+                            std::to_string(layer_idx) + " on " + device.to_string());
+                    }
+
+                    if (!initializeFullLocalDecodeRuntimeTable(
+                            moe_runtime_table,
+                            layer_idx,
+                            config_.moe.num_experts,
+                            config_.moe.top_k,
+                            config_.d_model,
+                            expert_intermediate,
+                            expert_params.prepared_gate_gemm,
+                            expert_params.prepared_up_gemm,
+                            expert_params.prepared_down_gemm,
+                            nullptr,
+                            "single-device GPU decode graph build"))
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE graph failed to initialize device decode "
+                            "runtime table for layer " +
+                            std::to_string(layer_idx) + " on " + device.to_string());
+                    }
+                }
 
                 graph.addNode(prefix + "moe_expert_ffn",
                               ComputeStageFactory::createMoEExpertCompute(expert_params),
@@ -1543,9 +1797,20 @@ namespace llaminar2
             shared_params.intermediate = shared_intermediate;
             shared_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
             shared_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+            /*
+             * Shared-expert verifier rows are independent of top-k routing.
+             * Main-verifier rows still use the decode-equivalent path because
+             * full-model M=2..4 parity is the authority here; isolated grouped
+             * shared-expert kernels were not enough to prevent integrated row
+             * drift.  The grouped shared route remains available to sidecar
+             * prefill and is tracked as Phase 9.8 performance debt.
+             */
+            const bool shared_grouped_verifier_prefill =
+                forceGroupedSharedMoEVerifierPrefill(shared_device);
             shared_params.force_grouped_verifier_prefill_for_decode =
-                forceCudaSmallMMoEPrefill(shared_device);
+                shared_grouped_verifier_prefill;
             shared_params.force_decode_equivalent_verifier_prefill =
+                !shared_grouped_verifier_prefill &&
                 forceDecodeEquivalentMoEVerifier(shared_device);
             shared_params.prepared_ref_gate = preparedRefForGraphWeight(
                 layer_bindings.shared_expert_gate, shared_device);
@@ -1559,6 +1824,23 @@ namespace llaminar2
                           ComputeStageFactory::createSharedExpertFFN(shared_params),
                           shared_device);
             graph.addDependency(prefix + "shared_expert_ffn", prefix + "ffn_norm");
+            if (!mtp_sidecar_context &&
+                config_.compute_all_position_logits &&
+                total_tokens > 1 &&
+                total_tokens <= 4 &&
+                !ffn_terminal.empty())
+            {
+                /*
+                 * Phase 9.8 correctness guard: CUDA/ROCm MoE grouped decode
+                 * kernels still own singleton scratch buffers inside the MoE
+                 * kernel bridge.  Running routed and shared expert verifier
+                 * rows concurrently can race those decode scratch buffers and
+                 * produce strict cosine/L2/KL drift.  Serialize the two MoE
+                 * branches for decode-equivalent verifier rows until the final
+                 * branch-scoped workspace design lands.
+                 */
+                graph.addDependency(prefix + "shared_expert_ffn", ffn_terminal);
+            }
             shared_ffn_last = prefix + "shared_expert_ffn";
 
             // Allreduce after shared expert down projection (InputParallel sharding)

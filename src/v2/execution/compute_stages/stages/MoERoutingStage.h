@@ -140,6 +140,9 @@ namespace llaminar2
         bool isDeviceRoutedPrefillExecutionSupported() const;
         bool isDeviceRoutedPrefillGraphCaptureSupported() const;
         bool isDeviceRoutedPrefillGraphCapturable() const;
+        bool isDecodeEquivalentVerifierPrefillExecutionSupported() const;
+        bool isDecodeEquivalentVerifierPrefillGraphCaptureSupported() const;
+        bool isDecodeEquivalentVerifierPrefillGraphCapturable() const;
         bool hasInitializedRuntimeTableIfProvided() const;
         bool executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
         void recordRuntimeHistogramTokenBoundary() const;
@@ -148,10 +151,6 @@ namespace llaminar2
             const std::vector<float> &expert_weights,
             int seq_len, int top_k) const;
 
-        /// Device-row scratch for decode-equivalent verifier routing.
-        mutable std::shared_ptr<TensorBase> verifier_row_input_;
-        mutable std::shared_ptr<TensorBase> verifier_row_indices_;
-        mutable std::shared_ptr<TensorBase> verifier_row_weights_;
     };
 
 } // namespace llaminar2

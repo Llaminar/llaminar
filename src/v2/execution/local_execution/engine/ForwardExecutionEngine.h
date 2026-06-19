@@ -105,8 +105,22 @@ namespace llaminar2
         /** Sync GPU stream and mark logits as host-readable. */
         virtual void syncLogitsAtBoundary(IDeviceContext *ctx) = 0;
 
-        /** Access the logits tensor (for mapped-memory sync checks). */
+        /** Access the ordinary terminal logits tensor. */
         virtual TensorBase *logitsTensor() = 0;
+
+        /**
+         * @brief Access the tensor published as the logits result for this forward.
+         *
+         * Most forwards publish the ordinary terminal logits tensor.  Verifier
+         * forwards that request all-position logits publish a separate compact or
+         * full row tensor instead.  Boundary synchronization must use this active
+         * publication tensor so mapped-memory and host-read coherence are applied
+         * to the buffer the graph actually wrote.
+         */
+        virtual TensorBase *logitsPublicationTensor()
+        {
+            return logitsTensor();
+        }
 
         // ----- Decode Capture Policy -----
 

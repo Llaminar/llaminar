@@ -992,6 +992,91 @@ namespace llaminar2
         return true;
     }
 
+    template <typename RowAccessor>
+    bool CPUGatedDeltaNet::chunkForwardVerifierDecodeEquivalentRows(
+        RowAccessor &&row_accessor,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        const int state_floats = n_heads * d_k * d_v;
+        if (!alpha || !beta_raw || !A_log || !dt_bias ||
+            !output || !state || !state_snapshots ||
+            seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+            snapshot_stride_floats < state_floats || max_snapshot_rows <= 0)
+        {
+            return false;
+        }
+
+        const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
+        constexpr float l2_eps = 1e-6f;
+        const int v_stride = n_heads * d_v;
+
+        /**
+         * The verifier rows must be decode-equivalent, but they must not be a
+         * hidden sequence of full one-token decode launches.  GDN's recurrence
+         * dependency is per head, so the grouped verifier kernel owns a head's
+         * state for all rows, advances that head in serial decode order, and
+         * publishes the head slice of every post-row snapshot.  This preserves
+         * the exact recurrent_step() operation order for each head while using
+         * one OpenMP worksharing region for the whole M=2..4 verifier chunk.
+         */
+        auto grouped_decode_equivalent = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int h = 0; h < n_heads; ++h)
+            {
+                alignas(64) float q_local[512];
+                alignas(64) float k_local[512];
+
+                const size_t head_state_floats = static_cast<size_t>(d_k) * d_v;
+                float *S = state + static_cast<size_t>(h) * head_state_floats;
+
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    const float *q_t = nullptr;
+                    const float *k_t = nullptr;
+                    const float *v_t = nullptr;
+                    row_accessor(t, h, q_t, k_t, v_t);
+                    const float *alpha_t = alpha + static_cast<size_t>(t) * n_heads;
+                    const float *beta_t = beta_raw + static_cast<size_t>(t) * n_heads;
+                    float *output_t = output + static_cast<size_t>(t) * v_stride + h * d_v;
+
+                    if (use_qk_l2norm)
+                    {
+                        gdn_preprocess_qk_l2norm(q_t, k_t, q_local, k_local, d_k, scale_val, l2_eps);
+                    }
+                    else
+                    {
+                        gdn_preprocess_qk_scale(q_t, k_t, q_local, k_local, d_k, scale_val);
+                    }
+
+                    const float x = alpha_t[h] + dt_bias[h];
+                    const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
+                    const float decay = std::exp(A_log[h] * sp);
+                    const float beta_h = 1.0f / (1.0f + std::exp(-beta_t[h]));
+
+                    gdn_delta_recurrence(S, q_local, k_local, v_t, output_t, decay, beta_h, d_k, d_v);
+
+                    if (t < max_snapshot_rows)
+                    {
+                        float *snapshot_head =
+                            state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats +
+                            static_cast<size_t>(h) * head_state_floats;
+                        std::memcpy(snapshot_head, S, head_state_floats * sizeof(float));
+                    }
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(grouped_decode_equivalent);
+
+        return true;
+    }
+
     bool CPUGatedDeltaNet::chunkForwardVerifierDecodeEquivalent(
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
@@ -1002,75 +1087,73 @@ namespace llaminar2
         float *state_snapshots, int snapshot_stride_floats,
         int max_snapshot_rows)
     {
-        const int state_floats = n_heads * d_k * d_v;
-        if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
-            !output || !state || !state_snapshots ||
-            seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
-            snapshot_stride_floats < state_floats || max_snapshot_rows <= 0)
+        if (!Q || !K || !V)
+            return false;
+
+        const int qk_stride = n_heads * d_k;
+        const int v_stride = n_heads * d_v;
+        auto contiguous_rows =
+            [=](int t, int h, const float *&q_t, const float *&k_t, const float *&v_t)
+        {
+            q_t = Q + static_cast<size_t>(t) * qk_stride + h * d_k;
+            k_t = K + static_cast<size_t>(t) * qk_stride + h * d_k;
+            v_t = V + static_cast<size_t>(t) * v_stride + h * d_v;
+        };
+
+        return chunkForwardVerifierDecodeEquivalentRows(
+            contiguous_rows,
+            alpha, beta_raw, A_log, dt_bias, output, state,
+            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardMergedQKVWithStateSnapshots(
+        const float *merged_qkv, int qkv_stride,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+        int global_v_head_offset, int chunk_size, bool use_qk_l2norm,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        (void)chunk_size;
+        if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
+            n_heads <= 0 || d_k <= 0 || d_v <= 0)
         {
             return false;
         }
 
-        const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
-        constexpr float l2_eps = 1e-6f;
-        const int qk_stride = n_heads * d_k;
-        const int v_stride = n_heads * d_v;
+        const int q_src_dim = n_k_heads * d_k;
+        const int k_src_dim = n_k_heads * d_k;
+        const int v_dim = n_heads * d_v;
+        const int state_floats = n_heads * d_k * d_v;
+        if (qkv_stride < q_src_dim + k_src_dim + v_dim)
+            return false;
 
-        for (int t = 0; t < seq_len; ++t)
+        float *state_for_compute = prepareSpeculativeState(state, state_floats);
+        if (!state_for_compute)
+            return false;
+
+        auto merged_rows =
+            [=](int t, int h, const float *&q_t, const float *&k_t, const float *&v_t)
         {
-            const float *q_t = Q + static_cast<size_t>(t) * qk_stride;
-            const float *k_t = K + static_cast<size_t>(t) * qk_stride;
-            const float *v_t = V + static_cast<size_t>(t) * v_stride;
-            const float *alpha_t = alpha + static_cast<size_t>(t) * n_heads;
-            const float *beta_t = beta_raw + static_cast<size_t>(t) * n_heads;
-            float *output_t = output + static_cast<size_t>(t) * v_stride;
+            int qk_head = (h + global_v_head_offset) % n_k_heads;
+            if (qk_head < 0)
+                qk_head += n_k_heads;
 
-            // This mirrors recurrent_step() exactly: each row observes the
-            // state left by the prior row, then snapshots that post-row state.
-            auto do_work = [&]()
-            {
-#pragma omp for schedule(static)
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    alignas(64) float q_local[512];
-                    alignas(64) float k_local[512];
+            const float *row =
+                merged_qkv + static_cast<size_t>(t) * qkv_stride;
+            q_t = row + static_cast<size_t>(qk_head) * d_k;
+            k_t = row + q_src_dim + static_cast<size_t>(qk_head) * d_k;
+            v_t = row + q_src_dim + k_src_dim + static_cast<size_t>(h) * d_v;
+        };
 
-                    const float *q_src = q_t + h * d_k;
-                    const float *k_src = k_t + h * d_k;
-
-                    if (use_qk_l2norm)
-                    {
-                        gdn_preprocess_qk_l2norm(q_src, k_src, q_local, k_local, d_k, scale_val, l2_eps);
-                    }
-                    else
-                    {
-                        gdn_preprocess_qk_scale(q_src, k_src, q_local, k_local, d_k, scale_val);
-                    }
-
-                    const float x = alpha_t[h] + dt_bias[h];
-                    const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
-                    const float decay = std::exp(A_log[h] * sp);
-                    const float beta_h = 1.0f / (1.0f + std::exp(-beta_t[h]));
-
-                    float *S = state + static_cast<size_t>(h) * d_k * d_v;
-                    const float *v_h = v_t + h * d_v;
-                    float *o_h = output_t + h * d_v;
-
-                    gdn_delta_recurrence(S, q_local, k_local, v_h, o_h, decay, beta_h, d_k, d_v);
-                }
-            };
-            OMP_WORKSHARE_REGION(do_work);
-
-            if (t < max_snapshot_rows)
-            {
-                std::memcpy(
-                    state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats,
-                    state,
-                    static_cast<size_t>(state_floats) * sizeof(float));
-            }
-        }
-
-        return true;
+        return chunkForwardVerifierDecodeEquivalentRows(
+            merged_rows,
+            alpha, beta_raw, A_log, dt_bias, output, state_for_compute,
+            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows);
     }
 
     bool CPUGatedDeltaNet::chunkForwardImpl(

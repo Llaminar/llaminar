@@ -197,10 +197,11 @@ namespace llaminar2
         bool allocate();
 
         /**
-         * @brief Log a per-buffer allocation summary at INFO level.
+         * @brief Log a per-buffer allocation summary at TRACE level.
          *
          * Shows each buffer's name, shape, dtype, and size. Called after
-         * allocate() to give visibility into activation memory usage.
+         * allocate() to give deep visibility into activation memory usage
+         * without flooding normal DEBUG logs during graph rebuilds.
          */
         void logAllocationSummary() const;
 

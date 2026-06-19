@@ -80,6 +80,27 @@ extern "C" bool cudaMoE_group_tokens_small_float(
     int device_idx,
     void *stream);
 
+extern "C" bool cudaMoE_group_tokens_small_float_with_shared_gate(
+    const float *routing_indices,
+    const float *routing_weights,
+    const float *hidden,
+    const float *shared_gate_inp,
+    int *expert_counts,
+    int *expert_offsets,
+    int *grouped_token_indices,
+    int *original_to_grouped,
+    int *original_expert_ids,
+    int *single_expert_ids,
+    int *active_expert_ids,
+    float *grouped_weights,
+    int seq_len,
+    int d_model,
+    int num_routed_experts,
+    int routed_top_k,
+    int max_active_experts,
+    int device_idx,
+    void *stream);
+
 extern "C" bool cudaMoE_route_logits(
     const float *hidden,
     const float *gate_weights,
@@ -135,6 +156,86 @@ namespace
     {
         for (size_t i = 0; i < count; ++i)
             ASSERT_NEAR(actual[i], expected[i], tolerance) << "at element " << i;
+    }
+
+    double cosineSimilarity(const float *a, const float *b, size_t count)
+    {
+        double dot = 0.0;
+        double norm_a = 0.0;
+        double norm_b = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+            norm_a += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+            norm_b += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+        }
+        if (norm_a < 1.0e-30 && norm_b < 1.0e-30)
+            return 1.0;
+        if (norm_a < 1.0e-30 || norm_b < 1.0e-30)
+            return 0.0;
+        return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
+    }
+
+    double relativeL2Error(const float *actual, const float *reference, size_t count)
+    {
+        double err_sq = 0.0;
+        double ref_sq = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double diff = static_cast<double>(actual[i]) - static_cast<double>(reference[i]);
+            err_sq += diff * diff;
+            ref_sq += static_cast<double>(reference[i]) * static_cast<double>(reference[i]);
+        }
+        if (ref_sq < 1.0e-30)
+            return err_sq < 1.0e-30 ? 0.0 : std::numeric_limits<double>::infinity();
+        return std::sqrt(err_sq / ref_sq);
+    }
+
+    double klDivergence(const float *actual, const float *reference, size_t count)
+    {
+        constexpr double kEps = 1.0e-30;
+        double kl = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double p = std::max(static_cast<double>(reference[i]), kEps);
+            const double q = std::max(static_cast<double>(actual[i]), kEps);
+            kl += p * (std::log(p) - std::log(q));
+        }
+        return kl;
+    }
+
+    /**
+     * @brief Check that batched verifier top-k rows are numerically identical
+     * enough to the row-wise decode router to be used as live MTP state.
+     */
+    void expectStrictTopKRowsEquivalent(
+        const std::vector<float> &batched_indices,
+        const std::vector<float> &batched_weights,
+        const std::vector<float> &rowwise_indices,
+        const std::vector<float> &rowwise_weights,
+        int seq_len,
+        int top_k)
+    {
+        ASSERT_EQ(batched_indices.size(), rowwise_indices.size());
+        ASSERT_EQ(batched_weights.size(), rowwise_weights.size());
+        for (size_t i = 0; i < batched_indices.size(); ++i)
+            ASSERT_EQ(static_cast<int>(batched_indices[i]), static_cast<int>(rowwise_indices[i]))
+                << "top-k index mismatch at flattened slot " << i;
+
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const float *actual = batched_weights.data() + static_cast<size_t>(row) * top_k;
+            const float *reference = rowwise_weights.data() + static_cast<size_t>(row) * top_k;
+            const double cosine = cosineSimilarity(actual, reference, static_cast<size_t>(top_k));
+            const double rel_l2 = relativeL2Error(actual, reference, static_cast<size_t>(top_k));
+            const double kl = klDivergence(actual, reference, static_cast<size_t>(top_k));
+            for (int k = 0; k < top_k; ++k)
+                ASSERT_NEAR(actual[k], reference[k], 1.0e-4f)
+                    << "row=" << row << " slot=" << k;
+            EXPECT_GT(cosine, 0.999999) << "row=" << row;
+            EXPECT_LT(rel_l2, 1.0e-3) << "row=" << row;
+            EXPECT_LT(kl, 1.0e-5) << "row=" << row;
+        }
     }
 
     bool hasCudaDevice()
@@ -1778,7 +1879,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenIsCudaGraphCapturableDevi
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMVerifierUsesCuBLASAndCaptures)
+TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMVerifierUsesDecodeEquivalentKernelAndCaptures)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -1859,7 +1960,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMVerifierUsesCuBLASAndCaptures)
     expectNearArray(captured_weights.data(), cpu_weights->data(), captured_weights.size(), 1.0e-4f);
 
     const auto records =
-        llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_router_cublas_small_m_calls"});
+        llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_router_decode_equivalent_small_m_calls"});
     const auto match = std::find_if(records.begin(), records.end(), [&](const llaminar2::PerfStatRecord &record)
                                     {
                                         auto tag_equals = [&](const char *key, const std::string &value)
@@ -1867,18 +1968,143 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMVerifierUsesCuBLASAndCaptures)
                                             const auto it = record.tags.find(key);
                                             return it != record.tags.end() && it->second == value;
                                         };
-                                        return record.name == "cuda_moe_router_cublas_small_m_calls" &&
+                                        return record.name == "cuda_moe_router_decode_equivalent_small_m_calls" &&
                                                tag_equals("seq_len", std::to_string(seq_len)) &&
                                                tag_equals("d_model", std::to_string(d_model)) &&
                                                tag_equals("num_experts", std::to_string(num_experts));
                                     });
-    ASSERT_NE(match, records.end()) << "small-M cuBLAS router counter missing; test did not exercise the verifier route";
+    ASSERT_NE(match, records.end()) << "small-M decode-equivalent router counter missing; test did not exercise the verifier route";
     EXPECT_GE(match->count, 2u);
     EXPECT_GE(match->value, 2.0);
     llaminar2::PerfStatsCollector::reset();
 
     ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
     ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMMatchesSerialDecodeRouterForVerifierRows)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using llaminar2::DeviceMoERuntimeTable;
+    constexpr int d_model = 2048;
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+
+    DeviceMoERuntimeTable::Config cuda_config;
+    cuda_config.device_id = llaminar2::DeviceId::cuda(0);
+    cuda_config.num_layers = 1;
+    cuda_config.num_experts = num_experts;
+    cuda_config.top_k = top_k;
+    cuda_config.mirror_to_device = true;
+    DeviceMoERuntimeTable cuda_table(cuda_config);
+
+    llaminar2::MoEPlacementUpdate update;
+    update.epoch = 1;
+    update.expert_count = num_experts;
+    update.experts.resize(num_experts);
+    update.local_compute_mask.assign(num_experts, 0);
+    update.replica_role.resize(num_experts, 0);
+    for (int expert = 0; expert < num_experts; ++expert)
+        update.experts[expert].logical_expert_id = expert;
+    ASSERT_TRUE(cuda_table.prepareInactiveBank(0, update));
+    ASSERT_TRUE(cuda_table.flipActiveBank(0, update.epoch, stream_));
+
+    std::vector<float> gate_values(static_cast<size_t>(num_experts) * d_model);
+    for (size_t i = 0; i < gate_values.size(); ++i)
+        gate_values[i] = 0.035f * std::sin(0.011f * static_cast<float>(i + 13)) +
+                         0.027f * std::cos(0.017f * static_cast<float>(i + 19)) +
+                         0.0007f * static_cast<float>(static_cast<int>(i % 23) - 11);
+    auto gate = makeTensor({num_experts, d_model}, gate_values);
+
+    for (int seq_len : {2, 3, 4})
+    {
+        std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
+        for (size_t i = 0; i < hidden_values.size(); ++i)
+            hidden_values[i] = 0.05f * std::sin(0.007f * static_cast<float>(i + 1 + seq_len)) -
+                               0.031f * std::cos(0.013f * static_cast<float>(i + 5)) +
+                               0.0013f * static_cast<float>(static_cast<int>(i % 17) - 8);
+
+        auto hidden = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            hidden_values);
+        auto batched_indices = makeZeros(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+        auto batched_weights = makeZeros(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+
+        llaminar2::MoERoutingResult batched_result;
+        ASSERT_TRUE(cuda_kernel_->routeWithTensors(
+            hidden.get(), gate.get(), seq_len, d_model,
+            num_experts, top_k, true,
+            batched_indices.get(), batched_weights.get(), batched_result))
+            << "seq_len=" << seq_len;
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+        std::vector<float> batched_indices_host(static_cast<size_t>(seq_len) * top_k);
+        std::vector<float> batched_weights_host(static_cast<size_t>(seq_len) * top_k);
+        ASSERT_EQ(cudaMemcpyAsync(batched_indices_host.data(), batched_indices->gpu_data_ptr(),
+                                  batched_indices_host.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost, stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(batched_weights_host.data(), batched_weights->gpu_data_ptr(),
+                                  batched_weights_host.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost, stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+        std::vector<float> serial_indices(static_cast<size_t>(seq_len) * top_k);
+        std::vector<float> serial_weights(static_cast<size_t>(seq_len) * top_k);
+        for (int row = 0; row < seq_len; ++row)
+        {
+            std::vector<float> row_hidden_values(static_cast<size_t>(d_model));
+            std::copy_n(hidden_values.data() + static_cast<size_t>(row) * d_model,
+                        d_model,
+                        row_hidden_values.data());
+            auto row_hidden = makeTensor({1, d_model}, row_hidden_values);
+            auto row_indices = makeZeros({1, top_k});
+            auto row_weights = makeZeros({1, top_k});
+
+            ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+                cuda_table.deviceLayerState(0),
+                row_hidden.get(),
+                gate.get(),
+                d_model,
+                num_experts,
+                top_k,
+                true,
+                row_indices.get(),
+                row_weights.get(),
+                /*write_legacy_outputs=*/true,
+                /*update_runtime_histogram=*/false))
+                << "seq_len=" << seq_len << " row=" << row;
+
+            ASSERT_EQ(cudaMemcpyAsync(serial_indices.data() + static_cast<size_t>(row) * top_k,
+                                      row_indices->gpu_data_ptr(),
+                                      static_cast<size_t>(top_k) * sizeof(float),
+                                      cudaMemcpyDeviceToHost, stream_),
+                      cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(serial_weights.data() + static_cast<size_t>(row) * top_k,
+                                      row_weights->gpu_data_ptr(),
+                                      static_cast<size_t>(top_k) * sizeof(float),
+                                      cudaMemcpyDeviceToHost, stream_),
+                      cudaSuccess);
+        }
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+        expectStrictTopKRowsEquivalent(
+            batched_indices_host,
+            batched_weights_host,
+            serial_indices,
+            serial_weights,
+            seq_len,
+            top_k);
+    }
 #endif
 }
 
@@ -2134,7 +2360,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddFromTensorsMatchesCPU)
 
 TEST_F(Test__CUDAMoEKernel, PrepareExpertGroupsMatchesCPUGroups)
 {
-    constexpr int seq_len = 4;
+    constexpr int seq_len = 3;
     constexpr int top_k = 2;
     constexpr int num_experts = 4;
     constexpr int d_model = 3;
@@ -2354,6 +2580,173 @@ TEST_F(Test__CUDAMoEKernel, SmallFloatGroupingEmitsCompactActiveExperts)
     cudaFree(d_original_expert_ids);
     cudaFree(d_grouped_weights);
     cudaFree(d_active);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, SharedGateGroupingPublishesSingletonExpertId)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int seq_len = 3;
+    constexpr int routed_top_k = 4;
+    constexpr int d_model = 16;
+    constexpr int routed_experts = 11;
+    constexpr int shared_expert = routed_experts;
+    constexpr int combined_top_k = routed_top_k + 1;
+    constexpr int routed_slots = seq_len * routed_top_k;
+    constexpr int combined_slots = seq_len * combined_top_k;
+    constexpr int combined_experts = routed_experts + 1;
+    constexpr int max_active_experts = combined_slots;
+
+    const std::vector<float> routing_indices = {
+        7.0f, 3.0f, 7.0f, 1.0f,
+        5.0f, 1.0f, 9.0f, 3.0f,
+        7.0f, 5.0f, 10.0f, 1.0f,
+    };
+    std::vector<float> routing_weights(static_cast<size_t>(routed_slots));
+    for (int i = 0; i < routed_slots; ++i)
+        routing_weights[static_cast<size_t>(i)] =
+            0.03f * static_cast<float>(i + 2);
+
+    std::vector<float> hidden(static_cast<size_t>(seq_len * d_model));
+    std::vector<float> shared_gate(static_cast<size_t>(d_model));
+    for (int i = 0; i < seq_len * d_model; ++i)
+        hidden[static_cast<size_t>(i)] =
+            0.01f * static_cast<float>((i % 9) - 4);
+    for (int i = 0; i < d_model; ++i)
+        shared_gate[static_cast<size_t>(i)] =
+            0.02f * static_cast<float>((i % 7) - 3);
+
+    float *d_indices = nullptr;
+    float *d_weights = nullptr;
+    float *d_hidden = nullptr;
+    float *d_shared_gate = nullptr;
+    int *d_counts = nullptr;
+    int *d_offsets = nullptr;
+    int *d_grouped_tokens = nullptr;
+    int *d_original_to_grouped = nullptr;
+    int *d_original_expert_ids = nullptr;
+    int *d_single_expert_ids = nullptr;
+    int *d_active = nullptr;
+    float *d_grouped_weights = nullptr;
+
+    ASSERT_EQ(cudaMalloc(&d_indices, routing_indices.size() * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_weights, routing_weights.size() * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_hidden, hidden.size() * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_shared_gate, shared_gate.size() * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_counts, combined_experts * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_offsets, combined_experts * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_grouped_tokens, combined_slots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_original_to_grouped, combined_slots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_original_expert_ids, combined_slots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_single_expert_ids, sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_active, max_active_experts * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_grouped_weights, combined_slots * sizeof(float)), cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpyAsync(d_indices, routing_indices.data(),
+                              routing_indices.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_weights, routing_weights.data(),
+                              routing_weights.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_hidden, hidden.data(),
+                              hidden.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_shared_gate, shared_gate.data(),
+                              shared_gate.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+
+    ASSERT_TRUE(cudaMoE_group_tokens_small_float_with_shared_gate(
+        d_indices,
+        d_weights,
+        d_hidden,
+        d_shared_gate,
+        d_counts,
+        d_offsets,
+        d_grouped_tokens,
+        d_original_to_grouped,
+        d_original_expert_ids,
+        d_single_expert_ids,
+        d_active,
+        d_grouped_weights,
+        seq_len,
+        d_model,
+        routed_experts,
+        routed_top_k,
+        max_active_experts,
+        0,
+        stream_));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    int singleton = -1;
+    std::vector<int> counts(static_cast<size_t>(combined_experts));
+    std::vector<int> offsets(static_cast<size_t>(combined_experts));
+    std::vector<int> original_expert_ids(static_cast<size_t>(combined_slots));
+    ASSERT_EQ(cudaMemcpy(&singleton, d_single_expert_ids, sizeof(int), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(counts.data(), d_counts,
+                         counts.size() * sizeof(int), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(offsets.data(), d_offsets,
+                         offsets.size() * sizeof(int), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(original_expert_ids.data(), d_original_expert_ids,
+                         original_expert_ids.size() * sizeof(int), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+
+    EXPECT_EQ(singleton, shared_expert)
+        << "mixed-codebook verifier prefill must launch the shared expert from "
+           "a dedicated singleton id buffer, not from a routed slot";
+    EXPECT_EQ(counts[shared_expert], seq_len);
+    EXPECT_EQ(offsets[shared_expert], routed_slots);
+    for (int row = 0; row < seq_len; ++row)
+    {
+        const int shared_slot = row * combined_top_k + routed_top_k;
+        EXPECT_EQ(original_expert_ids[static_cast<size_t>(shared_slot)], shared_expert)
+            << "row " << row << " appended shared route slot";
+    }
+
+    EXPECT_FALSE(cudaMoE_group_tokens_small_float_with_shared_gate(
+        d_indices,
+        d_weights,
+        d_hidden,
+        d_shared_gate,
+        d_counts,
+        d_offsets,
+        d_grouped_tokens,
+        d_original_to_grouped,
+        d_original_expert_ids,
+        d_single_expert_ids,
+        d_active,
+        d_grouped_weights,
+        seq_len,
+        d_model,
+        routed_experts,
+        routed_top_k,
+        max_active_experts,
+        0,
+        nullptr));
+
+    cudaFree(d_indices);
+    cudaFree(d_weights);
+    cudaFree(d_hidden);
+    cudaFree(d_shared_gate);
+    cudaFree(d_counts);
+    cudaFree(d_offsets);
+    cudaFree(d_grouped_tokens);
+    cudaFree(d_original_to_grouped);
+    cudaFree(d_original_expert_ids);
+    cudaFree(d_single_expert_ids);
+    cudaFree(d_active);
+    cudaFree(d_grouped_weights);
 #endif
 }
 
@@ -2658,12 +3051,12 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
     ASSERT_FALSE(grid_records.empty());
     EXPECT_EQ(grid_records.front().tags.at("active_expert_slots"), std::to_string(seq_len * top_k));
     EXPECT_EQ(grid_records.front().tags.at("num_experts"), std::to_string(num_experts));
-    EXPECT_EQ(grid_records.front().tags.at("tile_m"), "4")
-        << "seq_len=4 verifier-style grouped prefill should use the small-M tile by default";
+    EXPECT_EQ(grid_records.front().tags.at("tile_m"), "2")
+        << "seq_len=4 verifier-style grouped prefill should use the tuned tiny-M tile by default";
     EXPECT_EQ(grid_records.front().tags.at("tile_n"), "64")
         << "compact verifier rows use the small-N expert tile while "
            "max_tokens_per_expert <= 4";
-    expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 4);
+    expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 2);
 
     llaminar2::PerfStatsCollector::reset();
 #endif
@@ -3487,7 +3880,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
                            /*min_row_cosine=*/0.9998,
                            /*max_row_relative_l2=*/0.008,
                            /*max_row_kl=*/1.0e-4);
-        expectPrefillSwiGLUPathRecord("split", seq_len, top_k, num_experts, seq_len == 2 ? 2 : 4);
+        expectPrefillSwiGLUPathRecord("split", seq_len, top_k, num_experts, 2);
         prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
 
         std::vector<float> rowwise_decode_values;
@@ -3566,9 +3959,9 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         for (size_t i = 0; i < prefill_output->numel(); ++i)
             ASSERT_TRUE(std::isfinite(captured_output[i])) << "captured output element " << i;
 
-        expect_prefill_record(seq_len, seq_len == 2 ? 2 : 4);
+        expect_prefill_record(seq_len, 2);
         expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
-                                      seq_len == 2 ? 2 : 4,
+                                      2,
                                       "kpart_swiglu",
                                       "kpart_prefill",
                                       "token_direct");
@@ -4037,10 +4430,17 @@ TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefillMatchesSplitPathAndCapt
         ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 
         expect_combined_group_record(seq_len);
+        /*
+         * The combined routed+shared verifier keeps the shared expert in a
+         * singleton descriptor lane so routed and shared codebooks never share
+         * one active-expert launch.  The grouped-prefill counter therefore
+         * reports only the active routed lane count, while the appended shared
+         * expert is still covered by the strict split-path parity check above.
+         */
         const int expected_active_expert_slots =
-            std::min(seq_len * combined_top_k, combined_experts);
+            std::min(seq_len * routed_top_k, routed_experts);
         expectPrefillSwiGLUPathRecord("fused", seq_len, combined_top_k, combined_experts,
-                                      seq_len == 2 ? 2 : 4,
+                                      2,
                                       "kpart_swiglu",
                                       "kpart_prefill",
                                       "token_direct",
@@ -4141,19 +4541,19 @@ TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefill_Qwen36ShapeMatchesSeri
 
     GemmTriplet shared;
     shared.gate = add_prepared(
-        llaminar2::test::TestTensorFactory::createIQ4_XSRandom(
+        llaminar2::test::TestTensorFactory::createQ6_KRandom(
             {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)},
             884000),
         884000,
         "shared_gate");
     shared.up = add_prepared(
-        llaminar2::test::TestTensorFactory::createIQ4_XSRandom(
+        llaminar2::test::TestTensorFactory::createQ6_KRandom(
             {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)},
             885000),
         885000,
         "shared_up");
     shared.down = add_prepared(
-        llaminar2::test::TestTensorFactory::createIQ2_SRandom(
+        llaminar2::test::TestTensorFactory::createQ6_KRandom(
             {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)},
             886000),
         886000,
@@ -4173,9 +4573,15 @@ TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefill_Qwen36ShapeMatchesSeri
     merge_gemm_reqs(routed[0].gate, seq_len, intermediate, d_model);
     merge_gemm_reqs(routed[0].up, seq_len, intermediate, d_model);
     merge_gemm_reqs(routed[0].down, seq_len, d_model, intermediate);
+    merge_gemm_reqs(shared.gate, seq_len, intermediate, d_model);
+    merge_gemm_reqs(shared.up, seq_len, intermediate, d_model);
+    merge_gemm_reqs(shared.down, seq_len, d_model, intermediate);
     merge_gemm_reqs(routed[0].gate, 1, intermediate, d_model);
     merge_gemm_reqs(routed[0].up, 1, intermediate, d_model);
     merge_gemm_reqs(routed[0].down, 1, d_model, intermediate);
+    merge_gemm_reqs(shared.gate, 1, intermediate, d_model);
+    merge_gemm_reqs(shared.up, 1, intermediate, d_model);
+    merge_gemm_reqs(shared.down, 1, d_model, intermediate);
     llaminar2::addCudaConcurrentDecodeGemvSideStreamWorkspace(
         gemm_reqs,
         device,
@@ -4279,114 +4685,105 @@ TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefill_Qwen36ShapeMatchesSeri
         return routed[index];
     };
 
-    std::vector<float> routed_reference(
+    std::vector<float> expected_serial_rows(
         static_cast<size_t>(seq_len) * static_cast<size_t>(d_model),
         0.0f);
-    std::vector<std::vector<std::pair<int, float>>> routes_by_expert(
-        static_cast<size_t>(routed_experts));
-    for (int row = 0; row < seq_len; ++row)
+
+    /**
+     * Build the oracle exactly like serial decode: one token row at a time,
+     * using the M=1 GEMV route for routed experts and for the shared expert.
+     * A batched-by-expert reference is easier to write, but it can hide the
+     * small-M drift this test is supposed to catch.
+     */
+    for (int token = 0; token < seq_len; ++token)
     {
+        auto row_hidden = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(d_model)});
+        std::copy(hidden_host + static_cast<size_t>(token) * d_model,
+                  hidden_host + static_cast<size_t>(token + 1) * d_model,
+                  row_hidden->mutable_data());
+        ASSERT_TRUE(row_hidden->ensureOnDevice(device, stream_));
+
+        std::vector<float> routed_row(static_cast<size_t>(d_model), 0.0f);
         for (int route = 0; route < routed_top_k; ++route)
         {
-            const int slot = row * routed_top_k + route;
+            const int slot = token * routed_top_k + route;
             const int expert = static_cast<int>(route_indices[static_cast<size_t>(slot)]);
-            routes_by_expert[static_cast<size_t>(expert)].push_back(
-                {row, route_weights[static_cast<size_t>(slot)]});
+            const float route_weight = route_weights[static_cast<size_t>(slot)];
+            const GemmTriplet &triplet = triplet_for_expert(expert);
+
+            auto gate = llaminar2::test::TestTensorFactory::createFP32(
+                {1u, static_cast<size_t>(intermediate)});
+            auto up = llaminar2::test::TestTensorFactory::createFP32(
+                {1u, static_cast<size_t>(intermediate)});
+            auto expert_out = llaminar2::test::TestTensorFactory::createFP32(
+                {1u, static_cast<size_t>(d_model)});
+            ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(up->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(expert_out->ensureOnDevice(device, stream_));
+
+            std::vector<llaminar2::ITensorGemm::TensorProjectionDesc> projections = {
+                {triplet.gate, gate.get(), intermediate, nullptr, "routed_gate_serial"},
+                {triplet.up, up.get(), intermediate, nullptr, "routed_up_serial"}};
+            ASSERT_TRUE(triplet.gate->multiply_fused_tensor(
+                row_hidden.get(), projections, 1, d_model));
+            gate->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            up->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            ASSERT_TRUE(triplet.down->multiply_tensor_with_fused_swiglu(
+                gate.get(), up.get(), expert_out.get(), 1, d_model, intermediate));
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+            expert_out->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            const float *expert_data = expert_out->data();
+            for (int col = 0; col < d_model; ++col)
+                routed_row[static_cast<size_t>(col)] +=
+                    route_weight * expert_data[static_cast<size_t>(col)];
         }
-    }
 
-    for (int expert = 0; expert < routed_experts; ++expert)
-    {
-        const auto &routes = routes_by_expert[static_cast<size_t>(expert)];
-        if (routes.empty())
-            continue;
+        auto routed_row_tensor = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(d_model)});
+        std::copy(routed_row.begin(), routed_row.end(), routed_row_tensor->mutable_data());
+        ASSERT_TRUE(routed_row_tensor->ensureOnDevice(device, stream_));
 
-        const int count = static_cast<int>(routes.size());
-        const GemmTriplet &triplet = triplet_for_expert(expert);
-        auto batch = llaminar2::test::TestTensorFactory::createFP32(
-            {static_cast<size_t>(count), static_cast<size_t>(d_model)});
-        for (int row = 0; row < count; ++row)
-        {
-            const int token = routes[static_cast<size_t>(row)].first;
-            std::copy(hidden_host + static_cast<size_t>(token) * d_model,
-                      hidden_host + static_cast<size_t>(token + 1) * d_model,
-                      batch->mutable_data() + static_cast<size_t>(row) * d_model);
-        }
-        ASSERT_TRUE(batch->ensureOnDevice(device, stream_));
-
-        auto gate = llaminar2::test::TestTensorFactory::createFP32(
-            {static_cast<size_t>(count), static_cast<size_t>(intermediate)});
-        auto up = llaminar2::test::TestTensorFactory::createFP32(
-            {static_cast<size_t>(count), static_cast<size_t>(intermediate)});
-        auto expert_out = llaminar2::test::TestTensorFactory::createFP32(
-            {static_cast<size_t>(count), static_cast<size_t>(d_model)});
-        ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
-        ASSERT_TRUE(up->ensureOnDevice(device, stream_));
-        ASSERT_TRUE(expert_out->ensureOnDevice(device, stream_));
-
-        std::vector<llaminar2::ITensorGemm::TensorProjectionDesc> projections = {
-            {triplet.gate, gate.get(), intermediate, nullptr, "routed_gate"},
-            {triplet.up, up.get(), intermediate, nullptr, "routed_up"}};
-        ASSERT_TRUE(triplet.gate->multiply_fused_tensor(
-            batch.get(), projections, count, d_model));
-        gate->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        up->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        ASSERT_TRUE(triplet.down->multiply_tensor_with_fused_swiglu(
-            gate.get(), up.get(), expert_out.get(), count, d_model, intermediate));
+        auto shared_gate_out = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(intermediate)});
+        auto shared_up_out = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(intermediate)});
+        auto shared_out = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(d_model)});
+        auto expected_row = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(d_model)});
+        ASSERT_TRUE(shared_gate_out->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(shared_up_out->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(shared_out->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(expected_row->ensureOnDevice(device, stream_));
+        std::vector<llaminar2::ITensorGemm::TensorProjectionDesc> shared_projections = {
+            {shared.gate, shared_gate_out.get(), intermediate, nullptr, "shared_gate_serial"},
+            {shared.up, shared_up_out.get(), intermediate, nullptr, "shared_up_serial"}};
+        ASSERT_TRUE(shared.gate->multiply_fused_tensor(
+            row_hidden.get(), shared_projections, 1, d_model));
+        shared_gate_out->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        shared_up_out->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        ASSERT_TRUE(shared.down->multiply_tensor_with_fused_swiglu(
+            shared_gate_out.get(), shared_up_out.get(),
+            shared_out.get(), 1, d_model, intermediate));
+        shared_out->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        cuda_kernel_->sharedExpertGateAddFromTensors(
+            row_hidden.get(),
+            shared_gate.get(),
+            shared_out.get(),
+            routed_row_tensor.get(),
+            expected_row.get(),
+            1,
+            d_model);
         ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-        expert_out->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        const float *expert_rows = expert_out->data();
-        for (int row = 0; row < count; ++row)
-        {
-            const int token = routes[static_cast<size_t>(row)].first;
-            const float weight = routes[static_cast<size_t>(row)].second;
-            for (int col = 0; col < d_model; ++col)
-            {
-                routed_reference[static_cast<size_t>(token) * d_model + col] +=
-                    weight * expert_rows[static_cast<size_t>(row) * d_model + col];
-            }
-        }
+        expected_row->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        const float *row_data = expected_row->data();
+        std::copy(row_data,
+                  row_data + d_model,
+                  expected_serial_rows.begin() + static_cast<ptrdiff_t>(token) * d_model);
     }
-
-    auto shared_gate_out = llaminar2::test::TestTensorFactory::createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(intermediate)});
-    auto shared_up_out = llaminar2::test::TestTensorFactory::createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(intermediate)});
-    auto shared_out = llaminar2::test::TestTensorFactory::createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-    ASSERT_TRUE(shared_gate_out->ensureOnDevice(device, stream_));
-    ASSERT_TRUE(shared_up_out->ensureOnDevice(device, stream_));
-    ASSERT_TRUE(shared_out->ensureOnDevice(device, stream_));
-    std::vector<llaminar2::ITensorGemm::TensorProjectionDesc> shared_projections = {
-        {shared.gate, shared_gate_out.get(), intermediate, nullptr, "shared_gate"},
-        {shared.up, shared_up_out.get(), intermediate, nullptr, "shared_up"}};
-    ASSERT_TRUE(shared.gate->multiply_fused_tensor(
-        hidden.get(), shared_projections, seq_len, d_model));
-    ASSERT_TRUE(shared.down->multiply_tensor_with_fused_swiglu(
-        shared_gate_out.get(), shared_up_out.get(),
-        shared_out.get(), seq_len, d_model, intermediate));
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-
-    auto routed_reference_tensor = llaminar2::test::TestTensorFactory::createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-    std::copy(routed_reference.begin(), routed_reference.end(),
-              routed_reference_tensor->mutable_data());
-    ASSERT_TRUE(routed_reference_tensor->ensureOnDevice(device, stream_));
-
-    auto expected = llaminar2::test::TestTensorFactory::createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-    ASSERT_TRUE(expected->ensureOnDevice(device, stream_));
-    cuda_kernel_->sharedExpertGateAddFromTensors(
-        hidden.get(),
-        shared_gate.get(),
-        shared_out.get(),
-        routed_reference_tensor.get(),
-        expected.get(),
-        seq_len,
-        d_model);
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-    expected->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
 
     std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs(static_cast<size_t>(combined_experts));
     std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs(static_cast<size_t>(combined_experts));
@@ -4440,13 +4837,13 @@ TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefill_Qwen36ShapeMatchesSeri
         ASSERT_TRUE(std::isfinite(combined_data[i])) << "combined output element " << i;
     expectVectorsClose(
         std::vector<float>(combined_data, combined_data + output_count),
-        std::vector<float>(expected->data(), expected->data() + output_count),
-        0.9999,
-        0.006,
+        expected_serial_rows,
+        0.999995,
+        0.001,
         /*row_width=*/d_model,
-        /*min_row_cosine=*/0.9998,
-        /*max_row_relative_l2=*/0.008,
-        /*max_row_kl=*/1.0e-4);
+        /*min_row_cosine=*/0.999995,
+        /*max_row_relative_l2=*/0.001,
+        /*max_row_kl=*/1.0e-5);
 
     const auto group_records = llaminar2::PerfStatsCollector::snapshot(
         {"kernel.cuda_moe_combined_shared_prefill_group_calls"});
@@ -4456,7 +4853,7 @@ TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefill_Qwen36ShapeMatchesSeri
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefill_IQ3S_M2MatchesRowByRowVerifier)
+TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefill_IQ3S_M3StrictMatchesRowByRowVerifier)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -4464,7 +4861,7 @@ TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefill_IQ3S_M2MatchesRowByRow
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
 
-    constexpr int seq_len = 2;
+    constexpr int seq_len = 3;
     constexpr int d_model = 2048;
     constexpr int intermediate = 512;
     constexpr int routed_experts = 256;
@@ -4642,7 +5039,8 @@ TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefill_IQ3S_M2MatchesRowByRow
 
     const std::array<int, routed_top_k * seq_len> experts = {
         0, 13, 41, 96, 131, 159, 220, 238,
-        3, 17, 42, 99, 144, 171, 221, 251};
+        3, 17, 42, 99, 144, 171, 221, 251,
+        5, 19, 53, 107, 151, 183, 229, 255};
     std::vector<float> route_indices(static_cast<size_t>(seq_len * routed_top_k));
     std::vector<float> route_weights(static_cast<size_t>(seq_len * routed_top_k));
     for (int row = 0; row < seq_len; ++row)
@@ -4812,12 +5210,272 @@ TEST_F(Test__CUDAMoEKernel, CombinedSharedVerifierPrefill_IQ3S_M2MatchesRowByRow
     expectVectorsClose(
         std::vector<float>(combined->data(), combined->data() + output_count),
         row_by_row_expected,
-        0.9999,
-        0.006,
+        0.999995,
+        0.001,
         /*row_width=*/d_model,
-        /*min_row_cosine=*/0.9998,
-        /*max_row_relative_l2=*/0.008,
-        /*max_row_kl=*/1.0e-4);
+        /*min_row_cosine=*/0.999995,
+        /*max_row_relative_l2=*/0.001,
+        /*max_row_kl=*/1.0e-5);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDecode)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    /*
+     * This is the routed-only companion to the combined shared-expert IQ3_S
+     * regression above.  Qwen3.6 MoE production MTP verifier rows often have no
+     * shared expert path, so the grouped routed expert pipeline itself must be
+     * decode-equivalent for M=2..4 before the graph can publish verifier rows
+     * from it.
+     */
+    constexpr int d_model = 2048;
+    constexpr int intermediate = 512;
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+    constexpr int routed_variants = 16;
+    const auto device = llaminar2::DeviceId::cuda(0);
+
+    ScopedCudaMoEPrefillConfig prefill_config;
+    prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
+    ScopedCudaMoEGemmConfig gemm_config;
+    gemm_config.set(
+        /*gateup_kpart=*/true,
+        /*gateup_kparts=*/16,
+        /*down_kpart=*/true,
+        /*down_kparts=*/16);
+
+    std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
+    std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
+    owned_weights.reserve(static_cast<size_t>(routed_variants * 3));
+    prepared_weights.reserve(static_cast<size_t>(routed_variants * 3));
+
+    auto add_prepared_iq3 = [&](int rows,
+                                int cols,
+                                int seed,
+                                const char *role) -> llaminar2::ITensorGemm *
+    {
+        auto weight = llaminar2::test::TestTensorFactory::createIQ3_SRandom(
+            {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+            static_cast<unsigned>(seed));
+        auto *weight_ptr = weight.get();
+        owned_weights.push_back(std::move(weight));
+        prepared_weights.push_back(llaminar2::test::makeGpuPreparedGemm(
+            weight_ptr,
+            device,
+            std::string("test.cuda_moe.qwen36_iq3_routed_verifier.") + role +
+                "." + std::to_string(seed),
+            llaminar2::ModelContextId{910000 + static_cast<uint64_t>(seed)}));
+
+        auto *kernel = prepared_weights.back().kernel;
+        auto *tensor_kernel = dynamic_cast<llaminar2::ITensorKernel *>(kernel);
+        if (!tensor_kernel)
+            throw std::runtime_error(
+                "prepared CUDA IQ3_S routed GEMM must expose an explicit stream contract");
+        tensor_kernel->setGPUStream(stream_);
+        return kernel;
+    };
+
+    struct GemmTriplet
+    {
+        llaminar2::ITensorGemm *gate = nullptr;
+        llaminar2::ITensorGemm *up = nullptr;
+        llaminar2::ITensorGemm *down = nullptr;
+    };
+
+    std::array<GemmTriplet, routed_variants> routed{};
+    for (int variant = 0; variant < routed_variants; ++variant)
+    {
+        routed[static_cast<size_t>(variant)].gate =
+            add_prepared_iq3(intermediate, d_model, 911000 + variant, "routed_gate");
+        routed[static_cast<size_t>(variant)].up =
+            add_prepared_iq3(intermediate, d_model, 912000 + variant, "routed_up");
+        routed[static_cast<size_t>(variant)].down =
+            add_prepared_iq3(d_model, intermediate, 913000 + variant, "routed_down");
+    }
+
+    auto variant_for_expert = [&](int expert_id) -> size_t
+    {
+        return static_cast<size_t>(expert_id % routed_variants);
+    };
+
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs(
+        static_cast<size_t>(num_experts));
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs(
+        static_cast<size_t>(num_experts));
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs(
+        static_cast<size_t>(num_experts));
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        const GemmTriplet &triplet = routed[variant_for_expert(expert)];
+        ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(
+            gate_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(
+            up_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(
+            down_descs[static_cast<size_t>(expert)]));
+    }
+
+    const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(gateup_table, 0);
+    const int down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+        down_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(down_table, 0);
+
+    auto make_hidden = [](int seq_len)
+    {
+        auto hidden = llaminar2::test::TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+        for (size_t i = 0; i < hidden->numel(); ++i)
+        {
+            hidden->mutable_data()[i] =
+                0.013f * static_cast<float>(static_cast<int>(i % 43) - 21) +
+                0.004f * static_cast<float>(static_cast<int>((i / 17) % 19) - 9);
+        }
+        return hidden;
+    };
+
+    auto make_routes = [](int seq_len, std::vector<float> &indices, std::vector<float> &weights)
+    {
+        static constexpr std::array<int, top_k * 4> kExperts = {
+            0, 13, 41, 96, 131, 159, 220, 238,
+            3, 17, 42, 99, 144, 171, 221, 251,
+            0, 17, 43, 96, 145, 159, 223, 251,
+            5, 13, 42, 101, 131, 173, 220, 239};
+        indices.resize(static_cast<size_t>(seq_len * top_k));
+        weights.resize(static_cast<size_t>(seq_len * top_k));
+        for (int row = 0; row < seq_len; ++row)
+        {
+            float sum = 0.0f;
+            for (int route = 0; route < top_k; ++route)
+            {
+                const int slot = row * top_k + route;
+                indices[static_cast<size_t>(slot)] =
+                    static_cast<float>(kExperts[static_cast<size_t>(slot)]);
+                weights[static_cast<size_t>(slot)] =
+                    0.09f + 0.013f * static_cast<float>((slot * 5 + 3) % 11);
+                sum += weights[static_cast<size_t>(slot)];
+            }
+            for (int route = 0; route < top_k; ++route)
+            {
+                const int slot = row * top_k + route;
+                weights[static_cast<size_t>(slot)] /= sum;
+            }
+        }
+    };
+
+    for (int seq_len : {2, 3, 4})
+    {
+        auto hidden = make_hidden(seq_len);
+        ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+
+        std::vector<float> route_indices;
+        std::vector<float> route_weights;
+        make_routes(seq_len, route_indices, route_weights);
+        auto routing_indices = llaminar2::test::TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+        auto routing_weights = llaminar2::test::TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+        std::copy(route_indices.begin(), route_indices.end(), routing_indices->mutable_data());
+        std::copy(route_weights.begin(), route_weights.end(), routing_weights->mutable_data());
+        ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream_));
+
+        std::vector<float> row_by_row_expected(
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model));
+        for (int row = 0; row < seq_len; ++row)
+        {
+            auto hidden_row = llaminar2::test::TestTensorFactory::createFP32(
+                {1u, static_cast<size_t>(d_model)});
+            std::copy(hidden->data() + static_cast<size_t>(row) * d_model,
+                      hidden->data() + static_cast<size_t>(row + 1) * d_model,
+                      hidden_row->mutable_data());
+            ASSERT_TRUE(hidden_row->ensureOnDevice(device, stream_));
+
+            std::array<int, top_k> expert_ids = {};
+            std::array<float, top_k> expert_weights = {};
+            for (int route = 0; route < top_k; ++route)
+            {
+                const int slot = row * top_k + route;
+                expert_ids[static_cast<size_t>(route)] =
+                    static_cast<int>(route_indices[static_cast<size_t>(slot)]);
+                expert_weights[static_cast<size_t>(route)] =
+                    route_weights[static_cast<size_t>(slot)];
+            }
+
+            std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> gate_owned;
+            std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> up_owned;
+            std::array<llaminar2::ITensor *, top_k> gate_outputs = {};
+            std::array<llaminar2::ITensor *, top_k> up_outputs = {};
+            for (int route = 0; route < top_k; ++route)
+            {
+                gate_owned[static_cast<size_t>(route)] =
+                    llaminar2::test::TestTensorFactory::createFP32(
+                        {1u, static_cast<size_t>(intermediate)});
+                up_owned[static_cast<size_t>(route)] =
+                    llaminar2::test::TestTensorFactory::createFP32(
+                        {1u, static_cast<size_t>(intermediate)});
+                ASSERT_TRUE(gate_owned[static_cast<size_t>(route)]->ensureOnDevice(device, stream_));
+                ASSERT_TRUE(up_owned[static_cast<size_t>(route)]->ensureOnDevice(device, stream_));
+                gate_outputs[static_cast<size_t>(route)] = gate_owned[static_cast<size_t>(route)].get();
+                up_outputs[static_cast<size_t>(route)] = up_owned[static_cast<size_t>(route)].get();
+            }
+
+            auto decode_output = llaminar2::test::TestTensorFactory::createFP32(
+                {1u, static_cast<size_t>(d_model)});
+            ASSERT_TRUE(decode_output->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
+                hidden_row.get(), expert_ids.data(), gateup_table, top_k,
+                gate_outputs.data(), up_outputs.data(), d_model, intermediate));
+            ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromTable(
+                gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
+                down_table, top_k, decode_output.get(), d_model, intermediate));
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            decode_output->transitionTo(
+                llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                device);
+            std::copy(decode_output->data(),
+                      decode_output->data() + d_model,
+                      row_by_row_expected.begin() + static_cast<size_t>(row) * d_model);
+        }
+
+        auto grouped_output = llaminar2::test::TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+        ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
+            routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
+        ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
+            hidden.get(),
+            grouped_output.get(),
+            gateup_table,
+            down_table,
+            seq_len,
+            d_model,
+            intermediate,
+            num_experts,
+            top_k));
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        grouped_output->transitionTo(
+            llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE,
+            device);
+
+        expectVectorsClose(
+            std::vector<float>(grouped_output->data(),
+                               grouped_output->data() + grouped_output->numel()),
+            row_by_row_expected,
+            0.9999,
+            0.006,
+            /*row_width=*/d_model,
+            /*min_row_cosine=*/0.9998,
+            /*max_row_relative_l2=*/0.008,
+            /*max_row_kl=*/1.0e-4);
+    }
 #endif
 }
 
