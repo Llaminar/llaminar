@@ -106,28 +106,37 @@ namespace
         ASSERT_NE(routed_grouped, records.end())
             << "ROCm Qwen3.6 MoE MTP verifier should stay on the current "
             << "graph-capturable active-expert grouped prefill path for verifier "
-            << "rows while shared-expert work is owned by the safe composite "
-            << "decode-equivalent verifier stage. Falling back to rowwise decode "
+            << "rows while shared-expert work is owned by the standalone "
+            << "decode-equivalent GEMV-many verifier stage. Falling back to rowwise decode "
             << "would be a Phase 10 performance regression.\n"
             << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
-        const auto safe_composite = std::find_if(
+        const auto shared_gemv_many = std::find_if(
             records.begin(),
             records.end(),
             [&](const PerfStatRecord &record)
             {
                 return record.domain == "mtp" &&
-                       record.name == "moe_combined_decode_equivalent_verifier_prefill_rows" &&
-                       tag_equals(record, "route", "safe_composite") &&
-                       tag_equals(record, "stage", "routed_plus_shared") &&
-                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
-                       tag_equals(record, "routed_top_k", "8") &&
-                       tag_equals(record, "routed_experts", "256");
+                       record.name == "moe_shared_grouped_decode_equivalent_verifier_prefill_rows" &&
+                       tag_equals(record, "route", "gemv_many") &&
+                       tag_equals(record, "stage", "shared_expert");
             });
-        ASSERT_NE(safe_composite, records.end())
-            << "ROCm Qwen3.6 MoE MTP verifier did not run the safe composite "
-            << "routed+shared owner. The old single-table shortcut must stay "
-            << "forbidden, but the verified composite path should be active.\n"
+        ASSERT_NE(shared_gemv_many, records.end())
+            << "ROCm Qwen3.6 MoE MTP verifier did not run the standalone "
+            << "shared-expert GEMV-many verifier path.\n"
+            << PerfStatsCollector::summaryString({"kernel", "mtp"});
+
+        const auto combined = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.domain == "mtp" &&
+                       record.name == "moe_combined_decode_equivalent_verifier_prefill_rows";
+            });
+        ASSERT_EQ(combined, records.end())
+            << "ROCm Qwen3.6 MoE MTP verifier unexpectedly ran the unaccepted "
+            << "combined routed+shared owner.\n"
             << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
     }

@@ -1269,24 +1269,16 @@ namespace llaminar2
             };
 
             /*
-             * The old combined verifier represented the shared expert as one
-             * extra routed expert in the backend MoE prefill table; strict
-             * full-continuation parity rejected that math.  The current combined
-             * verifier is a safe composite owner instead: routed grouped prefill
-             * stays routed, shared expert uses decode-equivalent GEMV-many, and
-             * the normal shared gate-add kernel joins the branches.  Limit this
-             * promotion to the proven single-device GPU verifier shape.
+             * Phase 9.8 production guard: the only accepted GPU verifier route
+             * is split branch-local math.  Routed experts use the grouped MoE
+             * verifier pipeline, while the shared expert uses its standalone
+             * decode-equivalent GEMV-many path plus the normal gate/combine
+             * stage.  The combined routed+shared owner is intentionally kept out
+             * of the graph until a full-model cosine/L2/KL/max-abs proof passes;
+             * previous attempts diverged even when the component microbenches
+             * looked healthy.
              */
-            const bool can_combine_shared_verifier =
-                !use_expert_overlay &&
-                !mtp_sidecar_context &&
-                config_.compute_all_position_logits &&
-                forceGroupedSharedMoEVerifierPrefill(device) &&
-                layer.shared_expert_gate &&
-                layer.shared_expert_up &&
-                layer.shared_expert_down &&
-                layer.shared_expert_gate_inp &&
-                buffers.attn_proj;
+            const bool can_combine_shared_verifier = false;
 
             if (overlay_requested && !use_expert_overlay)
             {
@@ -1667,26 +1659,10 @@ namespace llaminar2
             }
             else
             {
-                auto expert_params = makeExpertParams(can_combine_shared_verifier ? buffers.attn_proj : moe_output,
-                                                      can_combine_shared_verifier
-                                                          ? buffers.idFor(BufferId::ATTN_PROJ)
-                                                          : buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
+                auto expert_params = makeExpertParams(moe_output,
+                                                      buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
                                                       {},
                                                       device);
-                if (can_combine_shared_verifier)
-                {
-                    expert_params.combine_shared_expert_in_verifier = true;
-                    expert_params.shared_gate_w = layer.shared_expert_gate;
-                    expert_params.shared_up_w = layer.shared_expert_up;
-                    expert_params.shared_down_w = layer.shared_expert_down;
-                    expert_params.shared_gate_inp = layer.shared_expert_gate_inp;
-                    expert_params.prepared_shared_ref_gate = preparedRefForGraphWeight(
-                        layer_bindings.shared_expert_gate, device);
-                    expert_params.prepared_shared_ref_up = preparedRefForGraphWeight(
-                        layer_bindings.shared_expert_up, device);
-                    expert_params.prepared_shared_ref_down = preparedRefForGraphWeight(
-                        layer_bindings.shared_expert_down, device);
-                }
                 if (!prepareExpertParams(expert_params, device))
                 {
                     throw std::runtime_error(
@@ -1739,8 +1715,6 @@ namespace llaminar2
                               device);
                 graph.addDependency(prefix + "moe_expert_ffn", prefix + "moe_routing");
                 ffn_terminal = prefix + "moe_expert_ffn";
-                if (can_combine_shared_verifier)
-                    shared_gate_writes_combined_output = true;
 
                 // Qwen35 MoE expert weights are normally replicated, so every rank
                 // computes the full routed-expert contribution. Only allreduce this

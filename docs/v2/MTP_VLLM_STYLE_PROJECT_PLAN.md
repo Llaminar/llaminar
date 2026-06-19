@@ -217,11 +217,10 @@ Done:
   The fixed root causes were stale singleton MoE scratch bindings across
   workspace-manager ABA and ROCm shared-expert gate wrappers reading host-only
   gate tensors without ensuring device residency on the explicit HIP stream.
-- ROCm combined routed+shared verifier grouping now handles Qwen3.6 MoE's
-  256 routed experts plus one logical shared-expert slot. The grouping kernel
-  publishes counts/offsets with a strided loop, so slot 256 is not silently
-  dropped by a 256-thread block. `V2_Integration_ROCmMoEKernel` and focused
-  ROCm Qwen3.6 MoE greedy/stochastic/all-position parity gates pass.
+- The combined routed+shared verifier owner is not a production path. It
+  previously handled the 256+1 slot shape but failed full-model strict
+  continuation checks; production now requires split routed grouped verifier
+  plus standalone shared GEMV-many verifier counters.
 - CUDA and ROCm dense/MoE stochastic verifier parity now pass on the same
   all-position state-publication path.
 - vLLM-style stochastic verification is wired into the GPU SingleDevice runner
@@ -3139,10 +3138,10 @@ Current status:
   strict metrics for the paths that remain supported. The rejected single-table
   routed+shared shortcut, its grouping kernels, workspace buffers, perf tests,
   and integration tests have been removed rather than kept as negative debt.
-  The accepted production path is a safe composite: routed experts use the
-  proven grouped verifier pipeline; the shared expert uses decode-equivalent
-  M=2/3/4 GEMV-many gate/up and SwiGLU/down projections; the normal shared-gate
-  add combines the two outputs. Sprint gate:
+  The accepted production path is split branch-local verifier math: routed
+  experts use the proven grouped verifier pipeline; the shared expert uses
+  decode-equivalent M=2/3/4 GEMV-many gate/up and SwiGLU/down projections; the
+  normal shared-gate add combines the two outputs. Sprint gate:
   `LLAMINAR_MOE_VERIFIER_PREFILL_ITERS=5 LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS=1 LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS=1 build_v2_release/tests/v2/v2_perf_moe_verifier_prefill --gtest_filter='Perf__MoEVerifierPrefill.CUDA_M1234_RoutedAndShared:Perf__MoEVerifierPrefill.CUDA_M4_CombinedRoutedSharedUpperBound:Perf__MoEVerifierPrefill.CUDA_M234_SharedExpertFFNStageDecodeEquivalent:Perf__MoEVerifierPrefill.ROCm_M1234_RoutedAndShared:Perf__MoEVerifierPrefill.ROCm_M4_CombinedRoutedSharedUpperBound:Perf__MoEVerifierPrefill.ROCm_M234_SharedExpertFFNStageDecodeEquivalent'`.
   Latest strict routed/shared component rows before the shortcut deletion had
   cosine `1.0`, relative L2 below `3e-7`, and symmetric KL `0`; CUDA routed
@@ -3527,13 +3526,12 @@ Current status:
   first drift at `MOE_SHARED_EXPERT_OUTPUT`. `SharedExpertFFNStage` now uses the
   decode-equivalent M=2..4 GEMV-many contract for shared gate/up and
   SwiGLU/down, with explicit stream and workspace ownership, while routed
-  experts keep the grouped verifier path. The attempted single-table
-  routed+shared shortcut is no longer a supported implementation: production
-  code, perf tests, and strict integration tests were excised so future work
-  cannot accidentally promote the broken prefill-style math. The current
-  combined stage instead owns the safe composite route and emits
-  `mtp.moe_combined_decode_equivalent_verifier_prefill_rows route=safe_composite`
-  when it executes. Focused gates to keep green are `V2_Integration_ROCmMoEKernel`,
+  experts keep the grouped verifier path. The attempted combined routed+shared
+  owner is not a supported production implementation: graph wiring and strict
+  integration guards reject the
+  `mtp.moe_combined_decode_equivalent_verifier_prefill_rows` counter so future
+  work cannot accidentally promote the broken full-model path. Focused gates to
+  keep green are `V2_Integration_ROCmMoEKernel`,
   the matching CUDA MoE kernel integration target when CUDA hardware is present,
   `V2_Integration_ROCmQuantisedGemmSmallM`, and `V2_Perf_MoEVerifierPrefill`.
   CUDA/ROCm grouped routed/shared kernel economics remain useful, but full-pipeline
@@ -4699,15 +4697,14 @@ Current status:
   single-table routed+shared shortcut remains hard-disabled. Focused gates
   `V2_Unit_GpuWorkspaceAllocationPolicy` and `V2_Perf_MoEVerifierPrefill` pass.
   A fresh bounded SingleDevice MoE speed refresh at
-  `benchmark_results/mtp_vllm_style/shared_expert_20260619T192043Z` shows the
-  wiring is stable but not yet speed-accepted: CUDA best greedy/stochastic rows
-  are `0.49x/0.54x` baseline and ROCm best greedy/stochastic rows are
-  `0.84x/0.78x`. Acceptance is healthy enough to optimize (`30/39` on both CUDA
-  and ROCm stochastic d3), and compact bridge waits are sub-millisecond to about
-  one millisecond in the best stochastic rows. The remaining blocker is full
-  verifier producer economics: CUDA still spends about `234 ms` in main verifier
-  graph replay on the best stochastic row, and ROCm about `200 ms`, led by MoE
-  expert/shared/router plus GDN/attention work.
+  `benchmark_results/mtp_vllm_style/20260619T231915Z-moe-stochastic-split-verifier-regression-fix`
+  shows acceptance recovered after rejecting the combined owner in production:
+  CUDA stochastic fixed d3 is `138.87 -> 75.15 tok/s` (`0.54x`) and ROCm is
+  `84.81 -> 73.32 tok/s` (`0.86x`), both at `30/39` accepted tokens. The
+  remaining blocker is full verifier producer economics: CUDA spent about
+  `539.7 ms` in verifier forward in the bounded run, while ROCm spent about
+  `307.2 ms` plus `110.1 ms` in first-sidecar prelaunch and `166.8 ms` response
+  readiness wait.
 - The stale routed-to-shared verifier graph dependency is now removed for the
   promoted standalone shared verifier route. That route uses branch-local
   GEMV-many decode-equivalent math instead of backend MoE grouped-prefill

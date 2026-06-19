@@ -4368,43 +4368,24 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
         "if (overlay_requested && !use_expert_overlay)");
     const std::string compact_combined_shared =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(combined_shared_section));
-    EXPECT_NE(compact_combined_shared.find("!use_expert_overlay"),
+    EXPECT_NE(compact_combined_shared.find("false"),
               std::string::npos)
-        << "The safe composite routed+shared verifier owner is only proven for "
-           "single-device graph execution, not ExpertOverlay.";
-    EXPECT_NE(compact_combined_shared.find("!mtp_sidecar_context"),
-              std::string::npos)
-        << "MTP sidecars need their own persistent MoE metadata before using the "
-           "main-verifier routed+shared composite owner.";
-    EXPECT_NE(compact_combined_shared.find("config_.compute_all_position_logits"),
-              std::string::npos)
-        << "The composite owner is a verifier-row optimization and must not run "
-           "during ordinary decode.";
-    EXPECT_NE(compact_combined_shared.find("forceGroupedSharedMoEVerifierPrefill(device)"),
-              std::string::npos)
-        << "The composite owner must stay tied to the same strict GPU M=2..4 "
-           "grouped-verifier policy as the standalone shared-expert path.";
-    EXPECT_NE(compact_combined_shared.find("layer.shared_expert_gate&&"
-                                           "layer.shared_expert_up&&"
-                                           "layer.shared_expert_down&&"
-                                           "layer.shared_expert_gate_inp&&"
-                                           "buffers.attn_proj"),
-              std::string::npos)
-        << "The composite owner needs all shared expert weights plus the final "
-           "routed+shared output buffer before it can replace the separate "
-           "shared-expert graph branch.";
+        << "The combined routed+shared verifier owner must remain disabled in "
+           "production until full-model cosine/L2/KL/max-abs gates prove it. "
+           "The accepted route is split routed grouped verifier plus standalone "
+           "shared-expert GEMV-many.";
 
     const auto expert_stage_section = sliceBetween(
         graph_source,
-        "auto expert_params = makeExpertParams(can_combine_shared_verifier",
+        "auto expert_params = makeExpertParams(moe_output",
         "if (!prepareExpertParams(expert_params, device))");
     const std::string compact_expert_stage =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(expert_stage_section));
-    EXPECT_NE(compact_expert_stage.find("expert_params.combine_shared_expert_in_verifier=true;"),
+    EXPECT_EQ(compact_expert_stage.find("expert_params.combine_shared_expert_in_verifier=true;"),
               std::string::npos)
-        << "The graph must explicitly ask MoEExpertComputeStage for the safe "
-           "composite routed+shared verifier owner instead of relying on a "
-           "separate shared branch.";
+        << "Do not wire the unaccepted combined routed+shared verifier owner. "
+           "It previously passed component microbenches while failing strict "
+           "full-model continuation parity.";
 
     const auto shared_stage_section = sliceBetween(
         graph_source,

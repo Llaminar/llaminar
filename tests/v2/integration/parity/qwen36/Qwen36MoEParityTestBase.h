@@ -2762,10 +2762,17 @@ namespace llaminar2::test::parity::qwen36
                 << PerfStatsCollector::summaryString({"kernel", "mtp"});
             EXPECT_TRUE(hasMTPPerfCounter(
                 records,
+                "moe_shared_grouped_decode_equivalent_verifier_prefill_rows"))
+                << "SingleDevice GPU MoE verifier must exercise the standalone "
+                   "shared-expert grouped GEMV-many verifier path alongside "
+                   "the routed grouped prefill path.\n"
+                << PerfStatsCollector::summaryString({"kernel", "mtp"});
+            EXPECT_FALSE(hasMTPPerfCounter(
+                records,
                 "moe_combined_decode_equivalent_verifier_prefill_rows"))
-                << "SingleDevice GPU MoE verifier must exercise the safe composite "
-                   "routed+shared path: routed grouped prefill plus shared "
-                   "decode-equivalent GEMV-many, not row-serial replay.\n"
+                << "The combined routed+shared verifier owner is not accepted "
+                   "for production; strict full-model continuation gates failed "
+                   "after component-only microbenches looked healthy.\n"
                 << PerfStatsCollector::summaryString({"kernel", "mtp"});
             EXPECT_FALSE(hasMTPPerfCounter(
                 records,
@@ -4769,23 +4776,32 @@ namespace llaminar2::test::parity::qwen36
             << PerfStatsCollector::summaryString({"kernel", "mtp"});
         EXPECT_GT(match->count, 0u);
 
-        const auto safe_composite = std::find_if(
+        const auto shared_gemv_many = std::find_if(
             records.begin(),
             records.end(),
             [&](const PerfStatRecord &record)
             {
                 return record.domain == "mtp" &&
-                       record.name == "moe_combined_decode_equivalent_verifier_prefill_rows" &&
-                       tag_equals(record, "route", "safe_composite") &&
-                       tag_equals(record, "stage", "routed_plus_shared") &&
-                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
-                       tag_equals(record, "routed_top_k", "8") &&
-                       tag_equals(record, "routed_experts", "256");
+                       record.name == "moe_shared_grouped_decode_equivalent_verifier_prefill_rows" &&
+                       tag_equals(record, "route", "gemv_many") &&
+                       tag_equals(record, "stage", "shared_expert");
             });
-        ASSERT_NE(safe_composite, records.end())
-            << "CUDA Qwen3.6 MoE MTP verifier did not run the safe composite "
-            << "routed+shared owner. This path must replace the old standalone "
-            << "shared branch before claiming grouped verifier economics.\n"
+        ASSERT_NE(shared_gemv_many, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier did not run the standalone "
+            << "shared-expert GEMV-many verifier path.\n"
+            << PerfStatsCollector::summaryString({"kernel", "mtp"});
+
+        const auto combined = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.domain == "mtp" &&
+                       record.name == "moe_combined_decode_equivalent_verifier_prefill_rows";
+            });
+        ASSERT_EQ(combined, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier unexpectedly ran the unaccepted "
+            << "combined routed+shared owner.\n"
             << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
     }
