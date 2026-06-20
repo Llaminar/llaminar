@@ -1017,6 +1017,7 @@ namespace
         int *__restrict__ expert_offsets,
         int *__restrict__ expert_counts,
         int *__restrict__ grouped_token_indices,
+        int *__restrict__ original_to_grouped,
         float *__restrict__ grouped_weights,
         int *__restrict__ active_expert_ids,
         int seq_len)
@@ -1031,6 +1032,7 @@ namespace
         if (idx < seq_len)
         {
             grouped_token_indices[idx] = idx;
+            original_to_grouped[idx] = idx;
             grouped_weights[idx] = 1.0f;
         }
     }
@@ -2665,6 +2667,7 @@ extern "C"
         int *expert_offsets,
         int *expert_counts,
         int *grouped_token_indices,
+        int *original_to_grouped,
         float *grouped_weights,
         int *active_expert_ids,
         int seq_len,
@@ -2673,7 +2676,8 @@ extern "C"
     {
         cudaSetDevice(device_idx);
         prepare_shared_expert_group_kernel<<<blocksFor(seq_len), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            expert_offsets, expert_counts, grouped_token_indices, grouped_weights, active_expert_ids, seq_len);
+            expert_offsets, expert_counts, grouped_token_indices, original_to_grouped,
+            grouped_weights, active_expert_ids, seq_len);
         return finishLaunch("cudaMoE_prepare_shared_expert_group");
     }
 

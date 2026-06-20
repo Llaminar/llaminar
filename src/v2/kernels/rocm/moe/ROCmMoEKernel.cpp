@@ -5322,14 +5322,24 @@ namespace llaminar2
             return false;
         }
 
-        // Zero the output buffer (pre-zero requirement for scatter-add)
+        /*
+         * The ordered scatter kernel writes every output element exactly once.
+         * Only the legacy atomic scatter fallback needs a pre-zeroed output
+         * buffer.  Keeping this branch outside the device pipeline removes one
+         * captured graph node per verifier MoE layer in the normal small-M path.
+         */
+        const bool ordered_scatter_overwrites_output =
+            active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
         hipStream_t stream = static_cast<hipStream_t>(getStream());
-        hipError_t memset_err = hipMemsetAsync(d_output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float), stream);
-        if (memset_err != hipSuccess)
+        if (!ordered_scatter_overwrites_output)
         {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] output zero failed: "
-                      << hipGetErrorString(memset_err));
-            return false;
+            hipError_t memset_err = hipMemsetAsync(d_output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float), stream);
+            if (memset_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] output zero failed: "
+                          << hipGetErrorString(memset_err));
+                return false;
+            }
         }
 
         // Call the fully-grouped pipeline (5 kernel launches, zero sync)
@@ -5341,7 +5351,7 @@ namespace llaminar2
             d_group_counts_,
             d_group_offsets_,
             d_group_token_indices_,
-            d_group_original_to_grouped_,
+            ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
             d_group_weights_,
             d_active_expert_ids,
             d_prefill_A_int8_,

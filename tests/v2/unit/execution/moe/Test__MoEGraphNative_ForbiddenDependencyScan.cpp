@@ -449,6 +449,65 @@ namespace llaminar2::test
         }();
     }
 
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, GroupedVerifierPrefillSkipsPreZeroForOrderedScatter)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path rocm_path = root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp";
+        const fs::path cuda_path = root / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp";
+        ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
+        ASSERT_TRUE(fs::exists(cuda_path)) << cuda_path;
+
+        auto functionBody = [](const std::string &contents,
+                               const std::string &start_marker,
+                               const std::string &next_marker)
+        {
+            const size_t start = contents.find(start_marker);
+            if (start == std::string::npos)
+                return std::string{};
+            const size_t end = contents.find(next_marker, start + start_marker.size());
+            return contents.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        };
+
+        const std::string rocm_body = functionBody(
+            readFile(rocm_path),
+            "bool ROCmMoEKernel::executeGroupedPrefillPipeline(",
+            "} // namespace llaminar2");
+        const std::string cuda_body = functionBody(
+            readFile(cuda_path),
+            "bool CUDAMoEKernel::executeGroupedPrefillPipeline(",
+            "bool CUDAMoEKernel::groupedExpertGateUpDecodeFromTable(");
+        ASSERT_FALSE(rocm_body.empty()) << rocm_path;
+        ASSERT_FALSE(cuda_body.empty()) << cuda_path;
+
+        for (const auto &[name, body] : std::vector<std::pair<std::string, std::string>>{
+                 {"ROCm", rocm_body},
+                 {"CUDA", cuda_body}})
+        {
+            EXPECT_NE(body.find("const bool ordered_scatter_overwrites_output"),
+                      std::string::npos)
+                << name << " grouped verifier prefill must explicitly model ordered scatter ownership";
+            EXPECT_NE(body.find("active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr"),
+                      std::string::npos)
+                << name << " ordered scatter validity must not rely on a stale workspace pointer alone";
+            EXPECT_NE(body.find("if (!ordered_scatter_overwrites_output)"),
+                      std::string::npos)
+                << name << " must only pre-zero output for the atomic scatter fallback";
+        }
+
+        const fs::path cuda_kernels_path = root / "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu";
+        ASSERT_TRUE(fs::exists(cuda_kernels_path)) << cuda_kernels_path;
+        const std::string shared_kernel = functionBody(
+            readFile(cuda_kernels_path),
+            "__global__ void prepare_shared_expert_group_kernel(",
+            "__global__ void gather_expert_fixed_kernel(");
+        ASSERT_FALSE(shared_kernel.empty()) << cuda_kernels_path;
+        EXPECT_NE(shared_kernel.find("int *__restrict__ original_to_grouped"),
+                  std::string::npos);
+        EXPECT_NE(shared_kernel.find("original_to_grouped[idx] = idx;"),
+                  std::string::npos)
+            << "CUDA shared verifier grouping must publish the same identity map ROCm uses";
+    }
+
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, LocalExpertCompactRoutingUsesInvalidPadding)
     {
         const fs::path root = findRepoRoot();

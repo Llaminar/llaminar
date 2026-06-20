@@ -1,107 +1,78 @@
 # vLLM-Style MTP Tuning Dashboard
 
 Scope: Qwen3.6 dense/MoE MTP on CUDA/ROCm/CPU across SingleDevice, LocalTP,
-LocalPP, NodeLocalTP, ExpertOverlay. Keep under 6 KB.
+LocalPP, NodeLocalTP, and ExpertOverlay. Keep under 6 KB.
 
 RAG: **G** correct and speed-positive, **A** correct but slow/stale,
-**R** failing, speed-negative, or unproven. Fresh speed rows use bounded
+**R** failing, speed-negative, or unproven. Fresh rows use bounded
 `--decode-tokens 16 --perfstats`.
 
-## Current Snapshot
+## Snapshot
 
-Dense SingleDevice CUDA is green. ROCm dense is correct but still needs a full
-speed refresh. SingleDevice MoE correctness is restored after removing the
-unaccepted combined routed+shared verifier owner from production graph wiring.
+Latest MoE run: `20260620T013557Z-moe-ordered-scatter-no-prezero`.
+The verifier grouped path is correct on CUDA/ROCm, but SingleDevice MoE MTP
+remains speed-negative. This slice removed the ordered-scatter prezero node from
+CUDA/ROCm grouped verifier prefill. It is a small/noise-positive win, not a
+phase-changing speedup.
+
 Accepted MoE verifier route: routed experts use grouped verifier; shared expert
-uses decode-equivalent GEMV-many plus normal shared-gate combine.
-
-Latest MoE stochastic fixed-d3 refresh:
-`20260620T011447Z-moe-stochastic-rocm-down-kpart`.
-Acceptance stayed at `30/39` (`76.92%`) on both GPUs. CUDA shared gate/up
-side-stream overlap remains the accepted win. A ROCm split-K down experiment
-passed strict microbench gates but did not improve full-model throughput, so it
-was not promoted. The new reset guard prevents request reset from clearing
-declared ROCm grouped verifier workspace used by captured graphs.
-
-Focused verifier FFN gates remain green. Routed M4 grouped verifier is
-`0.1062 ms` vs `9.6544 ms` row replay (`90.9x`); production
-`SharedExpertFFNStage` M=2/3/4 all-codebook gates are exact under
-cos/L2/KLD/max_abs and speed-positive (`4.5x-8.1x`).
+uses decode-equivalent GEMV-many plus normal shared-gate combine. Do not revive
+the old combined routed+shared owner without strict L2, KLD, cosine, max_abs,
+token, and continuation proof.
 
 ## Device And Topology Matrix
 
 | Mode | Device / degree | Dense greedy | Dense stoch | MoE greedy | MoE stoch | Status |
 |---|---|:---:|:---:|:---:|:---:|---|
-| SingleDevice | CPU d1 | R | R | A | A | CPU refresh paused; tests must stay symmetric |
+| SingleDevice | CPU d1 | R | R | A | A | CPU refresh paused; symmetric tests required |
 | SingleDevice | CUDA d1 | G | G | R | R | Dense green; MoE correct, speed-negative |
-| SingleDevice | ROCm d1 | A | A | A | A/R | MoE acceptance restored, still below baseline |
+| SingleDevice | ROCm d1 | A | A | A | A/R | MoE correct, still below baseline |
 | LocalTP | CUDA deg2 | R | R | R | R | Dense greedy accepts 0; stochastic unsupported |
 | LocalTP | ROCm deg2 | R | R | R | R | Fixed d1 segfaults in LocalTP allreduce |
 | LocalTP | ROCm deg4 | A | R | R | R | Preset/bench refresh pending |
 | LocalPP | CUDA stages | A | R | R | R | Correctness/bench refresh pending |
-| LocalPP | ROCm deg2 stages | R | R | R | R | Prior dense run speed-negative |
+| LocalPP | ROCm stages | R | R | R | R | Prior dense run speed-negative |
 | NodeLocalTP | CPU sockets | A | A | R | R | Skipped in latest refresh per CPU pause |
 | ExpertOverlay | GPU hot + CPU cold | A | R | A | R | Skipped in latest refresh per CPU pause |
 
-## Fresh SingleDevice MoE
+## SingleDevice Speeds
 
-| Device | Baseline | Stoch fixed d3 | Acceptance | Main blocker | RAG |
-|---|---:|---:|---:|---|:---:|
-| CUDA | `138.26 tok/s` | `88.37 tok/s` (`0.64x`) | `30/39` | verifier `445.9 ms`; graph replay `181.8 ms`; stage body `144.4 ms`; dist build `19.8 ms` | R |
-| ROCm | `83.36 tok/s` | `67.04 tok/s` (`0.80x`) | `30/39` | verifier `522.5 ms`; graph replay `198.9 ms`; stage body `168.5 ms`; dist build `58.3 ms` | A/R |
+| Lane | Baseline | MTP | Acceptance | RAG |
+|---|---:|---:|---:|:---:|
+| CUDA dense greedy | `44.46` | `74.92 tok/s` d3 (`1.69x`) | n/a | G |
+| CUDA dense stoch | `44.47` | `57.07 tok/s` d1 (`1.28x`) | n/a | G |
+| ROCm dense greedy | `31.30` | `39.79 tok/s` dyn (`1.27x`) | n/a | A |
+| ROCm dense stoch | `31.79` | `32.16 tok/s` dyn (`1.01x`) | n/a | A |
+| CUDA MoE stoch | `138.23` | `88.47 tok/s` d3 (`0.64x`) | `30/39` | R |
+| ROCm MoE stoch | `84.58` | `68.18 tok/s` d3 (`0.81x`) | `30/39` | A/R |
 
-Regression note: `20260619T230340Z-moe-verifier-stage-refresh` collapsed
-acceptance to `2/45` on both GPUs. Root cause was re-promotion of the combined
-routed+shared verifier owner despite existing strict full-model failures. The
-guard tests now require routed grouped verifier plus shared GEMV-many and assert
-that `mtp.moe_combined_decode_equivalent_verifier_prefill_rows` is absent.
+Latest MoE stage blockers:
 
-## Fresh Dense SingleDevice
+| Device | Main verifier | Stage body | Largest buckets |
+|---|---:|---:|---|
+| CUDA | `445.1 ms` | `143.9 ms` | GEMM `35.3`, routed FFN `27.2`, shared FFN `25.4` |
+| ROCm | `523.7 ms` | `167.8 ms` | routed FFN `47.7`, shared FFN `16.3`, router `15.2` |
 
-Evidence: `20260619T_dense_grouped_greedy_refresh/single_dense_gpu` and ROCm
-bridge split `20260619T_rocm_dense_greedy_bridge_split`.
+## Focused Proofs
 
-| Lane | Greedy | Stochastic | RAG |
-|---|---:|---:|:---:|
-| CUDA dense single | `44.46 -> 74.92 tok/s` (`1.69x`, d3) | `44.47 -> 57.07 tok/s` (`1.28x`, d1) | G |
-| ROCm dense single | `31.30 -> 39.79 tok/s` (`1.27x`, dyn) | `31.79 -> 32.16 tok/s` (`1.01x`, dyn) | A |
-| ROCm dense focused | fixed d3 `52.06 tok/s`, accepted `30/39` | not rerun | A |
-
-ROCm dense bridge accounting is settled: compact D2H wait was about `0.36 ms`;
-the active bottleneck is verifier producer time.
-
-## Correctness Gates
-
-- `V2_Unit_GpuWorkspaceAllocationPolicy` passed after the split-route guard.
-- `V2_Unit_MoEForbiddenDependencyScan` now guards ROCm MoE reset/workspace
-  ownership so request reset cannot drop captured grouped workspace addresses.
-- CUDA long-prompt MoE greedy parity passed after the fix:
-  `MTPBenchmarkStyleDepth3LongPromptGreedyMatchesReference`.
-- CUDA/ROCm path guards passed and now reject the combined verifier counter.
-- CUDA/ROCm `MTPStochasticSamplingVerifierRuns` passed after the fix.
-- `V2_Unit_MoERuntimeTable` proves histogram reset preserves placement banks.
-- `V2_Unit_PrefillGraphCapturability` rejects shared-gate graph capture
-  until the effective gate tensor is device-resident on the stage device.
-- `V2_Unit_MoEExpertComputeStage` now proves CUDA M=2..4 shared-expert
-  verifier rows declare side-stream GEMV partial workspace structurally.
-- Shared-expert `SharedExpertFFNStage` M=2/3/4 all-codebook gates pass on
-  CUDA/ROCm with cosine, relative L2, KLD, and max_abs checks.
-- The experimental lower-level shared-as-MoE prefill route is not accepted and
-  has been pruned from perf gates; the accepted shared route is GEMV-many via
-  production `SharedExpertFFNStage`.
+- `V2_Unit_MoEForbiddenDependencyScan` guards reset/workspace ownership,
+  rejects the old combined verifier counter, and now requires CUDA/ROCm grouped
+  prefill to skip output prezero only when ordered scatter owns all rows.
+- CUDA/ROCm routed verifier microbench passed strict cos/L2/KLD/max_abs gates.
+  ROCm M4: `0.1829 ms` graph vs `4.3160 ms` row replay. CUDA M4:
+  `0.1048 ms` graph vs `4.0157 ms` row replay.
+- CUDA/ROCm shared direct and `SharedExpertFFNStage` M=2/3/4 gates pass under
+  strict metrics; the accepted shared route is GEMV-many, not shared-as-MoE.
+- CUDA long-prompt MoE greedy parity and CUDA/ROCm stochastic verifier runs are
+  green after pruning the broken combined owner.
 - Token equality alone is not an accepted verifier parity proof.
 
 ## Next Phase 10 Moves
 
-1. Keep SingleDevice priority. CUDA/ROCm MoE MTP is correct enough to optimize
-   but not speed-accepted.
-2. Attack full MoE verifier producer economics. Latest CUDA stage buckets are
-   GEMM `35.2 ms`, routed FFN `27.8 ms`, shared FFN `25.3 ms`, GDN projection
-   `17.5 ms`; latest ROCm buckets are routed FFN `48.7 ms`, router `15.1 ms`,
-   GDN projection `13.4 ms`, attention/recurrence about `10.8 ms`.
-3. Do not revive the combined routed+shared owner without strict L2, KLD,
-   cosine, max_abs, token, and continuation proof.
-4. Prefer branch-side concurrent or fused decode-equivalent producers over graph
-   edge shuffling.
-5. After SingleDevice dense/MoE economics are healthy, return to LocalTP,
-   LocalPP, NodeLocalTP, and ExpertOverlay rows.
+1. Keep SingleDevice priority: dense first, then MoE, then LocalTP/LocalPP.
+2. Attack MoE verifier producer economics directly. ROCm routed FFN and CUDA
+   dense GEMM buckets are the next largest pieces.
+3. Prefer grouped/concurrent decode-equivalent kernels over serial row replay.
+4. Eliminate D2H/H2D bridges and graph rebuilds before polishing controllers.
+5. After each concrete win: run strict focused parity, refresh tok/s, update
+   this dashboard, and make a WiP commit.

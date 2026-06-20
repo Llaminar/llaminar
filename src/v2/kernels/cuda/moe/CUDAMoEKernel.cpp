@@ -605,6 +605,7 @@ extern "C"
         int *expert_offsets,
         int *expert_counts,
         int *grouped_token_indices,
+        int *original_to_grouped,
         float *grouped_weights,
         int *active_expert_ids,
         int seq_len,
@@ -2764,6 +2765,7 @@ namespace llaminar2
                 d_group_offsets_,
                 d_group_counts_,
                 d_group_token_indices_,
+                d_group_original_to_grouped_,
                 d_group_weights_,
                 d_group_active_expert_ids_,
                 seq_len,
@@ -2840,17 +2842,25 @@ namespace llaminar2
             return false;
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        cudaError_t err = cudaMemsetAsync(d_output, 0,
-                                          static_cast<size_t>(seq_len) * d_model * sizeof(float),
-                                          cuda_stream);
-        if (err != cudaSuccess)
+        /*
+         * Ordered scatter overwrites every output element, including the shared
+         * expert identity-map case.  Only the atomic scatter fallback needs a
+         * zeroed destination before accumulation.
+         */
+        const bool ordered_scatter_overwrites_output =
+            active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
+        if (!ordered_scatter_overwrites_output)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] output memset failed: "
-                      << cudaGetErrorString(err));
-            return false;
+            cudaError_t err = cudaMemsetAsync(d_output, 0,
+                                              static_cast<size_t>(seq_len) * d_model * sizeof(float),
+                                              cuda_stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] output memset failed: "
+                          << cudaGetErrorString(err));
+                return false;
+            }
         }
-
-        const bool shared_expert_group = prepared_num_experts_ == 1 && num_experts == 1 && top_k == 1;
 
         const bool ok = cudaMoE_grouped_prefill_pipeline(
             d_hidden,
@@ -2860,7 +2870,7 @@ namespace llaminar2
             d_group_counts_,
             d_group_offsets_,
             d_group_token_indices_,
-            shared_expert_group ? nullptr : d_group_original_to_grouped_,
+            ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
             d_active_expert_ids,
             d_group_weights_,
             d_prefill_A_int8_,
