@@ -1243,6 +1243,73 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, ForcedDecodeReplayCapturesAfterGroupe
 #endif
 }
 
+TEST_F(SharedExpertFFNPrefillGraphCapture, SessionResetPreservesForcedVerifierPrefillReadiness)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    auto expect_backend = [&](DeviceId device,
+                              bool route_supported,
+                              bool capture_supported,
+                              const char *backend_name)
+    {
+        SharedExpertFFNStage::Params params;
+        params.device_id = device;
+        params.seq_len = 4;
+        params.d_model = D_MODEL;
+        params.intermediate = INTERMEDIATE;
+        params.input = input_.get();
+        params.gate_w = gate_w.get();
+        params.up_w = up_w.get();
+        params.down_w = down_w.get();
+        params.output = output_.get();
+        params.force_grouped_verifier_prefill_for_decode = true;
+
+        SharedExpertFFNStage stage(params);
+        EXPECT_EQ(stage.usesGroupedVerifierPrefillRouteForTesting(), route_supported)
+            << backend_name << " forced verifier replay route support mismatch";
+
+        stage.setMoEKernelForTesting(&stub_kernel_);
+        stage.setScratchSeqLenForTesting(params.seq_len);
+        stage.setGroupedDecodeWarmedForTesting(true);
+        EXPECT_EQ(stage.isGraphCapturable(), capture_supported)
+            << backend_name << " forced verifier replay should capture after grouped-prefill warmup";
+
+        /**
+         * Session reset clears grouped-decode pointer-table readiness, but the
+         * forced verifier path is a grouped-prefill route. Its safety predicate
+         * is the warmed scratch capacity plus MoE kernel binding, so resetting
+         * decode state must not silently push verifier rows back to serial work.
+         */
+        stage.resetSessionState();
+        EXPECT_EQ(stage.usesGroupedVerifierPrefillRouteForTesting(), route_supported)
+            << backend_name << " reset must not change verifier route selection";
+        EXPECT_EQ(stage.isGraphCapturable(), capture_supported)
+            << backend_name << " reset must preserve warmed verifier-prefill capture readiness";
+    };
+
+#if defined(ENABLE_PIPELINE_SNAPSHOTS)
+    constexpr bool kGraphCaptureSupportedInThisBuild = false;
+#else
+    constexpr bool kGraphCaptureSupportedInThisBuild = true;
+#endif
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true, kGraphCaptureSupportedInThisBuild, "CUDA");
+#else
+    expect_backend(DeviceId::cuda(0), false, false, "CUDA");
+#endif
+
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true, kGraphCaptureSupportedInThisBuild, "ROCm");
+#else
+    expect_backend(DeviceId::rocm(0), false, false, "ROCm");
+#endif
+}
+
 TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalDecodeUsesWorkspaceBackedGroupedTableRoute)
 {
     ScopedRocmMoEFlags flags(true, true, true);
