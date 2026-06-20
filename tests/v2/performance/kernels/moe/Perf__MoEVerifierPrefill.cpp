@@ -77,6 +77,8 @@ namespace
         int d_model = 0;
         int intermediate = 0;
         double eager_ms = 0.0;
+        double prepare_ms = 0.0;
+        double pipeline_ms = 0.0;
         double graph_ms = 0.0;
         double rowwise_ms = 0.0;
         CloseMetrics metrics;
@@ -549,7 +551,7 @@ namespace
         {
             std::cout
                 << "backend,case,m,top_k,num_experts,d_model,intermediate,"
-                   "eager_ms,graph_ms,rowwise_ms,speedup_vs_reference,"
+                   "eager_ms,prepare_ms,pipeline_ms,graph_ms,rowwise_ms,speedup_vs_reference,"
                    "cosine,relative_l2,max_abs,"
                    "min_row_cosine,max_row_relative_l2,max_row_kl,"
                    "nonfinite_count,nonfinite_actual_count,nonfinite_expected_count,"
@@ -568,6 +570,8 @@ namespace
                   << result.d_model << ','
                   << result.intermediate << ','
                   << result.eager_ms << ','
+                  << result.prepare_ms << ','
+                  << result.pipeline_ms << ','
                   << result.graph_ms << ','
                   << result.rowwise_ms << ','
                   << speedup << ','
@@ -1038,23 +1042,34 @@ namespace
         EXPECT_TRUE(route_weights_tensor->ensureOnDevice(device, stream));
         EXPECT_TRUE(grouped_output->ensureOnDevice(device, stream));
 
-        auto run_grouped = [&]()
+        /**
+         * @brief Run only the device-resident route grouping half of the case.
+         *
+         * This perf split tells future tuning whether verifier time is stuck in
+         * route metadata construction or in the grouped GEMV/scatter producer.
+         */
+        auto run_prepare = [&]()
         {
             if (shared)
             {
-                if (!moe->prepareSharedExpertPrefillGroup(rows))
-                    return false;
+                return moe->prepareSharedExpertPrefillGroup(rows);
             }
-            else if (!moe->prepareExpertGroupsAsync(
-                         route_indices_tensor.get(), route_weights_tensor.get(),
-                         rows, num_experts, top_k))
-            {
-                return false;
-            }
+            return moe->prepareExpertGroupsAsync(
+                route_indices_tensor.get(), route_weights_tensor.get(),
+                rows, num_experts, top_k);
+        };
+
+        auto run_pipeline = [&]()
+        {
             return moe->executeGroupedPrefillPipeline(
                 hidden.get(), grouped_output.get(),
                 tables.gateup_table_id, tables.down_table_id,
                 rows, d_model, intermediate, num_experts, top_k);
+        };
+
+        auto run_grouped = [&]()
+        {
+            return run_prepare() && run_pipeline();
         };
 
         for (int i = 0; i < warmups; ++i)
@@ -1062,6 +1077,12 @@ namespace
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
         const double eager_ms = timeCudaEvents(stream, iterations, run_grouped);
+        EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        const double prepare_ms = timeCudaEvents(stream, iterations, run_prepare);
+        EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_TRUE(run_prepare());
+        EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        const double pipeline_ms = timeCudaEvents(stream, iterations, run_pipeline);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
         CudaGraphOwner graph;
@@ -1107,6 +1128,8 @@ namespace
             d_model,
             intermediate,
             eager_ms,
+            prepare_ms,
+            pipeline_ms,
             graph_ms,
             rowwise_ms,
             metrics};
@@ -1262,6 +1285,8 @@ namespace
             d_model,
             intermediate,
             eager_ms,
+            0.0,
+            0.0,
             graph_ms,
             serial_ms,
             metrics};

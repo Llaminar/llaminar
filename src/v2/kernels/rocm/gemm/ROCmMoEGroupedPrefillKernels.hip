@@ -780,40 +780,67 @@ void moe_grouped_gate_up_prefill_kpart_kernel(
 }
 
 /**
- * @brief Sum split-K gate/up partials into the standard grouped-prefill scratch.
+ * @brief Reduce split-K gate/up partials and quantize SwiGLU in one pass.
+ *
+ * Each lane sums the k-partitions in the same order used by the former
+ * reduce-then-quantize sequence, computes the same `silu(gate) * up` value, and
+ * then uses the same 32-lane blockwise INT8 scaling contract consumed by the
+ * down-projection kernel. Keeping this as one graph node removes one launch and
+ * the FP32 gate/up scratch round trip from verifier-sized MoE batches.
  */
-__global__ __launch_bounds__(64)
-void moe_grouped_gate_up_prefill_kpart_reduce_kernel(
+__global__ __launch_bounds__(32)
+void moe_grouped_gate_up_prefill_kpart_reduce_swiglu_quantize_kernel(
     const float* __restrict__ gate_partials,
     const float* __restrict__ up_partials,
-    float* __restrict__ gate_output,
-    float* __restrict__ up_output,
+    int8_t* __restrict__ swiglu_int8,
+    float* __restrict__ swiglu_scales,
     int total_slots,
     int N,
     int k_partitions)
 {
-    constexpr int TILE_N = 64;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    constexpr int TILE_N = 32;
+    const int lane = threadIdx.x;
+    const int quant_block = blockIdx.x;
     const int slot = blockIdx.y;
-    if (slot >= total_slots || n >= N)
+    const int n = quant_block * TILE_N + lane;
+    if (slot >= total_slots)
         return;
 
+    const bool active = n < N;
     const size_t slot_base =
         static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
+
     float gate_sum = 0.0f;
     float up_sum = 0.0f;
-    for (int k_part = 0; k_part < k_partitions; ++k_part)
+    if (active)
     {
-        const size_t idx =
-            slot_base + static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
-        gate_sum += gate_partials[idx];
-        up_sum += up_partials[idx];
+        for (int k_part = 0; k_part < k_partitions; ++k_part)
+        {
+            const size_t idx =
+                slot_base + static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
+            gate_sum += gate_partials[idx];
+            up_sum += up_partials[idx];
+        }
     }
 
-    gate_output[static_cast<size_t>(slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
-        gate_sum;
-    up_output[static_cast<size_t>(slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
-        up_sum;
+    const float value = active ? ((gate_sum / (1.0f + expf(-gate_sum))) * up_sum) : 0.0f;
+    float abs_val = fabsf(value);
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
+
+    const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
+    const int blocks_per_row = (N + TILE_N - 1) / TILE_N;
+    if (lane == 0)
+        swiglu_scales[static_cast<size_t>(slot) * static_cast<size_t>(blocks_per_row) +
+                      static_cast<size_t>(quant_block)] = scale;
+
+    if (active)
+    {
+        const float qval = value / scale;
+        swiglu_int8[static_cast<size_t>(slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
+            static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+    }
 }
 
 template <NativeVNNIFormatPrefill FMT, int TILE_M>
@@ -1613,24 +1640,15 @@ bool rocmMoE_grouped_prefill_pipeline(
 
         if (use_gateup_kpart)
         {
-            constexpr int TILE_N = 64;
+            constexpr int TILE_N = 32;
             dim3 reduce_grid((intermediate + TILE_N - 1) / TILE_N, total_slots);
             dim3 reduce_block(TILE_N);
             hipLaunchKernelGGL(
-                moe_grouped_gate_up_prefill_kpart_reduce_kernel,
+                moe_grouped_gate_up_prefill_kpart_reduce_swiglu_quantize_kernel,
                 reduce_grid, reduce_block, 0, hip_stream,
                 d_gate_partials, d_up_partials,
-                d_scratch_gate, d_scratch_up,
-                total_slots, intermediate, gateup_k_partitions);
-
-            dim3 swiglu_grid(intermediate / 32, total_slots);
-            dim3 swiglu_block(32);
-            hipLaunchKernelGGL(
-                moe_grouped_swiglu_quantize_prefill_kernel,
-                swiglu_grid, swiglu_block, 0, hip_stream,
-                d_scratch_gate, d_scratch_up,
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-                intermediate);
+                total_slots, intermediate, gateup_k_partitions);
         }
     }
 

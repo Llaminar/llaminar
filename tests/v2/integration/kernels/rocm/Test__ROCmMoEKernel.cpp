@@ -6261,7 +6261,16 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36ShapeM234MatchesRowByR
         }
     };
 
-    for (int seq_len : {2, 3, 4})
+    /**
+     * @brief Execute the grouped verifier path and compare it with serial
+     * row-by-row decode for the same rows.
+     *
+     * The lambda is intentionally reused after a workspace rebind below.  ROCm
+     * MoE keeps several grouped-verifier scratch pointers cached between calls;
+     * a workspace handoff must invalidate those pointers before any capacity
+     * check can short-circuit rebinding.
+     */
+    auto run_grouped_and_check = [&](int seq_len, const char *label)
     {
         auto hidden = make_hidden(seq_len);
         ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
@@ -6353,7 +6362,7 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36ShapeM234MatchesRowByR
 
         expectStrictVerifierSimilarity(
             ("ROCm Qwen3.6 routed-only verifier M=" + std::to_string(seq_len) +
-             " must match row-by-row decode").c_str(),
+             " (" + std::string(label) + ") must match row-by-row decode").c_str(),
             grouped_output->data(),
             row_by_row_expected.data(),
             grouped_output->numel(),
@@ -6363,7 +6372,24 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36ShapeM234MatchesRowByR
             /*min_row_cosine=*/0.99995,
             /*max_row_relative_l2=*/0.005,
             /*max_row_kl=*/1.0e-4);
+    };
+
+    for (int seq_len : {2, 3, 4})
+    {
+        run_grouped_and_check(seq_len, "initial workspace");
     }
+
+    auto rebound_workspace = bindDefaultMoEWorkspace(
+        moe_kernel,
+        /*max_seq_len=*/4,
+        d_model,
+        intermediate,
+        num_experts,
+        top_k);
+    moe_workspace.reset();
+
+    SCOPED_TRACE("ROCm grouped verifier scratch pointers must be rebound after workspace handoff");
+    run_grouped_and_check(4, "after workspace rebind");
 
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }

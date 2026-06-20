@@ -2139,36 +2139,66 @@ namespace
     }
 
     /**
-     * @brief Reduce split-K verifier-prefill gate/up partials into contiguous scratch.
+     * @brief Reduce split-K gate/up partials and quantize SwiGLU in one pass.
+     *
+     * Each lane sums k-partitions in the same order used by the former
+     * reduce-then-quantize sequence, computes the same SwiGLU value, and writes
+     * the same blockwise INT8 row layout for the down-projection kernel.  The
+     * benefit is architectural: verifier graphs avoid a launch and a global
+     * FP32 gate/up scratch round trip.
      */
-    __global__ void grouped_native_vnni_gate_up_prefill_kpart_reduce_kernel(
+    __global__ void grouped_native_vnni_gate_up_prefill_kpart_reduce_swiglu_kernel(
         const float *__restrict__ gate_partials,
         const float *__restrict__ up_partials,
-        float *__restrict__ gate_output,
-        float *__restrict__ up_output,
+        int8_t *__restrict__ swiglu_int8,
+        float *__restrict__ swiglu_scales,
         int total_slots,
         int N,
         int k_partitions)
     {
-        constexpr int kTileN = 64;
-        const int n = blockIdx.x * kTileN + threadIdx.x;
+        constexpr int kTileN = 32;
+        const int lane = threadIdx.x;
+        const int block_idx = blockIdx.x;
         const int slot = blockIdx.y;
-        if (slot >= total_slots || n >= N)
+        const int n = block_idx * kTileN + lane;
+        if (slot >= total_slots)
             return;
 
+        const bool active = n < N;
         const size_t slot_base =
             static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
+
         float gate_sum = 0.0f;
         float up_sum = 0.0f;
-        for (int k_part = 0; k_part < k_partitions; ++k_part)
+        if (active)
         {
-            const size_t idx =
-                slot_base + static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
-            gate_sum += gate_partials[idx];
-            up_sum += up_partials[idx];
+            for (int k_part = 0; k_part < k_partitions; ++k_part)
+            {
+                const size_t idx =
+                    slot_base + static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                gate_sum += gate_partials[idx];
+                up_sum += up_partials[idx];
+            }
         }
-        gate_output[static_cast<size_t>(slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] = gate_sum;
-        up_output[static_cast<size_t>(slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] = up_sum;
+
+        const float value = active ? (silu(gate_sum) * up_sum) : 0.0f;
+        float abs_value = fabsf(value);
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+
+        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        const int blocks_per_row = (N + kTileN - 1) / kTileN;
+        if (lane == 0)
+            swiglu_scales[static_cast<size_t>(slot) * static_cast<size_t>(blocks_per_row) +
+                          static_cast<size_t>(block_idx)] = scale;
+
+        if (active)
+        {
+            const float q = value / scale;
+            swiglu_int8[static_cast<size_t>(slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
+                static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+        }
     }
 
     template <uint8_t CodebookId>
@@ -3220,15 +3250,15 @@ extern "C"
 
             if (use_gateup_kpart)
             {
-                constexpr int kReduceTileN = 64;
+                constexpr int kReduceTileN = 32;
                 dim3 reduce_grid((intermediate + kReduceTileN - 1) / kReduceTileN, total_slots);
                 dim3 reduce_block(kReduceTileN);
-                grouped_native_vnni_gate_up_prefill_kpart_reduce_kernel<<<
+                grouped_native_vnni_gate_up_prefill_kpart_reduce_swiglu_kernel<<<
                     reduce_grid, reduce_block, 0, cuda_stream>>>(
                     d_gate_partials, d_up_partials,
-                    d_scratch_gate, d_scratch_up,
+                    d_scratch_swiglu_int8, d_scratch_swiglu_scales,
                     total_slots, intermediate, gateup_k_partitions);
-                if (!finishLaunch("cudaMoE_grouped_gate_up_prefill_kpart_reduce"))
+                if (!finishLaunch("cudaMoE_grouped_gate_up_prefill_kpart_reduce_swiglu"))
                     return false;
             }
 
@@ -3241,7 +3271,7 @@ extern "C"
 
         // Separate SwiGLU + blockwise-quant pass. Skipped when fusion is enabled — the fused
         // gate/up kernel already produced d_scratch_swiglu_int8 / d_scratch_swiglu_scales.
-        if (use_gateup_kpart || !llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
+        if (!use_gateup_kpart && !llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
         {
             dim3 grid(intermediate / 32, total_slots);
             dim3 block(32);

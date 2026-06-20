@@ -9,11 +9,11 @@ RAG: **G** correct and speed-positive, **A** correct but slow/stale,
 
 ## Snapshot
 
-Latest MoE run: `20260620T013557Z-moe-ordered-scatter-no-prezero`.
+Latest MoE run: `20260620T022609Z-moe-fused-gateup-reduce-swiglu`.
 The verifier grouped path is correct on CUDA/ROCm, but SingleDevice MoE MTP
-remains speed-negative. This slice removed the ordered-scatter prezero node from
-CUDA/ROCm grouped verifier prefill. It is a small/noise-positive win, not a
-phase-changing speedup.
+remains speed-negative. This slice fused split-K gate/up reduction with SwiGLU
+quantization for CUDA/ROCm verifier prefill. It removed one graph node and moved
+tok/s slightly, but not enough to change the phase status.
 
 Accepted MoE verifier route: routed experts use grouped verifier; shared expert
 uses decode-equivalent GEMV-many plus normal shared-gate combine. Do not revive
@@ -43,15 +43,15 @@ token, and continuation proof.
 | CUDA dense stoch | `44.47` | `57.07 tok/s` d1 (`1.28x`) | n/a | G |
 | ROCm dense greedy | `31.30` | `39.79 tok/s` dyn (`1.27x`) | n/a | A |
 | ROCm dense stoch | `31.79` | `32.16 tok/s` dyn (`1.01x`) | n/a | A |
-| CUDA MoE stoch | `138.23` | `88.47 tok/s` d3 (`0.64x`) | `30/39` | R |
-| ROCm MoE stoch | `84.58` | `68.18 tok/s` d3 (`0.81x`) | `30/39` | A/R |
+| CUDA MoE stoch | `139.29` | `89.36 tok/s` d3 (`0.64x`) | `30/39` | R |
+| ROCm MoE stoch | `84.46` | `69.00 tok/s` d3 (`0.82x`) | `30/39` | A/R |
 
 Latest MoE stage blockers:
 
 | Device | Main verifier | Stage body | Largest buckets |
 |---|---:|---:|---|
-| CUDA | `445.1 ms` | `143.9 ms` | GEMM `35.3`, routed FFN `27.2`, shared FFN `25.4` |
-| ROCm | `523.7 ms` | `167.8 ms` | routed FFN `47.7`, shared FFN `16.3`, router `15.2` |
+| CUDA | `440.4 ms` | `142.4 ms` | routed FFN `26.4`, GDN proj `17.6`, router `7.1` |
+| ROCm | `516.7 ms` | `167.1 ms` | routed FFN `47.1`, shared FFN `16.2`, router `15.2` |
 
 ## Focused Proofs
 
@@ -59,8 +59,10 @@ Latest MoE stage blockers:
   rejects the old combined verifier counter, and now requires CUDA/ROCm grouped
   prefill to skip output prezero only when ordered scatter owns all rows.
 - CUDA/ROCm routed verifier microbench passed strict cos/L2/KLD/max_abs gates.
-  ROCm M4: `0.1829 ms` graph vs `4.3160 ms` row replay. CUDA M4:
-  `0.1048 ms` graph vs `4.0157 ms` row replay.
+  ROCm M4: `0.1778 ms` graph vs `4.7366 ms` row replay. CUDA M4:
+  `0.1035 ms` graph vs `9.8135 ms` row replay.
+- ROCm verifier workspace handoff regression reruns M4 after workspace rebind
+  and reset; this guards stale cached workspace-backed pointers.
 - CUDA/ROCm shared direct and `SharedExpertFFNStage` M=2/3/4 gates pass under
   strict metrics; the accepted shared route is GEMV-many, not shared-as-MoE.
 - CUDA long-prompt MoE greedy parity and CUDA/ROCm stochastic verifier runs are
