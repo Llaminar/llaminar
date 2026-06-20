@@ -3272,6 +3272,20 @@ namespace llaminar2
         }
     }
 
+    void DeviceGraphOrchestrator::recordKernelDynamicStatePreservedForCapturedReplay(
+        const char *reason) const
+    {
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "kernel_dynamic_state_preserved_for_captured_replay",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            PerfStatsCollector::Tags{
+                {"reason", reason ? reason : "unknown"},
+                {"scope", "request_boundary"}});
+    }
+
     bool DeviceGraphOrchestrator::hasValidCachedGraph(int layer_idx, bool is_attention) const
     {
         if (!cache_config_.enabled)
@@ -14567,7 +14581,9 @@ namespace llaminar2
             livePrefixMutationReasonName(reason)};
     }
 
-    void DeviceGraphOrchestrator::recordLivePrefixSessionReset(const char *operation)
+    void DeviceGraphOrchestrator::recordLivePrefixSessionReset(
+        const char *operation,
+        bool preserve_gpu_replay_state)
     {
         clearPendingAllPositionVerifierStateReady();
         clearPendingAcceptedSpecPublicationReady();
@@ -14587,10 +14603,22 @@ namespace llaminar2
             tags["model"] = "moe";
             tags["moe_placement_epoch"] = std::to_string(moePlacementEpoch());
         }
-        tags["forward_replay_reset_scope"] = "session";
-        tags["replay_state"] = "reset";
-        tags["sidecar_replay_state"] = "reset";
-        tags["kernel_dynamic_state"] = "reset";
+        if (preserve_gpu_replay_state)
+        {
+            tags["forward_replay_reset_scope"] = "request_boundary_preserve";
+            tags["replay_state"] = "preserved";
+            tags["sidecar_replay_state"] = "preserved";
+            tags["kernel_dynamic_state"] = "preserved";
+            tags["gpu_replay_preserve_reason"] =
+                operation ? operation : "session_reset";
+        }
+        else
+        {
+            tags["forward_replay_reset_scope"] = "session";
+            tags["replay_state"] = "reset";
+            tags["sidecar_replay_state"] = "reset";
+            tags["kernel_dynamic_state"] = "reset";
+        }
         PerfStatsCollector::addCounter("mtp",
                                        "live_prefix_replay_state_after_mutation",
                                        1.0,
@@ -20871,6 +20899,114 @@ namespace llaminar2
         {
             graph_builder_->setPreparedWeightStore(prepared_weight_store_.get());
         }
+
+        if (!prepareMTPMoEExpertSlabs(device))
+        {
+            throw std::runtime_error(
+                "[DGO] Failed to prepare MTP MoE expert slabs before host weight release");
+        }
+    }
+
+    bool DeviceGraphOrchestrator::prepareMTPMoEExpertSlabs(DeviceId device)
+    {
+        if (!device.is_cpu())
+            return true;
+        if (!prepared_weight_store_ || !frozen_weight_set_ || !graph_builder_)
+            return true;
+
+        const auto bindings = makeModelWeightBindings(*frozen_weight_set_);
+        if (bindings.mtp.empty() || bindings.mtp.depths.empty())
+            return true;
+
+        const GraphConfig &cfg = graph_builder_->config();
+        int prepared_depths = 0;
+
+        for (const auto &depth : bindings.mtp.depths)
+        {
+            const bool has_any_moe_weight =
+                depth.fa_block.moe_gate ||
+                depth.fa_block.moe_gate_exps ||
+                depth.fa_block.moe_up_exps ||
+                depth.fa_block.moe_down_exps;
+            if (!has_any_moe_weight)
+                continue;
+
+            TensorBase *gate_exps = legacyTensor(depth.fa_block.moe_gate_exps);
+            TensorBase *up_exps = legacyTensor(depth.fa_block.moe_up_exps);
+            TensorBase *down_exps = legacyTensor(depth.fa_block.moe_down_exps);
+            if (!gate_exps || !up_exps || !down_exps)
+            {
+                LOG_ERROR("[DGO] MTP depth " << depth.depth_index
+                                             << " has partial MoE expert tensor bindings; refusing lazy raw fallback");
+                return false;
+            }
+
+            const auto &shape = gate_exps->shape();
+            if (shape.size() != 3 || shape[1] == 0)
+            {
+                LOG_ERROR("[DGO] MTP depth " << depth.depth_index
+                                             << " MoE gate expert tensor must be 3D [cols, rows, experts]");
+                return false;
+            }
+
+            MoEExpertComputeStage::Params params;
+            params.device_id = device;
+            params.num_experts = cfg.moe.num_experts;
+            params.top_k = cfg.moe.top_k;
+            params.d_model = cfg.d_model;
+            params.expert_intermediate = cfg.moe.intermediate_size > 0
+                                             ? cfg.moe.intermediate_size
+                                             : static_cast<int>(shape[1]);
+            params.layer_idx = depth.source_layer_index >= 0
+                                   ? depth.source_layer_index
+                                   : cfg.n_layers + depth.depth_index;
+            params.gate_exps = gate_exps;
+            params.up_exps = up_exps;
+            params.down_exps = down_exps;
+            params.prepared_store = prepared_weight_store_.get();
+
+            if (cfg.moe.expert_mode == MoEExpertMode::ExpertParallel)
+            {
+                params.local_expert_start = cfg.moe.local_expert_start;
+                params.local_expert_count = cfg.moe.local_expert_count;
+                if (params.local_expert_count >= 0)
+                {
+                    params.expert_mask.assign(cfg.moe.num_experts, false);
+                    const int start = std::max(0, params.local_expert_start);
+                    const int end = std::min(cfg.moe.num_experts,
+                                             start + params.local_expert_count);
+                    for (int expert = start; expert < end; ++expert)
+                        params.expert_mask[static_cast<size_t>(expert)] = true;
+                }
+            }
+
+            if (!MoEExpertComputeStage::extractExpertViews(params) ||
+                !MoEExpertComputeStage::prepareExpertGemmEngines(params))
+            {
+                LOG_ERROR("[DGO] Failed to prepare MTP MoE expert slabs for depth "
+                          << depth.depth_index << " source_layer=" << params.layer_idx
+                          << " on " << device.to_string());
+                return false;
+            }
+
+            ++prepared_depths;
+        }
+
+        if (prepared_depths > 0)
+        {
+            LOG_DEBUG("[DGO] Prepared " << prepared_depths
+                                        << " MTP MoE expert slab set(s) for "
+                                        << device.to_string()
+                                        << " before host raw weight release");
+            PerfStatsCollector::addCounter(
+                "weight_loading",
+                "mtp_moe_expert_slab_preparations",
+                static_cast<double>(prepared_depths),
+                "load",
+                device.to_string());
+        }
+
+        return true;
     }
 
     void DeviceGraphOrchestrator::applyExpertMasks(

@@ -1109,6 +1109,88 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ClearCacheDropsStochasticDistributionSl
         "clear_cache() must fully empty stochastic distribution slots before ready-event cleanup.");
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, ClearCachePreservesReplaySafeMTPGraphCaptures)
+{
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto clear_cache_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        header,
+        "void clear_cache() override",
+        "/**\n         * @brief Get current position")));
+
+    /*
+     * Request boundaries should clear live KV/GDN/session state without forcing
+     * every production request to pay GPU graph warmup/capture again.  Forward
+     * engine policy still resets prefill and live-state-versioned multi-row
+     * decode captures; this guard makes sure clear_cache() opts into preserving
+     * the replay-safe single-token decode and all-position verifier classes.
+     */
+    EXPECT_NE(clear_cache_body.find(
+                  "forward_engine_->resetSessionReplayState(true);"),
+              std::string::npos)
+        << "clear_cache() must preserve replay-safe segmented forward captures.";
+    EXPECT_NE(clear_cache_body.find(
+                  "mtp_sidecar_depth0_cache_.resetSessionStatePreservingSegmentedReplay();"),
+              std::string::npos)
+        << "The ordinary MTP sidecar cache should stay replay-hot across requests.";
+    EXPECT_NE(clear_cache_body.find(
+                  "mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingSegmentedReplay();"),
+              std::string::npos)
+        << "Device-token sidecar replay is the served stochastic path and must not recapture every request.";
+    EXPECT_NE(clear_cache_body.find(
+                  "cache.resetSessionStatePreservingSegmentedReplay();"),
+              std::string::npos)
+        << "Batched KV-only sidecar caches must use the same replay-preserving request reset.";
+    EXPECT_EQ(clear_cache_body.find(
+                  "mtp_sidecar_depth0_cache_.resetSessionState();"),
+              std::string::npos)
+        << "The request boundary must not use the replay-dropping sidecar reset for the hot path.";
+    EXPECT_EQ(clear_cache_body.find("resetKernelDynamicState();"),
+              std::string::npos)
+        << "clear_cache() preserves captured replay-safe GPU graphs, so it must not wipe "
+           "kernel-owned dynamic pointer tables captured by those executables.";
+    EXPECT_NE(clear_cache_body.find(
+                  "recordKernelDynamicStatePreservedForCapturedReplay("),
+              std::string::npos)
+        << "Request-boundary kernel-state preservation must remain visible in perf counters.";
+    const auto clear_cache_body_with_strings = removeAsciiWhitespace(sliceBetween(
+        header,
+        "void clear_cache() override",
+        "/**\n         * @brief Get current position"));
+    EXPECT_NE(clear_cache_body_with_strings.find(
+                  "recordLivePrefixSessionReset(\"clear_cache\","),
+              std::string::npos)
+        << "Live-prefix request-boundary telemetry must report replay/kernel "
+           "state as preserved, not as a hard session reset.";
+    EXPECT_NE(clear_cache_body_with_strings.find("/*preserve_gpu_replay_state=*/true"),
+              std::string::npos);
+
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto record_reset_body = removeAsciiWhitespace(sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::recordLivePrefixSessionReset(",
+        "void DeviceGraphOrchestrator::resetMTPSidecarDepth0ReplayState()"));
+    EXPECT_NE(record_reset_body.find("if(preserve_gpu_replay_state)"),
+              std::string::npos);
+    EXPECT_NE(record_reset_body.find("request_boundary_preserve"),
+              std::string::npos)
+        << "Request-boundary reset perf counters should explain why replay stayed hot.";
+    EXPECT_NE(record_reset_body.find("tags[\"kernel_dynamic_state\"]=\"preserved\";"),
+              std::string::npos);
+    EXPECT_NE(record_reset_body.find("tags[\"kernel_dynamic_state\"]=\"reset\";"),
+              std::string::npos)
+        << "Hard inference-state clears still need reset telemetry.";
+
+    const auto clear_inference_body = removeAsciiWhitespace(sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::clearInferenceState()",
+        "// ========================================================================="));
+    EXPECT_NE(clear_inference_body.find("recordLivePrefixSessionReset(\"clearInferenceState\")"),
+              std::string::npos)
+        << "clearInferenceState() is still a hard state reset.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, DeviceResidentShiftedMTPHostAdoptionAllowsTruncation)
 {
     const auto source =
@@ -3638,6 +3720,55 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMTPSidecarUsesPersistentDepthScopedM
            "main-state preservation and shifted-row reuse.";
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEDeviceRoutedDecodeTableRequiresFullExpertOwnership)
+{
+    const auto graph_source =
+        readFile(repoRoot() / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp");
+    const auto ffn_body = sliceBetween(
+        graph_source,
+        "ComputeGraph Qwen35MoEGraph::buildFFNGraph(",
+        "// =====================================================================\n"
+        "        // Stage 1: Pre-FFN RMSNorm");
+    const std::string compact =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(ffn_body));
+
+    EXPECT_NE(compact.find("has_static_full_local_expert_ownership"),
+              std::string::npos)
+        << "The one-token device-routed MoE runtime table is a full local "
+           "expert ownership contract. LocalTP sharded experts must not receive "
+           "that table until a sharded runtime table/reducer is implemented.";
+    EXPECT_NE(compact.find("local_count!=config_.moe.num_experts"),
+              std::string::npos)
+        << "Partial ExpertParallel ranges must use the mask/range + allreduce "
+           "path instead of the single-device full-owner runtime table.";
+    EXPECT_NE(compact.find("debugEnv().moe_rebalance.gpu_cache_experts_per_layer>0"),
+              std::string::npos)
+        << "GPU expert-cache bootstrap masks also break full-owner runtime-table "
+           "semantics and must keep decode capture disabled.";
+    EXPECT_NE(compact.find("&&static_full_local_expert_ownership)"),
+              std::string::npos)
+        << "Runtime-table creation must be gated before MoERoutingStage and "
+           "MoEExpertComputeStage are built; failing later in the expert stage "
+           "turns E2E requests into parse errors instead of policy counters.";
+    const std::string compact_graph =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(graph_source));
+    EXPECT_NE(compact_graph.find("route_params.allow_eager_gpu_single_row_route_for_partial_expert_owner=allow_eager_partial_owner_gpu_route"),
+              std::string::npos)
+        << "The temporary partial-owner LocalTP route path must stay explicit "
+           "at the graph-builder boundary.";
+
+    const auto routing_source =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/MoERoutingStage.cpp");
+    const std::string compact_routing =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(routing_source));
+    EXPECT_NE(compact_routing.find("params_.allow_eager_gpu_single_row_route_for_partial_expert_owner"),
+              std::string::npos);
+    EXPECT_NE(compact_routing.find("if(isGraphCaptureActive())"),
+              std::string::npos)
+        << "Partial-owner routeWithTensors is a correctness bridge for eager "
+           "TP execution only; graph capture must remain fail-closed.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, ProductionGpuMoERoutingRejectsHostTopKFallback)
 {
     const auto source =
@@ -3935,6 +4066,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GDNDeinterleaveScratchUsesBoundWorkspac
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDAFlashAttentionDecodePartialsUseWorkspace)
 {
+    const auto kernel_header =
+        readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.h");
     const auto kernel_source =
         readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp");
     const auto allocation_body = sliceBetween(
@@ -3946,6 +4079,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDAFlashAttentionDecodePartialsUseWork
     EXPECT_NE(allocation_body.find("Flash decode requires bound graph workspace"), std::string::npos);
     EXPECT_NE(allocation_body.find("getBuffer(AttentionWorkspaceBuffers::PARTIAL_OUTPUT)"), std::string::npos);
     EXPECT_NE(allocation_body.find("getBufferSize(AttentionWorkspaceBuffers::PARTIAL_OUTPUT)"), std::string::npos);
+
+    const auto attention_wrapper_source = kernel_header + kernel_source;
+    EXPECT_EQ(attention_wrapper_source.find("cudaMallocHost("), std::string::npos)
+        << "Attention param staging is request-local metadata; it must use fixed "
+           "host storage and upload into the workspace-owned DEVICE_PARAMS buffer.";
+    EXPECT_EQ(attention_wrapper_source.find("cudaFreeHost("), std::string::npos)
+        << "Attention param staging should not own pinned host allocations.";
+    EXPECT_NE(kernel_header.find("std::array<attention::AttentionDeviceParams"), std::string::npos)
+        << "The small-M attention param rows should stay in bounded member storage.";
+    EXPECT_NE(kernel_source.find("getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS)"), std::string::npos)
+        << "The CUDA graph-visible attention params must remain workspace-backed.";
 
     const auto cuda_kernel_source =
         readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
@@ -4536,6 +4680,58 @@ TEST(Test__GpuWorkspaceAllocationPolicy, VerifierStateBatchRestoreHasHardFailCon
                   .find("params_.kernel->restoreVerifierStateCaptureRowsFromDeviceIndices("),
               std::string::npos)
         << "The short-conv stage hook should delegate to the backend batch contract.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, PrefillReplayStagesPreserveCapturedResetState)
+{
+    const auto attention_header =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/AttentionComputeStage.h");
+    const auto embedding_header =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/EmbeddingStage.h");
+    const auto rope_header =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/RoPEStage.h");
+    const auto kv_append_header =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/KVCacheAppendStage.h");
+    const auto gdn_header =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/GDNRecurrenceStage.h");
+    const auto shortconv_header =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/ShortConv1dStage.h");
+    const auto moe_routing_header =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/MoERoutingStage.h");
+    const auto moe_expert_header =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.h");
+
+    const std::vector<std::pair<std::string, std::string>> headers = {
+        {"AttentionComputeStage", attention_header},
+        {"EmbeddingStage", embedding_header},
+        {"RoPEStage", rope_header},
+        {"KVCacheAppendStage", kv_append_header},
+        {"GDNRecurrenceStage", gdn_header},
+        {"ShortConv1dStage", shortconv_header},
+        {"MoERoutingStage", moe_routing_header},
+        {"SharedExpertGateStage", moe_expert_header},
+    };
+
+    for (const auto &[name, source] : headers)
+    {
+        EXPECT_NE(source.find("resetSessionStatePreservingCapturedReplay"),
+                  std::string::npos)
+            << name << " must not fall back to resetSessionState() when a "
+            << "Ready bucketed prefill graph is intentionally preserved.";
+        EXPECT_NE(source.find("resetSessionStatePreservingLazyInitialization"),
+                  std::string::npos)
+            << name << " must keep warmup-created resources alive when an "
+            << "Initialized bucket is captured after clear_cache().";
+    }
+
+    EXPECT_NE(attention_header.find("must not call resetDynamicState()"),
+              std::string::npos)
+        << "Attention reset comments should document why captured device-param "
+           "storage survives request reset.";
+    EXPECT_NE(gdn_header.find("Do not clear the verifier workspace binding"),
+              std::string::npos)
+        << "GDN reset comments should document why captured verifier-state "
+           "workspace identities survive request reset.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPCatchupUsesOneGraphLifecycleContext)

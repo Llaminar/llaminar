@@ -787,10 +787,33 @@ __global__ void rocm_moe_softmax_topk_kernel(
     int *__restrict__ expert_indices,       // [seq_len * top_k] OUT
     float *__restrict__ expert_weights,     // [seq_len * top_k] OUT
     int seq_len, int num_experts, int top_k,
-    bool normalize_weights)
+    bool normalize_weights,
+    const int *__restrict__ effective_seq_len_ptr)
 {
     const int token = blockIdx.x;
     if (token >= seq_len) return;
+
+    int effective_seq_len = seq_len;
+    if (effective_seq_len_ptr)
+    {
+        const int raw_effective = *effective_seq_len_ptr;
+        effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+    }
+    if (token >= effective_seq_len)
+    {
+        if (threadIdx.x == 0)
+        {
+            for (int k = 0; k < top_k; ++k)
+            {
+                const size_t out = static_cast<size_t>(token) * top_k + k;
+                expert_indices[out] = -1;
+                expert_weights[out] = 0.0f;
+            }
+        }
+        for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+            logits[static_cast<size_t>(token) * num_experts + e] = 0.0f;
+        return;
+    }
 
     float *row = logits + token * num_experts;
     __shared__ float values[kDeviceMoEMaxExperts];
@@ -1607,16 +1630,34 @@ __global__ void rocm_moe_shared_expert_gate_dot_kernel(
     }
 }
 
+__device__ __forceinline__ int rocm_moe_clamp_effective_seq_len(
+    int seq_len,
+    const int *__restrict__ device_effective_seq_len)
+{
+    if (!device_effective_seq_len)
+        return seq_len;
+    const int raw = *device_effective_seq_len;
+    return raw < 0 ? 0 : (raw > seq_len ? seq_len : raw);
+}
+
 __global__ void rocm_moe_shared_expert_gate_scale_kernel(
     float *__restrict__ shared_output,      // [seq_len, d_model]
     const float *__restrict__ gate_values,  // [seq_len]
-    int seq_len, int d_model)
+    int seq_len, int d_model,
+    const int *__restrict__ device_effective_seq_len = nullptr)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = seq_len * d_model;
     if (idx >= total) return;
 
     const int token = idx / d_model;
+    const int effective_seq_len =
+        rocm_moe_clamp_effective_seq_len(seq_len, device_effective_seq_len);
+    if (token >= effective_seq_len)
+    {
+        shared_output[idx] = 0.0f;
+        return;
+    }
     shared_output[idx] *= gate_values[token];
 }
 
@@ -1665,12 +1706,24 @@ __global__ void rocm_moe_shared_expert_gate_add_kernel(
     float *__restrict__ shared_output,          // [seq_len, d_model]
     const float *__restrict__ routed_residual,  // [seq_len, d_model]
     float *__restrict__ combined_output,        // [seq_len, d_model]
-    int seq_len, int d_model)
+    int seq_len, int d_model,
+    const int *__restrict__ device_effective_seq_len = nullptr)
 {
     const int token = blockIdx.x;
     if (token >= seq_len) return;
 
     const size_t row_offset = static_cast<size_t>(token) * d_model;
+    const int effective_seq_len =
+        rocm_moe_clamp_effective_seq_len(seq_len, device_effective_seq_len);
+    if (token >= effective_seq_len)
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        {
+            shared_output[row_offset + i] = 0.0f;
+            combined_output[row_offset + i] = 0.0f;
+        }
+        return;
+    }
     const float *x = input + row_offset;
 
     float sum = 0.0f;
@@ -2166,7 +2219,8 @@ bool hipMoE_softmax_topk(
     int *expert_indices, float *expert_weights,
     int seq_len, int num_experts, int top_k,
     bool normalize_weights,
-    int device_idx, void *stream)
+    int device_idx, void *stream,
+    const int *device_effective_seq_len)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
@@ -2184,7 +2238,8 @@ bool hipMoE_softmax_topk(
     hipLaunchKernelGGL(rocm_moe_softmax_topk_kernel,
         dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
         logits, expert_indices, expert_weights,
-        seq_len, num_experts, top_k, normalize_weights);
+        seq_len, num_experts, top_k, normalize_weights,
+        device_effective_seq_len);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -2508,6 +2563,51 @@ bool hipMoE_shared_expert_gate(
     return true;
 }
 
+bool hipMoE_shared_expert_gate_effective_seq_len(
+    const float *input, const float *gate_inp,
+    float *shared_output, float *gate_scratch,
+    int seq_len, int d_model,
+    const int *device_effective_seq_len,
+    int device_idx, void *stream)
+{
+    if (!input || !gate_inp || !shared_output || !gate_scratch ||
+        !device_effective_seq_len || seq_len <= 0 || d_model <= 0 || !stream)
+    {
+        fprintf(stderr, "HIP MoE shared_expert_gate_effective_seq_len invalid args\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_shared_expert_gate_dot_kernel,
+        dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        input, gate_inp, gate_scratch, seq_len, d_model);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE shared_expert_gate_effective_seq_len dot kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    const int total = seq_len * d_model;
+    const int blocks = (total + threads - 1) / threads;
+    hipLaunchKernelGGL(rocm_moe_shared_expert_gate_scale_kernel,
+        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        shared_output, gate_scratch, seq_len, d_model, device_effective_seq_len);
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE shared_expert_gate_effective_seq_len scale kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    return true;
+}
+
 bool hipMoE_shared_expert_gate_decode_fused(
     const float *input, const float *gate_inp,
     float *shared_output, int d_model,
@@ -2564,6 +2664,41 @@ bool hipMoE_shared_expert_gate_add(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE shared_expert_gate_add kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    return true;
+}
+
+bool hipMoE_shared_expert_gate_add_effective_seq_len(
+    const float *input, const float *gate_inp,
+    float *shared_output, const float *routed_residual,
+    float *combined_output, int seq_len, int d_model,
+    const int *device_effective_seq_len,
+    int device_idx, void *stream)
+{
+    if (!input || !gate_inp || !shared_output || !routed_residual ||
+        !combined_output || !device_effective_seq_len ||
+        seq_len <= 0 || d_model <= 0 || !stream)
+    {
+        fprintf(stderr, "HIP MoE shared_expert_gate_add_effective_seq_len invalid args\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_shared_expert_gate_add_kernel,
+        dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        input, gate_inp, shared_output, routed_residual, combined_output,
+        seq_len, d_model, device_effective_seq_len);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE shared_expert_gate_add_effective_seq_len kernel launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }

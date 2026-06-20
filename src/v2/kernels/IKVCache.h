@@ -604,6 +604,20 @@ namespace llaminar2
         virtual bool isGraphCaptureReady() const { return false; }
 
         /**
+         * @brief Whether setDynamicAppendState() is a real backend capability.
+         *
+         * Graph-captured GPU append stages need device-side metadata mailboxes
+         * for the current ring head, cached-token count, and padded-prefill
+         * real append count. CPU caches and other host-only implementations
+         * must keep the default false value so generic cached-graph plumbing
+         * does not call the GPU-only update path and report a false hard
+         * failure. Returning true is a promise that setDynamicAppendState()
+         * is implemented and should fail loudly if a required upload cannot
+         * be performed on the explicit stream.
+         */
+        virtual bool supportsDynamicAppendState() const { return false; }
+
+        /**
          * @brief Prepare current head position in a device buffer for graph replay
          *
          * Implementations upload the current ring buffer head position to a
@@ -620,6 +634,32 @@ namespace llaminar2
             (void)layer;
             (void)seq_idx;
             (void)gpu_stream;
+        }
+
+        /**
+         * @brief Prepare device-side KV append metadata for graph replay.
+         *
+         * Padded prefill graph buckets record a fixed-size append kernel so the
+         * graph can be reused for nearby prompt lengths.  The cache metadata,
+         * however, must advance by the real prompt length rather than the bucket
+         * length.  GPU caches override this method to upload both the current
+         * ring head/count and an optional real append count to explicit-stream
+         * device scalars before graph capture/replay.
+         *
+         * @param layer Layer index
+         * @param seq_idx Sequence index
+         * @param append_tokens Real tokens appended by this replay.  A value
+         *        less than or equal to zero means "use the captured append
+         *        kernel's token count", which preserves legacy exact-shape
+         *        decode behavior.
+         * @param gpu_stream Explicit GPU stream for the pre-capture upload
+         * @return true when the backend accepted the dynamic append state
+         */
+        virtual bool setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream)
+        {
+            (void)append_tokens;
+            setDynamicHead(layer, seq_idx, gpu_stream);
+            return false;
         }
 
         /**

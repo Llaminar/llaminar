@@ -9,6 +9,7 @@
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
 #include "../../../memory/BufferId.h"
+#include "../../../utils/Logger.h"
 
 #include <optional>
 #include <memory>
@@ -99,7 +100,10 @@ namespace llaminar2
         {
             return params_.kv_cache && params_.kv_cache->isGraphCaptureReady();
         }
-        bool hasDynamicParams() const override { return true; }
+        bool hasDynamicParams() const override
+        {
+            return params_.kv_cache && params_.kv_cache->supportsDynamicAppendState();
+        }
         bool supportsDeviceResidentDynamicPositionReplay() const override
         {
             return true;
@@ -108,15 +112,24 @@ namespace llaminar2
         {
             (void)pos_offset;
             params_.seq_len = seq_len;
-            if (params_.kv_cache)
+            if (params_.kv_cache && params_.kv_cache->supportsDynamicAppendState())
             {
-                // Upload current head position to the graph-owned device scalar.
-                // NOTE: Do NOT advanceHead here — that happens in onGraphReplayed()
-                // after the graph launches. This preserves the invariant that
-                // get_cached_tokens() returns the previous step's count when
-                // AttentionComputeStage::updateDynamicParams() reads it.
+                // Upload current ring state and the real append length to
+                // graph-owned device scalars. Padded prefill buckets keep a
+                // bucket-shaped kernel for reuse, but sequence metadata must
+                // advance by the real prompt length so padding never becomes
+                // visible cache state.
                 void *stream = gpuStream();
-                params_.kv_cache->setDynamicHead(params_.layer_idx, params_.seq_idx, stream);
+                int append_tokens = params_.seq_len > 0 ? params_.seq_len : params_.num_tokens;
+                if (params_.batch_size <= 1 && replay_advance_tokens_ > 0)
+                {
+                    append_tokens = replay_advance_tokens_;
+                }
+                if (!params_.kv_cache->setDynamicAppendState(
+                        params_.layer_idx, params_.seq_idx, append_tokens, stream))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] KV cache refused dynamic append state for graph replay");
+                }
             }
         }
         bool hasPrefillReplayParams() const override { return true; }
@@ -150,6 +163,25 @@ namespace llaminar2
             debug_append_source_k_cols_ = 0;
             debug_append_source_v_rows_ = 0;
             debug_append_source_v_cols_ = 0;
+        }
+        /**
+         * @brief Clear host-side append bookkeeping for preserved graph replay.
+         *
+         * The captured append kernel reads stable tensor/cache pointers, while
+         * replay_advance_tokens_ is restamped from PrefillReplayParams before
+         * each launch. Normal request bookkeeping can therefore be cleared
+         * without discarding the preserved prefill executable.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            resetSessionState();
+        }
+        /**
+         * @brief Keep append topology warm for capture-from-Initialized.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionState();
         }
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         StageBufferRequirements getBufferRequirements() const override;

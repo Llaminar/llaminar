@@ -821,6 +821,47 @@ TEST(Test__ForwardGraphCache, MarkReplayStateSafeForLiveEpochStampsPreservedCapt
     EXPECT_FALSE(cache.segment_cache.needs_capture);
 }
 
+TEST(Test__ForwardGraphCache, RequestResetPreservesSegmentedReplayAndDemotesWarmupPrefill)
+{
+    ForwardGraphCache cache;
+    cache.segment_cache.initialized = true;
+    cache.segment_cache.needs_capture = false;
+    cache.segment_cache.decode_step = 9;
+    cache.gpu_stream_applied = true;
+    cache.applied_stream = reinterpret_cast<void *>(0x4321);
+    cache.gpu_graph_update_failures = 2;
+    cache.phase3_active = true;
+    cache.segmented_capture_live_state_epoch = 17;
+
+    PrefillGraphConfig prefill_config;
+    prefill_config.enabled = true;
+    prefill_config.min_seq_len = 1;
+    cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(prefill_config);
+    PrefillGraphCacheKey prefill_key;
+    prefill_key.seq_len = 64;
+    prefill_key.device_id = DeviceId::cuda(0);
+    cache.prefill_graph_cache->markWarmedUp(prefill_key);
+    ASSERT_EQ(cache.prefill_graph_cache->phase(prefill_key), PrefillGraphPhase::Warmup);
+
+    cache.resetSessionStatePreservingSegmentedReplay();
+
+    EXPECT_TRUE(cache.segment_cache.initialized)
+        << "Replay-safe decode/verifier segmented captures should stay hot across request reset.";
+    EXPECT_FALSE(cache.segment_cache.needs_capture);
+    EXPECT_EQ(cache.segment_cache.decode_step, 9u);
+    EXPECT_FALSE(cache.gpu_stream_applied)
+        << "Stage stream bindings must be dirtied so dynamic params rebind an explicit capture stream.";
+    EXPECT_EQ(cache.applied_stream, nullptr);
+    EXPECT_EQ(cache.gpu_graph_update_failures, 0);
+    EXPECT_TRUE(cache.phase3_active);
+    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u)
+        << "Request reset clears live-state epoch stamps; only version-safe caches may use this path.";
+    EXPECT_EQ(cache.prefill_graph_cache->phase(prefill_key), PrefillGraphPhase::Initialized)
+        << "A warmed prefill bucket has no executable graph, so request reset must drop request arming "
+           "while preserving lazy stage/kernel initialization for strict re-capture preflight.";
+    EXPECT_EQ(cache.prefill_graph_cache->initializedCount(prefill_key), 1u);
+}
+
 TEST(Test__ForwardGraphCache, ReplayStateEpochClearsOnStateInvalidatingResets)
 {
     ForwardGraphCache cache;
@@ -909,6 +950,8 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
 
     ForwardGraphSignature prefill;
     prefill.decode = false;
+    ForwardGraphSignature bucketed_prefill = prefill;
+    bucketed_prefill.is_bucketed_prefill = true;
 
     EXPECT_EQ(classifyForwardReplayStateCache(single_token_decode),
               ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode);
@@ -924,6 +967,8 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
            "and refreshes row metadata before every launch.";
     EXPECT_EQ(classifyForwardReplayStateCache(prefill),
               ForwardReplayStateCacheClass::Other);
+    EXPECT_EQ(classifyForwardReplayStateCache(bucketed_prefill),
+              ForwardReplayStateCacheClass::BucketedPrefill);
 
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
@@ -950,12 +995,61 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
                   ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
                   classifyForwardReplayStateCache(prefill)),
               ForwardReplayStateAction::PreserveReplayStateAndRebindStreams);
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary,
+                  bucketed_prefill),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams);
 
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::GeneralLiveStateMutation,
                   classifyForwardReplayStateCache(all_position_verifier)),
               ForwardReplayStateAction::ResetReplayState)
         << "Only the MTP correction boundary may preserve verifier replay state.";
+}
+
+TEST(Test__ForwardReplayStatePolicy, RequestBoundaryPreservesOnlyReplaySafeDecodeClasses)
+{
+    ForwardGraphSignature single_token_decode;
+    single_token_decode.decode = true;
+    single_token_decode.seq_len = 1;
+    single_token_decode.batch_size = 1;
+
+    ForwardGraphSignature ordinary_decode = single_token_decode;
+    ordinary_decode.seq_len = 2;
+
+    ForwardGraphSignature all_position_verifier = ordinary_decode;
+    all_position_verifier.all_position_logits = true;
+
+    ForwardGraphSignature prefill;
+    prefill.decode = false;
+    ForwardGraphSignature bucketed_prefill = prefill;
+    bucketed_prefill.is_bucketed_prefill = true;
+
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  single_token_decode),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Single-token decode uses stable device buffers and refreshed token/position metadata.";
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  all_position_verifier),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "All-position verifier rows publish through device-owned speculative slots.";
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  ordinary_decode),
+              ForwardReplayStateAction::ResetReplayState)
+        << "Multi-token ordinary decode is still live-state-versioned.";
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  prefill),
+              ForwardReplayStateAction::ResetReplayState)
+        << "Non-bucketed prefill remains request-stateful.";
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  bucketed_prefill),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Ready bucketed prefill captures replay from refreshed graph-facing buffers.";
 }
 
 TEST(Test__ForwardGraphCache, InvalidateDestroysSegmentCaptureStream)

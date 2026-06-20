@@ -273,6 +273,21 @@ namespace llaminar2
             IComputeStage::resetSessionState();
             runtime_grouped_decode_warmed_ = false;
         }
+
+        /**
+         * @brief Clear stream ownership without invalidating captured decode tables.
+         *
+         * The runtime grouped decode path warms descriptor and pointer-table
+         * slots before graph capture. A preserved CUDA/HIP graph executable
+         * still reads those device slots by address, so request-boundary replay
+         * preservation must not flip runtime_grouped_decode_warmed_ back to
+         * false. True topology changes still use resetSessionState(),
+         * invalidate(), or graph rebuild paths.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+        }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -556,6 +571,19 @@ namespace llaminar2
             IComputeStage::resetSessionState();
             grouped_decode_warmed_ = false;
         }
+
+        /**
+         * @brief Preserve grouped shared-expert pointer tables for graph replay.
+         *
+         * Normal request reset marks grouped decode cold so a following capture
+         * gets a warmup pass. If the caller is deliberately keeping the already
+         * captured executable alive, those warmed tables are part of the
+         * executable contract and must remain valid.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+        }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -661,7 +689,7 @@ namespace llaminar2
      * - input: [seq_len, d_model]
      * - shared_expert_output: [seq_len, d_model]
      */
-    class SharedExpertGateStage : public IComputeStage
+    class SharedExpertGateStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
         struct Params
@@ -689,6 +717,7 @@ namespace llaminar2
         };
 
         explicit SharedExpertGateStage(Params params);
+        ~SharedExpertGateStage() override;
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::MOE_SHARED_EXPERT_GATE; }
@@ -705,11 +734,42 @@ namespace llaminar2
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
+        bool supportsPaddedPrefillRealLengthContract() const override;
+        bool hasPrefillReplayParams() const override { return params_.device_id.is_gpu() && params_.seq_len > 1; }
+        void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        bool needsGraphLaunchPreparation() const override { return hasPrefillReplayParams(); }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override;
+        DeviceWorkspaceManager *getWorkspace() const override;
+
+        /**
+         * @brief Clear request-local padded prefill parameters while preserving
+         * kernel handles and warmed model weights.
+         */
+        void resetSessionState() override;
+        /**
+         * @brief Preserve shared-expert effective-length storage for graph replay.
+         *
+         * The standalone shared-expert verifier path uses a workspace-backed
+         * scalar that is refreshed before every padded prefill replay. Request
+         * reset may clear host mirrors, but it must not make the preserved
+         * executable lose the stable scalar identity.
+         */
+        void resetSessionStatePreservingCapturedReplay() override;
+        /**
+         * @brief Preserve warmed shared-expert metadata for capture-from-Initialized.
+         */
+        void resetSessionStatePreservingLazyInitialization() override;
 
     private:
+        struct GpuEffectiveSeqLenState;
+
         Params params_;
 
         mutable std::shared_ptr<FP32Tensor> fp32_gate_inp_;
@@ -719,7 +779,16 @@ namespace llaminar2
 
         /// Cached MoE kernel for sigmoid gating
         mutable IMoEKernel *moe_kernel_ = nullptr;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        int prefill_effective_seq_len_ = 0;
+        bool prefill_replay_params_set_ = false;
+        std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
         IMoEKernel *ensureMoEKernel() const;
+        int effectivePrefillSeqLen() const;
+        void refreshPinnedEffectiveSeqLen();
+        bool ensureGpuEffectiveSeqLenStateInitialized();
+        bool uploadGpuEffectiveSeqLen();
+        void releaseGpuEffectiveSeqLenState();
 
     public:
         // Test accessors

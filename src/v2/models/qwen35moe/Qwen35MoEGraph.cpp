@@ -975,7 +975,47 @@ namespace llaminar2
                                                      ? "mtp_depth" + std::to_string(mtp_depth_idx)
                                                      : std::string{};
         const bool register_runtime_histogram = !use_mtp_runtime_table;
-        if (total_tokens == 1 && rocm_env.moe_grouped_decode && rocm_env.moe_device_routed_decode)
+        const auto has_static_full_local_expert_ownership = [&]()
+        {
+            /*
+             * Device-routed one-token MoE decode captures a full layer-local
+             * runtime table: router output, local-compute mask, and prepared
+             * gate/up/down descriptors for every logical expert.  LocalTP
+             * ExpertParallel runners own only a contiguous expert range, so
+             * handing them this table would make the expert stage fail at graph
+             * build or, worse, capture a single-device contract for a sharded
+             * topology.  Keep the fast table for full-owner lanes and let
+             * partial-owner TP use the ordinary mask/range + allreduce path
+             * until a sharded runtime table/reducer is implemented.
+             */
+            if (config_.moe.expert_mode == MoEExpertMode::ExpertParallel)
+            {
+                const int local_count = config_.moe.local_expert_count < 0
+                                            ? config_.moe.num_experts
+                                            : config_.moe.local_expert_count;
+                if (config_.moe.local_expert_start != 0 ||
+                    local_count != config_.moe.num_experts)
+                {
+                    return false;
+                }
+            }
+
+            if (device.is_gpu() && debugEnv().moe_rebalance.gpu_cache_experts_per_layer > 0)
+                return false;
+
+            return true;
+        };
+        const bool static_full_local_expert_ownership =
+            has_static_full_local_expert_ownership();
+        const bool allow_eager_partial_owner_gpu_route =
+            device.is_gpu() &&
+            total_tokens == 1 &&
+            !static_full_local_expert_ownership &&
+            config_.moe.expert_mode == MoEExpertMode::ExpertParallel;
+        if (total_tokens == 1 &&
+            rocm_env.moe_grouped_decode &&
+            rocm_env.moe_device_routed_decode &&
+            static_full_local_expert_ownership)
         {
             moe_runtime_table = moeRuntimeTableForDevice(
                 device,
@@ -1045,6 +1085,8 @@ namespace llaminar2
             route_params.moe_runtime_table = moe_runtime_table;
             route_params.force_grouped_verifier_prefill_for_decode =
                 forceGroupedMoEVerifierPrefill(device);
+            route_params.allow_eager_gpu_single_row_route_for_partial_expert_owner =
+                allow_eager_partial_owner_gpu_route;
             route_params.force_decode_equivalent_verifier_prefill =
                 forceDecodeEquivalentMoERouting(device);
             route_params.output_indices = routing_indices;

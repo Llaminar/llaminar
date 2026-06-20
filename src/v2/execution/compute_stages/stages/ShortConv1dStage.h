@@ -127,6 +127,32 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Reset request-local short-conv metadata while preserving capture slots.
+         *
+         * Preserved prefill graphs replay over the same verifier-state capture
+         * workspace and effective-length scalar addresses. The scalar is
+         * restamped before launch, so request reset only clears host mirrors and
+         * stream ownership here.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+            prefill_effective_seq_len_ = 0;
+            prefill_bucket_seq_len_ = 0;
+            prefill_replay_params_set_ = false;
+            if (params_.kernel)
+                params_.kernel->setGPUStream(nullptr);
+        }
+
+        /**
+         * @brief Preserve warmed short-conv workspaces for capture-from-Initialized.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionStatePreservingCapturedReplay();
+        }
+
         bool hasPrefillReplayParams() const override { return true; }
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
         bool supportsPaddedPrefillRealLengthContract() const override;

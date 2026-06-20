@@ -58,6 +58,20 @@ namespace llaminar2
             bool force_grouped_verifier_prefill_for_decode = false;
 
             /**
+             * @brief Permit eager GPU routeWithTensors() for partial expert owners.
+             *
+             * Single-device GPU decode must use the device-routed runtime table
+             * so graph capture, route metadata, and expert execution share one
+             * device-owned source of truth.  LocalTP ExpertParallel runners are
+             * different: each participant owns only a subset of experts and the
+             * current runtime table is a full-owner contract.  Until the sharded
+             * runtime-table reducer exists, those TP participants use the explicit
+             * mask/range + allreduce path in eager mode and must not advertise
+             * decode graph capture.
+             */
+            bool allow_eager_gpu_single_row_route_for_partial_expert_owner = false;
+
+            /**
              * @brief Replay verifier rows through the normal one-token route path.
              *
              * MTP all-position verifier batches produce several candidate rows at
@@ -79,6 +93,7 @@ namespace llaminar2
         };
 
         explicit MoERoutingStage(Params params);
+        ~MoERoutingStage() override;
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::MOE_ROUTER; }
@@ -91,6 +106,11 @@ namespace llaminar2
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
+        bool supportsPaddedPrefillRealLengthContract() const override;
+        bool hasPrefillReplayParams() const override { return params_.device_id.is_gpu() && params_.seq_len > 1; }
+        void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        bool needsGraphLaunchPreparation() const override { return hasPrefillReplayParams(); }
         void onGraphReplayed() override;
         bool needsOnGraphReplayed() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
@@ -107,19 +127,27 @@ namespace llaminar2
         /**
          * @brief Clear per-request routing metadata while preserving kernel handles.
          */
-        void resetSessionState() override
-        {
-            IComputeStage::resetSessionState();
-            routing_indices_f32_.clear();
-            routing_weights_.clear();
-            router_logits_.clear();
-            cached_routing_ = MoERoutingResult{};
-        }
+        void resetSessionState() override;
+        /**
+         * @brief Clear routing mirrors while preserving captured MoE replay slots.
+         *
+         * Padded prefill replay refreshes the effective-length scalar before
+         * graph launch and records histogram boundaries after replay. Keeping
+         * the workspace-backed scalar and runtime table identity alive is
+         * required for Ready prefill graphs preserved across clear_cache().
+         */
+        void resetSessionStatePreservingCapturedReplay() override;
+        /**
+         * @brief Preserve warmed routing workspace for capture-from-Initialized.
+         */
+        void resetSessionStatePreservingLazyInitialization() override;
 
         // Test accessors
         void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
 
     private:
+        struct GpuEffectiveSeqLenState;
+
         Params params_;
 
         /// Stashed routing results for snapshot capture
@@ -134,6 +162,10 @@ namespace llaminar2
         /// Pre-allocated routing result (avoids heap allocs per decode token)
         mutable MoERoutingResult cached_routing_;
         DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
+        int prefill_effective_seq_len_ = 0;
+        int prefill_bucket_seq_len_ = 0;
+        bool prefill_replay_params_set_ = false;
+        std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
 
         IMoEKernel *ensureMoEKernel() const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
@@ -145,6 +177,11 @@ namespace llaminar2
         bool isDecodeEquivalentVerifierPrefillGraphCapturable() const;
         bool hasInitializedRuntimeTableIfProvided() const;
         bool executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
+        int effectivePrefillSeqLen() const;
+        void refreshPinnedEffectiveSeqLen();
+        bool ensureGpuEffectiveSeqLenStateInitialized();
+        bool uploadGpuEffectiveSeqLen();
+        void releaseGpuEffectiveSeqLenState();
         void recordRuntimeHistogramTokenBoundary() const;
         void stashRoutingResults(
             const std::vector<int> &expert_indices,

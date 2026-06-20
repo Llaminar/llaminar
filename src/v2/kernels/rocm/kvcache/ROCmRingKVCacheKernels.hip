@@ -215,6 +215,27 @@ namespace llaminar2
         *d_count = next_count > max_seq_len ? max_seq_len : next_count;
     }
 
+    __global__ void hip_kv_sequence_state_advance_dynamic_kernel(
+        int *__restrict__ d_head,
+        int *__restrict__ d_count,
+        const int *__restrict__ d_append_count,
+        int captured_num_tokens,
+        int max_seq_len)
+    {
+        if (threadIdx.x != 0 || blockIdx.x != 0)
+            return;
+
+        int advance_tokens = d_append_count ? *d_append_count : captured_num_tokens;
+        if (advance_tokens <= 0 || advance_tokens > captured_num_tokens)
+            advance_tokens = captured_num_tokens;
+
+        const int old_head = *d_head;
+        const int old_count = *d_count;
+        *d_head = (old_head + advance_tokens) % max_seq_len;
+        const int next_count = old_count + advance_tokens;
+        *d_count = next_count > max_seq_len ? max_seq_len : next_count;
+    }
+
     /**
      * @brief Publish accepted verifier-row sequence metadata on device.
      *
@@ -1002,6 +1023,20 @@ namespace llaminar2
         hipLaunchKernelGGL(hip_kv_sequence_state_advance_kernel,
                            dim3(1), dim3(1), 0, stream,
                            d_head, d_count, num_tokens, max_seq_len);
+    }
+
+    extern "C" void hip_kv_sequence_state_advance_dynamic(
+        int *d_head, int *d_count, const int *d_append_count,
+        int captured_num_tokens, int max_seq_len,
+        hipStream_t stream)
+    {
+        if (!d_head || !d_count || captured_num_tokens <= 0 || max_seq_len <= 0)
+            return;
+
+        hipLaunchKernelGGL(hip_kv_sequence_state_advance_dynamic_kernel,
+                           dim3(1), dim3(1), 0, stream,
+                           d_head, d_count, d_append_count,
+                           captured_num_tokens, max_seq_len);
     }
 
     template <typename T>

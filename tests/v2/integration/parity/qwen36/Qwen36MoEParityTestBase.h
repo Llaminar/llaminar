@@ -1105,7 +1105,9 @@ namespace llaminar2::test::parity::qwen36
     }
 
     inline void runMoEStochasticMTPVerifierParity(
-        const MoEPrefixRestoreParityCase &test_case)
+        const MoEPrefixRestoreParityCase &test_case,
+        int draft_depth = 1,
+        bool require_accepted_draft_after_reuse = false)
     {
         ScopedMoEParityDeterministicMode deterministic_mode(
             shouldUseMoEParityDeterministicMode(test_case));
@@ -1162,7 +1164,13 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(baseline_snapshot.mtp_stochastic_accept_tests, 0u);
 
         auto mtp_config =
-            makeMoEPrefixRestoreConfig(test_case, model_path, false, block_size, true, 1);
+            makeMoEPrefixRestoreConfig(
+                test_case,
+                model_path,
+                false,
+                block_size,
+                true,
+                draft_depth);
         mtp_config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
 
         auto mtp = factory->createFromOrchestrationConfig(mtp_config);
@@ -1230,6 +1238,15 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_NEAR(after_reused_mtp.mtp_request.stochastic_acceptance_rate,
                         expected_rate,
                         1e-12);
+        }
+        if (require_accepted_draft_after_reuse)
+        {
+            EXPECT_GT(after_reused_mtp.mtp_stochastic_accepts, 0u)
+                << "Fixed-depth stochastic MTP must accept at least one draft "
+                   "after clearCache(); zero accepts usually means a preserved "
+                   "captured sidecar/verifier graph is reading stale dynamic "
+                   "kernel or request metadata.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
         }
 
         const bool used_decode_equivalent_stochastic_verifier =

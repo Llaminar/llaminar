@@ -171,6 +171,39 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Clear request mirrors while preserving captured attention params.
+         *
+         * Bucketed prefill replay updates the attention device-param row before
+         * launch. A preserved CUDA/HIP graph still owns that row by address, so
+         * request reset must not call resetDynamicState() on the kernel when the
+         * graph executable is intentionally kept hot.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+            params_.position_offset = 0;
+            prefill_replay_params_set_ = false;
+            prefill_effective_seq_len_ = 0;
+            prefill_bucket_seq_len_ = 0;
+            debug_effective_k_snapshot_.clear();
+            debug_effective_v_snapshot_.clear();
+            debug_effective_k_rows_ = 0;
+            debug_effective_k_cols_ = 0;
+            debug_effective_v_rows_ = 0;
+            debug_effective_v_cols_ = 0;
+            if (cached_kernel_)
+                cached_kernel_->setGPUStream(nullptr);
+        }
+
+        /**
+         * @brief Keep warmed attention workspace/device-param storage for capture.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionStatePreservingCapturedReplay();
+        }
+
         const Params &getParams() const { return params_; }
 
         // =================================================================

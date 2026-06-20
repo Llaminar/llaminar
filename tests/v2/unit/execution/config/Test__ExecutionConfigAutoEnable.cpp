@@ -163,6 +163,8 @@ namespace
         EXPECT_TRUE(config.exec_residual);
         EXPECT_TRUE(config.exec_embedding);
         EXPECT_TRUE(config.exec_lm_head);
+        EXPECT_TRUE(config.gpu_graphs);
+        EXPECT_TRUE(config.prefill_graph_buckets);
     }
 
     // =============================================================================
@@ -353,6 +355,16 @@ namespace
         EXPECT_EQ(config.prefill_graph_bucket_sizes, (std::vector<int>{64, 128, 256, 512}));
         EXPECT_EQ(config.prefill_graph_max_cached_buckets, 3);
         EXPECT_EQ(config.prefill_graph_pad_token_id, 151643);
+    }
+
+    TEST_F(Test__ExecutionConfigAutoEnable, PrefillGraphBuckets_EnvCanOptOut)
+    {
+        EnvVarGuard guard("LLAMINAR_PREFILL_GRAPH_BUCKETS", "0");
+
+        llaminar2::ExecutionConfig config;
+
+        EXPECT_FALSE(config.prefill_graph_buckets);
+        EXPECT_TRUE(config.gpu_graphs);
     }
 
     // =============================================================================

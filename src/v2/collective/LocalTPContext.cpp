@@ -447,6 +447,8 @@ namespace llaminar2
         // Build lookup index
         buildDeviceIndex();
         onstream_sequence_by_slot_.assign(devices_.size(), 0);
+        fp16_scratch_buffers_.assign(devices_.size(), nullptr);
+        fp16_scratch_counts_.assign(devices_.size(), 0);
 
         LOG_DEBUG("LocalTPContext created: degree=" << degree()
                                                     << ", backend=" << collectiveBackendTypeToString(backend_));
@@ -846,11 +848,19 @@ namespace llaminar2
         {
             constexpr size_t kFP16ScratchGuardBytes = 4096;
 
-            // Lazy-init scratch buffer vectors
-            if (fp16_scratch_buffers_.empty())
+            // The on-stream collective path runs concurrently on one worker
+            // thread per device. Scratch metadata must therefore be fully sized
+            // before workers enter this method; resizing either vector here can
+            // race another participant and corrupt the vector pair.
+            if (fp16_scratch_buffers_.size() != devices_.size() ||
+                fp16_scratch_counts_.size() != devices_.size())
             {
-                fp16_scratch_buffers_.resize(degree(), nullptr);
-                fp16_scratch_counts_.resize(degree(), 0);
+                LOG_ERROR("LocalTPContext::allreduceOnStream: FP16 scratch metadata invariant broken "
+                          << "(buffers=" << fp16_scratch_buffers_.size()
+                          << ", counts=" << fp16_scratch_counts_.size()
+                          << ", degree=" << devices_.size() << ")");
+                requestAbort();
+                return false;
             }
 
             // Ensure scratch buffer is large enough for this allreduce

@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include "backends/GPUDeviceContextPool.h"
+#include "backends/BackendManager.h"
 #include "backends/IWorkerGPUContext.h"
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
@@ -593,6 +594,48 @@ namespace
             return kv_cache_ ? kv_cache_->get_cached_tokens(0, 0) : 0;
         }
 
+        /// @brief Return the device mirror of the probe KV cached-token count.
+        int kvDeviceCachedTokensForTesting() const
+        {
+            if (!kv_cache_ || !ctx_)
+                return -1;
+            const int *device_count = kv_cache_->deviceCachedTokenCountPtr(0, 0);
+            if (!device_count)
+                return -1;
+
+            IBackend *backend = getBackendFor(device_);
+            if (!backend)
+                return -1;
+
+            int value = -1;
+            void *stream = nullptr;
+            if (device_.is_cuda())
+            {
+                stream = GPUDeviceContextPool::instance()
+                             .getNvidiaContext(device_.toKernelDeviceIndex())
+                             .defaultStream();
+            }
+            else if (device_.is_rocm())
+            {
+                stream = GPUDeviceContextPool::instance()
+                             .getAMDContext(device_.toKernelDeviceIndex())
+                             .defaultStream();
+            }
+            if (!stream)
+                return -1;
+            if (!backend->deviceToHostFast(
+                    &value,
+                    device_count,
+                    sizeof(value),
+                    device_.toKernelDeviceIndex(),
+                    stream))
+            {
+                return -1;
+            }
+            ctx_->synchronize();
+            return value;
+        }
+
         int build_calls = 0;
         int get_context_calls = 0;
         int ensure_workspace_calls = 0;
@@ -805,20 +848,12 @@ namespace
         auto after_build = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(after_build.has_value());
         EXPECT_TRUE(after_build->forward_cache_valid);
-        EXPECT_FALSE(after_build->prefill_cache_initialized)
-            << "Current engine builds the reusable forward graph on the first request; prefill cache warmup starts on the first cache hit.";
-
-        ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
-        EXPECT_EQ(host_->build_calls, 1) << "Same exact bucket should reuse the cached forward graph";
-        expectProbeOutputMatches(*host_, kExactBucketSeqLen);
-
-        auto after_warmup = engine_->prefillGraphCacheSnapshot(signature, key);
-        ASSERT_TRUE(after_warmup.has_value());
-        ASSERT_TRUE(after_warmup->prefill_cache_initialized);
-        EXPECT_EQ(after_warmup->phase, PrefillGraphPhase::Warmup);
-        EXPECT_EQ(after_warmup->warmup_count, 1u);
-        EXPECT_EQ(after_warmup->capture_count, 0u);
-        EXPECT_EQ(after_warmup->replay_count, 0);
+        ASSERT_TRUE(after_build->prefill_cache_initialized);
+        EXPECT_EQ(after_build->phase, PrefillGraphPhase::Warmup)
+            << "The first bucketed request should build the reusable forward graph and arm prefill capture.";
+        EXPECT_EQ(after_build->warmup_count, 1u);
+        EXPECT_EQ(after_build->capture_count, 0u);
+        EXPECT_EQ(after_build->replay_count, 0);
 
         ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
         EXPECT_EQ(host_->build_calls, 1);
@@ -847,8 +882,8 @@ namespace
         EXPECT_EQ(after_replay->eviction_count, 0u);
 
         ASSERT_NE(host_->stage(), nullptr);
-        EXPECT_GE(host_->stage()->executeCount(), 3)
-            << "Normal build, warmup, and capture recording execute the stage directly.";
+        EXPECT_GE(host_->stage()->executeCount(), 2)
+            << "Normal build/warmup and capture recording execute the stage directly.";
         EXPECT_GE(host_->stage()->replayCallbackCount(), 2)
             << "Capture launch and Ready replay both run post-graph callbacks.";
     }
@@ -920,6 +955,149 @@ namespace
         EXPECT_EQ(after_warmup->warmup_count, ready->warmup_count + 1);
     }
 
+    TEST_F(PrefillGraphCacheExecutionTest, RequestResetPreservesReadyPrefillExecutable)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+        });
+
+        auto tokens = makeSequentialInts(kExactBucketSeqLen, 1150);
+        ForwardInput input;
+        input.token_ids = tokens.data();
+        input.batch_size = 1;
+        input.seq_len = kExactBucketSeqLen;
+        input.device = device_;
+
+        const auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+            input,
+            debugEnv().execution.prefill_graph_bucket_sizes,
+            kPadTokenId,
+            /*allow_padded_execution=*/false);
+        ASSERT_TRUE(plan) << plan.error;
+
+        ForwardOutput output;
+        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
+
+        ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
+        ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
+        ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
+
+        auto ready = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(ready.has_value());
+        ASSERT_EQ(ready->phase, PrefillGraphPhase::Ready);
+        ASSERT_GE(ready->replay_count, 1);
+        const int replay_count_before_reset = ready->replay_count;
+        const uint64_t warmups_before_reset = ready->warmup_count;
+        const uint64_t captures_before_reset = ready->capture_count;
+        const size_t nodes_before_reset = ready->node_count;
+        ASSERT_GT(nodes_before_reset, 0u);
+
+        engine_->resetSessionReplayState(
+            /*preserve_replay_safe_segmented_captures=*/true);
+
+        auto preserved = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(preserved.has_value());
+        ASSERT_TRUE(preserved->prefill_cache_initialized);
+        EXPECT_EQ(preserved->phase, PrefillGraphPhase::Ready)
+            << "Request-boundary reset should preserve a proven Ready exact-bucket prefill executable.";
+        EXPECT_EQ(preserved->replay_count, replay_count_before_reset);
+        EXPECT_EQ(preserved->warmup_count, warmups_before_reset);
+        EXPECT_EQ(preserved->capture_count, captures_before_reset);
+        EXPECT_EQ(preserved->node_count, nodes_before_reset);
+
+        ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
+        expectProbeOutputMatches(*host_, kExactBucketSeqLen);
+
+        auto after_replay = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_replay.has_value());
+        EXPECT_EQ(after_replay->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(after_replay->replay_count, replay_count_before_reset + 1)
+            << "The first request after reset should replay the preserved executable, not warm/capture again.";
+        EXPECT_EQ(after_replay->warmup_count, warmups_before_reset);
+        EXPECT_EQ(after_replay->capture_count, captures_before_reset);
+        EXPECT_EQ(host_->build_calls, 1)
+            << "Preserved prefill replay must not rebuild the forward graph.";
+    }
+
+    TEST_F(PrefillGraphCacheExecutionTest, RequestResetDemotesWarmupAndCapturesFromLazyInitialization)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+        });
+
+        auto tokens = makeSequentialInts(kExactBucketSeqLen, 1150);
+        ForwardInput input;
+        input.token_ids = tokens.data();
+        input.batch_size = 1;
+        input.seq_len = kExactBucketSeqLen;
+        input.device = device_;
+
+        const auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+            input,
+            debugEnv().execution.prefill_graph_bucket_sizes,
+            kPadTokenId,
+            /*allow_padded_execution=*/false);
+        ASSERT_TRUE(plan) << plan.error;
+
+        ForwardOutput output;
+        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
+
+        ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
+        expectProbeOutputMatches(*host_, kExactBucketSeqLen);
+
+        auto warmed = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(warmed.has_value());
+        ASSERT_TRUE(warmed->prefill_cache_initialized);
+        ASSERT_EQ(warmed->phase, PrefillGraphPhase::Warmup);
+        ASSERT_EQ(warmed->warmup_count, 1u);
+        ASSERT_EQ(warmed->capture_count, 0u);
+
+        engine_->resetSessionReplayState(
+            /*preserve_replay_safe_segmented_captures=*/true);
+
+        auto initialized = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(initialized.has_value());
+        EXPECT_EQ(initialized->phase, PrefillGraphPhase::Initialized)
+            << "clear_cache() must not carry a request-armed Warmup entry across the boundary.";
+        EXPECT_EQ(initialized->initialized_count, 1u);
+        EXPECT_EQ(initialized->warmup_count, 1u);
+        EXPECT_EQ(initialized->capture_count, 0u);
+        EXPECT_EQ(initialized->replay_count, 0);
+
+        ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
+        expectProbeOutputMatches(*host_, kExactBucketSeqLen);
+
+        auto captured = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(captured.has_value());
+        EXPECT_EQ(captured->phase, PrefillGraphPhase::Ready)
+            << "Initialized preserves lazy stage/kernel readiness so the next request can capture "
+               "after fresh metadata preparation and strict capture-readiness preflight.";
+        EXPECT_EQ(captured->warmup_count, 1u)
+            << "The second request should not need another normal warmup when lazy init survived reset.";
+        EXPECT_EQ(captured->initialized_count, 1u);
+        EXPECT_EQ(captured->capture_count, 1u);
+        EXPECT_EQ(captured->replay_count, 1)
+            << "Capture path launches the newly instantiated graph once for the current request.";
+        EXPECT_EQ(host_->build_calls, 1)
+            << "Initialized capture should reuse the cached forward graph topology.";
+    }
+
     TEST_F(PrefillGraphCacheExecutionTest, ChunkScheduleFixedPlacementReachesCapturedReplay)
     {
         ScopedDebugEnv env({
@@ -981,8 +1159,8 @@ namespace
         EXPECT_EQ(snapshot->phase, PrefillGraphPhase::Ready);
         EXPECT_EQ(snapshot->warmup_count, 1u);
         EXPECT_EQ(snapshot->capture_count, 1u);
-        EXPECT_EQ(snapshot->replay_count, 2)
-            << "Chunk 2 launches after capture and chunk 3 replays the captured graph.";
+        EXPECT_EQ(snapshot->replay_count, 3)
+            << "Chunk 1 launches after capture, then chunks 2 and 3 replay the captured graph.";
         EXPECT_TRUE(snapshot->observation_valid);
         EXPECT_EQ(snapshot->chunk_index, 3);
         EXPECT_EQ(snapshot->real_token_start, 3 * kExactBucketSeqLen);
@@ -1071,8 +1249,8 @@ namespace
         EXPECT_EQ(snapshot->phase, PrefillGraphPhase::Ready);
         EXPECT_EQ(snapshot->warmup_count, 1u);
         EXPECT_EQ(snapshot->capture_count, 1u);
-        EXPECT_EQ(snapshot->replay_count, 2)
-            << "The post-rebalance graph should capture on chunk 7 and replay on chunk 8.";
+        EXPECT_EQ(snapshot->replay_count, 3)
+            << "The post-rebalance graph should capture on chunk 6 and replay on chunks 7 and 8.";
         EXPECT_TRUE(snapshot->observation_valid);
         EXPECT_EQ(snapshot->chunk_index, 8);
         EXPECT_EQ(snapshot->real_token_start, 8 * kExactBucketSeqLen);
@@ -1162,45 +1340,38 @@ namespace
         EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
         EXPECT_EQ(host_->kvCachedTokensForTesting(), kExactBucketSeqLen - 3)
             << "First padded cache miss must append only real prompt tokens.";
+        EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
+            << "Warmup must keep the GPU KV count mirror aligned to the real prompt length.";
         expectSelectedProbeOutputMatches(*host_, kExactBucketSeqLen - 3);
 
         auto after_build = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(after_build.has_value());
         EXPECT_TRUE(after_build->forward_cache_valid);
-        EXPECT_FALSE(after_build->prefill_cache_initialized);
+        ASSERT_TRUE(after_build->prefill_cache_initialized);
+        EXPECT_EQ(after_build->phase, PrefillGraphPhase::Warmup);
+        EXPECT_EQ(after_build->warmup_count, 1u);
+        EXPECT_EQ(after_build->capture_count, 0u);
+        EXPECT_TRUE(after_build->observation_valid);
+        EXPECT_EQ(after_build->chunk_index, 0);
+        EXPECT_EQ(after_build->bucket_seq_len, kExactBucketSeqLen);
+        EXPECT_EQ(after_build->real_token_start, 128);
+        EXPECT_EQ(after_build->real_token_count, kExactBucketSeqLen - 3);
+        EXPECT_EQ(after_build->real_token_end, 128 + kExactBucketSeqLen - 3);
+        EXPECT_EQ(after_build->domain_id, "overlay_routed_rocm_hot");
+        EXPECT_EQ(after_build->participant_id, 2);
+        EXPECT_EQ(after_build->placement_epoch, 17u);
+        EXPECT_EQ(after_build->topology_signature, 0x321u);
+        EXPECT_EQ(after_build->capture_phase, "warmup");
+        EXPECT_EQ(after_build->recapture_reason, "none");
 
         ASSERT_TRUE(engine_->runPrefillChunk(input63, plan63, output, *host_));
-        EXPECT_EQ(host_->build_calls, 1) << "Same padded bucket should reuse the cached forward graph";
+        EXPECT_EQ(host_->build_calls, 1);
         EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 2);
         EXPECT_EQ(host_->kvCachedTokensForTesting(), (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1))
-            << "Warmup execution must append by the second request's real length, not the bucket length.";
-        expectSelectedProbeOutputMatches(*host_, kExactBucketSeqLen - 1);
-
-        auto after_warmup = engine_->prefillGraphCacheSnapshot(signature, key);
-        ASSERT_TRUE(after_warmup.has_value());
-        ASSERT_TRUE(after_warmup->prefill_cache_initialized);
-        EXPECT_EQ(after_warmup->phase, PrefillGraphPhase::Warmup);
-        EXPECT_EQ(after_warmup->warmup_count, 1u);
-        EXPECT_EQ(after_warmup->capture_count, 0u);
-        EXPECT_TRUE(after_warmup->observation_valid);
-        EXPECT_EQ(after_warmup->chunk_index, 0);
-        EXPECT_EQ(after_warmup->bucket_seq_len, kExactBucketSeqLen);
-        EXPECT_EQ(after_warmup->real_token_start, 512);
-        EXPECT_EQ(after_warmup->real_token_count, kExactBucketSeqLen - 1);
-        EXPECT_EQ(after_warmup->real_token_end, 512 + kExactBucketSeqLen - 1);
-        EXPECT_EQ(after_warmup->domain_id, "overlay_routed_rocm_hot");
-        EXPECT_EQ(after_warmup->participant_id, 2);
-        EXPECT_EQ(after_warmup->placement_epoch, 17u);
-        EXPECT_EQ(after_warmup->topology_signature, 0x321u);
-        EXPECT_EQ(after_warmup->capture_phase, "warmup");
-        EXPECT_EQ(after_warmup->recapture_reason, "none");
-
-        ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
-        EXPECT_EQ(host_->build_calls, 1);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
-        EXPECT_EQ(host_->kvCachedTokensForTesting(), (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1) + (kExactBucketSeqLen - 3))
             << "Capture launch callback must advance KV metadata by real tokens only.";
-        expectSelectedProbeOutputMatches(*host_, kExactBucketSeqLen - 3);
+        EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
+            << "Capture launch must advance the GPU KV count mirror by real tokens, not bucket tokens.";
+        expectSelectedProbeOutputMatches(*host_, kExactBucketSeqLen - 1);
 
         auto after_capture = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(after_capture.has_value());
@@ -1210,21 +1381,23 @@ namespace
         EXPECT_EQ(after_capture->replay_count, 1);
         EXPECT_GT(after_capture->node_count, 0u);
         EXPECT_TRUE(after_capture->observation_valid);
-        EXPECT_EQ(after_capture->real_token_start, 128);
-        EXPECT_EQ(after_capture->real_token_count, kExactBucketSeqLen - 3);
-        EXPECT_EQ(after_capture->real_token_end, 128 + kExactBucketSeqLen - 3);
+        EXPECT_EQ(after_capture->real_token_start, 512);
+        EXPECT_EQ(after_capture->real_token_count, kExactBucketSeqLen - 1);
+        EXPECT_EQ(after_capture->real_token_end, 512 + kExactBucketSeqLen - 1);
         EXPECT_EQ(after_capture->capture_phase, "capture");
         EXPECT_EQ(after_capture->recapture_reason, "armed_warmup");
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input63, plan63, output, *host_));
+        ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
         EXPECT_EQ(host_->build_calls, 1);
         // The monolithic cache test proves the engine delivers updated real-length
         // metadata before Ready replay. The dedicated row-select graph tests verify
         // the backend-level selected-row device output for no-recapture replays.
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 2);
+        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
         EXPECT_EQ(host_->kvCachedTokensForTesting(),
-                  (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1) + (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1))
+                  (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1) + (kExactBucketSeqLen - 3))
             << "Ready replay must advance KV metadata by the latest real length, not the bucket length.";
+        EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
+            << "Ready replay must keep GPU KV count mirror aligned to the latest real length.";
 
         auto after_replay = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(after_replay.has_value());
@@ -1235,15 +1408,26 @@ namespace
         EXPECT_EQ(after_replay->replay_count, 2);
         EXPECT_EQ(after_replay->eviction_count, 0u);
         EXPECT_TRUE(after_replay->observation_valid);
-        EXPECT_EQ(after_replay->real_token_start, 512);
-        EXPECT_EQ(after_replay->real_token_count, kExactBucketSeqLen - 1);
-        EXPECT_EQ(after_replay->real_token_end, 512 + kExactBucketSeqLen - 1);
+        EXPECT_EQ(after_replay->real_token_start, 128);
+        EXPECT_EQ(after_replay->real_token_count, kExactBucketSeqLen - 3);
+        EXPECT_EQ(after_replay->real_token_end, 128 + kExactBucketSeqLen - 3);
         EXPECT_EQ(after_replay->domain_id, "overlay_routed_rocm_hot");
         EXPECT_EQ(after_replay->participant_id, 2);
         EXPECT_EQ(after_replay->placement_epoch, 17u);
         EXPECT_EQ(after_replay->topology_signature, 0x321u);
         EXPECT_EQ(after_replay->capture_phase, "replay");
         EXPECT_EQ(after_replay->recapture_reason, "none");
+
+        ASSERT_TRUE(engine_->runPrefillChunk(input63, plan63, output, *host_));
+        EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
+            << "Second Ready replay must keep GPU KV count mirror aligned.";
+        auto after_second_replay = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_second_replay.has_value());
+        EXPECT_EQ(after_second_replay->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(after_second_replay->replay_count, 3);
+        EXPECT_EQ(after_second_replay->real_token_start, 512);
+        EXPECT_EQ(after_second_replay->real_token_count, kExactBucketSeqLen - 1);
+        EXPECT_EQ(after_second_replay->real_token_end, 512 + kExactBucketSeqLen - 1);
 
         const auto records = PerfStatsCollector::snapshot({"forward_graph"});
         const PerfStatsCollector::Tags replay_tags = {
@@ -1313,34 +1497,27 @@ namespace
         EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
         EXPECT_EQ(host_->kvCachedTokensForTesting(), kExactBucketSeqLen - 3)
             << "Raw execute cache miss must append only real prompt tokens.";
+        EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
+            << "Raw warmup must keep GPU KV count mirror aligned.";
         expectSelectedProbeOutputMatches(*host_, kExactBucketSeqLen - 3);
 
         auto after_build = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(after_build.has_value());
         EXPECT_TRUE(after_build->forward_cache_valid);
-        EXPECT_FALSE(after_build->prefill_cache_initialized);
+        ASSERT_TRUE(after_build->prefill_cache_initialized);
+        EXPECT_EQ(after_build->phase, PrefillGraphPhase::Warmup);
+        EXPECT_EQ(after_build->warmup_count, 1u);
+        EXPECT_EQ(after_build->capture_count, 0u);
 
         ASSERT_TRUE(engine_->execute(input63, output, *host_));
         EXPECT_EQ(host_->build_calls, 1)
             << "Server-style prompts in one bucket must reuse the cached forward graph.";
         EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 2);
         EXPECT_EQ(host_->kvCachedTokensForTesting(), (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1))
-            << "Warmup execution must append by the second request's real length, not the bucket length.";
+            << "Capture launch must append by the second request's real length, not the bucket length.";
+        EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
+            << "Raw capture launch must advance GPU KV count mirror by real length.";
         expectSelectedProbeOutputMatches(*host_, kExactBucketSeqLen - 1);
-
-        auto after_warmup = engine_->prefillGraphCacheSnapshot(signature, key);
-        ASSERT_TRUE(after_warmup.has_value());
-        ASSERT_TRUE(after_warmup->prefill_cache_initialized);
-        EXPECT_EQ(after_warmup->phase, PrefillGraphPhase::Warmup);
-        EXPECT_EQ(after_warmup->warmup_count, 1u);
-        EXPECT_EQ(after_warmup->capture_count, 0u);
-
-        ASSERT_TRUE(engine_->execute(input61, output, *host_));
-        EXPECT_EQ(host_->build_calls, 1);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
-        EXPECT_EQ(host_->kvCachedTokensForTesting(), (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1) + (kExactBucketSeqLen - 3))
-            << "Capture launch callback must advance KV metadata by real tokens only.";
-        expectSelectedProbeOutputMatches(*host_, kExactBucketSeqLen - 3);
 
         auto after_capture = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(after_capture.has_value());
@@ -1350,12 +1527,14 @@ namespace
         EXPECT_EQ(after_capture->replay_count, 1);
         EXPECT_GT(after_capture->node_count, 0u);
 
-        ASSERT_TRUE(engine_->execute(input63, output, *host_));
+        ASSERT_TRUE(engine_->execute(input61, output, *host_));
         EXPECT_EQ(host_->build_calls, 1);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 2);
+        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
         EXPECT_EQ(host_->kvCachedTokensForTesting(),
-                  (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1) + (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1))
+                  (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1) + (kExactBucketSeqLen - 3))
             << "Ready replay must advance KV metadata by the latest real length, not the bucket length.";
+        EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
+            << "Raw Ready replay must keep GPU KV count mirror aligned.";
 
         auto after_replay = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(after_replay.has_value());
@@ -1438,7 +1617,11 @@ namespace
         auto after_128_build = engine_->prefillGraphCacheSnapshot(signature128, key128);
         ASSERT_TRUE(after_128_build.has_value());
         EXPECT_TRUE(after_128_build->forward_cache_valid);
-        EXPECT_FALSE(after_128_build->prefill_cache_initialized);
+        ASSERT_TRUE(after_128_build->prefill_cache_initialized);
+        EXPECT_EQ(after_128_build->phase, PrefillGraphPhase::Warmup)
+            << "The first request for a newly built bucket should arm capture immediately.";
+        EXPECT_EQ(after_128_build->warmup_count, 1u);
+        EXPECT_EQ(after_128_build->capture_count, 0u);
         EXPECT_EQ(after_128_build->eviction_count, 1u);
 
         ASSERT_TRUE(engine_->runPrefillChunk(input64, plan64, output, *host_));
@@ -1448,20 +1631,13 @@ namespace
         auto after_64_rebuild = engine_->prefillGraphCacheSnapshot(signature64, key64);
         ASSERT_TRUE(after_64_rebuild.has_value());
         EXPECT_TRUE(after_64_rebuild->forward_cache_valid);
-        EXPECT_FALSE(after_64_rebuild->prefill_cache_initialized)
-            << "The first request after eviction should be an explicit rebuild, not a hidden replay.";
+        ASSERT_TRUE(after_64_rebuild->prefill_cache_initialized);
+        EXPECT_EQ(after_64_rebuild->phase, PrefillGraphPhase::Warmup)
+            << "The first request after eviction rebuilds the forward graph and arms capture.";
+        EXPECT_EQ(after_64_rebuild->warmup_count, 1u);
+        EXPECT_EQ(after_64_rebuild->capture_count, 0u);
         EXPECT_EQ(after_64_rebuild->eviction_count, 2u)
             << "Rebuilding bucket64 under cap=1 should evict bucket128 at the top-level cache.";
-
-        ASSERT_TRUE(engine_->runPrefillChunk(input64, plan64, output, *host_));
-        auto after_64_rewarm = engine_->prefillGraphCacheSnapshot(signature64, key64);
-        ASSERT_TRUE(after_64_rewarm.has_value());
-        ASSERT_TRUE(after_64_rewarm->prefill_cache_initialized);
-        EXPECT_EQ(after_64_rewarm->phase, PrefillGraphPhase::Warmup)
-            << "The rebuilt bucket must explicitly re-enter warmup.";
-        EXPECT_EQ(after_64_rewarm->warmup_count, 1u);
-        EXPECT_EQ(after_64_rewarm->capture_count, 0u);
-        EXPECT_EQ(after_64_rewarm->eviction_count, 2u);
 
         ASSERT_TRUE(engine_->runPrefillChunk(input64, plan64, output, *host_));
         auto after_64_recapture = engine_->prefillGraphCacheSnapshot(signature64, key64);

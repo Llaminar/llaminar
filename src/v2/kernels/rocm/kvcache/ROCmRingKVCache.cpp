@@ -131,6 +131,8 @@ namespace llaminar2
         const int *, int, int, int, hipStream_t);
     extern "C" void hip_kv_sequence_state_advance(
         int *, int *, int, int, hipStream_t);
+    extern "C" void hip_kv_sequence_state_advance_dynamic(
+        int *, int *, const int *, int, int, hipStream_t);
 
     extern "C" void hip_ring_append_verifier_rows_fp32(
         float *, float *, const float *, const float *,
@@ -961,8 +963,9 @@ namespace llaminar2
                                              &d_head_params_[idx], tokens_to_write, effective_stream);
                 if (d_count_params_)
                 {
-                    hip_kv_sequence_state_advance(
+                    hip_kv_sequence_state_advance_dynamic(
                         &d_head_params_[idx], &d_count_params_[idx],
+                        deviceDynamicAppendCountPtr(layer, seq_idx),
                         tokens_to_write, max_seq_len_, effective_stream);
                 }
             }

@@ -983,6 +983,14 @@ Open gaps:
   `discarded_sidecar_checkpoint` tag; that tag remains only on the sequential
   verifier path where a post-sidecar checkpoint is still a real object.
   Phase 5 is accepted on the focused gate.
+- Server E2E repair: CPU NodeLocal MTP thinking-budget requests no longer hang.
+  Rank 0 now sends the per-step decode token budget with `DECODE_STEP`, worker
+  ranks reset that budget after the step, and an MPI sidecar boundary fence keeps
+  sidecar/verifier collectives ordered across ranks. The launcher also maps CPU
+  NodeLocal ranks with `--bind-to core --map-by socket:PE=<cores/socket>`.
+  Gates: `V2_Unit_MPIBootstrap`, `V2_Unit_PrefillDecodeTransition`, focused CPU
+  MTP thinking E2E `27/27`, and dense Qwen3.6 baseline/prefix/MTP E2E `261/261`
+  on CPU/CUDA/ROCm.
 - TP/PP/ExpertParallel MTP is out of scope until SingleDevice is green.
 
 ## Implementation Phases
@@ -3229,6 +3237,16 @@ Current status:
   factory path. Focused guard: `V2_Unit_MmapRegion`. Observed CUDA dense
   verifier perf now starts weight upload immediately and loads 14.3GB in 4.5s;
   the same perf test fails only on verifier economy, not loader hang.
+- [x] The intermittent CPU model-load crawl has a production guard. Single-rank
+  CPU mmap loads and node-leader multi-rank CPU loads now explicitly
+  prepopulate the page cache and skip immediate mmap cache eviction, with
+  structured perfstats counters/timers. The same sprint fixed the exposed CPU
+  MoE MTP lifecycle bug: nextn/MTP-only MoE expert slabs are prepared into
+  `PreparedWeightStore` before host raw data release, so first sidecar graph
+  construction never repacks from released raw tensors. Focused gates:
+  `V2_Unit_NodeLeaderPageCache`,
+  `MTPMoESidecarReusesPreparedExpertSlabsAfterRawRelease`, and focused CPU
+  Qwen3.6 MoE MTP d2 E2E `20260620_081525` (`27/27`).
 - [x] CUDA and ROCm dense M=2/3/4 grouped verifier economy is accepted for
   the current GPU proof lane. The rejected CUDA M=2 row was fixed by removing
   hidden small-M serial GDN/short-conv verifier helpers on both GPU backends
@@ -4732,6 +4750,39 @@ Current status:
   `139.3 -> 75.1 tok/s` and ROCm is `84.0 -> 69.9 tok/s`. The next Phase 10
   slice must implement real branch-side concurrency or a decode-equivalent fused
   producer; graph-edge cleanup alone does not eliminate the producer cost.
+- Request-boundary graph reuse now follows the intended production/server model:
+  warmup may build/capture replay-safe decode, sidecar, and exact bucketed
+  prefill graphs, while later request boundaries clear live KV/GDN/session
+  state without tearing down those executables. `clear_cache()` now calls the
+  replay-preserving forward/sidecar reset path, preserves kernel dynamic pointer
+  tables that captured CUDA/HIP graph nodes reference, and records
+  `live_prefix_replay_state_after_mutation` with
+  `forward_replay_reset_scope=request_boundary_preserve`. Hard
+  `clearInferenceState()` still reports and performs a full replay/kernel
+  reset. Focused gates passed:
+  `V2_Unit_GpuWorkspaceAllocationPolicy`,
+  `V2_Unit_ForwardGraphTypes`, `V2_Unit_PrefillGraphCache`,
+  `V2_Integration_PrefillGraphCacheExecution_{CUDA,ROCm}`,
+  `V2_Integration_MultiTurnSessionReset`, and CUDA/ROCm Qwen3.6 MoE
+  stochastic depth-3/dynamic request-reset parity. A bounded Release refresh at
+  `benchmark_results/mtp_vllm_style/20260620T_request-replay-preserve-fix`
+  restored CUDA MoE stochastic fixed d3 from the recapture/regression lane to
+  `99.93 tok/s` with `30/39` accepted tokens and `sidecar_replay_reset_ms=0`;
+  ROCm posted `80.19 tok/s` with the same acceptance. Phase 10 remains open
+  because CUDA is still below its no-MTP baseline and ROCm is only near
+  break-even; the next target is verifier graph economics, not request recapture.
+- Bucketed prefill graph capture is now default-on. Request-boundary reset
+  preserves armed Warmup entries as well as Ready executables, so repeated
+  same-key served requests progress through build+warmup -> capture -> replay
+  instead of warming every request. The initial cache miss now runs on the
+  dedicated prefill capture stream and arms Warmup after successful preflight.
+  The E2E server harness has a `prefill-graph-probe` option that sends three
+  identical long-enough prompts and requires perfstats `prefill_graph_phase`
+  records for both capture and replay. Focused CUDA and ROCm probes passed:
+  `20260620_045923_*prefill-graph-probe-cuda*.perfstats.json` and
+  `20260620_045943_*prefill-graph-probe-rocm*.perfstats.json`, each showing one
+  `warmup`, one `capture`, and one `replay` record for the same 2048-token
+  bucket.
 - No default-enable proposal is allowed until the active dashboard matrix has
   same-run parity and benchmark evidence for the exact backend/model/sampling
   lanes under consideration.

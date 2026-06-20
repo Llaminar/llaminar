@@ -3841,9 +3841,9 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
     const auto session_reset_tags = PerfStatsCollector::Tags{
         {"operation", "clear_cache"},
         {"mutation_reason", "session_reset"},
-        {"kernel_dynamic_state", "reset"},
-        {"replay_state", "reset"},
-        {"sidecar_replay_state", "reset"}};
+        {"kernel_dynamic_state", "preserved"},
+        {"replay_state", "preserved"},
+        {"sidecar_replay_state", "preserved"}};
     const auto restore_tags = PerfStatsCollector::Tags{
         {"operation", "restore_payload_checkpoint"},
         {"mutation_reason", "prefix_restore"},

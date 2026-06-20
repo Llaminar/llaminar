@@ -11,6 +11,7 @@
 #include "../../../execution/moe/MoEExpertWeightService.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/Tensors.h"
@@ -26,6 +27,14 @@
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include <mpi.h>
+
+#ifdef HAVE_CUDA
+#include "../../../kernels/cuda/ops/CUDARowSelectKernels.h"
+#endif
+
+#ifdef HAVE_ROCM
+#include "../../../kernels/rocm/ops/ROCmRowSelectKernels.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -4191,6 +4200,221 @@ namespace llaminar2
     {
     }
 
+    struct SharedExpertGateStage::GpuEffectiveSeqLenState
+    {
+        DeviceId device = DeviceId::invalid();   ///< Device that owns device_effective_seq_len.
+        int *host_effective_seq_len = nullptr;   ///< Pinned host scalar uploaded before capture/replay.
+        int *device_effective_seq_len = nullptr; ///< Workspace scalar read by shared-gate kernels.
+        bool device_value_uploaded = false;      ///< True once device scalar matches host_effective_seq_len.
+    };
+
+    SharedExpertGateStage::~SharedExpertGateStage()
+    {
+        releaseGpuEffectiveSeqLenState();
+    }
+
+    void SharedExpertGateStage::resetSessionState()
+    {
+        IComputeStage::resetSessionState();
+        prefill_effective_seq_len_ = 0;
+        prefill_replay_params_set_ = false;
+        if (gpu_effective_seq_len_state_)
+            gpu_effective_seq_len_state_->device_value_uploaded = false;
+    }
+
+    void SharedExpertGateStage::resetSessionStatePreservingCapturedReplay()
+    {
+        IComputeStage::resetSessionState();
+        prefill_effective_seq_len_ = 0;
+        prefill_replay_params_set_ = false;
+        if (gpu_effective_seq_len_state_)
+            gpu_effective_seq_len_state_->device_value_uploaded = false;
+    }
+
+    void SharedExpertGateStage::resetSessionStatePreservingLazyInitialization()
+    {
+        resetSessionStatePreservingCapturedReplay();
+    }
+
+    int SharedExpertGateStage::effectivePrefillSeqLen() const
+    {
+        if (!prefill_replay_params_set_ || prefill_effective_seq_len_ <= 0)
+            return params_.seq_len;
+        return std::clamp(prefill_effective_seq_len_, 1, std::max(1, params_.seq_len));
+    }
+
+    void SharedExpertGateStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
+    {
+        prefill_replay_params_set_ = true;
+        const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
+        prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
+        refreshPinnedEffectiveSeqLen();
+        if (gpu_effective_seq_len_state_)
+            gpu_effective_seq_len_state_->device_value_uploaded = false;
+        if (params_.device_id.is_gpu() && gpuStream() && bound_workspace_)
+            (void)(ensureGpuEffectiveSeqLenStateInitialized() && uploadGpuEffectiveSeqLen());
+    }
+
+    void SharedExpertGateStage::refreshPinnedEffectiveSeqLen()
+    {
+        if (gpu_effective_seq_len_state_ && gpu_effective_seq_len_state_->host_effective_seq_len)
+            *gpu_effective_seq_len_state_->host_effective_seq_len = effectivePrefillSeqLen();
+    }
+
+    bool SharedExpertGateStage::ensureGpuEffectiveSeqLenStateInitialized()
+    {
+        if (!bound_workspace_ ||
+            !bound_workspace_->hasBuffer(MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN) ||
+            bound_workspace_->getBufferSize(MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN) < sizeof(int))
+        {
+            LOG_ERROR("[SharedExpertGateStage] Missing graph workspace buffer '"
+                      << MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN
+                      << "' for padded shared-expert gate replay on "
+                      << params_.device_id.toString());
+            return false;
+        }
+
+        auto *device_effective_seq_len = static_cast<int *>(
+            bound_workspace_->getBuffer(MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN));
+        if (!device_effective_seq_len)
+        {
+            LOG_ERROR("[SharedExpertGateStage] Graph workspace buffer '"
+                      << MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN
+                      << "' resolved to null on " << params_.device_id.toString());
+            return false;
+        }
+
+        if (gpu_effective_seq_len_state_)
+        {
+            gpu_effective_seq_len_state_->device_effective_seq_len = device_effective_seq_len;
+            return true;
+        }
+
+        auto state = std::make_unique<GpuEffectiveSeqLenState>();
+        state->device = params_.device_id;
+        state->device_effective_seq_len = device_effective_seq_len;
+
+        bool allocated = false;
+        if (params_.device_id.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            allocated = cuda::allocateRowSelectHostParam(
+                params_.device_id.cuda_ordinal(),
+                &state->host_effective_seq_len);
+#endif
+        }
+        else if (params_.device_id.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            allocated = rocm::allocateRowSelectHostParam(
+                params_.device_id.rocm_ordinal(),
+                &state->host_effective_seq_len);
+#endif
+        }
+
+        if (!allocated || !state->host_effective_seq_len || !state->device_effective_seq_len)
+        {
+            LOG_ERROR("[SharedExpertGateStage] Failed to allocate pinned effective-length scalar for "
+                      << params_.device_id.toString());
+            return false;
+        }
+
+        gpu_effective_seq_len_state_ = std::move(state);
+        refreshPinnedEffectiveSeqLen();
+        return true;
+    }
+
+    bool SharedExpertGateStage::uploadGpuEffectiveSeqLen()
+    {
+        if (!gpu_effective_seq_len_state_)
+            return false;
+        refreshPinnedEffectiveSeqLen();
+
+        if (isGraphCaptureActive())
+        {
+            if (!gpu_effective_seq_len_state_->device_value_uploaded)
+            {
+                LOG_ERROR("[SharedExpertGateStage] Effective sequence length scalar was not uploaded before graph capture");
+                return false;
+            }
+            return true;
+        }
+
+        bool uploaded = false;
+        if (params_.device_id.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            uploaded = cuda::uploadRowSelectParam(
+                gpu_effective_seq_len_state_->device_effective_seq_len,
+                gpu_effective_seq_len_state_->host_effective_seq_len,
+                gpuStream());
+#endif
+        }
+        else if (params_.device_id.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            uploaded = rocm::uploadRowSelectParam(
+                gpu_effective_seq_len_state_->device_effective_seq_len,
+                gpu_effective_seq_len_state_->host_effective_seq_len,
+                gpuStream());
+#endif
+        }
+        gpu_effective_seq_len_state_->device_value_uploaded = uploaded;
+        return uploaded;
+    }
+
+    void SharedExpertGateStage::releaseGpuEffectiveSeqLenState()
+    {
+        if (!gpu_effective_seq_len_state_)
+            return;
+
+        if (gpu_effective_seq_len_state_->device.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            cuda::freeRowSelectHostParam(
+                gpu_effective_seq_len_state_->device.cuda_ordinal(),
+                gpu_effective_seq_len_state_->host_effective_seq_len);
+#endif
+        }
+        else if (gpu_effective_seq_len_state_->device.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            rocm::freeRowSelectHostParam(
+                gpu_effective_seq_len_state_->device.rocm_ordinal(),
+                gpu_effective_seq_len_state_->host_effective_seq_len);
+#endif
+        }
+
+        gpu_effective_seq_len_state_.reset();
+    }
+
+    bool SharedExpertGateStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
+    {
+        (void)ctx;
+        if (stream)
+            setGPUStream(stream);
+
+        if (!hasPrefillReplayParams() || !prefill_replay_params_set_)
+            return true;
+
+        if (!ensureGpuEffectiveSeqLenStateInitialized())
+            return false;
+        const bool uploaded = uploadGpuEffectiveSeqLen();
+        if (uploaded && PerfStatsCollector::isEnabled())
+        {
+            PerfStatsCollector::addCounter(
+                "moe",
+                "shared_gate_padded_prefill_effective_len_prepare",
+                1.0,
+                "prefill",
+                params_.device_id.toString(),
+                PerfStatsCollector::Tags{
+                    {"bucket_seq_len", std::to_string(params_.seq_len)},
+                    {"effective_seq_len", std::to_string(effectivePrefillSeqLen())}});
+        }
+        return uploaded;
+    }
+
     TensorBase *SharedExpertGateStage::effectiveGateInput() const
     {
         if (!params_.gate_inp)
@@ -4278,10 +4502,27 @@ namespace llaminar2
 
         if (fused_combine)
         {
-            kernel->sharedExpertGateAddFromTensors(
-                params_.input, gate_inp, params_.shared_output,
-                params_.routed_residual, params_.combined_output,
-                seq_len, d_model);
+            if (hasPrefillReplayParams() && prefill_replay_params_set_)
+            {
+                if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
+                    return false;
+                if (!kernel->sharedExpertGateAddFromTensorsEffectiveSeqLen(
+                        params_.input, gate_inp, params_.shared_output,
+                        params_.routed_residual, params_.combined_output,
+                        seq_len, d_model,
+                        gpu_effective_seq_len_state_->device_effective_seq_len))
+                {
+                    LOG_ERROR("[SharedExpertGateStage] Effective-length fused shared gate-add failed");
+                    return false;
+                }
+            }
+            else
+            {
+                kernel->sharedExpertGateAddFromTensors(
+                    params_.input, gate_inp, params_.shared_output,
+                    params_.routed_residual, params_.combined_output,
+                    seq_len, d_model);
+            }
             // Fused gate-add materializes both semantic outputs: the gated
             // shared contribution and the final routed+shared combined row.
             markGpuTensorWritten(params_.shared_output, params_.device_id, gpuStream());
@@ -4289,9 +4530,25 @@ namespace llaminar2
             return true;
         }
 
-        kernel->sharedExpertGateFromTensors(
-            params_.input, gate_inp, params_.shared_output,
-            seq_len, d_model);
+        if (hasPrefillReplayParams() && prefill_replay_params_set_)
+        {
+            if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
+                return false;
+            if (!kernel->sharedExpertGateFromTensorsEffectiveSeqLen(
+                    params_.input, gate_inp, params_.shared_output,
+                    seq_len, d_model,
+                    gpu_effective_seq_len_state_->device_effective_seq_len))
+            {
+                LOG_ERROR("[SharedExpertGateStage] Effective-length shared gate failed");
+                return false;
+            }
+        }
+        else
+        {
+            kernel->sharedExpertGateFromTensors(
+                params_.input, gate_inp, params_.shared_output,
+                seq_len, d_model);
+        }
         markGpuTensorWritten(params_.shared_output, params_.device_id, gpuStream());
         if (params_.device_id.is_gpu() && params_.shared_output->needsUpload())
         {
@@ -4310,7 +4567,13 @@ namespace llaminar2
     {
         if (!moe_kernel_)
             moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
-        return bindStageStream(moe_kernel_);
+        auto *kernel = bindStageStream(moe_kernel_);
+        if (bound_workspace_)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel))
+                consumer->bindWorkspace(bound_workspace_);
+        }
+        return kernel;
     }
 
     size_t SharedExpertGateStage::estimatedFlops() const
@@ -4383,6 +4646,49 @@ namespace llaminar2
                params_.shared_output &&
                ((!params_.routed_residual && !params_.combined_output) ||
                 (params_.routed_residual && params_.combined_output));
+    }
+
+    bool SharedExpertGateStage::supportsPaddedPrefillRealLengthContract() const
+    {
+        return supportsPaddedPrefillGraphCapturePreflight();
+    }
+
+    WorkspaceRequirements SharedExpertGateStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        (void)m;
+        (void)n;
+        (void)k;
+        WorkspaceRequirements reqs;
+        if (hasPrefillReplayParams())
+            MoEWorkspaceBuffers::add(reqs, MoEWorkspaceBuffers::PREFILL_EFFECTIVE_SEQ_LEN, sizeof(int));
+        return reqs;
+    }
+
+    void SharedExpertGateStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        bound_workspace_ = workspace;
+        if (gpu_effective_seq_len_state_)
+            gpu_effective_seq_len_state_->device_value_uploaded = false;
+    }
+
+    void SharedExpertGateStage::unbindWorkspace()
+    {
+        bound_workspace_ = nullptr;
+        if (gpu_effective_seq_len_state_)
+        {
+            gpu_effective_seq_len_state_->device_effective_seq_len = nullptr;
+            gpu_effective_seq_len_state_->device_value_uploaded = false;
+        }
+    }
+
+    bool SharedExpertGateStage::hasWorkspace() const
+    {
+        return bound_workspace_ != nullptr;
+    }
+
+    DeviceWorkspaceManager *SharedExpertGateStage::getWorkspace() const
+    {
+        return bound_workspace_;
     }
 
     StageBufferRequirements SharedExpertGateStage::getBufferRequirements() const

@@ -112,6 +112,7 @@ namespace llaminar2
             {
                 if (disable_reason != BenchmarkPrefillBucketDisableReason::None)
                 {
+                    setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "0", 1);
                     if (mpi_ctx && mpi_ctx->rank() == 0)
                     {
                         const char *reason = benchmarkPrefillBucketDisableMessage(disable_reason);

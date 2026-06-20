@@ -104,6 +104,29 @@ protected:
         return r;
     }
 
+    /// Helper: make a minimal template with Qwen-style thinking tags.
+    static std::unique_ptr<ChatTemplate> makeThinkingTemplate()
+    {
+        return ChatTemplate::create(R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- if enable_thinking is defined and enable_thinking is true %}
+<think>
+{%- else %}
+<think>
+
+</think>
+
+{%- endif %}
+{%- endif %})",
+                                    "",
+                                    "");
+    }
+
     std::unique_ptr<MockOrchestrationRunner> runner_;
     std::unique_ptr<MockTokenizer> tokenizer_;
 };
@@ -2553,6 +2576,32 @@ TEST_F(Test__ChatCompletionHandler, ThinkSplitter_AfterTransition_ContentField)
     EXPECT_EQ(r.text, "answer");
 }
 
+TEST_F(Test__ChatCompletionHandler, ThinkSplitter_DuplicateEndTagStopsContent)
+{
+    StreamingThinkSplitter splitter("</think>");
+
+    // The first marker closes reasoning; later markers are malformed answer
+    // text and should stop the stream before the marker is emitted.
+    auto r1 = splitter.process("reasoning</think>\n\nAnswer ");
+    EXPECT_EQ(r1.field, "reasoning_content");
+    EXPECT_FALSE(splitter.inThinking());
+
+    auto first_content = splitter.flush();
+    EXPECT_EQ(first_content.field, "content");
+    EXPECT_EQ(first_content.text, "Answer ");
+    EXPECT_FALSE(first_content.stop_generation);
+
+    auto r2 = splitter.process("</th");
+    EXPECT_EQ(r2.field, "content");
+    EXPECT_TRUE(r2.text.empty());
+    EXPECT_FALSE(r2.stop_generation);
+
+    auto r3 = splitter.process("ink>\n\nIgnored");
+    EXPECT_EQ(r3.field, "content");
+    EXPECT_TRUE(r3.text.empty());
+    EXPECT_TRUE(r3.stop_generation);
+}
+
 TEST_F(Test__ChatCompletionHandler, ThinkSplitter_EndTagOnly_EmptyReasoning)
 {
     StreamingThinkSplitter splitter("</think>");
@@ -2773,6 +2822,69 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_InjectsStopSequ
         << "Injected stop-thinking tokens should appear in output";
     EXPECT_NE(content.find(" thinking"), std::string::npos);
     EXPECT_NE(content.find(" now"), std::string::npos);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_StopsAtDuplicateEndTag)
+{
+    auto handler = makeHandler();
+    auto tmpl = makeThinkingTemplate();
+    ASSERT_TRUE(tmpl->isThinkingModel());
+
+    ON_CALL(*tokenizer_, hasChatTemplate())
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, getChatTemplate())
+        .WillByDefault(::testing::ReturnRef(*tmpl));
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+
+    ON_CALL(*runner_, getStopThinkingPrompt())
+        .WillByDefault(Return("Considering the limited time.\n</think>\n\n"));
+    ON_CALL(*tokenizer_, encode("Considering the limited time.\n</think>\n\n", _, _))
+        .WillByDefault(Return(std::vector<int>{90}));
+    EXPECT_CALL(*tokenizer_, encode("Considering the limited time.\n</think>\n\n", false, false))
+        .Times(1);
+
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("reasoning"));
+    ON_CALL(*tokenizer_, decode_token(90))
+        .WillByDefault(Return("Considering the limited time.\n</think>\n\n"));
+    ON_CALL(*tokenizer_, decode_token(11))
+        .WillByDefault(Return("13"));
+    ON_CALL(*tokenizer_, decode_token(12))
+        .WillByDefault(Return("\n</think>\n\n"));
+    ON_CALL(*tokenizer_, decode_token(13))
+        .WillByDefault(Return("13"));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10))) // Exhausts the thinking budget.
+        .WillOnce(Return(makeToken(11))) // First answer token after the forced close.
+        .WillOnce(Return(makeToken(12))); // Duplicate close tag stops generation.
+    EXPECT_CALL(*runner_, forceDecodeToken(90))
+        .WillOnce(Return(makeToken(90)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "think briefly")};
+    request.max_tokens = 20;
+    request.enable_thinking = true;
+    request.thinking_budget_tokens = 1;
+
+    auto response = handler->handleRequest(request);
+    ASSERT_TRUE(response.ok);
+
+    auto body = json::parse(response.json_body);
+    auto message = body["choices"][0]["message"];
+    const auto content = message["content"].get<std::string>();
+
+    EXPECT_EQ(content, "13\n");
+    EXPECT_EQ(content.find("</think>"), std::string::npos)
+        << "Duplicate thinking end tags must not leak into answer content";
+    ASSERT_TRUE(message.contains("reasoning_content"));
+    EXPECT_NE(message["reasoning_content"].get<std::string>().find("reasoning"),
+              std::string::npos);
 }
 
 TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_DisabledByDefault)

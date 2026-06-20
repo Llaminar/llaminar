@@ -1245,6 +1245,19 @@ add_v2_test(V2_Unit_MPIBackend
     MPI_PROCS 1
 )
 
+# Test: MPIBootstrap - self-launch mpirun command construction and CPU PE binding
+add_executable(v2_unit_mpi_bootstrap unit/utils/Test__MPIBootstrap.cpp)
+target_link_libraries(v2_unit_mpi_bootstrap
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MPIBootstrap
+    COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
+    LABELS "V2;Unit;MPI;CPU;Bootstrap;Regression"
+    MPI_PROCS 1
+)
+
 # Test: UPIBackend - UPI-based collective backend for cross-socket CPU tensor parallelism
 add_executable(v2_unit_upi_backend unit/collective/backends/Test__UPIBackend.cpp)
 target_link_libraries(v2_unit_upi_backend 

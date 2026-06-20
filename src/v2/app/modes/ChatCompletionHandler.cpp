@@ -129,6 +129,56 @@ namespace llaminar2
             return debugEnv().runtime_debug.trace_generated_tokens;
         }
 
+        /**
+         * @brief Remove duplicate thinking end tags from an accumulated raw
+         *        assistant transcript.
+         *
+         * The first end tag is the legitimate transition from reasoning to
+         * answer content.  Any later end tag is a structural marker leaking
+         * into answer text, and Qwen thinking models can loop on
+         * "answer </think> answer" after a forced thinking-budget close.  We
+         * truncate at that second marker and let the already-generated answer
+         * stand.
+         *
+         * @return true if a duplicate marker was removed and generation should
+         *         stop.
+         */
+        bool truncateAtDuplicateThinkingEndTag(
+            std::string &generated_text,
+            const std::string &end_tag)
+        {
+            if (end_tag.empty())
+                return false;
+
+            const size_t first = generated_text.find(end_tag);
+            if (first == std::string::npos)
+                return false;
+
+            const size_t second = generated_text.find(end_tag, first + end_tag.size());
+            if (second == std::string::npos)
+                return false;
+
+            generated_text.erase(second);
+            return true;
+        }
+
+        /**
+         * @brief Return the longest suffix of @p text that could be the prefix
+         *        of @p marker.
+         */
+        size_t partialMarkerSuffixLength(
+            const std::string &text,
+            const std::string &marker)
+        {
+            size_t match_len = 0;
+            for (size_t len = 1; len < marker.size() && len <= text.size(); ++len)
+            {
+                if (text.substr(text.size() - len) == marker.substr(0, len))
+                    match_len = len;
+            }
+            return match_len;
+        }
+
         std::string previewTokenText(std::string text)
         {
             for (char &ch : text)
@@ -314,8 +364,35 @@ namespace llaminar2
     {
         if (!in_thinking_ || end_tag_.empty())
         {
-            // Not in thinking mode or no end tag — everything is content
-            return {"content", token_text};
+            if (end_tag_.empty())
+            {
+                // Not a thinking model: everything is user-visible content.
+                return {"content", token_text};
+            }
+
+            /*
+             * Once the first </think> has closed reasoning, a later </think>
+             * is not valid answer content.  Keep a tiny suffix buffer so tags
+             * split across tokenizer pieces are suppressed before emission.
+             */
+            buffer_ += token_text;
+            const auto pos = buffer_.find(end_tag_);
+            if (pos != std::string::npos)
+            {
+                std::string content = buffer_.substr(0, pos);
+                buffer_.clear();
+                return {"content", content, true};
+            }
+
+            const size_t match_len = partialMarkerSuffixLength(buffer_, end_tag_);
+            if (buffer_.size() > match_len)
+            {
+                std::string safe = buffer_.substr(0, buffer_.size() - match_len);
+                buffer_ = buffer_.substr(buffer_.size() - match_len);
+                return {"content", safe};
+            }
+
+            return {"content", ""};
         }
 
         // We're in thinking mode. Check if this token contains the end tag.
@@ -401,6 +478,17 @@ namespace llaminar2
     {
         if (buffer_.empty())
             return {in_thinking_ ? "reasoning_content" : "content", ""};
+
+        if (!in_thinking_ && !end_tag_.empty())
+        {
+            const auto pos = buffer_.find(end_tag_);
+            if (pos != std::string::npos)
+            {
+                std::string content = buffer_.substr(0, pos);
+                buffer_.clear();
+                return {"content", content, true};
+            }
+        }
 
         std::string result = buffer_;
         buffer_.clear();
@@ -800,6 +888,13 @@ namespace llaminar2
         std::string generated_text;
         int completion_tokens = 0;
         std::string finish_reason = "length";
+        std::string thinking_end_tag;
+        if (request.enable_thinking && tokenizer_.hasChatTemplate())
+        {
+            const auto &chat_template = tokenizer_.getChatTemplate();
+            if (chat_template.isThinkingModel())
+                thinking_end_tag = chat_template.thinkingEndTag();
+        }
 
         // Thinking budget state
         int thinking_tokens = 0;
@@ -968,6 +1063,12 @@ namespace llaminar2
                                     step_forced);
                 completion_tokens++;
                 generated_text += token_text;
+                if (truncateAtDuplicateThinkingEndTag(generated_text, thinking_end_tag))
+                {
+                    finish_reason = "stop";
+                    stop_generation = true;
+                    break;
+                }
             }
 
             if (!stop_generation && !runner_.maybeApplyMoERebalance())
@@ -1327,6 +1428,12 @@ namespace llaminar2
                             }
                         }
                     }
+                    if (split.stop_generation)
+                    {
+                        finish_reason = "stop";
+                        stop_generation = true;
+                        break;
+                    }
 
                     // Check if the splitter transitioned and has buffered content
                     if (!splitter.inThinking())
@@ -1345,6 +1452,12 @@ namespace llaminar2
                                     break;
                                 }
                             }
+                        }
+                        if (flushed.stop_generation)
+                        {
+                            finish_reason = "stop";
+                            stop_generation = true;
+                            break;
                         }
                     }
                 }

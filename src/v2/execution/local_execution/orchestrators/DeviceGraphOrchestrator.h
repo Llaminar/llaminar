@@ -923,6 +923,22 @@ namespace llaminar2
         /// Qwen3.5 MoE expert GEMM preparation, before host weight data is released.
         bool materializeForwardGraphForShape(int seq_len, int batch_size = 1);
 
+        /**
+         * @brief Prepare CPU MoE expert slabs used only by MTP/nextn sidecars.
+         *
+         * Qwen nextn/MTP blocks can live outside the main transformer layer loop,
+         * so ordinary eager forward-graph materialization may never construct a
+         * MoE stage for those expert tensors before raw mmap-backed host data is
+         * released.  This hook materializes the same local expert range that the
+         * sidecar graph will later request, ensuring sidecar graph construction
+         * resolves persistent PreparedWeightStore slabs instead of attempting a
+         * late raw repack.
+         *
+         * @return true when no MTP MoE slabs are needed or all required slabs
+         *         were prepared successfully.
+         */
+        bool prepareMTPMoEExpertSlabs(DeviceId device);
+
         /// Transfer packed weights for migrating experts via MPI.
         /// Returns received weights map: [layer_idx][expert_id] → blobs.
         ReceivedWeightsMap transferExpertWeights(
@@ -2399,11 +2415,18 @@ namespace llaminar2
          * @brief IInferenceRunner request-boundary reset.
          *
          * Resets live sequence state (KV cache, positions, model recurrence,
-         * pending stream handoffs, resident mailboxes, and stage dynamic
-         * metadata) while preserving cached ComputeGraphs and BufferArena
-         * bindings.  Cached stages and GPU replay segments are reset in-place so
-         * the next prompt reuses topology without inheriting request-scoped
-         * KV/GDN/RoPE/kernel state.
+         * pending stream handoffs, resident mailboxes, and request-local stage
+         * metadata) while preserving cached ComputeGraphs, BufferArena
+         * bindings, prepared weights, and proven replay-safe kernel dynamic
+         * objects.  Captured GPU graphs may hold argument pointers into
+         * kernel-owned dynamic buffers, so this path must not globally wipe
+         * kernel dynamic state while it keeps those graph executables alive.
+         *
+         * Proven replay-safe GPU segments, such as single-token decode,
+         * all-position verifier replay, and MTP sidecar graphs, keep their
+         * captured executables; their stages are reset and rebound to explicit
+         * streams before the next launch.  Unproven request-stateful captures,
+         * such as monolithic prefill, still recapture.
          */
         void clear_cache() override
         {
@@ -2418,16 +2441,17 @@ namespace llaminar2
             }
             if (forward_engine_)
             {
-                forward_engine_->resetSessionReplayState();
+                forward_engine_->resetSessionReplayState(
+                    /*preserve_replay_safe_segmented_captures=*/true);
             }
-            mtp_sidecar_depth0_cache_.resetSessionState();
-            mtp_sidecar_depth0_device_token_cache_.resetSessionState();
-            mtp_sidecar_depth0_chained_cache_.resetSessionState();
-            mtp_sidecar_depth0_chained_device_token_cache_.resetSessionState();
-            mtp_sidecar_depth0_kv_only_cache_.resetSessionState();
-            mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionState();
+            mtp_sidecar_depth0_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_chained_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_chained_device_token_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_kv_only_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionStatePreservingSegmentedReplay();
             for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
-                cache.resetSessionState();
+                cache.resetSessionStatePreservingSegmentedReplay();
             mtp_terminal_hidden_row_select_cache_.invalidate();
             mtp_terminal_hidden_rows_select_cache_.invalidate();
             last_pos_offset_ = -1;
@@ -2468,8 +2492,18 @@ namespace llaminar2
             // are expensive and model-specific (e.g., GDN buffers for Qwen3.5).
             // The arena is created once in initializeBuffers() and persists for
             // the lifetime of the orchestrator.
-            // Reset input-dependent cached state on all kernels (e.g., stale token IDs)
-            resetKernelDynamicState();
+            /*
+             * Do not call resetKernelDynamicState() here.  The request reset
+             * above deliberately preserves replay-safe captured CUDA/HIP graph
+             * executables, and those executable nodes can reference
+             * kernel-owned dynamic pointer tables populated during graph
+             * warmup.  Hard dynamic resets are still used when graph replay is
+             * discarded (invalidateExecutionCaches(), clearInferenceState(),
+             * MoE rebalance, prefix restore), but request-boundary state must be
+             * reset through graph/stage contracts that keep capture-owned
+             * pointer identity stable.
+             */
+            recordKernelDynamicStatePreservedForCapturedReplay("clear_cache");
             // Reset model-internal state (no-op for models with hybrid cache since
             // state_.clear() → kv_cache->clear() already handles GDN state reset)
             if (graph_builder_)
@@ -2478,7 +2512,8 @@ namespace llaminar2
             // the host data is gone and cannot be re-uploaded.
             device_sampling_counter_ = 0;
             ++session_epoch_;
-            recordLivePrefixSessionReset("clear_cache");
+            recordLivePrefixSessionReset("clear_cache",
+                                         /*preserve_gpu_replay_state=*/true);
         }
 
         /**
@@ -3362,7 +3397,20 @@ namespace llaminar2
         LivePrefixMutationRecord recordLivePrefixMutation(
             LivePrefixMutationReason reason,
             const char *operation);
-        void recordLivePrefixSessionReset(const char *operation);
+        /**
+         * @brief Record a request/session state reset in live-state telemetry.
+         *
+         * `clear_cache()` is a request-boundary reset: it clears live KV/GDN
+         * and request-local metadata, but deliberately preserves replay-safe
+         * CUDA/HIP graph executables and their captured dynamic pointer tables.
+         * `clearInferenceState()` is a hard reset and must continue to report
+         * replay/kernel teardown.  Keeping the distinction explicit avoids
+         * misleading Phase 10 perf counters and makes the ownership contract
+         * visible to future reset call sites.
+         */
+        void recordLivePrefixSessionReset(
+            const char *operation,
+            bool preserve_gpu_replay_state = false);
         /**
          * @brief Reset every cached depth-0 MTP sidecar graph replay handle.
          *
@@ -3520,6 +3568,29 @@ namespace llaminar2
                         ComputeNode *node = graph->getNode(node_name);
                         if (node && node->stage)
                             node->stage->resetSessionState();
+                    }
+                }
+            }
+
+            /**
+             * @brief Clear request-local sidecar metadata without dropping replay graphs.
+             *
+             * MTP sidecar graphs read stable token/position/device-mailbox
+             * buffers that are rewritten before every launch.  Request reset
+             * must still clear stage-owned dynamic metadata and explicit stream
+             * bindings, but preserving the segmented capture avoids paying
+             * warmup/capture again for every served request with the same shape.
+             */
+            void resetSessionStatePreservingSegmentedReplay()
+            {
+                if (graph)
+                {
+                    graph->reset();
+                    for (const auto &node_name : graph->getExecutionOrder())
+                    {
+                        ComputeNode *node = graph->getNode(node_name);
+                        if (node && node->stage)
+                            node->stage->resetSessionStatePreservingCapturedReplay();
                     }
                 }
             }
@@ -4534,9 +4605,20 @@ namespace llaminar2
         /// Copy the latest forward pass terminal hidden row into the stable MTP input buffer.
         bool refreshMTPTerminalHiddenState(int seq_len, int batch_size);
 
-        /// Reset input-dependent dynamic state on all cached kernels
-        /// Implemented in .cpp to avoid including KernelFactory.h in the header
+        /// Reset input-dependent dynamic state on all cached kernels.
+        ///
+        /// This is a hard graph-replay invalidation helper. Do not call it from
+        /// clear_cache(), because request-boundary reset preserves some captured
+        /// GPU graph executables and their kernel-owned dynamic argument tables.
+        /// Implemented in .cpp to avoid including KernelFactory.h in the header.
         void resetKernelDynamicState();
+
+        /// Record the intentional preservation of kernel dynamic state.
+        ///
+        /// Keeping this visible in perf counters makes request-boundary capture
+        /// reuse auditable and helps catch accidental hard resets in hot paths.
+        void recordKernelDynamicStatePreservedForCapturedReplay(
+            const char *reason) const;
     };
 
 } // namespace llaminar2

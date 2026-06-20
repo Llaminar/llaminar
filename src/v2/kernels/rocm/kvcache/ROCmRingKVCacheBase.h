@@ -59,12 +59,17 @@ namespace llaminar2
         // Graph Capture Support (IKVCache overrides)
         // =====================================================================
 
-        bool isGraphCaptureReady() const override { return d_head_params_ != nullptr; }
+        bool isGraphCaptureReady() const override
+        {
+            return d_head_params_ != nullptr && d_append_count_params_ != nullptr;
+        }
+        bool supportsDynamicAppendState() const override { return true; }
         bool supportsDeviceResidentSequenceStatePublication() const override
         {
             return d_head_params_ != nullptr && d_count_params_ != nullptr;
         }
         void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override;
+        bool setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream) override;
         void advanceHead(int layer, int seq_idx, int num_tokens) override;
         const int *deviceCachedTokenCountPtr(int layer, int seq_idx = 0) const override;
         const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const override;
@@ -111,11 +116,14 @@ namespace llaminar2
         int *h_head_params_ = nullptr;  ///< Pinned host-side head position buffer
         int *d_count_params_ = nullptr; ///< Device-side cached-token count buffer
         int *h_count_params_ = nullptr; ///< Pinned host-side cached-token count buffer
+        int *d_append_count_params_ = nullptr; ///< Device-side real append count override
+        int *h_append_count_params_ = nullptr; ///< Pinned host-side real append count override
 
         void allocateDeviceParams();
         void freeDeviceParams();
         void refreshHostDeviceParamMirror(int layer, int seq_idx);
         bool uploadHostDeviceParamMirror(int layer, int seq_idx, void *gpu_stream);
+        const int *deviceDynamicAppendCountPtr(int layer, int seq_idx) const;
 
         bool validLayerSeq(int layer, int seq_idx) const
         {

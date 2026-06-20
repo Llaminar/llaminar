@@ -52,11 +52,20 @@ namespace llaminar2
     /// Phase of the prefill graph cache state machine.
     enum class PrefillGraphPhase
     {
-        Disabled,  ///< Feature disabled or unsupported config
-        Cold,      ///< No graph for this key; next run is warmup
-        Warmup,    ///< Warmup complete, armed for capture on next run
-        Capturing, ///< Capture run in progress (stream recording)
-        Ready      ///< Graph instantiated, ready for replay
+        Disabled,    ///< Feature disabled or unsupported config
+        Cold,        ///< No reusable graph or lazy-initialization state for this key
+        Initialized, ///< Lazy stage/kernel resources are initialized; current request is not armed
+        Warmup,      ///< Current-request warmup complete, armed for capture on next run
+        Capturing,   ///< Capture run in progress (stream recording)
+        Ready        ///< Graph instantiated, ready for replay
+    };
+
+    /// Controls how preflight treats padded-bucket stages that warm lazily.
+    enum class PrefillGraphPreflightMode
+    {
+        Default,           ///< Cold padded buckets may use support-only checks; other states require readiness
+        ColdPaddedSupport, ///< Validate padded-bucket support without requiring warmed capture readiness
+        CaptureReady       ///< Require strict capture readiness for every stage
     };
 
     /// Reasons a prefill graph capture can be rejected.
@@ -86,7 +95,7 @@ namespace llaminar2
         bool enabled = true;                 ///< LLAMINAR_GPU_GRAPHS master flag
         int min_seq_len = 256;               ///< LLAMINAR_PREFILL_GRAPH_MIN_SEQ
         bool trace = false;                  ///< LLAMINAR_PREFILL_GRAPH_TRACE
-        bool buckets_enabled = false;        ///< LLAMINAR_PREFILL_GRAPH_BUCKETS
+        bool buckets_enabled = true;         ///< Bucketed capture is on by default; LLAMINAR_PREFILL_GRAPH_BUCKETS=0 opts out.
         std::vector<int> bucket_sizes;       ///< LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES
         size_t max_cached_entries = 10;      ///< LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS
     };
@@ -106,8 +115,17 @@ namespace llaminar2
     /// Lifetime counters for a bucket key, retained even if the graph entry is evicted.
     struct PrefillGraphLifecycleStats
     {
-        uint64_t warmup_count = 0;  ///< Number of times this key entered Warmup.
-        uint64_t capture_count = 0; ///< Number of successful captures for this key.
+        uint64_t warmup_count = 0;      ///< Number of times this key entered Warmup.
+        uint64_t initialized_count = 0; ///< Number of times request reset preserved lazy init only.
+        uint64_t capture_count = 0;     ///< Number of successful captures for this key.
+    };
+
+    /// Summary of request-boundary prefill graph-cache cleanup.
+    struct PrefillGraphRequestResetSummary
+    {
+        size_t ready_preserved = 0; ///< Ready executable entries kept for replay.
+        size_t initialized = 0;     ///< Entries kept as lazy-initialized, without request capture arming.
+        size_t dropped = 0;         ///< Capturing/invalid entries dropped to Cold.
     };
 
     class PrefillGraphCache
@@ -130,13 +148,21 @@ namespace llaminar2
             bool snapshots_active,
             bool moe_rebalancing_active = false,
             int real_seq_len = 0,
-            int bucket_seq_len = 0) const;
+            int bucket_seq_len = 0,
+            PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default) const;
 
         /// Mark warmup complete for a key. Transitions Cold → Warmup (arms capture).
         void markWarmedUp(const PrefillGraphCacheKey &key);
 
-        /// Begin graph capture on the given explicit stream.
-        /// Transitions Warmup → Capturing. Returns false if not in Warmup phase or capture fails.
+        /**
+         * @brief Begin graph capture on the given explicit stream.
+         *
+         * Warmup entries are armed by a fresh request-local warmup. Initialized
+         * entries are accepted only after the caller has run strict capture-ready
+         * preflight and prepared current request metadata. The cache keeps this
+         * method narrow: it validates lifecycle and stream ownership, while the
+         * executor decides whether capture is semantically safe for this request.
+         */
         bool beginCapture(const PrefillGraphCacheKey &key, IWorkerGPUContext *gpu_ctx, void *stream);
 
         /// End graph capture, instantiate the executable graph.
@@ -149,6 +175,28 @@ namespace llaminar2
 
         /// Invalidate all cached entries (e.g., after expert placement mutation).
         void invalidateAll(PrefillGraphRejectReason reason = PrefillGraphRejectReason::InvalidatedByPlacement);
+
+        /**
+         * @brief Preserve replay-ready entries across a request-boundary reset.
+         *
+         * `clear_cache()` resets live KV/GDN/short-conv contents, but replay-ready
+         * bucketed prefill graph entries are designed to read refreshed graph-facing
+         * buffers and then replay the same deterministic mutation sequence.
+         *
+         * Warmup entries are intentionally not preserved as Warmup. A warmed
+         * entry has observed request-local runtime metadata, but it has also
+         * performed useful lazy stage/kernel initialization. Request reset converts
+         * Warmup to Initialized: the next same-key request may capture only after a
+         * strict capture-ready preflight and fresh metadata preparation, or else it
+         * executes a fresh warmup. This preserves lazy resources without carrying
+         * a request-armed state across `clear_cache()`.
+         *
+         * @return Summary of preserved, initialized, and dropped entries.
+         */
+        PrefillGraphRequestResetSummary prepareEntriesForRequestReset();
+
+        /// Compatibility wrapper returning only dropped entries.
+        size_t preserveReadyEntriesAcrossRequestReset();
 
         /// Invalidate a specific entry.
         void invalidate(const PrefillGraphCacheKey &key);
@@ -170,6 +218,9 @@ namespace llaminar2
 
         /// Get lifetime warmup count for a key, including entries later evicted.
         uint64_t warmupCount(const PrefillGraphCacheKey &key) const;
+
+        /// Get lifetime lazy-initialized count for a key, including entries later evicted.
+        uint64_t initializedCount(const PrefillGraphCacheKey &key) const;
 
         /// Get lifetime successful capture count for a key, including recaptures.
         uint64_t captureCount(const PrefillGraphCacheKey &key) const;

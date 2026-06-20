@@ -82,6 +82,17 @@ namespace llaminar2
             return;
         }
 
+        err = hipMalloc(&d_append_count_params_, num_entries * sizeof(int));
+        if (err != hipSuccess)
+        {
+            LOG_WARN("[ROCmRingKVCacheBase] Failed to allocate device append-count params: "
+                     << hipGetErrorString(err) << " - graph capture disabled");
+            d_append_count_params_ = nullptr;
+            h_append_count_params_ = nullptr;
+            freeDeviceParams();
+            return;
+        }
+
         err = hipHostMalloc(&h_head_params_, num_entries * sizeof(int));
         if (err != hipSuccess)
         {
@@ -99,6 +110,16 @@ namespace llaminar2
             LOG_WARN("[ROCmRingKVCacheBase] Failed to allocate pinned count params: "
                      << hipGetErrorString(err) << " - device-resident KV sequence publication disabled");
             h_count_params_ = nullptr;
+            freeDeviceParams();
+            return;
+        }
+
+        err = hipHostMalloc(&h_append_count_params_, num_entries * sizeof(int));
+        if (err != hipSuccess)
+        {
+            LOG_WARN("[ROCmRingKVCacheBase] Failed to allocate pinned append-count params: "
+                     << hipGetErrorString(err) << " - graph capture disabled");
+            h_append_count_params_ = nullptr;
             freeDeviceParams();
             return;
         }
@@ -121,6 +142,14 @@ namespace llaminar2
             freeDeviceParams();
             return;
         }
+        err = hipMemsetAsync(d_append_count_params_, 0, num_entries * sizeof(int), init_stream);
+        if (err != hipSuccess)
+        {
+            LOG_WARN("[ROCmRingKVCacheBase] Failed to initialize device append-count params: "
+                     << hipGetErrorString(err) << " - graph capture disabled");
+            freeDeviceParams();
+            return;
+        }
         err = hipStreamSynchronize(init_stream);
         if (err != hipSuccess)
         {
@@ -131,9 +160,10 @@ namespace llaminar2
         }
         std::memset(h_head_params_, 0, num_entries * sizeof(int));
         std::memset(h_count_params_, 0, num_entries * sizeof(int));
+        std::memset(h_append_count_params_, 0, num_entries * sizeof(int));
 
         LOG_DEBUG("[ROCmRingKVCacheBase] Allocated device params for graph capture: "
-                  << num_entries << " entries (" << num_entries * sizeof(int) * 2 << " bytes)");
+                  << num_entries << " entries (" << num_entries * sizeof(int) * 3 << " bytes)");
     }
 
     void ROCmRingKVCacheBase::freeDeviceParams()
@@ -173,6 +203,24 @@ namespace llaminar2
                 fprintf(stderr, "WARNING: hipHostFree(h_count_params_) failed: %s\n", hipGetErrorString(err));
             }
             h_count_params_ = nullptr;
+        }
+        if (d_append_count_params_)
+        {
+            hipError_t err = hipFree(d_append_count_params_);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(d_append_count_params_) failed: %s\n", hipGetErrorString(err));
+            }
+            d_append_count_params_ = nullptr;
+        }
+        if (h_append_count_params_)
+        {
+            hipError_t err = hipHostFree(h_append_count_params_);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipHostFree(h_append_count_params_) failed: %s\n", hipGetErrorString(err));
+            }
+            h_append_count_params_ = nullptr;
         }
     }
 
@@ -235,19 +283,26 @@ namespace llaminar2
 
     void ROCmRingKVCacheBase::setDynamicHead(int layer, int seq_idx, void *gpu_stream)
     {
+        (void)setDynamicAppendState(layer, seq_idx, 0, gpu_stream);
+    }
+
+    bool ROCmRingKVCacheBase::setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream)
+    {
         if (!d_head_params_ || !h_head_params_)
-            return;
+            return false;
         if (!validLayerSeq(layer, seq_idx))
-            return;
+            return false;
 
         int idx = layer * batch_size_ + seq_idx;
         refreshHostDeviceParamMirror(layer, seq_idx);
+        if (h_append_count_params_)
+            h_append_count_params_[idx] = append_tokens;
         if (!gpu_stream)
-            return;
+            return false;
         if (isGraphCaptureActive())
         {
-            LOG_ERROR("[ROCmRingKVCacheBase] Refusing to upload dynamic KV head inside HIP graph capture");
-            return;
+            LOG_ERROR("[ROCmRingKVCacheBase] Refusing to upload dynamic KV append state inside HIP graph capture");
+            return false;
         }
 
         hipError_t err = hipMemcpyAsync(
@@ -275,6 +330,22 @@ namespace llaminar2
                           << hipGetErrorString(err));
             }
         }
+        if (d_append_count_params_ && h_append_count_params_)
+        {
+            err = hipMemcpyAsync(
+                &d_append_count_params_[idx],
+                &h_append_count_params_[idx],
+                sizeof(int),
+                hipMemcpyHostToDevice,
+                static_cast<hipStream_t>(gpu_stream));
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmRingKVCacheBase] Failed to upload dynamic KV append count: "
+                          << hipGetErrorString(err));
+                return false;
+            }
+        }
+        return true;
     }
 
     void ROCmRingKVCacheBase::advanceHead(int layer, int seq_idx, int num_tokens)
@@ -315,6 +386,14 @@ namespace llaminar2
             return nullptr;
         const int idx = layer * batch_size_ + seq_idx;
         return &d_head_params_[idx];
+    }
+
+    const int *ROCmRingKVCacheBase::deviceDynamicAppendCountPtr(int layer, int seq_idx) const
+    {
+        if (!d_append_count_params_ || !validLayerSeq(layer, seq_idx))
+            return nullptr;
+        const int idx = layer * batch_size_ + seq_idx;
+        return &d_append_count_params_[idx];
     }
 
     void ROCmRingKVCacheBase::refreshHostDeviceParamMirror(int layer, int seq_idx)

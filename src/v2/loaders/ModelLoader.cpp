@@ -1803,21 +1803,21 @@ namespace llaminar2
         {
             if (col_start % block_size != 0)
             {
-                LOG_ERROR("[ModelLoader] Column start (" << col_start
+                LOG_DEBUG("[ModelLoader] Column start (" << col_start
                                                          << ") must be aligned to block size (" << block_size
                                                          << ") for: " << tensor_name);
                 return nullptr;
             }
             if (col_end % block_size != 0)
             {
-                LOG_ERROR("[ModelLoader] Column end (" << col_end
+                LOG_DEBUG("[ModelLoader] Column end (" << col_end
                                                        << ") must be aligned to block size (" << block_size
                                                        << ") for: " << tensor_name);
                 return nullptr;
             }
             if (total_cols % block_size != 0)
             {
-                LOG_ERROR("[ModelLoader] Total columns (" << total_cols
+                LOG_DEBUG("[ModelLoader] Total columns (" << total_cols
                                                           << ") not divisible by block size (" << block_size
                                                           << ") for: " << tensor_name);
                 return nullptr;

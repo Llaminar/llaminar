@@ -3,6 +3,7 @@
 #include "loaders/gpu_pipeline/PinnedRingBuffer.h"
 #include "backends/IBackend.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/WeightLoadingProfiler.h"
 #include "utils/DebugEnv.h"
 
@@ -400,6 +401,25 @@ namespace llaminar2
         const double throughput_gbs = (pipeline_ms > 0.0)
                                           ? (total_mb / 1024.0) / (pipeline_ms / 1000.0)
                                           : 0.0;
+        const double cpu_staging_gbs = (cpu_staging_ms > 0.0)
+                                           ? (total_mb / 1024.0) / (cpu_staging_ms / 1000.0)
+                                           : 0.0;
+        if (PerfStatsCollector::isEnabled())
+        {
+            const std::string device = "gpu:" + std::to_string(device_id_);
+            PerfStatsCollector::addCounter("weight_loading", "gpu_pipeline_bytes",
+                                           static_cast<double>(total_bytes), "load", device);
+            PerfStatsCollector::addCounter("weight_loading", "gpu_pipeline_throughput_gbs",
+                                           throughput_gbs, "load", device);
+            PerfStatsCollector::addCounter("weight_loading", "gpu_pipeline_cpu_staging_ms",
+                                           cpu_staging_ms, "load", device);
+            PerfStatsCollector::addCounter("weight_loading", "gpu_pipeline_cpu_staging_gbs",
+                                           cpu_staging_gbs, "load", device);
+            PerfStatsCollector::addCounter("weight_loading", "gpu_pipeline_event_wait_ms",
+                                           event_wait_ms, "load", device);
+            PerfStatsCollector::addCounter("weight_loading", "gpu_pipeline_drain_ms",
+                                           drain_ms, "load", device);
+        }
         LOG_DEBUG("DeviceLoadPipeline: device " << device_id_ << " loaded "
                                                 << num_processed_ << " weights, " << std::fixed << std::setprecision(1)
                                                 << total_mb << " MB in " << pipeline_ms << " ms ("

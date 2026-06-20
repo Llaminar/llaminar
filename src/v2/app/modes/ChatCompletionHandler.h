@@ -117,6 +117,15 @@ namespace llaminar2
         {
             std::string field; ///< "reasoning_content" or "content"
             std::string text;  ///< Text to emit (may be empty if buffering)
+            /**
+             * @brief True when a structural thinking marker was seen after
+             *        the reasoning block had already been closed.
+             *
+             * Thinking tags are protocol markers, not user-visible answer
+             * text.  A second end tag means generation has entered a malformed
+             * answer loop, so callers should stop without emitting the tag.
+             */
+            bool stop_generation{false};
         };
         SplitResult process(const std::string &token_text);
 

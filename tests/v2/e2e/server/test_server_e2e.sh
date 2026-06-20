@@ -53,6 +53,10 @@
 #   LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B Minimum parsed model size in billions (default: 4)
 #   LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS Seconds to poll for GPU VRAM release
 #                       after server shutdown before declaring a leak (default: 30)
+#   LLAMINAR_E2E_PERF_STATS Enable per-case PerfStats JSON artifacts and graph
+#                       capture assertions for MTP GPU cases (default: 1)
+#   LLAMINAR_E2E_PERF_STATS_GPU_STAGE_TIMING Include GPU stage timing in
+#                       PerfStats artifacts where supported (default: 1)
 #   LLAMINAR_E2E_ENABLE_REMOTE_EXPERT_OVERLAY Enable experimental remote
 #                       NodeLocal CPU-cold ExpertOverlay suites. These are
 #                       intentionally off until production participant graphs
@@ -80,6 +84,8 @@ GPU_ACTIVE_MIN_MB="${LLAMINAR_E2E_GPU_ACTIVE_MIN_MB:-256}"
 GPU_RELEASE_TIMEOUT_SECONDS="${LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS:-30}"
 TRACE_TOKENS="${LLAMINAR_E2E_TRACE_TOKENS:-0}"
 REMOTE_EXPERT_OVERLAY_E2E="${LLAMINAR_E2E_ENABLE_REMOTE_EXPERT_OVERLAY:-0}"
+PERF_STATS_ENABLED="${LLAMINAR_E2E_PERF_STATS:-1}"
+PERF_STATS_GPU_STAGE_TIMING="${LLAMINAR_E2E_PERF_STATS_GPU_STAGE_TIMING:-1}"
 # Thinking-capable Qwen models may spend hundreds of tokens deliberating before
 # answering. The E2E suite is a bounded server regression gate, so exercise the
 # thinking-budget path by default instead of relying on unconstrained thinking
@@ -94,6 +100,9 @@ THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
 # The optional 5th field (label) is a short display/log suffix for feature cases.
 # The optional 6th field (suite_options) is harness metadata. Supported:
 #   no-long-context  Skip duplicate optional long-context helper for feature variants.
+#   no-prefill-graph-buckets  Opt this suite out of default bucketed prefill graph capture.
+#   prefill-graph-probe  Send repeated same-key long-enough prompts to prove capture/replay.
+#   require-prefill-graph-capture  Fail unless perfstats record prefill capture/replay.
 # If the 3rd field is non-numeric, it's treated as extra_flags (max_tokens defaults to 200).
 # Each --suite flag appends to the list. If none given, defaults are used.
 declare -a SUITES=()
@@ -164,7 +173,7 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     # <think>...</think> tags before the actual answer.
     S6_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
     if [ -f "$S6_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S6_MODEL}|tp|200|--tp-devices rocm:0,rocm:1")
+        SUITES+=("${S6_MODEL}|tp|200|--tp-devices rocm:0,rocm:1|qwen35-dense-rocm2tp|no-prefill-graph-buckets")
     fi
 
     # Suite 7: Qwen3.5 27B dense PP2 (pipeline parallel: cuda:0 + rocm:0, equal layer split)
@@ -172,7 +181,7 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     # Uses max_tokens=200 because Qwen3.5 is a thinking model.
     S7_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
     if [ -f "$S7_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S7_MODEL}|pp|200|--define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-31 --pp-stage 1=rocm_pp:32-63")
+        SUITES+=("${S7_MODEL}|pp|200|--define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-31 --pp-stage 1=rocm_pp:32-63|qwen35-dense-localpp-cuda-rocm|no-prefill-graph-buckets")
     fi
 
     # Suite 8: Qwen3.6 27B dense baseline and feature server cases.
@@ -207,19 +216,19 @@ if [ ${#SUITES[@]} -eq 0 ]; then
         SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200||qwen36-moe-baseline")
         SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_PREFIX_FLAGS}|qwen36-moe-prefix-ram|no-long-context")
         SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_MTP_FLAGS}|qwen36-moe-mtp-greedy-d2|no-long-context")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-prefix-ram-cuda2tp|no-long-context")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-mtp-greedy-d2-cuda2tp|no-long-context")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-prefix-ram-rocm2tp|no-long-context")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-prefix-ram-cuda2tp|no-long-context,no-prefill-graph-buckets")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-mtp-greedy-d2-cuda2tp|no-long-context,no-prefill-graph-buckets")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-prefix-ram-rocm2tp|no-long-context,no-prefill-graph-buckets")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context,no-prefill-graph-buckets")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context,no-prefill-graph-buckets")
+        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context,no-prefill-graph-buckets")
         if [[ "$REMOTE_EXPERT_OVERLAY_E2E" == "1" ]]; then
-            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-rocm2-cpu2|no-long-context")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-rocm2-cpu2|no-long-context")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-cpu2|no-long-context")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-cpu2|no-long-context")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-rocm2-cpu2|no-long-context")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-rocm2-cpu2|no-long-context")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
+            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
         fi
     fi
 fi
@@ -282,9 +291,24 @@ is_prefix_cache_case() {
     [[ " ${extra_flags} " == *" --prefix-cache "* ]]
 }
 
+is_mtp_case() {
+    local extra_flags="$1"
+    [[ " ${extra_flags} " == *" --mtp "* ]]
+}
+
 suite_disables_long_context() {
     local suite_options="$1"
     [[ ",${suite_options}," == *",no-long-context,"* ]]
+}
+
+suite_disables_prefill_graph_buckets() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",no-prefill-graph-buckets,"* ]]
+}
+
+suite_runs_prefill_graph_probe() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",prefill-graph-probe,"* ]]
 }
 
 is_gpu_backend() {
@@ -343,7 +367,8 @@ run_long_context_checks() {
     local port="$2"
     local thinking_model="$3"
 
-    if python3 "$SCRIPT_DIR/long_context_checks.py" \
+    if LLAMINAR_E2E_LONG_CONTEXT_ARTIFACT_DIR="$LOG_DIR" \
+        python3 "$SCRIPT_DIR/long_context_checks.py" \
         --base-url "http://127.0.0.1:${port}" \
         --tag "$tag" \
         --tier "$LONG_CONTEXT_TIER" \
@@ -848,6 +873,157 @@ check_memory_usage() {
     fi
 }
 
+validate_perf_stats() {
+    local tag="$1"
+    local backend="$2"
+    local extra_flags="$3"
+    local perf_path="$4"
+    local long_context_run="${5:-false}"
+    local suite_options="${6:-}"
+
+    if [ "$PERF_STATS_ENABLED" != "1" ]; then
+        return
+    fi
+
+    if [ ! -s "$perf_path" ]; then
+        if is_mtp_case "$extra_flags"; then
+            fail "[${tag}] PerfStats: missing artifact for MTP case (${perf_path})"
+        else
+            echo -e "  ${YELLOW}SKIP${NC} [${tag}] PerfStats: no records emitted (${perf_path})"
+        fi
+        return
+    fi
+
+    local validation
+    validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" <<'PY'
+import json
+import sys
+
+path, backend, extra_flags, long_context_run, suite_options = sys.argv[1:6]
+is_gpu = backend.startswith(("cuda:", "rocm:")) or backend in {"tp", "pp"}
+is_mtp = f" {extra_flags} ".find(" --mtp ") >= 0
+suite_option_set = {
+    option.strip()
+    for option in suite_options.split(",")
+    if option.strip()
+}
+expect_prefill_phase = (
+    is_gpu
+    and long_context_run == "true"
+    and "no-prefill-graph-buckets" not in suite_option_set
+)
+require_prefill_capture = (
+    "require-prefill-graph-capture" in suite_option_set
+    or "prefill-graph-probe" in suite_option_set
+)
+require_prefill_replay = "prefill-graph-probe" in suite_option_set
+expect_decode_replay = (
+    is_mtp
+    or long_context_run == "true"
+    or "require-decode-graph-replay" in suite_option_set
+)
+
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+records = data.get("records")
+if not isinstance(records, list):
+    print("FAIL: missing records array")
+    sys.exit(0)
+
+def has_record(name=None, domain=None, tags=None):
+    tags = tags or {}
+    for record in records:
+        if name is not None and record.get("name") != name:
+            continue
+        if domain is not None and record.get("domain") != domain:
+            continue
+        record_tags = record.get("tags") or {}
+        if all(record_tags.get(key) == value for key, value in tags.items()):
+            return True
+    return False
+
+decode_graph_captured = (
+    has_record("decode_graph_phase", "forward_graph", {"phase": "capture"})
+    or has_record("decode_segmented_phase", "forward_graph", {"phase": "capture"})
+)
+decode_graph_replayed = (
+    has_record("decode_graph_phase", "forward_graph", {"phase": "replay"})
+    or has_record("decode_segmented_phase", "forward_graph", {"phase": "replay"})
+)
+decode_graph_explicitly_unsupported = has_record(
+    "decode_capture_policy",
+    "forward_graph",
+    {
+        "has_collectives": "true",
+        "collectives_graph_capturable": "false",
+    },
+)
+
+if is_mtp and not has_record(domain="mtp"):
+    print("FAIL: MTP case emitted no mtp-domain counters")
+    sys.exit(0)
+
+if is_gpu:
+    if not decode_graph_captured and not decode_graph_explicitly_unsupported:
+        print("FAIL: GPU case emitted no decode graph capture counter")
+        sys.exit(0)
+    # Short arithmetic probes may finish immediately after warmup/capture,
+    # especially on ROCm.  Require replay only for cases that deliberately
+    # create enough decode work or explicitly ask for a replay proof.  LocalTP
+    # and PP suites that include non-capturable collectives must emit an
+    # explicit policy counter instead of quietly pretending graph replay was
+    # available.
+    if expect_decode_replay and not decode_graph_replayed and not decode_graph_explicitly_unsupported:
+        print("FAIL: GPU case expected decode graph replay but emitted no replay counter")
+        sys.exit(0)
+
+if expect_prefill_phase:
+    if not has_record("prefill_graph_phase", "forward_graph"):
+        print("FAIL: eligible GPU long-context case emitted no prefill graph phase counters")
+        sys.exit(0)
+
+if require_prefill_capture:
+    if not has_record("prefill_graph_phase", "forward_graph", {"capture_phase": "capture"}):
+        print("FAIL: suite required prefill graph capture but no capture phase was recorded")
+        sys.exit(0)
+
+if require_prefill_replay:
+    if not has_record("prefill_graph_phase", "forward_graph", {"capture_phase": "replay"}):
+        print("FAIL: suite required prefill graph replay but no replay phase was recorded")
+        sys.exit(0)
+
+if is_gpu and is_mtp:
+    if not (
+        has_record("sidecar_graph_cache_hits", "mtp")
+        or has_record("sidecar_graph_cache_misses", "mtp")
+        or has_record("sidecar_graph_capture_path", "mtp")
+    ):
+        print("FAIL: GPU MTP case emitted no sidecar graph cache/capture counters")
+        sys.exit(0)
+    if not has_record(
+        "live_prefix_replay_state_after_mutation",
+        "mtp",
+        {
+            "operation": "clear_cache",
+            "forward_replay_reset_scope": "request_boundary_preserve",
+            "kernel_dynamic_state": "preserved",
+        },
+    ):
+        print("FAIL: GPU MTP case did not preserve replay state at request-boundary clear_cache")
+        sys.exit(0)
+
+print(f"ok {len(records)}")
+PY
+)
+
+    if [[ "$validation" == ok* ]]; then
+        pass "[${tag}] PerfStats: captured ${validation#ok } records (${perf_path})"
+    else
+        fail "[${tag}] PerfStats: ${validation} (${perf_path})"
+    fi
+}
+
 # ─── Validation ───────────────────────────────────────────────────────────────
 if [ ! -x "$BINARY" ]; then
     echo -e "${RED}Error: Binary not found: ${BINARY}${NC}"
@@ -895,6 +1071,14 @@ run_chat_answer_check() {
             pass "[${tag}] ${test_name} (${mode}): got '${content_preview}' (answer ${expected_answer})"
         else
             fail "[${tag}] ${test_name} (${mode}): expected answer ${expected_answer}, got '${content_preview}'"
+        fi
+
+        if [ "$thinking_model" = "true" ] && [ "$enable_thinking" = "true" ]; then
+            if printf '%s' "$content" | grep -q '</think>'; then
+                fail "[${tag}] ${test_name} (${mode}): leaked thinking control tag in content '${content_preview}'"
+            else
+                pass "[${tag}] ${test_name} (${mode}): no leaked thinking control tags"
+            fi
         fi
 
         if [ "$thinking_model" = "true" ]; then
@@ -1002,6 +1186,14 @@ print('ok')
             fail "[${tag}] SSE streaming (${mode}): expected answer ${expected_answer}, got '${stream_preview}'"
         fi
 
+        if [ "$thinking_model" = "true" ] && [ "$enable_thinking" = "true" ]; then
+            if printf '%s' "$stream_content" | grep -q '</think>'; then
+                fail "[${tag}] SSE streaming (${mode}): leaked thinking control tag in content '${stream_preview}'"
+            else
+                pass "[${tag}] SSE streaming (${mode}): no leaked thinking control tags"
+            fi
+        fi
+
         if [ "$thinking_model" = "true" ]; then
             if [ -z "$reference_answer" ]; then
                 reference_answer="$answer"
@@ -1012,6 +1204,73 @@ print('ok')
             fi
         fi
     done
+}
+
+run_prefill_graph_probe() {
+    local tag="$1"
+    local port="$2"
+
+    local messages_json payload response validation i
+    messages_json=$(python3 - <<'PY'
+import json
+
+filler = " ".join(
+    f"capture probe block {i}: alpha beta gamma delta epsilon zeta eta theta."
+    for i in range(90)
+)
+messages = [
+    {
+        "role": "system",
+        "content": "You are a deterministic probe endpoint. Reply briefly.",
+    },
+    {
+        "role": "user",
+        "content": (
+            f"{filler}\n\n"
+            "This is a repeated prefill graph capture probe. Reply with the word OK."
+        ),
+    },
+]
+print(json.dumps(messages, separators=(",", ":")))
+PY
+)
+
+    for i in 1 2 3; do
+        payload=$(make_chat_payload "$messages_json" 4 "false" "false")
+        response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
+
+        validation=$(printf '%s' "$response" | python3 -c "
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+    content = data.get('choices', [{}])[0].get('message', {}).get('content')
+    usage = data.get('usage', {})
+    prompt_tokens = int(usage.get('prompt_tokens', 0))
+    completion_tokens = int(usage.get('completion_tokens', 0))
+    if not isinstance(content, str):
+        print('FAIL: missing assistant content')
+    elif prompt_tokens < 256:
+        print(f'FAIL: prompt_tokens {prompt_tokens} below prefill graph threshold')
+    elif completion_tokens <= 0:
+        print('FAIL: no completion tokens')
+    else:
+        print(f'ok prompt_tokens={prompt_tokens} completion_tokens={completion_tokens}')
+except Exception as exc:
+    print(f'FAIL: malformed response: {exc}')
+")
+        if [[ "$validation" == ok* ]]; then
+            continue
+        fi
+        fail "[${tag}] Prefill graph probe request ${i}: ${validation}"
+        return
+    done
+
+    pass "[${tag}] Prefill graph probe: repeated same-key long prefill completed through replay request"
 }
 
 # ─── Test Runner Function ─────────────────────────────────────────────────────
@@ -1053,10 +1312,14 @@ run_backend_tests() {
     if [[ "$backend" != "tp" && "$backend" != "pp" ]]; then
         device_flag="-d ${backend}"
     fi
-    local safe_tag log_path gpu_before_mb
+    local safe_tag log_path perf_path gpu_before_mb
     safe_tag=$(sanitize_name "$tag")
     log_path="${LOG_DIR}/$(date +%Y%m%d_%H%M%S)_${safe_tag}_port${port}.log"
+    perf_path="${log_path%.log}.perfstats.json"
     gpu_before_mb=$(get_total_gpu_memory_mb)
+    if [ "$PERF_STATS_ENABLED" = "1" ]; then
+        echo -e "  ${BLUE}INFO${NC} [${tag}] PerfStats artifact: ${perf_path}"
+    fi
 
     # Start server
     local context_args=()
@@ -1064,9 +1327,22 @@ run_backend_tests() {
         context_args=(-c "$CONTEXT_LENGTH")
     fi
 
-    LLAMINAR_LOG_LEVEL="$LOG_LEVEL" \
-        LLAMINAR_TRACE_GENERATED_TOKENS="$TRACE_TOKENS" \
-        "$BINARY" serve --port "$port" \
+    local -a server_env=(
+        "LLAMINAR_LOG_LEVEL=$LOG_LEVEL"
+        "LLAMINAR_TRACE_GENERATED_TOKENS=$TRACE_TOKENS"
+    )
+    if suite_disables_prefill_graph_buckets "$suite_options"; then
+        echo -e "  ${BLUE}INFO${NC} [${tag}] Prefill graph buckets: disabled by suite option for unsupported collective topology"
+        server_env+=("LLAMINAR_PREFILL_GRAPH_BUCKETS=0")
+    fi
+    if [ "$PERF_STATS_ENABLED" = "1" ]; then
+        server_env+=("LLAMINAR_PERF_STATS_JSON=$perf_path")
+        if [ "$PERF_STATS_GPU_STAGE_TIMING" = "1" ]; then
+            server_env+=("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1")
+        fi
+    fi
+
+    env "${server_env[@]}" "$BINARY" serve --port "$port" \
         "${context_args[@]}" $device_flag $extra_flags -m "$model" >"$log_path" 2>&1 &
     local server_pid=$!
 
@@ -1172,6 +1448,17 @@ print(d.get('error', {}).get('type', ''))
         fail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}'"
     fi
 
+    # ─── Optional Prefill Graph Capture Probe ─────────────────────────
+    if suite_runs_prefill_graph_probe "$suite_options"; then
+        if suite_disables_prefill_graph_buckets "$suite_options"; then
+            fail "[${tag}] Prefill graph probe requested while no-prefill-graph-buckets is set"
+        elif ! is_gpu_backend "$backend"; then
+            fail "[${tag}] Prefill graph probe requested for non-GPU backend ${backend}"
+        else
+            run_prefill_graph_probe "$tag" "$port"
+        fi
+    fi
+
     # ─── Optional Long-Context Checks ─────────────────────────────────
     if [ "$long_context_run" = "true" ]; then
         run_long_context_checks "$tag" "$port" "$thinking_model"
@@ -1187,6 +1474,7 @@ print(d.get('error', {}).get('type', ''))
     # Scan AFTER shutdown so we catch errors during teardown too.
     # This covers exit code 1 from mpirun — if the child actually crashed
     # or errored, the log will have [ERROR]/[FATAL] entries.
+    validate_perf_stats "$tag" "$backend" "$extra_flags" "$perf_path" "$long_context_run" "$suite_options"
     scan_server_log "$tag" "$log_path"
     echo ""
 }
@@ -1199,6 +1487,11 @@ echo ""
 echo -e "  Binary: ${BINARY}"
 echo -e "  Server logs: ${LOG_DIR}"
 echo -e "  Server log level: ${LOG_LEVEL}"
+if [ "$PERF_STATS_ENABLED" = "1" ]; then
+    echo -e "  PerfStats: enabled, gpu_stage_timing=${PERF_STATS_GPU_STAGE_TIMING}"
+else
+    echo -e "  PerfStats: disabled"
+fi
 if [ "$LONG_CONTEXT_ENABLED" = "1" ]; then
     echo -e "  Long-context: enabled, tier=${LONG_CONTEXT_TIER}, context=${CONTEXT_LENGTH}, max_tokens=${LONG_MAX_TOKENS}, min_model_size=${LONG_MIN_MODEL_SIZE_B}B"
 else

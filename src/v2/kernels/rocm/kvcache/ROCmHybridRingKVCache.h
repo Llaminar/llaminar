@@ -426,6 +426,14 @@ namespace llaminar2
             Base::setDynamicHead(kv_idx, seq_idx, gpu_stream);
         }
 
+        bool setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream) override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return false;
+            return Base::setDynamicAppendState(kv_idx, seq_idx, append_tokens, gpu_stream);
+        }
+
         void advanceHead(int layer, int seq_idx, int num_tokens) override
         {
             int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));

@@ -283,11 +283,34 @@ namespace
         int *__restrict__ expert_indices,
         float *__restrict__ expert_weights,
         int seq_len, int num_experts, int top_k,
-        bool normalize_weights)
+        bool normalize_weights,
+        const int *__restrict__ effective_seq_len_ptr)
     {
         const int token = blockIdx.x;
         if (token >= seq_len)
             return;
+
+        int effective_seq_len = seq_len;
+        if (effective_seq_len_ptr)
+        {
+            const int raw_effective = *effective_seq_len_ptr;
+            effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+        }
+        if (token >= effective_seq_len)
+        {
+            if (threadIdx.x == 0)
+            {
+                for (int k = 0; k < top_k; ++k)
+                {
+                    const size_t out = static_cast<size_t>(token) * top_k + k;
+                    expert_indices[out] = -1;
+                    expert_weights[out] = 0.0f;
+                }
+            }
+            for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+                logits[static_cast<size_t>(token) * num_experts + expert] = 0.0f;
+            return;
+        }
 
         __shared__ float values[kMaxExperts];
         __shared__ float reductions[kThreads];
@@ -681,18 +704,42 @@ namespace
             dst[col] = row_buffer[col];
     }
 
+    __device__ __forceinline__ int clamp_effective_seq_len(
+        int seq_len,
+        const int *__restrict__ device_effective_seq_len)
+    {
+        if (!device_effective_seq_len)
+            return seq_len;
+        const int raw = *device_effective_seq_len;
+        return raw < 0 ? 0 : (raw > seq_len ? seq_len : raw);
+    }
+
     __global__ void shared_expert_gate_kernel(
         const float *__restrict__ input,
         const float *__restrict__ gate_inp,
         float *__restrict__ shared_output,
-        int seq_len, int d_model)
+        int seq_len, int d_model,
+        const int *__restrict__ device_effective_seq_len = nullptr)
     {
         const int token = blockIdx.x;
         if (token >= seq_len)
             return;
 
+        const int effective_seq_len = clamp_effective_seq_len(seq_len, device_effective_seq_len);
+        const size_t row_offset = static_cast<size_t>(token) * d_model;
+        if (token >= effective_seq_len)
+        {
+            float4 *out4 = reinterpret_cast<float4 *>(shared_output + row_offset);
+            const int n4 = d_model >> 2;
+            for (int i = threadIdx.x; i < n4; i += blockDim.x)
+                out4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            for (int i = (n4 << 2) + threadIdx.x; i < d_model; i += blockDim.x)
+                shared_output[row_offset + i] = 0.0f;
+            return;
+        }
+
         __shared__ float partial[kThreads];
-        const float *x = input + static_cast<size_t>(token) * d_model;
+        const float *x = input + row_offset;
 
         // d_model is always a multiple of 32 (enforced upstream), so it is also a
         // multiple of 4 → we can process the row as float4 to cut the load/store
@@ -720,7 +767,7 @@ namespace
         }
 
         const float gate = 1.0f / (1.0f + expf(-partial[0]));
-        float4 *out4 = reinterpret_cast<float4 *>(shared_output + static_cast<size_t>(token) * d_model);
+        float4 *out4 = reinterpret_cast<float4 *>(shared_output + row_offset);
         for (int i = threadIdx.x; i < n4; i += blockDim.x)
         {
             float4 v = out4[i];
@@ -730,6 +777,8 @@ namespace
             v.w *= gate;
             out4[i] = v;
         }
+        for (int i = (n4 << 2) + threadIdx.x; i < d_model; i += blockDim.x)
+            shared_output[row_offset + i] *= gate;
     }
 
     __global__ void shared_expert_gate_add_kernel(
@@ -738,7 +787,8 @@ namespace
         float *__restrict__ shared_output,
         const float *__restrict__ routed_residual,
         float *__restrict__ combined_output,
-        int seq_len, int d_model)
+        int seq_len, int d_model,
+        const int *__restrict__ device_effective_seq_len = nullptr)
     {
         const int token = blockIdx.x;
         if (token >= seq_len)
@@ -746,6 +796,24 @@ namespace
 
         __shared__ float partial[kThreads];
         const size_t row_offset = static_cast<size_t>(token) * d_model;
+        const int effective_seq_len = clamp_effective_seq_len(seq_len, device_effective_seq_len);
+        if (token >= effective_seq_len)
+        {
+            float4 *shared4 = reinterpret_cast<float4 *>(shared_output + row_offset);
+            float4 *out4 = reinterpret_cast<float4 *>(combined_output + row_offset);
+            const int n4 = d_model >> 2;
+            for (int i = threadIdx.x; i < n4; i += blockDim.x)
+            {
+                shared4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                out4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+            for (int i = (n4 << 2) + threadIdx.x; i < d_model; i += blockDim.x)
+            {
+                shared_output[row_offset + i] = 0.0f;
+                combined_output[row_offset + i] = 0.0f;
+            }
+            return;
+        }
         const float *x = input + row_offset;
 
         const int n4 = d_model >> 2;
@@ -2445,13 +2513,15 @@ extern "C"
 
     bool cudaMoE_softmax_topk(float *logits, int *expert_indices, float *expert_weights,
                               int seq_len, int num_experts, int top_k, bool normalize_weights,
-                              int device_idx, void *stream)
+                              int device_idx, void *stream,
+                              const int *device_effective_seq_len)
     {
         if (num_experts > kMaxExperts || top_k > kMaxTopK)
             return false;
         cudaSetDevice(device_idx);
         softmax_topk_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            logits, expert_indices, expert_weights, seq_len, num_experts, top_k, normalize_weights);
+            logits, expert_indices, expert_weights, seq_len, num_experts, top_k,
+            normalize_weights, device_effective_seq_len);
         return finishLaunch("cudaMoE_softmax_topk");
     }
 
@@ -2584,6 +2654,20 @@ extern "C"
         return finishLaunch("cudaMoE_shared_expert_gate");
     }
 
+    bool cudaMoE_shared_expert_gate_effective_seq_len(
+        const float *input, const float *gate_inp, float *shared_output,
+        int seq_len, int d_model, const int *device_effective_seq_len,
+        int device_idx, void *stream)
+    {
+        if (!input || !gate_inp || !shared_output || !device_effective_seq_len ||
+            seq_len <= 0 || d_model <= 0 || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        shared_expert_gate_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            input, gate_inp, shared_output, seq_len, d_model, device_effective_seq_len);
+        return finishLaunch("cudaMoE_shared_expert_gate_effective_seq_len");
+    }
+
     bool cudaMoE_shared_expert_gate_add(
         const float *input, const float *gate_inp, float *shared_output,
         const float *routed_residual, float *combined_output,
@@ -2593,6 +2677,23 @@ extern "C"
         shared_expert_gate_add_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             input, gate_inp, shared_output, routed_residual, combined_output, seq_len, d_model);
         return finishLaunch("cudaMoE_shared_expert_gate_add");
+    }
+
+    bool cudaMoE_shared_expert_gate_add_effective_seq_len(
+        const float *input, const float *gate_inp, float *shared_output,
+        const float *routed_residual, float *combined_output,
+        int seq_len, int d_model, const int *device_effective_seq_len,
+        int device_idx, void *stream)
+    {
+        if (!input || !gate_inp || !shared_output || !routed_residual ||
+            !combined_output || !device_effective_seq_len ||
+            seq_len <= 0 || d_model <= 0 || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        shared_expert_gate_add_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            input, gate_inp, shared_output, routed_residual, combined_output,
+            seq_len, d_model, device_effective_seq_len);
+        return finishLaunch("cudaMoE_shared_expert_gate_add_effective_seq_len");
     }
 
     bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream)

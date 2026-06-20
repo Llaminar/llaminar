@@ -54,7 +54,7 @@ namespace
      * verify that KVCacheAppendStage calls advanceHead() with the count selected by
      * its dynamic replay metadata.
      */
-    class RecordingKVCache final : public IKVCache
+    class RecordingKVCache : public IKVCache
     {
     public:
         ActivationPrecision k_precision() const override { return ActivationPrecision::FP32; }
@@ -139,6 +139,40 @@ namespace
         int last_seq_idx_ = -1;
         int last_advance_tokens_ = 0;
         int advance_calls_ = 0;
+    };
+
+    /**
+     * @brief KV cache test double that models CUDA/ROCm dynamic append mailboxes.
+     */
+    class DynamicAppendRecordingKVCache final : public RecordingKVCache
+    {
+    public:
+        bool supportsDynamicAppendState() const override { return true; }
+
+        bool setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream) override
+        {
+            last_dynamic_layer_ = layer;
+            last_dynamic_seq_idx_ = seq_idx;
+            last_dynamic_append_tokens_ = append_tokens;
+            last_dynamic_stream_ = gpu_stream;
+            ++dynamic_append_calls_;
+            return accept_dynamic_state_;
+        }
+
+        void setAcceptDynamicState(bool accept) { accept_dynamic_state_ = accept; }
+        int dynamicAppendCalls() const { return dynamic_append_calls_; }
+        int lastDynamicLayer() const { return last_dynamic_layer_; }
+        int lastDynamicSeqIdx() const { return last_dynamic_seq_idx_; }
+        int lastDynamicAppendTokens() const { return last_dynamic_append_tokens_; }
+        void *lastDynamicStream() const { return last_dynamic_stream_; }
+
+    private:
+        bool accept_dynamic_state_ = true;
+        int dynamic_append_calls_ = 0;
+        int last_dynamic_layer_ = -1;
+        int last_dynamic_seq_idx_ = -1;
+        int last_dynamic_append_tokens_ = 0;
+        void *last_dynamic_stream_ = nullptr;
     };
 
     // =========================================================================
@@ -588,6 +622,45 @@ namespace
 
         KVCacheAppendStage stage(kv_params);
         EXPECT_TRUE(stage.needsOnGraphReplayed());
+    }
+
+    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_DynamicParamsRequireMailboxCapability)
+    {
+        RecordingKVCache host_only_cache;
+        DynamicAppendRecordingKVCache dynamic_cache;
+
+        KVCacheAppendStage::Params host_params{};
+        host_params.device_id = DeviceId::cpu();
+        host_params.kv_cache = &host_only_cache;
+        host_params.layer_idx = 0;
+        host_params.seq_idx = 0;
+        host_params.num_tokens = 1;
+
+        KVCacheAppendStage host_stage(host_params);
+        EXPECT_FALSE(host_stage.hasDynamicParams())
+            << "CPU/host-only KV caches must not enter the GPU dynamic append-state path";
+        host_stage.updateDynamicParams(/*pos_offset=*/7, /*seq_len=*/1);
+
+        KVCacheAppendStage::Params dynamic_params = host_params;
+        dynamic_params.device_id = DeviceId::cuda(0);
+        dynamic_params.kv_cache = &dynamic_cache;
+        dynamic_params.layer_idx = 3;
+        dynamic_params.seq_idx = 2;
+        dynamic_params.num_tokens = 4;
+
+        KVCacheAppendStage dynamic_stage(dynamic_params);
+        EXPECT_TRUE(dynamic_stage.hasDynamicParams())
+            << "CUDA/ROCm KV caches with append-state mailboxes must advertise dynamic params";
+
+        void *stream = reinterpret_cast<void *>(static_cast<uintptr_t>(0x1234));
+        dynamic_stage.setGPUStream(stream);
+        dynamic_stage.updateDynamicParams(/*pos_offset=*/11, /*seq_len=*/2);
+
+        EXPECT_EQ(dynamic_cache.dynamicAppendCalls(), 1);
+        EXPECT_EQ(dynamic_cache.lastDynamicLayer(), 3);
+        EXPECT_EQ(dynamic_cache.lastDynamicSeqIdx(), 2);
+        EXPECT_EQ(dynamic_cache.lastDynamicAppendTokens(), 2);
+        EXPECT_EQ(dynamic_cache.lastDynamicStream(), stream);
     }
 
     TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_ReplayAdvancesByRealPrefillTokens)

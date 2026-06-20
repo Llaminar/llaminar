@@ -217,6 +217,28 @@ namespace llaminar2
             ITensor *output_indices, ITensor *output_weights,
             MoERoutingResult &host_result);
 
+        /**
+         * @brief Graph-capturable padded-prefill routing contract.
+         *
+         * Bucketed prefill graphs launch with a fixed @p seq_len, while the
+         * real prompt length can be smaller on replay.  GPU implementations
+         * read @p device_effective_seq_len from device memory inside the
+         * top-k kernel and mark padded rows as invalid routes
+         * (`expert=-1`, `weight=0`).  That keeps graph launch dimensions fixed
+         * without letting padded rows mutate grouped-expert state.
+         *
+         * CPU/default implementations deliberately fail for non-null device
+         * scalars because they cannot safely read backend-owned memory.  Call
+         * routeWithTensors() for ordinary non-padded routing.
+         */
+        virtual bool routeWithTensorsEffectiveSeqLen(
+            ITensor *hidden, ITensor *gate_weights,
+            int seq_len, int d_model, int num_experts, int top_k,
+            bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights,
+            MoERoutingResult &host_result,
+            const int *device_effective_seq_len);
+
         /// Decode-only runtime-table routing path. GPU implementations may
         /// keep top-k results entirely device-resident and optionally fill the
         /// legacy routing tensors for existing staged consumers.
@@ -292,6 +314,22 @@ namespace llaminar2
             int seq_len, int d_model);
 
         /**
+         * @brief Graph-capturable shared expert gate with a device-owned real length.
+         *
+         * Padded prefill graphs execute at bucket length, but only the first
+         * `*device_effective_seq_len` rows are semantically live. GPU backends
+         * must read that scalar on device and zero padded output rows so stale
+         * graph-replay tail state cannot leak into later layers.
+         *
+         * The default CPU implementation only accepts a null scalar because CPU
+         * callers cannot safely dereference a device pointer.
+         */
+        virtual bool sharedExpertGateFromTensorsEffectiveSeqLen(
+            ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+            int seq_len, int d_model,
+            const int *device_effective_seq_len);
+
+        /**
          * @brief Gate shared expert output and add routed MoE output in one step.
          *
          * Computes, for each token row:
@@ -307,6 +345,20 @@ namespace llaminar2
             ITensor *input, ITensor *gate_inp, ITensor *shared_output,
             ITensor *routed_residual, ITensor *combined_output,
             int seq_len, int d_model);
+
+        /**
+         * @brief Graph-capturable shared gate plus routed residual combine.
+         *
+         * For rows beyond `*device_effective_seq_len`, both the gated shared
+         * output and the final combined output are written as zero. This makes
+         * padded prefill bucket rows neutral at the MoE output boundary while
+         * keeping the launch shape stable for graph capture.
+         */
+        virtual bool sharedExpertGateAddFromTensorsEffectiveSeqLen(
+            ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+            ITensor *routed_residual, ITensor *combined_output,
+            int seq_len, int d_model,
+            const int *device_effective_seq_len);
 
         /// Tensor-aware SwiGLU: gate = silu(gate) * up, on active device.
         virtual void swiGLUFromTensors(ITensor *gate, ITensor *up, int count);

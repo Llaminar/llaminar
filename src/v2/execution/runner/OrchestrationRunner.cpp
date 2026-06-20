@@ -63,6 +63,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <print>
@@ -3415,6 +3416,58 @@ namespace llaminar2
             return result;
         };
 
+        const bool needs_mpi_mtp_boundary_fence =
+            mpi_ctx_ && mpi_ctx_->world_size() > 1;
+        auto fence_mpi_mtp_boundary =
+            [&](const char *boundary) -> std::optional<std::string>
+        {
+            if (!needs_mpi_mtp_boundary_fence)
+                return std::nullopt;
+
+            /*
+             * Global/NodeLocal TP ranks must enter sidecar and verifier
+             * collectives in the same logical order. A local runner flush only
+             * drains the participant's own work; it does not stop rank 0 from
+             * starting target-verifier allreduces while rank 1 is still inside
+             * the MTP sidecar. The shared-memory fast path matches by epoch and
+             * payload size, so this boundary fence is part of the transaction
+             * contract rather than a best-effort scheduling hint.
+             */
+            const std::string boundary_name = boundary ? boundary : "unknown";
+            try
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "sidecar_mpi_boundary_fence",
+                    "decode",
+                    std::string{},
+                    {{"boundary", boundary_name},
+                     {"rank", std::to_string(mpi_ctx_->rank())},
+                     {"world_size", std::to_string(mpi_ctx_->world_size())}});
+                mpi_ctx_->barrier();
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "sidecar_mpi_boundary_fences",
+                    1.0,
+                    "decode",
+                    std::string{},
+                    {{"boundary", boundary_name},
+                     {"rank", std::to_string(mpi_ctx_->rank())},
+                     {"world_size", std::to_string(mpi_ctx_->world_size())}});
+            }
+            catch (const std::exception &ex)
+            {
+                return std::string("MTP MPI sidecar boundary fence failed at ") +
+                       boundary_name + ": " + ex.what();
+            }
+            catch (...)
+            {
+                return std::string("MTP MPI sidecar boundary fence failed at ") +
+                       boundary_name;
+            }
+            return std::nullopt;
+        };
+
         if (use_ready_logits && ready_sampled_token.has_value())
         {
             /*
@@ -5195,6 +5248,17 @@ namespace llaminar2
                         {},
                         {{"draft_idx", std::to_string(draft_idx)}});
                 }
+                if (needs_mpi_mtp_boundary_fence)
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "sidecar_iteration_flush",
+                        "decode");
+                    if (!runner_->flushPendingMTPWork())
+                    {
+                        return fail_after_checkpoint("MTP sidecar stream flush failed");
+                    }
+                }
             }
             else
             {
@@ -5206,6 +5270,11 @@ namespace llaminar2
                 {
                     return fail_after_checkpoint("MTP sidecar stream flush failed");
                 }
+            }
+            if (auto fence_error =
+                    fence_mpi_mtp_boundary("after_sidecar_iteration_flush"))
+            {
+                return fail_after_checkpoint(*fence_error);
             }
 
             if (draft_idx == 0)
@@ -5330,6 +5399,7 @@ namespace llaminar2
             use_all_position_state_publication_verifier &&
             draft_tokens.size() > 1 &&
             !first_token_is_stop &&
+            !needs_mpi_mtp_boundary_fence &&
             stop_tokens_.size() <=
                 static_cast<size_t>(
                     sampling_math::kSpeculativeBatchMaxStopTokens) &&
@@ -5373,6 +5443,11 @@ namespace llaminar2
                   active_sampling_params_.has_penalties() ? "true" : "false"},
                  {"all_position",
                   use_all_position_state_publication_verifier ? "true" : "false"}});
+        }
+        if (auto fence_error =
+                fence_mpi_mtp_boundary("before_target_verifier"))
+        {
+            return fail_after_checkpoint(*fence_error);
         }
 
         if (DebugEnv::isTruthyEnv("LLAMINAR_MTP_VERIFY_SIDECAR_PRESERVES_MAIN_STATE"))
@@ -8199,16 +8274,15 @@ namespace llaminar2
         if (use_decode_equivalent_replay_publication_verifier)
         {
             const bool grouped_outcome_device_resident_publication =
-                verifier_policy.path ==
-                MTPVerifierExecutionPath::GroupedDecodeEquivalentOutcome;
+                use_grouped_outcome_device_resident_publication_verifier;
             if (grouped_outcome_device_resident_publication)
             {
                 /*
-                 * This is intentionally loud in perf output: grouped verifier
-                 * outcomes are proven and now publish from the compact device
-                 * outcome.  If this counter is high while the lane is slow, the
-                 * remaining debt is verifier/publication economics, not a
-                 * hidden scalar verifier fallback.
+                 * This is intentionally stricter than "policy selected the
+                 * grouped-outcome lane". LocalTP can prove grouped verifier
+                 * row math while still lacking a single compact reducer across
+                 * all TP shards. Only runners that passed the earlier
+                 * device-resident publication gate may enter this hot path.
                  */
                 PerfStatsCollector::addCounter(
                     "mtp",
@@ -9400,7 +9474,8 @@ namespace llaminar2
                     verifier_input_plan.compact_logit_row_count;
                 const bool needs_device_verifier_tokens =
                     first_token_deferred || has_deferred_draft_token ||
-                    use_greedy_device_draft_slots;
+                    use_greedy_device_draft_slots ||
+                    runner_->primaryDeviceId().is_gpu();
                 ScopedMTPAllPositionVerifierSyncDeferral verifier_sync_deferral(
                     runner_.get(),
                     true);
@@ -9436,18 +9511,39 @@ namespace llaminar2
                     }
                     if (needs_device_verifier_tokens)
                     {
-                        verifier_input_tokens_device =
-                            first_token_deferred
-                                ? runner_->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
-                                      /*first_target_sample_slot=*/0,
-                                      /*first_draft_slot=*/0,
-                                      verifier_input_plan.total_verifier_input_tokens - 1,
-                                      verifier_input_plan.total_verifier_input_tokens)
-                                : runner_->prepareMTPVerifierInputTokensOnDevice(
-                                      first_token,
-                                      /*first_draft_slot=*/0,
-                                      verifier_input_plan.total_verifier_input_tokens - 1,
-                                      verifier_input_plan.total_verifier_input_tokens);
+                        if (first_token_deferred)
+                        {
+                            verifier_input_tokens_device =
+                                runner_->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+                                    /*first_target_sample_slot=*/0,
+                                    /*first_draft_slot=*/0,
+                                    verifier_input_plan.total_verifier_input_tokens - 1,
+                                    verifier_input_plan.total_verifier_input_tokens);
+                        }
+                        else if (use_greedy_device_draft_slots ||
+                                 has_deferred_draft_token)
+                        {
+                            verifier_input_tokens_device =
+                                runner_->prepareMTPVerifierInputTokensOnDevice(
+                                    first_token,
+                                    /*first_draft_slot=*/0,
+                                    verifier_input_plan.total_verifier_input_tokens - 1,
+                                    verifier_input_plan.total_verifier_input_tokens);
+                        }
+                        else
+                        {
+                            /*
+                             * Host-visible warmup rows still feed the compact
+                             * resident reducer.  Stage the complete row once on
+                             * the verifier stream so the forward graph and the
+                             * outcome reducer consume one coherent device row.
+                             */
+                            verifier_input_tokens_device =
+                                runner_->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+                                    verifier_input_plan.verifier_input_tokens.data(),
+                                    verifier_input_plan.total_verifier_input_tokens,
+                                    verifier_input_plan.total_verifier_input_tokens - 1);
+                        }
                         if (!verifier_input_tokens_device)
                         {
                             runner_->setComputeAllPositionLogits(false);
@@ -10828,9 +10924,17 @@ namespace llaminar2
             return result;
         }
 
-        // Broadcast to worker ranks so they run decode in lockstep
+        // Broadcast to worker ranks so they run decode in lockstep.  The
+        // current token budget is part of the decode command: Qwen thinking
+        // budget handling calls setDecodeStepTokenBudget(1) only on rank 0,
+        // and MTP draft-depth clamping must be identical on every rank or TP
+        // collectives diverge inside the sidecar/verifier graphs.
         if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
+        {
             broadcastCommand(MPICommand::DECODE_STEP);
+            int32_t token_budget = static_cast<int32_t>(decode_step_token_budget_);
+            mpi_ctx_->broadcast_int32(&token_budget, 1, 0);
+        }
 
         const bool mpi_coordinated_world =
             mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->world_size() > 1;
@@ -11970,7 +12074,69 @@ namespace llaminar2
         // independently. An intra-node barrier ensures same-node ranks wait only
         // for their own leader, not a global rank-0.
         const bool is_multi_rank = mpi_ctx_ && mpi_ctx_->world_size() > 1;
-        if (is_multi_rank && config_.use_mmap)
+        const auto prepopulate_page_cache = [&](const std::string &reason)
+        {
+            LOG_DEBUG(reason << " pre-populating page cache for mmap load...");
+            uintmax_t model_file_bytes = 0;
+            try
+            {
+                model_file_bytes = std::filesystem::file_size(model_path);
+            }
+            catch (const std::exception &)
+            {
+                model_file_bytes = 0;
+            }
+            auto start = std::chrono::steady_clock::now();
+            const bool ok = MmapRegion::prepopulatePageCache(model_path);
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+            const double elapsed_s = elapsed_ms / 1000.0;
+            const double mb = static_cast<double>(model_file_bytes) / (1024.0 * 1024.0);
+            const double mbps = (model_file_bytes > 0 && elapsed_s > 0.0) ? (mb / elapsed_s) : 0.0;
+            WeightLoadingProfiler::addDetail("weights.mmap_page_cache_prepopulate", elapsed_ms);
+            PerfStatsCollector::addCounter("weight_loading", "mmap_page_cache_prepopulate_success",
+                                           ok ? 1.0 : 0.0, "load", {},
+                                           {{"reason", reason}});
+            PerfStatsCollector::addCounter("weight_loading", "mmap_page_cache_prepopulate_bytes",
+                                           static_cast<double>(model_file_bytes), "load", {},
+                                           {{"reason", reason},
+                                            {"success", perfBool(ok)}});
+            PerfStatsCollector::addCounter("weight_loading", "mmap_page_cache_prepopulate_mbps",
+                                           mbps, "load", {},
+                                           {{"reason", reason},
+                                            {"success", perfBool(ok)}});
+            if (!ok)
+            {
+                LOG_WARN(reason << " page-cache prepopulation failed; continuing with mmap demand faults");
+            }
+            else if (model_file_bytes > 0 && mbps > 0.0 && mbps < 256.0)
+            {
+                LOG_INFO(reason << " page-cache prepopulation was slow: "
+                                << std::fixed << std::setprecision(0) << mbps
+                                << " MB/s for " << std::fixed << std::setprecision(0)
+                                << mb << " MB. Subsequent counters can distinguish disk/cache speed from GPU staging.");
+            }
+            return ok;
+        };
+
+        if (!is_multi_rank && config_.use_mmap)
+        {
+            // Single-rank loads need the same protection as multi-rank loads.
+            //
+            // CPU: NUMA-bound parallel first-touch otherwise creates many cold
+            // page-fault streams.
+            //
+            // GPU: the demand-paged upload path copies tensor-sized mmap ranges
+            // into pinned staging slots.  On a cold file those copies can also
+            // defeat disk readahead and collapse to ~100 MB/s.  A single
+            // sequential prewarm keeps the upload path demand-paged while making
+            // the backing reads deterministic and full-bandwidth.
+            prepopulate_page_cache(weight_config.target_is_gpu
+                                       ? "Single-rank GPU"
+                                       : "Single-rank CPU");
+            weight_config.skip_mmap_cache_eviction = true;
+        }
+        else if (is_multi_rank && config_.use_mmap)
         {
             const auto *topo = mpi_ctx_->topology();
             if (topo)
@@ -11978,10 +12144,10 @@ namespace llaminar2
                 // Per-node prepopulation: each node leader warms its own page cache
                 if (topo->is_node_leader())
                 {
-                    LOG_DEBUG("Node leader (rank " << mpi_ctx_->rank()
-                                                   << ", node " << topo->placement().node_id
-                                                   << ") pre-populating page cache for multi-rank mmap...");
-                    MmapRegion::prepopulatePageCache(model_path);
+                    std::ostringstream reason;
+                    reason << "Node leader (rank " << mpi_ctx_->rank()
+                           << ", node " << topo->placement().node_id << ")";
+                    prepopulate_page_cache(reason.str());
                 }
                 // Intra-node barrier: same-node ranks wait for their node leader only.
                 // Ranks on other nodes proceed independently with their own leader.
@@ -11996,8 +12162,7 @@ namespace llaminar2
                 // Fallback: no topology available (mock or non-standard context)
                 if (mpi_ctx_->rank() == 0)
                 {
-                    LOG_DEBUG("Pre-populating page cache for multi-rank mmap (rank 0 fallback)...");
-                    MmapRegion::prepopulatePageCache(model_path);
+                    prepopulate_page_cache("Rank 0 fallback");
                 }
                 MPI_Barrier(mpi_ctx_->communicator());
             }
@@ -13262,7 +13427,14 @@ namespace llaminar2
 
             case MPICommand::DECODE_STEP:
             {
+                int32_t token_budget = 0;
+                mpi_ctx_->broadcast_int32(&token_budget, 1, 0);
+                setDecodeStepTokenBudget(token_budget);
                 decodeStep();
+                // Rank 0 scopes thinking-budget decode through ChatCompletionHandler;
+                // reset workers too so forced-token or later control commands never
+                // observe a stale request-local budget.
+                setDecodeStepTokenBudget(0);
                 break;
             }
 

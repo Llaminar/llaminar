@@ -286,7 +286,7 @@ namespace llaminar2
             CLEAR_CACHE = 1,         ///< Clear KV cache
             SET_SAMPLING = 2,        ///< Set sampling parameters (followed by SamplingParams broadcast)
             PREFILL = 3,             ///< Prefill (followed by token count + tokens)
-            DECODE_STEP = 4,         ///< Run one decode step
+            DECODE_STEP = 4,         ///< Run one decode step (followed by int32 token budget)
             SKIP_LOGITS_DECODE = 5,  ///< Set skip-logits-gather for decode
             APPLY_MOE_REBALANCE = 6, ///< Apply dynamic MoE rebalance/hot replicas
             FORCE_DECODE_TOKEN = 7,  ///< Commit a forced token (followed by token id)

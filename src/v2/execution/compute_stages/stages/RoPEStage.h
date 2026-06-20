@@ -207,6 +207,34 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Reset request-local RoPE params without invalidating device-param storage.
+         *
+         * CUDA/HIP graphs capture the RoPE dynamic parameter buffer by address.
+         * The next replay updates that buffer on the graph stream before launch,
+         * so this hook clears host-side request mirrors but keeps the underlying
+         * kernel slot alive for the preserved executable.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+            params_.pos_offset = 0;
+            params_.seq_len = 0;
+            params_.position_ids = nullptr;
+            params_.position_ids_device = nullptr;
+            position_ids_cache_.clear();
+            if (cached_kernel_)
+                cached_kernel_->setGPUStream(nullptr);
+        }
+
+        /**
+         * @brief Preserve warmed RoPE dynamic buffers for capture-from-Initialized.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionStatePreservingCapturedReplay();
+        }
+
         const Params &getParams() const { return params_; }
 
         // IWorkspaceConsumerStage implementation

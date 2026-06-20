@@ -609,16 +609,15 @@ namespace llaminar2
          * @brief Reset request/replay state without discarding cached forward graphs.
          *
          * Used at request/session boundaries after the orchestrator clears KV and
-         * model recurrent state. Keeping the ComputeGraph avoids weight re-coherence;
-         * resetting stage dynamic state and captured graph segments ensures the
-         * next prompt starts from the newly cleared session state.
+         * model recurrent state. Keeping the ComputeGraph avoids weight
+         * re-coherence.  When @p preserve_replay_safe_segmented_captures is true,
+         * single-token decode and all-position verifier segment captures survive
+         * the request reset because their device inputs are rebound/refreshed
+         * before every launch; unproven prefill and multi-token ordinary decode
+         * replay state is still discarded.
          */
-        void resetSessionReplayState()
-        {
-            all_position_verifier_recapture_pending_ = false;
-            for (auto &entry : cache_)
-                entry.second.resetSessionState();
-        }
+        ReplayStateResetSummary resetSessionReplayState(
+            bool preserve_replay_safe_segmented_captures = false);
 
         /** Check if cache is empty. */
         [[nodiscard]] bool cacheEmpty() const { return cache_.empty(); }
@@ -647,6 +646,7 @@ namespace llaminar2
             size_t node_count = 0;                             ///< Captured graph node count for Ready entries.
             int replay_count = 0;                              ///< Successful graph launches for this bucket.
             uint64_t warmup_count = 0;                         ///< Lifetime warmups for this bucket.
+            uint64_t initialized_count = 0;                    ///< Lifetime request resets preserving lazy init for this bucket.
             uint64_t capture_count = 0;                        ///< Lifetime successful captures for this bucket.
             uint64_t eviction_count = 0;                       ///< Total prefill bucket evictions observed by this engine.
             bool observation_valid = false;                    ///< True when runtime chunk/capture metadata has been observed.

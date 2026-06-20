@@ -433,10 +433,11 @@ namespace
 
         ASSERT_TRUE(result.success()) << result.error;
         ASSERT_THAT(result.tokens, ElementsAre(3));
-        ASSERT_EQ(mpi->broadcastCount(), 2u);
+        ASSERT_EQ(mpi->broadcastCount(), 3u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(3));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(3));
     }
 
     TEST_F(Test__MPICoordinatedMode, DecodeStepSkipsDeviceSamplerWhenCoordinatedSamplingDisabled)
@@ -454,10 +455,11 @@ namespace
         ASSERT_TRUE(result.success()) << result.error;
         EXPECT_THAT(result.tokens, ElementsAre(3));
         EXPECT_EQ(mock->sampleGreedyOnDeviceCount(), 0);
-        ASSERT_EQ(mpi->broadcastCount(), 2u);
+        ASSERT_EQ(mpi->broadcastCount(), 3u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(3));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(3));
     }
 
     TEST_F(Test__MPICoordinatedMode, DecodeStepUsesDeviceSamplerWhenCoordinatedSamplingEnabled)
@@ -475,10 +477,11 @@ namespace
         ASSERT_TRUE(result.success()) << result.error;
         EXPECT_THAT(result.tokens, ElementsAre(7));
         EXPECT_EQ(mock->sampleGreedyOnDeviceCount(), 1);
-        ASSERT_EQ(mpi->broadcastCount(), 2u);
+        ASSERT_EQ(mpi->broadcastCount(), 3u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(7));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(7));
     }
 
     TEST_F(Test__MPICoordinatedMode, ForceDecodeTokenBroadcastsCommandTokenAndFence)
@@ -1015,9 +1018,11 @@ namespace
         scripted->scriptInt32({42});
         // First decode: consumes prefill logits (no forward)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         scripted->scriptInt32({7}); // root-published token for next decode
         // Second decode: must call forward
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         scripted->scriptInt32({8}); // root-published token before shutdown
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
 
@@ -1036,8 +1041,10 @@ namespace
         scripted->scriptInt32({1});
         scripted->scriptInt32({42});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         scripted->scriptInt32({777}); // authoritative root sample
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         scripted->scriptInt32({778});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
 
@@ -1091,8 +1098,10 @@ namespace
         scripted->scriptInt32({2}); // token count
         scripted->scriptInt32({10, 20}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         scripted->scriptInt32({30}); // root-published token
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         scripted->scriptInt32({31}); // root-published token
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
 
@@ -1229,9 +1238,11 @@ namespace
         scripted->scriptInt32({10, 20});
         // First decode uses prefill logits (no forward call)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         scripted->scriptInt32({21}); // root-published token after first decode
         // Second decode calls forward — the 2nd forward call — which we fail
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         // Should still continue past the failed decode
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
@@ -1279,8 +1290,10 @@ namespace
         scripted->scriptInt32({3}); // token count
         scripted->scriptInt32({1, 2, 3}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         scripted->scriptInt32({13}); // root-published token
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         scripted->scriptInt32({14}); // root-published token
 
         // Request 2: clear → prefill → decode
@@ -1289,6 +1302,7 @@ namespace
         scripted->scriptInt32({2}); // token count
         scripted->scriptInt32({4, 5}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         scripted->scriptInt32({15}); // root-published token
 
         // Shutdown

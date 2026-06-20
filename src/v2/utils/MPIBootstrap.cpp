@@ -565,18 +565,41 @@ namespace llaminar2
             cmd.push_back(config.hostfile);
         }
 
-        // Process binding
+        const int pe_threads = config.omp_threads_per_rank > 0
+                                   ? config.omp_threads_per_rank
+                                   : std::max(1, topology.cores_per_socket);
+        const bool use_pe_mapping =
+            config.bind_to_socket &&
+            config.map_by_socket &&
+            pe_threads > 1;
+        const bool pe_fits_socket =
+            pe_threads <= std::max(1, topology.cores_per_socket);
+
+        // Process binding. OpenMPI requires bind-to core when a mapping
+        // requests multiple processing elements per rank; bind-to socket with
+        // PE=N is rejected and plain bind-to socket may bind only one core plus
+        // its SMT sibling on some systems.
         if (config.bind_to_socket)
         {
             cmd.push_back("--bind-to");
-            cmd.push_back("socket");
+            cmd.push_back(use_pe_mapping ? "core" : "socket");
         }
 
         // Process mapping
         if (config.map_by_socket)
         {
             cmd.push_back("--map-by");
-            cmd.push_back("socket");
+            if (use_pe_mapping)
+            {
+                std::ostringstream mapping;
+                mapping << (pe_fits_socket ? "socket" : "slot")
+                        << ":PE=" << pe_threads;
+                cmd.push_back(mapping.str());
+            }
+            else
+            {
+                cmd.push_back("socket");
+            }
         }
 
         // Optional explicit CPU affinity set

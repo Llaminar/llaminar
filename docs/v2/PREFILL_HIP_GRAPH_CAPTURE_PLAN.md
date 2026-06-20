@@ -390,9 +390,9 @@ Recommended minimal design:
 - Reuse `ForwardGraphCache::gpu_stream`, `gpu_ctx`, `gpu_graph`, `gpu_graph_update_failures`, `token_ids`, `position_ids`, and `dynamic_param_stages` where possible instead of adding parallel ownership.
 
 Capture/replay flow:
-1. **Cold normal run**: execute normal prefill fast path. This warms BufferArena device buffers, ROCm MoE grouping buffers, descriptor tables, shared expert scratch, GDN scratch, embedding workspace, and KV-cache device state.
-2. **Readiness preflight**: after warmup, verify every stage in the prefill graph returns `isGraphCapturable()`, there are no collective nodes, the backend is ROCm, snapshots are off, `seq_len >= LLAMINAR_PREFILL_GRAPH_MIN_SEQ`, MoE rebalancing is off/absent, and the graph is in the supported single-device/full-local MoE scope.
-3. **Capture run**: begin capture on the chosen ROCm stream, execute the same prefill stages on that stream, end capture, instantiate, and mark the entry ready. The capture run itself has executed the kernels, so its outputs are valid.
+1. **Build + warmup run**: the initial bucketed prefill cache miss builds the reusable forward graph, preflights it, binds every GPU stage to the dedicated explicit prefill capture stream, and executes normal prefill once. This warms BufferArena device buffers, ROCm/CUDA grouping buffers, descriptor tables, shared expert scratch, GDN scratch, embedding workspace, and KV-cache device state.
+2. **Readiness preflight**: before arming warmup, verify every stage in the prefill graph is capturable or warmup-dependent-capturable, there are no collective nodes, the backend is a supported GPU backend, snapshots are off, `seq_len >= LLAMINAR_PREFILL_GRAPH_MIN_SEQ`, MoE rebalancing is off/absent, and the graph is in the supported single-device/full-local scope.
+3. **Capture run**: begin capture on the chosen explicit stream, execute the same prefill stages on that stream, end capture, instantiate, and mark the entry ready. Captured kernels are then launched once immediately so the capture request produces logits and advances device state.
 4. **Replay**: update dynamic params, launch the executable graph, run replay callbacks, and perform only the existing final coherence/sync required to read logits.
 5. **Failure handling**: any preflight, capture, instantiate, update, replay, or callback failure is fatal for this execution. Emit `LOG_ERROR` with the exact phase/stage/reason and throw/propagate failure; do not silently run the normal prefill path.
 
@@ -409,7 +409,7 @@ struct ExecutionConfig {
     bool gpu_graphs = false;                // existing LLAMINAR_GPU_GRAPHS master switch
     int prefill_graph_min_seq = 256;        // LLAMINAR_PREFILL_GRAPH_MIN_SEQ
     bool prefill_graph_trace = false;       // LLAMINAR_PREFILL_GRAPH_TRACE
-    bool prefill_graph_buckets = false;     // LLAMINAR_PREFILL_GRAPH_BUCKETS, Tier 1 Phase 6
+    bool prefill_graph_buckets = true;      // LLAMINAR_PREFILL_GRAPH_BUCKETS=0 opts out, Tier 1 Phase 6
 };
 ```
 
@@ -884,7 +884,7 @@ Required gates:
 ```bash
 LLAMINAR_GPU_GRAPHS=1                  # Existing master enable for GPU graph execution
 LLAMINAR_PREFILL_GRAPH_MIN_SEQ=256     # Minimum seq_len to capture (default: 256)
-LLAMINAR_PREFILL_GRAPH_BUCKETS=0       # Enable bucketed capture for server (default: 0)
+LLAMINAR_PREFILL_GRAPH_BUCKETS=1       # Bucketed capture default; set 0 to opt out
 LLAMINAR_PREFILL_GRAPH_TRACE=0         # Verbose phase and failure logging
 ```
 

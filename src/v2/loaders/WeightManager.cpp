@@ -6360,7 +6360,22 @@ namespace llaminar2
 
         if (!slice_tensor)
         {
-            throw std::runtime_error("[WeightManager] Failed to load column slice for input-parallel: " + name);
+            LOG_DEBUG("[WeightManager] Native input-parallel column slice unavailable for " << name
+                                                                                           << " cols [" << col_start
+                                                                                           << ", " << (col_start + col_count)
+                                                                                           << "); falling back to FP32 slice");
+
+            // Some quantized GGUF formats require column slices to start and end on
+            // their packed block boundary. A 4-way TP shard can be narrower than
+            // that block (for example 128 columns from an IQ3_S 256-column block),
+            // so we dequantize once on the host and copy the exact logical columns.
+            auto full_fp32_tensor = loader_.loadTensor(name, DeviceId::cpu(), WeightPrecision::CONVERT_TO_FP32);
+            if (!full_fp32_tensor)
+            {
+                throw std::runtime_error("[WeightManager] Failed to load FP32 fallback for input-parallel: " + name);
+            }
+
+            slice_tensor = sliceColumnRange(full_fp32_tensor, col_start, col_count);
         }
 
         // Input-parallel uses row-parallel metadata (mathematically similar but with column slicing)

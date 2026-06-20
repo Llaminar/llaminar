@@ -148,6 +148,7 @@ namespace llaminar2
     enum class ForwardReplayStateCacheClass
     {
         Other,
+        BucketedPrefill,
         OrdinaryDecode,
         SingleTokenOrdinaryDecode,
         AllPositionVerifier,
@@ -157,6 +158,7 @@ namespace llaminar2
     {
         GeneralLiveStateMutation,
         MTPCorrectionReplayBoundary,
+        RequestBoundaryStateReset,
     };
 
     enum class ForwardReplayStateAction
@@ -169,7 +171,11 @@ namespace llaminar2
         const ForwardGraphSignature &signature)
     {
         if (!signature.decode)
+        {
+            if (signature.is_bucketed_prefill)
+                return ForwardReplayStateCacheClass::BucketedPrefill;
             return ForwardReplayStateCacheClass::Other;
+        }
         if (signature.all_position_logits)
             return ForwardReplayStateCacheClass::AllPositionVerifier;
         if (signature.seq_len == 1 && signature.batch_size <= 1)
@@ -213,6 +219,13 @@ namespace llaminar2
         {
             return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
         }
+        if (mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset &&
+            (cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode ||
+             cache_class == ForwardReplayStateCacheClass::AllPositionVerifier ||
+             cache_class == ForwardReplayStateCacheClass::BucketedPrefill))
+        {
+            return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
+        }
         return ForwardReplayStateAction::ResetReplayState;
     }
 
@@ -220,8 +233,14 @@ namespace llaminar2
         ForwardReplayStateMutationKind mutation,
         const ForwardGraphSignature &signature)
     {
-        if (mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary &&
+        if ((mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary ||
+             mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset) &&
             isLiveStateVersionedReplayCache(signature))
+        {
+            return ForwardReplayStateAction::ResetReplayState;
+        }
+        if (mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset &&
+            classifyForwardReplayStateCache(signature) == ForwardReplayStateCacheClass::Other)
         {
             return ForwardReplayStateAction::ResetReplayState;
         }
@@ -452,13 +471,10 @@ namespace llaminar2
         /**
          * @brief Reset GPU graph replay/capture state while keeping the cached ComputeGraph.
          *
-         * Session clears reset KV/GDN/conv recurrence but intentionally preserve graph
-         * objects so host-resident weights do not need to be reloaded. Captured GPU
-         * graphs are request-stateful: decode segment captures encode a specific
-         * replay lifecycle, and monolithic prefill captures encode recurrent/KV
-         * state mutation order from the previous request. Dropping executable
-         * captures forces the next request to warm up/capture against the freshly
-         * cleared model state while preserving the reusable ComputeGraph topology.
+         * Hard resets preserve graph topology but discard graph executables.
+         * Use this after topology/workspace/live-state mutations whose capture
+         * safety is not proven. Request-boundary resets that want served-style
+         * capture reuse should use resetSessionStatePreservingSegmentedReplay().
          *
          * The capture stream itself is retained because cached stages store that
          * stream pointer internally. Destroying it here would leave dynamic-param
@@ -522,6 +538,64 @@ namespace llaminar2
         void markReplayStateSafeForLiveEpoch(uint64_t live_state_epoch)
         {
             segmented_capture_live_state_epoch = live_state_epoch;
+        }
+
+        /**
+         * @brief Reset request-scoped stage state while preserving safe segmented replay.
+         *
+         * Request boundaries clear KV/GDN/short-conv live state, token metadata,
+         * and backend stream bindings, but single-token decode and all-position
+         * verifier captures are designed to read stable device buffers whose
+         * contents are refreshed before every launch.  Keeping those segmented
+         * executables hot is the served-inference path we want: warmup captures
+         * once, later requests replay after device-state reset.
+         *
+         * Bucketed prefill graph executables also stay hot across request
+         * boundaries. Ready entries replay the same deterministic prompt mutation
+         * over freshly reset live state with token/position metadata refreshed on
+         * the explicit capture stream before launch. Warmup-only entries are
+         * demoted to Initialized: lazy stage/kernel resources may survive, but
+         * request-local capture arming does not. Capturing or otherwise invalid
+         * entries are still dropped rather than silently reused.
+         */
+        void resetSessionStatePreservingSegmentedReplay()
+        {
+            if (gpu_graph)
+            {
+                gpu_graph->reset();
+                gpu_graph.reset();
+            }
+            PrefillGraphRequestResetSummary prefill_reset;
+            if (prefill_graph_cache)
+                prefill_reset = prefill_graph_cache->prepareEntriesForRequestReset();
+            last_prefill_graph_observation = {};
+
+            if (graph)
+            {
+                const bool captured_replay_preserved =
+                    (segment_cache.initialized && !segment_cache.needs_capture) ||
+                    prefill_reset.ready_preserved > 0;
+                const bool lazy_prefill_only =
+                    !captured_replay_preserved && prefill_reset.initialized > 0;
+
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                    {
+                        if (lazy_prefill_only)
+                            node->stage->resetSessionStatePreservingLazyInitialization();
+                        else
+                            node->stage->resetSessionStatePreservingCapturedReplay();
+                    }
+                }
+            }
+
+            markGPUStreamBindingsDirty();
+            gpu_graph_update_failures = 0;
+            phase3_active = segment_cache.initialized && !segment_cache.needs_capture;
+            segmented_capture_live_state_epoch = 0;
         }
 
         /**

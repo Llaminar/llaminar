@@ -9,6 +9,7 @@
 
 #include "IMoEKernel.h"
 #include "../tensors/ITensor.h"
+#include "../utils/Logger.h"
 
 #include <algorithm>
 #include <cmath>
@@ -38,6 +39,23 @@ namespace llaminar2
         std::copy(host_result.expert_weights.begin(),
                   host_result.expert_weights.end(), wt);
         return true;
+    }
+
+    bool IMoEKernel::routeWithTensorsEffectiveSeqLen(
+        ITensor *hidden, ITensor *gate_weights,
+        int seq_len, int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        MoERoutingResult &host_result,
+        const int *device_effective_seq_len)
+    {
+        if (device_effective_seq_len)
+            return false;
+        return routeWithTensors(hidden, gate_weights,
+                                seq_len, d_model, num_experts, top_k,
+                                normalize_weights,
+                                output_indices, output_weights,
+                                host_result);
     }
 
     void IMoEKernel::zeroBuffer(ITensor *tensor, size_t bytes)
@@ -95,6 +113,21 @@ namespace llaminar2
                          shared_output->mutable_data(), seq_len, d_model);
     }
 
+    bool IMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen(
+        ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+        int seq_len, int d_model,
+        const int *device_effective_seq_len)
+    {
+        if (device_effective_seq_len)
+        {
+            LOG_ERROR("[IMoEKernel] CPU/default sharedExpertGateFromTensorsEffectiveSeqLen "
+                      "cannot consume a device effective-length scalar");
+            return false;
+        }
+        sharedExpertGateFromTensors(input, gate_inp, shared_output, seq_len, d_model);
+        return true;
+    }
+
     void IMoEKernel::sharedExpertGateAddFromTensors(
         ITensor *input, ITensor *gate_inp, ITensor *shared_output,
         ITensor *routed_residual, ITensor *combined_output,
@@ -122,6 +155,24 @@ namespace llaminar2
                 combined_data[row_offset + j] = residual_data[row_offset + j] + gated_shared;
             }
         }
+    }
+
+    bool IMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen(
+        ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+        ITensor *routed_residual, ITensor *combined_output,
+        int seq_len, int d_model,
+        const int *device_effective_seq_len)
+    {
+        if (device_effective_seq_len)
+        {
+            LOG_ERROR("[IMoEKernel] CPU/default sharedExpertGateAddFromTensorsEffectiveSeqLen "
+                      "cannot consume a device effective-length scalar");
+            return false;
+        }
+        sharedExpertGateAddFromTensors(input, gate_inp, shared_output,
+                                       routed_residual, combined_output,
+                                       seq_len, d_model);
+        return true;
     }
 
     void IMoEKernel::swiGLUFromTensors(ITensor *gate, ITensor *up, int count)

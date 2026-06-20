@@ -185,6 +185,8 @@ namespace llaminar2
                 return "disabled";
             case PrefillGraphPhase::Cold:
                 return "cold";
+            case PrefillGraphPhase::Initialized:
+                return "initialized";
             case PrefillGraphPhase::Warmup:
                 return "warmup";
             case PrefillGraphPhase::Capturing:
@@ -274,6 +276,13 @@ namespace llaminar2
                 "prefill",
                 input.device.toString(),
                 prefillGraphObservationTags(observation, prefillGraphPhaseName(cache_phase)));
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "prefill_graph_phase",
+                1.0,
+                "prefill",
+                input.device.toString(),
+                prefillGraphObservationTags(observation, prefillGraphPhaseName(cache_phase)));
         }
 
         std::string forwardGraphPerfContext(const ForwardGraphSignature &signature)
@@ -307,7 +316,8 @@ namespace llaminar2
             const std::unordered_set<std::string> &collective_nodes,
             const ForwardInput &input,
             bool snapshots_active,
-            bool moe_rebalancing_active)
+            bool moe_rebalancing_active,
+            PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default)
         {
             return cache.preflight(
                 graph,
@@ -316,7 +326,8 @@ namespace llaminar2
                 snapshots_active,
                 moe_rebalancing_active,
                 effectiveRealSeqLen(input),
-                effectiveBucketSeqLen(input));
+                effectiveBucketSeqLen(input),
+                mode);
         }
 
         /// @brief Deterministic tie-breaker for bucketed forward-cache LRU victims.
@@ -617,6 +628,46 @@ namespace llaminar2
         {
             entry.second.resetReplayState();
         }
+    }
+
+    ForwardExecutionEngine::ReplayStateResetSummary
+    ForwardExecutionEngine::resetSessionReplayState(
+        bool preserve_replay_safe_segmented_captures)
+    {
+        ReplayStateResetSummary summary;
+        all_position_verifier_recapture_pending_ = false;
+        for (auto &[signature, cache] : cache_)
+        {
+            const ForwardReplayStateCacheClass cache_class =
+                classifyForwardReplayStateCache(signature);
+            const ForwardReplayStateAction action =
+                preserve_replay_safe_segmented_captures
+                    ? chooseForwardReplayStateAction(
+                          ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                          signature)
+                    : ForwardReplayStateAction::ResetReplayState;
+
+            if (action == ForwardReplayStateAction::ResetReplayState)
+            {
+                cache.resetSessionState();
+                ++summary.reset_replay_state;
+                if (cache_class == ForwardReplayStateCacheClass::OrdinaryDecode ||
+                    cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode)
+                    ++summary.ordinary_decode_reset;
+                continue;
+            }
+
+            cache.resetSessionStatePreservingSegmentedReplay();
+            ++summary.preserved_for_stream_rebind;
+            if (cache_class == ForwardReplayStateCacheClass::AllPositionVerifier)
+                ++summary.all_position_verifier_preserved;
+            else if (cache_class == ForwardReplayStateCacheClass::OrdinaryDecode ||
+                     cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode)
+                ++summary.other_preserved;
+            else
+                ++summary.other_preserved;
+        }
+        return summary;
     }
 
     ForwardExecutionEngine::ReplayStateResetSummary
@@ -2066,7 +2117,8 @@ namespace llaminar2
                 forward_cache.collective_nodes,
                 input,
                 snapshots_active,
-                moe_rebalancing_active);
+                moe_rebalancing_active,
+                PrefillGraphPreflightMode::ColdPaddedSupport);
             padded_preflight_checked = true;
 
             if (padded_preflight_reason != PrefillGraphRejectReason::None)
@@ -2177,7 +2229,24 @@ namespace llaminar2
             return true;
         }
 
-        if (phase == PrefillGraphPhase::Warmup)
+        const bool can_attempt_capture =
+            phase == PrefillGraphPhase::Warmup ||
+            phase == PrefillGraphPhase::Initialized;
+        PrefillGraphRejectReason capture_ready_reason = PrefillGraphRejectReason::None;
+        if (can_attempt_capture)
+        {
+            capture_ready_reason = preflightPrefillGraph(
+                cache,
+                *forward_cache.graph,
+                key,
+                forward_cache.collective_nodes,
+                input,
+                snapshots_active,
+                moe_rebalancing_active,
+                PrefillGraphPreflightMode::CaptureReady);
+        }
+
+        if (can_attempt_capture && capture_ready_reason == PrefillGraphRejectReason::None)
         {
             // === CAPTURE PATH ===
             auto [gpu_ctx, stream] = ensurePrefillCaptureStream();
@@ -2227,8 +2296,12 @@ namespace llaminar2
             // Kernels recorded during HIP/CUDA stream capture are not executed
             // until the executable graph is launched. Launch once immediately so
             // the capture request produces logits and advances device state.
+            const std::string recapture_reason =
+                phase == PrefillGraphPhase::Initialized
+                    ? "lazy_initialized_after_request_reset"
+                    : "armed_warmup";
             if (!launchPrefillGraph(gpu_ctx, stream, "capture", PrefillGraphPhase::Ready, "launch_after_capture",
-                                    phase == PrefillGraphPhase::Warmup ? "armed_warmup" : "recapture"))
+                                    recapture_reason))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph launch-after-capture failed for seq_len=" << input.seq_len);
                 return false;
@@ -2252,25 +2325,45 @@ namespace llaminar2
                 key,
                 PrefillGraphPhase::Ready,
                 "capture",
-                phase == PrefillGraphPhase::Warmup ? "armed_warmup" : "recapture");
+                recapture_reason);
             return true;
+        }
+
+        if (can_attempt_capture && capture_ready_reason != PrefillGraphRejectReason::None &&
+            cache.config().trace)
+        {
+            LOG_INFO("[ForwardExecutionEngine] Prefill graph capture readiness failed after "
+                     << prefillGraphPhaseName(phase)
+                     << ": " << toString(capture_ready_reason)
+                     << " seq_len=" << input.seq_len
+                     << "; running a fresh warmup");
         }
 
         // === WARMUP/COLD PATH ===
         bool cold_capture_candidate = false;
         PrefillGraphRejectReason cold_reject_reason = PrefillGraphRejectReason::None;
-        if (phase == PrefillGraphPhase::Cold)
+        if (phase == PrefillGraphPhase::Cold ||
+            phase == PrefillGraphPhase::Initialized ||
+            phase == PrefillGraphPhase::Warmup)
         {
-            cold_reject_reason = padded_preflight_checked
-                                     ? padded_preflight_reason
-                                     : preflightPrefillGraph(
-                                           cache,
-                                           *forward_cache.graph,
-                                           key,
-                                           forward_cache.collective_nodes,
-                                           input,
-                                           snapshots_active,
-                                           moe_rebalancing_active);
+            if (padded_preflight_checked)
+            {
+                cold_reject_reason = padded_preflight_reason;
+            }
+            else
+            {
+                cold_reject_reason = preflightPrefillGraph(
+                    cache,
+                    *forward_cache.graph,
+                    key,
+                    forward_cache.collective_nodes,
+                    input,
+                    snapshots_active,
+                    moe_rebalancing_active,
+                    padded_bucket
+                        ? PrefillGraphPreflightMode::ColdPaddedSupport
+                        : PrefillGraphPreflightMode::Default);
+            }
             cold_capture_candidate = (cold_reject_reason == PrefillGraphRejectReason::None);
         }
 
@@ -2309,7 +2402,9 @@ namespace llaminar2
             return false;
 
         // After successful warmup, check if graph capture is eligible
-        if (phase == PrefillGraphPhase::Cold)
+        if (phase == PrefillGraphPhase::Cold ||
+            phase == PrefillGraphPhase::Initialized ||
+            phase == PrefillGraphPhase::Warmup)
         {
             if (cold_capture_candidate && cold_stream_ready)
             {
@@ -2415,12 +2510,19 @@ namespace llaminar2
             return false;
         }
 
-        if (should_cache && build_cache && signature.is_bucketed_prefill && isPaddedBucketExecution(effective_input))
+        const bool bucketed_prefill_miss =
+            should_cache && build_cache && signature.is_bucketed_prefill && !is_decode;
+        const bool padded_bucketed_prefill_miss =
+            bucketed_prefill_miss && isPaddedBucketExecution(effective_input);
+        bool bucketed_prefill_capture_candidate = false;
+        PrefillGraphRejectReason bucketed_prefill_reject_reason = PrefillGraphRejectReason::None;
+
+        if (bucketed_prefill_miss)
         {
             PrefillGraphCache preflight_cache(makePrefillGraphConfigFromEnv());
             PrefillGraphCacheKey key = makePrefillGraphKey(effective_input, host);
 
-            const PrefillGraphRejectReason reject_reason = preflightPrefillGraph(
+            bucketed_prefill_reject_reason = preflightPrefillGraph(
                 preflight_cache,
                 graph,
                 key,
@@ -2428,11 +2530,13 @@ namespace llaminar2
                 effective_input,
                 executor_.config().snapshot_callback != nullptr,
                 host.isMoeRebalancingActive());
+            bucketed_prefill_capture_candidate =
+                (bucketed_prefill_reject_reason == PrefillGraphRejectReason::None);
 
-            if (reject_reason != PrefillGraphRejectReason::None)
+            if (!bucketed_prefill_capture_candidate && padded_bucketed_prefill_miss)
             {
                 LOG_ERROR("[ForwardExecutionEngine] Padded prefill graph rejected by preflight before execution: "
-                          << toString(reject_reason)
+                          << toString(bucketed_prefill_reject_reason)
                           << " real_seq_len=" << effectiveRealSeqLen(effective_input)
                           << " bucket_seq_len=" << effectiveBucketSeqLen(effective_input));
                 return false;
@@ -2499,19 +2603,38 @@ namespace llaminar2
             LOG_DEBUG("[ForwardExecutionEngine] Got device context, starting execution...");
 
             void *execution_stream = nullptr;
+            IWorkerGPUContext *execution_gpu_ctx = nullptr;
             if (ctx->deviceId().is_gpu())
             {
                 try
                 {
-                    execution_stream = GPUDeviceContextPool::instance()
-                                           .getContext(ctx->deviceId())
-                                           .defaultStream();
+                    execution_gpu_ctx = &GPUDeviceContextPool::instance().getContext(ctx->deviceId());
+                    execution_stream = execution_gpu_ctx->defaultStream();
                 }
                 catch (const std::exception &e)
                 {
                     LOG_ERROR("[ForwardExecutionEngine] Could not resolve forward graph stream for "
                               << ctx->deviceId().toString() << ": " << e.what());
                     return false;
+                }
+
+                if (bucketed_prefill_capture_candidate)
+                {
+                    /*
+                     * The first bucketed-prefill cache miss is the warmup pass
+                     * for the later monolithic graph capture.  Run it on the
+                     * same explicit stream that the Warmup->Capture transition
+                     * will record on; otherwise lazy first-use work may be
+                     * ordered on one stream while capture later observes another.
+                     */
+                    if (!build_cache->prefill_capture_stream.ensure(execution_gpu_ctx) ||
+                        !build_cache->prefill_capture_stream.stream)
+                    {
+                        LOG_ERROR("[ForwardExecutionEngine] Bucketed prefill cache miss could not create an explicit capture stream for "
+                                  << ctx->deviceId().toString());
+                        return false;
+                    }
+                    execution_stream = build_cache->prefill_capture_stream.stream;
                 }
             }
 
@@ -2545,6 +2668,24 @@ namespace llaminar2
                     node->stage->setGPUStream(execution_stream);
                     if (node->stage->hasDynamicParams())
                         cache_miss_dynamic_param_stages.push_back(node->stage.get());
+                }
+
+                if (!is_decode)
+                {
+                    /*
+                     * Padded prefill replay params were pushed once before
+                     * workspace allocation so host-only stages can see the
+                     * metadata early.  GPU GDN/short-conv stages also upload a
+                     * workspace-backed effective-length scalar, so repeat the
+                     * update after the workspace has been bound and after every
+                     * stage owns this explicit stream.  Otherwise a warmup run
+                     * can leave the scalar at the previous real length and the
+                     * following capture mutates live GDN state through one or
+                     * more padding rows.
+                     */
+                    updatePrefillReplayParamStages(
+                        effective_input,
+                        prefill_replay_param_stages);
                 }
             }
 
@@ -2638,7 +2779,42 @@ namespace llaminar2
                       << "] (" << build_cache->graph->size() << " stages)");
 
             if (signature.is_bucketed_prefill)
+            {
+                if (!build_cache->prefill_graph_cache)
+                {
+                    build_cache->prefill_graph_cache =
+                        std::make_unique<PrefillGraphCache>(makePrefillGraphConfigFromEnv());
+                }
+
+                PrefillGraphCacheKey key = makePrefillGraphKey(effective_input, host);
+                if (bucketed_prefill_capture_candidate)
+                {
+                    build_cache->prefill_graph_cache->markWarmedUp(key);
+                    publishPrefillGraphObservation(
+                        *build_cache,
+                        effective_input,
+                        key,
+                        PrefillGraphPhase::Warmup,
+                        "warmup",
+                        "none");
+                    if (build_cache->prefill_graph_cache->config().trace)
+                    {
+                        LOG_INFO("[ForwardExecutionEngine] Prefill graph ARMED during cache miss warmup: seq_len="
+                                 << effective_input.seq_len);
+                    }
+                }
+                else
+                {
+                    publishPrefillGraphObservation(
+                        *build_cache,
+                        effective_input,
+                        key,
+                        PrefillGraphPhase::Cold,
+                        "rejected",
+                        toString(bucketed_prefill_reject_reason));
+                }
                 enforceBucketedPrefillForwardCapacity(&signature);
+            }
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -2784,6 +2960,7 @@ namespace llaminar2
         snapshot.node_count = prefill_cache.nodeCount(key);
         snapshot.replay_count = prefill_cache.replayCount(key);
         snapshot.warmup_count = prefill_cache.warmupCount(key);
+        snapshot.initialized_count = prefill_cache.initializedCount(key);
         snapshot.capture_count = prefill_cache.captureCount(key);
         snapshot.eviction_count += prefill_cache.evictionCount();
         return snapshot;

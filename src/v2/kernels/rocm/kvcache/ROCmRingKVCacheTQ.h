@@ -101,7 +101,10 @@ namespace llaminar2
         // Graph Capture Support
         // =====================================================================
 
-        bool isGraphCaptureReady() const override { return d_dequant_params_ != nullptr; }
+        bool isGraphCaptureReady() const override
+        {
+            return ROCmRingKVCacheBase::isGraphCaptureReady() && d_dequant_params_ != nullptr;
+        }
 
         /**
          * @brief Set dynamic dequant params for graph capture.

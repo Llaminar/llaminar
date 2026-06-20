@@ -277,7 +277,7 @@ TEST(Test__PrefillGraphCache, DefaultConfig_MatchesExpectedDefaults)
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.min_seq_len, 256);
     EXPECT_FALSE(config.trace);
-    EXPECT_FALSE(config.buckets_enabled);
+    EXPECT_TRUE(config.buckets_enabled);
     EXPECT_EQ(config.max_cached_entries, 10u);
 }
 
@@ -777,6 +777,34 @@ TEST(Test__PrefillGraphCache, Preflight_ColdPaddedBucketUsesSupportBeforeWarmupR
         /*real_seq_len=*/595,
         /*bucket_seq_len=*/608);
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+
+    const auto reset = cache.prepareEntriesForRequestReset();
+    ASSERT_EQ(reset.initialized, 1u);
+    ASSERT_EQ(cache.phase(key), PrefillGraphPhase::Initialized);
+
+    reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/608,
+        PrefillGraphPreflightMode::ColdPaddedSupport);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None)
+        << "Initialized entries may validate padded-bucket support for a fresh warmup.";
+
+    reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/608,
+        PrefillGraphPreflightMode::CaptureReady);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable)
+        << "Initialized entries must still pass strict capture readiness before capture.";
 
     stage_ptr->setCaptureReady(true);
     reason = cache.preflight(
@@ -1500,6 +1528,67 @@ TEST_F(PrefillGraphCacheGPUTest, InvalidateAll_ResetsReadyEntries)
     EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Cold);
     EXPECT_FALSE(cache.hasGraph(key));
     EXPECT_EQ(cache.nodeCount(key), 0u);
+}
+
+TEST_F(PrefillGraphCacheGPUTest, RequestResetDemotesWarmupToInitializedAndPreservesReadyEntries)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+
+    auto ready_key = makeGPUKey(512);
+    cache.markWarmedUp(ready_key);
+
+    gpu_ctx_->submitAndWait([&]
+                            {
+        void *stream = gpu_ctx_->defaultStream();
+        ASSERT_TRUE(cache.beginCapture(ready_key, gpu_ctx_, stream));
+        ASSERT_TRUE(cache.endCaptureAndInstantiate(ready_key));
+        ASSERT_TRUE(cache.launch(ready_key));
+        EXPECT_EQ(cache.replayCount(ready_key), 1); });
+
+    auto warmup_key = makeGPUKey(1024);
+    cache.markWarmedUp(warmup_key);
+    ASSERT_EQ(cache.phase(warmup_key), PrefillGraphPhase::Warmup);
+
+    const auto reset = cache.prepareEntriesForRequestReset();
+    EXPECT_EQ(reset.ready_preserved, 1u);
+    EXPECT_EQ(reset.initialized, 1u)
+        << "Warmup-only entries keep lazy stage/kernel initialization but must lose request-armed capture state.";
+    EXPECT_EQ(reset.dropped, 0u);
+    EXPECT_EQ(cache.phase(ready_key), PrefillGraphPhase::Ready);
+    EXPECT_TRUE(cache.hasGraph(ready_key));
+    EXPECT_EQ(cache.replayCount(ready_key), 1);
+    EXPECT_EQ(cache.phase(warmup_key), PrefillGraphPhase::Initialized);
+    EXPECT_FALSE(cache.hasGraph(warmup_key));
+    EXPECT_EQ(cache.initializedCount(warmup_key), 1u);
+    EXPECT_EQ(cache.lastInvalidationReason(), PrefillGraphRejectReason::RequestStateReset);
+
+    gpu_ctx_->submitAndWait([&]
+                            {
+        ASSERT_TRUE(cache.launch(ready_key));
+        EXPECT_EQ(cache.replayCount(ready_key), 2); });
+}
+
+TEST_F(PrefillGraphCacheGPUTest, InitializedEntryCanCaptureAfterStrictReadiness)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(1024);
+    cache.markWarmedUp(key);
+    ASSERT_EQ(cache.phase(key), PrefillGraphPhase::Warmup);
+
+    const auto reset = cache.prepareEntriesForRequestReset();
+    ASSERT_EQ(reset.initialized, 1u);
+    ASSERT_EQ(cache.phase(key), PrefillGraphPhase::Initialized);
+
+    gpu_ctx_->submitAndWait([&]
+                            {
+        void *stream = gpu_ctx_->defaultStream();
+        ASSERT_TRUE(cache.beginCapture(key, gpu_ctx_, stream));
+        ASSERT_TRUE(cache.endCaptureAndInstantiate(key));
+        EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Ready);
+        EXPECT_EQ(cache.captureCount(key), 1u); });
 }
 
 TEST_F(PrefillGraphCacheGPUTest, ReplayCount_IncrementedOnLaunch)

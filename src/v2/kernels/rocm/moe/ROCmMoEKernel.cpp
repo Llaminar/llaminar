@@ -45,6 +45,37 @@ namespace
         return true;
     }
 
+    bool validateDevicePointerOrLog(
+        const void *ptr,
+        int expected_device,
+        const char *pointer_name,
+        const char *scope)
+    {
+#if LLAMINAR_ASSERTIONS_ACTIVE
+        if (!ptr)
+        {
+            LOG_ERROR("[" << scope << "] " << pointer_name << " is null");
+            return false;
+        }
+        hipPointerAttribute_t attr{};
+        hipError_t err = hipPointerGetAttributes(&attr, ptr);
+        if (err == hipSuccess && attr.device != expected_device)
+        {
+            LOG_ERROR("[" << scope << "] " << pointer_name
+                          << " is on ROCm device " << attr.device
+                          << ", expected " << expected_device);
+            return false;
+        }
+        return true;
+#else
+        (void)ptr;
+        (void)expected_device;
+        (void)pointer_name;
+        (void)scope;
+        return true;
+#endif
+    }
+
     /// @brief Returns whether grouped MoE kernels instantiate this native-VNNI codebook.
     bool groupedDecodeSupportsCodebook(uint8_t codebook_id)
     {
@@ -375,7 +406,8 @@ extern "C"
         int *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k,
         bool normalize_weights,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int *device_effective_seq_len);
 
     bool hipMoE_softmax_topk_decode_runtime(
         float *logits,
@@ -449,6 +481,13 @@ extern "C"
         int seq_len, int d_model,
         int device_idx, void *stream);
 
+    bool hipMoE_shared_expert_gate_effective_seq_len(
+        const float *input, const float *gate_inp,
+        float *shared_output, float *gate_scratch,
+        int seq_len, int d_model,
+        const int *device_effective_seq_len,
+        int device_idx, void *stream);
+
     bool hipMoE_shared_expert_gate_decode_fused(
         const float *input, const float *gate_inp,
         float *shared_output, int d_model,
@@ -458,6 +497,13 @@ extern "C"
         const float *input, const float *gate_inp,
         float *shared_output, const float *routed_residual,
         float *combined_output, int seq_len, int d_model,
+        int device_idx, void *stream);
+
+    bool hipMoE_shared_expert_gate_add_effective_seq_len(
+        const float *input, const float *gate_inp,
+        float *shared_output, const float *routed_residual,
+        float *combined_output, int seq_len, int d_model,
+        const int *device_effective_seq_len,
         int device_idx, void *stream);
 
     bool hipMoE_swiglu(
@@ -1617,7 +1663,8 @@ namespace llaminar2
     bool ROCmMoEKernel::routeCore(
         const float *hidden, const void *gate_weights, TensorType gate_type,
         int seq_len, int d_model, int num_experts, int top_k,
-        bool normalize_weights, DeviceRouteBuffers &bufs)
+        bool normalize_weights, DeviceRouteBuffers &bufs,
+        const int *device_effective_seq_len)
     {
         bufs.logits_count = static_cast<size_t>(seq_len) * num_experts;
         bufs.topk_count = static_cast<size_t>(seq_len) * top_k;
@@ -1628,6 +1675,15 @@ namespace llaminar2
         bufs.d_logits = d_route_logits_;
         bufs.d_indices = d_route_indices_;
         bufs.d_weights = d_route_weights_;
+        if (device_effective_seq_len &&
+            !validateDevicePointerOrLog(device_effective_seq_len,
+                                        device_ordinal_,
+                                        "effective prefill sequence length",
+                                        "ROCmMoEKernel::routeCore"))
+        {
+            bufs = {};
+            return false;
+        }
 
         const bool decode_single_token = (seq_len == 1);
         if (decode_single_token)
@@ -1712,7 +1768,8 @@ namespace llaminar2
         if (!hipMoE_softmax_topk(bufs.d_logits, bufs.d_indices, bufs.d_weights,
                                  seq_len, num_experts, top_k,
                                  normalize_weights,
-                                 device_ordinal_, getStream()))
+                                 device_ordinal_, getStream(),
+                                 device_effective_seq_len))
         {
             bufs = {};
             return false;
@@ -2704,12 +2761,14 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmMoEKernel::routeWithTensors(
+    bool ROCmMoEKernel::routeWithTensorsImpl(
         ITensor *hidden, ITensor *gate_weights,
         int seq_len, int d_model, int num_experts, int top_k,
         bool normalize_weights,
         ITensor *output_indices, ITensor *output_weights,
-        MoERoutingResult &host_result)
+        MoERoutingResult &host_result,
+        const int *device_effective_seq_len,
+        const char *context)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -2718,7 +2777,7 @@ namespace llaminar2
         const TensorType gate_type = gate_weights->native_type();
         if (!h || !g)
         {
-            LOG_ERROR("[ROCmMoEKernel::routeWithTensors] null device pointer "
+            LOG_ERROR("[" << context << "] null device pointer "
                       "(hidden="
                       << (const void *)h << " gate=" << (const void *)g << ")");
             return false;
@@ -2726,13 +2785,14 @@ namespace llaminar2
 
         DeviceRouteBuffers bufs;
         if (!routeCore(h, g, gate_type, seq_len, d_model, num_experts, top_k,
-                       normalize_weights, bufs))
+                       normalize_weights, bufs,
+                       device_effective_seq_len))
             return false;
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         if (!stream)
         {
-            LOG_ERROR("[ROCmMoEKernel::routeWithTensors] explicit HIP stream is required");
+            LOG_ERROR("[" << context << "] explicit HIP stream is required");
             return false;
         }
         hipError_t err;
@@ -2743,7 +2803,7 @@ namespace llaminar2
         float *d_wt = static_cast<float *>(output_weights->gpu_data_ptr());
         if (!d_idx || !d_wt)
         {
-            LOG_ERROR("[ROCmMoEKernel::routeWithTensors] output tensors have no device allocation");
+            LOG_ERROR("[" << context << "] output tensors have no device allocation");
             return false;
         }
 
@@ -2765,7 +2825,7 @@ namespace llaminar2
                                  static_cast<int>(bufs.topk_count),
                                  device_ordinal_, getStream()))
         {
-            LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2D index conversion failed");
+            LOG_ERROR("[" << context << "] D2D index conversion failed");
             return false;
         }
 
@@ -2774,7 +2834,7 @@ namespace llaminar2
                              hipMemcpyDeviceToDevice, stream);
         if (err != hipSuccess)
         {
-            LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2D weights failed: " << hipGetErrorString(err));
+            LOG_ERROR("[" << context << "] D2D weights failed: " << hipGetErrorString(err));
             return false;
         }
 
@@ -2788,7 +2848,7 @@ namespace llaminar2
             h_wt = static_cast<float *>(output_weights->raw_mutable_data());
             if (!h_idx || !h_wt)
             {
-                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] output tensors have no host storage");
+                LOG_ERROR("[" << context << "] output tensors have no host storage");
                 return false;
             }
 
@@ -2797,7 +2857,7 @@ namespace llaminar2
                                  hipMemcpyDeviceToHost, stream);
             if (err != hipSuccess)
             {
-                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2H decode indices failed: " << hipGetErrorString(err));
+                LOG_ERROR("[" << context << "] D2H decode indices failed: " << hipGetErrorString(err));
                 return false;
             }
 
@@ -2806,7 +2866,7 @@ namespace llaminar2
                                  hipMemcpyDeviceToHost, stream);
             if (err != hipSuccess)
             {
-                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2H decode weights failed: " << hipGetErrorString(err));
+                LOG_ERROR("[" << context << "] D2H decode weights failed: " << hipGetErrorString(err));
                 return false;
             }
         }
@@ -2819,7 +2879,7 @@ namespace llaminar2
                                  bufs.logits_count * sizeof(float), hipMemcpyDeviceToHost, stream);
             if (err != hipSuccess)
             {
-                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2H snapshot logits failed: " << hipGetErrorString(err));
+                LOG_ERROR("[" << context << "] D2H snapshot logits failed: " << hipGetErrorString(err));
                 return false;
             }
         }
@@ -2830,7 +2890,7 @@ namespace llaminar2
             err = hipStreamSynchronize(stream);
             if (err != hipSuccess)
             {
-                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] stream sync failed after routing D2H: " << hipGetErrorString(err));
+                LOG_ERROR("[" << context << "] stream sync failed after routing D2H: " << hipGetErrorString(err));
                 return false;
             }
         }
@@ -2853,6 +2913,44 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool ROCmMoEKernel::routeWithTensors(
+        ITensor *hidden, ITensor *gate_weights,
+        int seq_len, int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        MoERoutingResult &host_result)
+    {
+        return routeWithTensorsImpl(hidden, gate_weights,
+                                    seq_len, d_model, num_experts, top_k,
+                                    normalize_weights,
+                                    output_indices, output_weights,
+                                    host_result,
+                                    nullptr,
+                                    "ROCmMoEKernel::routeWithTensors");
+    }
+
+    bool ROCmMoEKernel::routeWithTensorsEffectiveSeqLen(
+        ITensor *hidden, ITensor *gate_weights,
+        int seq_len, int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        MoERoutingResult &host_result,
+        const int *device_effective_seq_len)
+    {
+        if (!device_effective_seq_len)
+        {
+            LOG_ERROR("[ROCmMoEKernel::routeWithTensorsEffectiveSeqLen] missing device effective length scalar");
+            return false;
+        }
+        return routeWithTensorsImpl(hidden, gate_weights,
+                                    seq_len, d_model, num_experts, top_k,
+                                    normalize_weights,
+                                    output_indices, output_weights,
+                                    host_result,
+                                    device_effective_seq_len,
+                                    "ROCmMoEKernel::routeWithTensorsEffectiveSeqLen");
     }
 
     bool ROCmMoEKernel::decodeRouteSelect(
@@ -3265,6 +3363,57 @@ namespace llaminar2
         markDeviceWritten(shared_output, device, stream);
     }
 
+    bool ROCmMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen(
+        ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+        int seq_len, int d_model,
+        const int *device_effective_seq_len)
+    {
+        if (!setMoEDevice(device_ordinal_, "sharedExpertGateFromTensorsEffectiveSeqLen"))
+            return false;
+        if (seq_len <= 0)
+            return true;
+        if (!device_effective_seq_len)
+        {
+            LOG_ERROR("[ROCmMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen] missing device effective length scalar");
+            return false;
+        }
+
+        void *stream = getStream();
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!ensureTensorOnDevice(input, device, stream, "input", "sharedExpertGateFromTensorsEffectiveSeqLen") ||
+            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateFromTensorsEffectiveSeqLen") ||
+            !ensureTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateFromTensorsEffectiveSeqLen"))
+            return false;
+
+        const float *in = static_cast<const float *>(input->gpu_data_ptr());
+        const float *gi = static_cast<const float *>(gate_inp->gpu_data_ptr());
+        float *so = static_cast<float *>(shared_output->gpu_data_ptr());
+        if (!in || !gi || !so)
+        {
+            LOG_ERROR("[ROCmMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen] null device pointer");
+            return false;
+        }
+
+        if (seq_len == 1)
+        {
+            sharedExpertGateFromTensors(input, gate_inp, shared_output, seq_len, d_model);
+            return true;
+        }
+
+        if (!ensureSharedGateScratchCapacity(seq_len))
+            return false;
+        if (!hipMoE_shared_expert_gate_effective_seq_len(
+                in, gi, so, d_shared_gate_scratch_,
+                seq_len, d_model, device_effective_seq_len,
+                device_ordinal_, stream))
+        {
+            LOG_ERROR("[ROCmMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen] kernel launch failed");
+            return false;
+        }
+        markDeviceWritten(shared_output, device, stream);
+        return true;
+    }
+
     void ROCmMoEKernel::sharedExpertGateAddFromTensors(
         ITensor *input, ITensor *gate_inp, ITensor *shared_output,
         ITensor *routed_residual, ITensor *combined_output,
@@ -3305,6 +3454,54 @@ namespace llaminar2
         }
         markDeviceWritten(shared_output, device, stream);
         markDeviceWritten(combined_output, device, stream);
+    }
+
+    bool ROCmMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen(
+        ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+        ITensor *routed_residual, ITensor *combined_output,
+        int seq_len, int d_model,
+        const int *device_effective_seq_len)
+    {
+        if (!setMoEDevice(device_ordinal_, "sharedExpertGateAddFromTensorsEffectiveSeqLen"))
+            return false;
+        if (seq_len <= 0)
+            return true;
+        if (!device_effective_seq_len)
+        {
+            LOG_ERROR("[ROCmMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen] missing device effective length scalar");
+            return false;
+        }
+
+        void *stream = getStream();
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!ensureTensorOnDevice(input, device, stream, "input", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
+            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
+            !ensureTensorOnDevice(shared_output, device, stream, "shared_output", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
+            !ensureTensorOnDevice(routed_residual, device, stream, "routed_residual", "sharedExpertGateAddFromTensorsEffectiveSeqLen") ||
+            !ensureTensorOnDevice(combined_output, device, stream, "combined_output", "sharedExpertGateAddFromTensorsEffectiveSeqLen"))
+            return false;
+
+        const float *in = static_cast<const float *>(input->gpu_data_ptr());
+        const float *gi = static_cast<const float *>(gate_inp->gpu_data_ptr());
+        float *so = static_cast<float *>(shared_output->gpu_data_ptr());
+        const float *rr = static_cast<const float *>(routed_residual->gpu_data_ptr());
+        float *co = static_cast<float *>(combined_output->gpu_data_ptr());
+        if (!in || !gi || !so || !rr || !co)
+        {
+            LOG_ERROR("[ROCmMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen] null device pointer");
+            return false;
+        }
+
+        if (!hipMoE_shared_expert_gate_add_effective_seq_len(
+                in, gi, so, rr, co, seq_len, d_model,
+                device_effective_seq_len, device_ordinal_, stream))
+        {
+            LOG_ERROR("[ROCmMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen] fused gate-add kernel launch failed");
+            return false;
+        }
+        markDeviceWritten(shared_output, device, stream);
+        markDeviceWritten(combined_output, device, stream);
+        return true;
     }
 
     void ROCmMoEKernel::swiGLUFromTensors(ITensor *gate, ITensor *up, int count)

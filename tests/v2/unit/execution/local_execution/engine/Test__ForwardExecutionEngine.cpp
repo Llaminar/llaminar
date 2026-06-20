@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <string>
@@ -122,6 +123,7 @@ namespace
         int graph_stage_count = 0; // stages in built graph (0 means empty graph)
         // Optional explicit stage types let safety tests assemble GDN/short-conv graphs.
         std::vector<ComputeStageType> graph_stage_types;
+        std::vector<std::function<std::unique_ptr<IComputeStage>(const std::string &, DeviceId)>> graph_stage_factories;
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
         bool mock_compute_all_position_logits = false;
@@ -161,21 +163,28 @@ namespace
                 return GraphBuildResult(build_error_message);
 
             ComputeGraph graph;
-            const int stage_count = graph_stage_types.empty()
-                                        ? graph_stage_count
-                                        : static_cast<int>(graph_stage_types.size());
+            const int stage_count = !graph_stage_factories.empty()
+                                        ? static_cast<int>(graph_stage_factories.size())
+                                        : (graph_stage_types.empty()
+                                               ? graph_stage_count
+                                               : static_cast<int>(graph_stage_types.size()));
             for (int i = 0; i < stage_count; ++i)
             {
                 const ComputeStageType type = graph_stage_types.empty()
                                                   ? ComputeStageType::GEMM
                                                   : graph_stage_types[static_cast<size_t>(i)];
                 const std::string stage_name = "mock_stage_" + std::to_string(i);
-                graph.addNode(
-                    stage_name,
-                    std::make_unique<llaminar2::testing::MockComputeStage>(
+                std::unique_ptr<IComputeStage> stage;
+                if (!graph_stage_factories.empty())
+                    stage = graph_stage_factories[static_cast<size_t>(i)](stage_name, input.device);
+                else
+                    stage = std::make_unique<llaminar2::testing::MockComputeStage>(
                         type,
                         stage_name,
-                        input.device),
+                        input.device);
+                graph.addNode(
+                    stage_name,
+                    std::move(stage),
                     input.device);
                 if (i > 0)
                 {
@@ -290,6 +299,48 @@ namespace
 
     private:
         IDeviceContext *ctx_;
+    };
+
+    struct PrefillReplayParamProbe
+    {
+        int updates = 0;
+        std::vector<int> real_seq_lens;
+        std::vector<int> bucket_seq_lens;
+        std::vector<bool> saw_stream;
+    };
+
+    /**
+     * @brief Test stage that records padded-prefill replay metadata handoff order.
+     *
+     * Real GDN and short-conv stages upload a tiny effective-length scalar when
+     * they receive PrefillReplayParams after workspace and stream binding. This
+     * probe mirrors their public graph-capture contract without launching a GPU
+     * kernel, so the engine ordering can be tested quickly in unit coverage.
+     */
+    class PrefillReplayParamProbeStage final : public llaminar2::testing::MockComputeStage
+    {
+    public:
+        PrefillReplayParamProbeStage(std::string name, DeviceId device, PrefillReplayParamProbe *probe)
+            : MockComputeStage(ComputeStageType::GDN_RECURRENCE, std::move(name), device),
+              probe_(probe)
+        {
+        }
+
+        bool hasPrefillReplayParams() const override { return true; }
+        bool supportsPaddedPrefillRealLengthContract() const override { return true; }
+        bool supportsPaddedPrefillGraphCapturePreflight() const override { return true; }
+
+        void updatePrefillReplayParams(const PrefillReplayParams &params) override
+        {
+            ASSERT_NE(probe_, nullptr);
+            ++probe_->updates;
+            probe_->real_seq_lens.push_back(params.real_seq_len);
+            probe_->bucket_seq_lens.push_back(params.bucket_seq_len);
+            probe_->saw_stream.push_back(gpuStream() != nullptr);
+        }
+
+    private:
+        PrefillReplayParamProbe *probe_ = nullptr;
     };
 
     /**
@@ -965,6 +1016,54 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedPlanDelegatesWithBuck
     EXPECT_EQ(host.last_forward_input.token_offset, 88);
     EXPECT_EQ(host.last_forward_input.position_offset, 88);
     EXPECT_EQ(host.last_workspace_seq_len, 4);
+}
+
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedReplayParamsRefreshAfterGpuStreamBinding)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    PrefillReplayParamProbe probe;
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_factories.push_back(
+        [&probe](const std::string &name, DeviceId device) -> std::unique_ptr<IComputeStage>
+        {
+            return std::make_unique<PrefillReplayParamProbeStage>(name, device, &probe);
+        });
+
+    const std::vector<int> tokens = {60, 61, 62};
+    auto base_input = makeTestInput(3, 1, DeviceId::cuda(0), tokens.data(), nullptr);
+
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        base_input,
+        std::vector<int>{4},
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/true);
+    ASSERT_TRUE(plan) << plan.error;
+    ASSERT_TRUE(plan.padding_required);
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.runPrefillChunk(base_input, plan, output, host));
+
+    ASSERT_GE(probe.updates, 2)
+        << "GPU padded-prefill stages must receive a second metadata refresh after stream binding";
+    EXPECT_FALSE(probe.saw_stream.front())
+        << "The first refresh happens before workspace/stream binding for host-side metadata";
+    EXPECT_TRUE(probe.saw_stream.back())
+        << "The final refresh must happen after assigning the explicit graph stream";
+    for (int real_seq_len : probe.real_seq_lens)
+        EXPECT_EQ(real_seq_len, 3);
+    for (int bucket_seq_len : probe.bucket_seq_lens)
+        EXPECT_EQ(bucket_seq_len, 4);
 }
 
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedGDNOrShortConvRejectedBeforeExecution)

@@ -21,6 +21,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/MPIContext.h"
 #include "../../attention/AttentionDeviceParams.h"
+#include <array>
 
 namespace llaminar2
 {
@@ -53,6 +54,15 @@ namespace llaminar2
             /// Temporary FP32 V buffer for mixed-precision KV conversion
             constexpr const char *V_TMP_FP32 = "attn_v_tmp_fp32";
         }
+
+        /**
+         * @brief Maximum verifier/decode rows that share one dynamic attention-param upload.
+         *
+         * The CUDA small-M attention path currently supports verifier groups up to
+         * four rows.  Keeping this value in the header lets both the workspace
+         * declaration and the host staging storage stay in lockstep.
+         */
+        constexpr int kMaxDynamicAttentionParamRows = 4;
         // Forward declaration of precision element type mapping
         namespace detail
         {
@@ -490,9 +500,9 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Pinned host staging for pre-capture attention-param uploads
-            attention::AttentionDeviceParams *h_attn_params_ = nullptr;
-            int h_attn_params_capacity_ = 0;
+            /// Fixed host staging for attention params that are uploaded before graph capture.
+            std::array<attention::AttentionDeviceParams, kMaxDynamicAttentionParamRows> h_attn_params_{};
+            int h_attn_params_capacity_ = kMaxDynamicAttentionParamRows;
             int dynamic_attn_kv_len_ = 0;
             int dynamic_attn_position_offset_ = 0;
             int dynamic_attn_query_rows_ = 1;
@@ -501,6 +511,13 @@ namespace llaminar2
             bool dynamic_attn_device_valid_ = false;
             bool dynamic_attn_device_derived_ = false;
 
+            /**
+             * @brief Validate that fixed host staging can hold the requested rows.
+             *
+             * No CUDA allocation is allowed here: callers may prepare attention
+             * params during lazy graph setup, and the actual device storage lives
+             * in the IWorkspaceConsumer buffer named @ref AttentionWorkspaceBuffers::DEVICE_PARAMS.
+             */
             bool ensureHostAttnParamsCapacity(int capacity);
             bool uploadDynamicAttnParams(void *stream);
             bool dynamicAttnParamsReady(
@@ -642,8 +659,9 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Pinned host staging for pre-capture attention-param uploads
-            attention::AttentionDeviceParams *h_attn_params_ = nullptr;
+            /// Single-row host staging for attention params uploaded to DEVICE_PARAMS.
+            attention::AttentionDeviceParams h_attn_params_{};
+            bool dynamic_attn_device_valid_ = false;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
@@ -782,8 +800,9 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Pinned host staging for pre-capture attention-param uploads
-            attention::AttentionDeviceParams *h_attn_params_ = nullptr;
+            /// Single-row host staging for attention params uploaded to DEVICE_PARAMS.
+            attention::AttentionDeviceParams h_attn_params_{};
+            bool dynamic_attn_device_valid_ = false;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();

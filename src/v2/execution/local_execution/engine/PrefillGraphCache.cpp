@@ -179,6 +179,14 @@ namespace llaminar2
         return it->second.phase == PrefillGraphPhase::Ready;
     }
 
+    /**
+     * @brief Validate whether the cached bucket can warm, capture, or replay.
+     *
+     * Padded buckets have two different checks. A cold warmup only needs to
+     * prove that every stage supports the fixed-bucket contract. Capture needs
+     * the stricter readiness check because graph capture records concrete
+     * backend handles, scratch pointers, and launch topology.
+     */
     PrefillGraphRejectReason PrefillGraphCache::preflight(
         const ComputeGraph &graph,
         const PrefillGraphCacheKey &key,
@@ -186,7 +194,8 @@ namespace llaminar2
         bool snapshots_active,
         bool moe_rebalancing_active,
         int real_seq_len,
-        int bucket_seq_len) const
+        int bucket_seq_len,
+        PrefillGraphPreflightMode mode) const
     {
         if (!config_.enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
@@ -209,7 +218,9 @@ namespace llaminar2
         const bool padded_bucket =
             real_seq_len > 0 && bucket_seq_len > 0 && real_seq_len < bucket_seq_len;
         const bool cold_padded_preflight =
-            padded_bucket && phase(key) == PrefillGraphPhase::Cold;
+            padded_bucket &&
+            (mode == PrefillGraphPreflightMode::ColdPaddedSupport ||
+             (mode == PrefillGraphPreflightMode::Default && phase(key) == PrefillGraphPhase::Cold));
         if (padded_bucket && !config_.buckets_enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
 
@@ -232,9 +243,10 @@ namespace llaminar2
             const auto *node = graph.getNode(name);
             if (!node || !node->stage)
                 continue;
-            const bool stage_ok = cold_padded_preflight
-                                      ? node->stage->supportsPaddedPrefillGraphCapturePreflight()
-                                      : node->stage->isGraphCapturable();
+            const bool stage_ok =
+                (mode != PrefillGraphPreflightMode::CaptureReady && cold_padded_preflight)
+                    ? node->stage->supportsPaddedPrefillGraphCapturePreflight()
+                    : node->stage->isGraphCapturable();
             if (!stage_ok)
             {
                 if (config_.trace)
@@ -251,6 +263,13 @@ namespace llaminar2
         return PrefillGraphRejectReason::None;
     }
 
+    /**
+     * @brief Mark the current request's normal execution as capture-arming warmup.
+     *
+     * This state is intentionally request-scoped. Request reset may preserve the
+     * lazy initialization side effects, but it must not preserve the fact that
+     * this particular request was next in line for capture.
+     */
     void PrefillGraphCache::markWarmedUp(const PrefillGraphCacheKey &key)
     {
         auto &entry = entries_[key];
@@ -270,12 +289,17 @@ namespace llaminar2
         }
     }
 
+    /**
+     * @brief Start recording a monolithic prefill GPU graph on an explicit stream.
+     */
     bool PrefillGraphCache::beginCapture(const PrefillGraphCacheKey &key, IWorkerGPUContext *gpu_ctx, void *stream)
     {
         auto it = entries_.find(key);
-        if (it == entries_.end() || it->second.phase != PrefillGraphPhase::Warmup)
+        if (it == entries_.end() ||
+            (it->second.phase != PrefillGraphPhase::Warmup &&
+             it->second.phase != PrefillGraphPhase::Initialized))
         {
-            LOG_ERROR("[PrefillGraphCache] beginCapture() called but entry not in Warmup phase"
+            LOG_ERROR("[PrefillGraphCache] beginCapture() called but entry not capture-armed"
                       << " (seq_len=" << key.seq_len << ")");
             return false;
         }
@@ -322,6 +346,9 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Finish recording and instantiate the captured prefill graph.
+     */
     bool PrefillGraphCache::endCaptureAndInstantiate(const PrefillGraphCacheKey &key)
     {
         auto it = entries_.find(key);
@@ -414,6 +441,72 @@ namespace llaminar2
         }
     }
 
+    /**
+     * @brief Split reusable lazy initialization from request-local warmup state.
+     *
+     * Ready entries keep their executable graphs. Warmup/Initialized entries keep
+     * only the fact that first-use stage/kernel setup has happened; they are not
+     * allowed to replay, and they cannot capture until the executor prepares
+     * fresh request metadata and reruns strict capture-readiness preflight.
+     */
+    PrefillGraphRequestResetSummary PrefillGraphCache::prepareEntriesForRequestReset()
+    {
+        PrefillGraphRequestResetSummary summary;
+        for (auto &[key, entry] : entries_)
+        {
+            const bool ready_for_replay =
+                entry.phase == PrefillGraphPhase::Ready &&
+                entry.capture &&
+                entry.capture->hasExecutable();
+            if (ready_for_replay)
+            {
+                ++summary.ready_preserved;
+                continue;
+            }
+
+            if (entry.phase == PrefillGraphPhase::Warmup ||
+                entry.phase == PrefillGraphPhase::Initialized)
+            {
+                // Preserve durable lazy setup, but discard any request-specific
+                // graph object and replay counters from the previous prompt.
+                entry.phase = PrefillGraphPhase::Initialized;
+                entry.capture.reset();
+                entry.node_count = 0;
+                entry.replay_count = 0;
+                lifecycle_stats_[key].initialized_count++;
+                ++summary.initialized;
+                continue;
+            }
+
+            entry.phase = PrefillGraphPhase::Cold;
+            entry.capture.reset();
+            entry.node_count = 0;
+            entry.replay_count = 0;
+            ++summary.dropped;
+        }
+
+        if (summary.initialized > 0 || summary.dropped > 0)
+        {
+            last_invalidation_reason_ = PrefillGraphRejectReason::RequestStateReset;
+            LOG_INFO("[PrefillGraphCache] Request reset preserved "
+                     << summary.ready_preserved
+                     << " ready prefill graph executables, kept "
+                     << summary.initialized
+                     << " entries as lazy-initialized only, and dropped "
+                     << summary.dropped
+                     << " stale entries");
+        }
+        return summary;
+    }
+
+    /**
+     * @brief Backward-compatible reset helper for callers that only need drops.
+     */
+    size_t PrefillGraphCache::preserveReadyEntriesAcrossRequestReset()
+    {
+        return prepareEntriesForRequestReset().dropped;
+    }
+
     void PrefillGraphCache::invalidate(const PrefillGraphCacheKey &key)
     {
         auto it = entries_.find(key);
@@ -458,6 +551,17 @@ namespace llaminar2
         if (it == lifecycle_stats_.end())
             return 0;
         return it->second.warmup_count;
+    }
+
+    /**
+     * @brief Return how many request resets kept lazy initialization for a key.
+     */
+    uint64_t PrefillGraphCache::initializedCount(const PrefillGraphCacheKey &key) const
+    {
+        auto it = lifecycle_stats_.find(key);
+        if (it == lifecycle_stats_.end())
+            return 0;
+        return it->second.initialized_count;
     }
 
     uint64_t PrefillGraphCache::captureCount(const PrefillGraphCacheKey &key) const

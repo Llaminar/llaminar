@@ -901,6 +901,40 @@ namespace llaminar2
         }
 
         /**
+         * @brief Reset request-scoped state while preserving captured replay metadata.
+         *
+         * A normal session reset may intentionally mark warmup-dependent
+         * backend metadata cold so the next execution warms and captures again.
+         * This hook is used only when the caller is keeping an already
+         * instantiated GPU graph executable alive across a request boundary.
+         * Derived stages must clear stream ownership and transient request
+         * mirrors, but must not invalidate descriptor tables, pointer slots, or
+         * other device metadata that the preserved graph launch reads by
+         * address. The default remains conservative for stages without a
+         * narrower contract.
+         */
+        virtual void resetSessionStatePreservingCapturedReplay()
+        {
+            resetSessionState();
+        }
+
+        /**
+         * @brief Reset request-scoped state while preserving lazy initialization.
+         *
+         * This is used for prefill buckets that warmed lazy kernels, descriptor
+         * banks, or workspace-backed helper allocations, but did not produce a
+         * graph executable before a request boundary. Implementations should
+         * clear host mirrors, dynamic stream ownership, per-request scalar
+         * values, and capture-arming flags while keeping model-weight
+         * preparations and backend objects that are safe to reuse before a
+         * fresh strict capture-readiness preflight.
+         */
+        virtual void resetSessionStatePreservingLazyInitialization()
+        {
+            resetSessionState();
+        }
+
+        /**
          * @brief Update prefill replay bookkeeping before a captured graph launch.
          *
          * The executor calls this on cached prefill graph hits before normal

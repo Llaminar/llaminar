@@ -60,6 +60,14 @@ TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPStochasticSamplingVerifierRuns)
     runMoEStochasticMTPVerifierParity(QWEN36_MOE_PREFIX_MTP_CASE());
 }
 
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPStochasticDepth3RequestStateResetAcceptsDrafts)
+{
+    runMoEStochasticMTPVerifierParity(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        3,
+        true);
+}
+
 TEST(QWEN36_MOE_PREFIX_MTP_SUITE, PrefixCacheMTPRestore)
 {
     runMoEMTPParity(QWEN36_MOE_PREFIX_MTP_CASE(), true);

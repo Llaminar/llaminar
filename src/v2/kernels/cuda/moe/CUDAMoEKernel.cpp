@@ -322,7 +322,8 @@ namespace
         int active_expert_slots,
         int tile_m,
         int tile_n,
-        bool fuse_swiglu)
+        bool fuse_swiglu,
+        bool ordered_scatter)
     {
         auto tags = groupedPrefillTags(seq_len, top_k, num_experts, active_expert_slots, tile_m, tile_n);
         if (active_expert_slots > 0)
@@ -338,6 +339,12 @@ namespace
             tags["gateup_route"] = fuse_swiglu ? "kpart_swiglu" : "kpart_prefill";
             tags["down_route"] = "kpart_prefill";
             tags["down_accumulation"] = "token_direct";
+        }
+        else if (ordered_scatter)
+        {
+            tags["gateup_route"] = "serial";
+            tags["down_route"] = "serial";
+            tags["down_accumulation"] = "row_ordered";
         }
         else
         {
@@ -505,7 +512,8 @@ extern "C"
     bool cudaMoE_softmax_topk(
         float *logits, int *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k, bool normalize_weights,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int *device_effective_seq_len);
 
     bool cudaMoE_softmax_topk_decode_runtime(
         float *logits, int *runtime_expert_ids, float *runtime_weights,
@@ -546,10 +554,21 @@ extern "C"
         const float *input, const float *gate_inp, float *shared_output,
         int seq_len, int d_model, int device_idx, void *stream);
 
+    bool cudaMoE_shared_expert_gate_effective_seq_len(
+        const float *input, const float *gate_inp, float *shared_output,
+        int seq_len, int d_model, const int *device_effective_seq_len,
+        int device_idx, void *stream);
+
     bool cudaMoE_shared_expert_gate_add(
         const float *input, const float *gate_inp, float *shared_output,
         const float *routed_residual, float *combined_output,
         int seq_len, int d_model, int device_idx, void *stream);
+
+    bool cudaMoE_shared_expert_gate_add_effective_seq_len(
+        const float *input, const float *gate_inp, float *shared_output,
+        const float *routed_residual, float *combined_output,
+        int seq_len, int d_model, const int *device_effective_seq_len,
+        int device_idx, void *stream);
 
     bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream);
     bool cudaMoE_weighted_add(float *output, const float *input, float weight, int count, int device_idx, void *stream);
@@ -1756,7 +1775,8 @@ namespace llaminar2
 
     bool CUDAMoEKernel::routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                                   int seq_len, int d_model, int num_experts, int top_k,
-                                  bool normalize_weights, DeviceRouteBuffers &buffers)
+                                  bool normalize_weights, DeviceRouteBuffers &buffers,
+                                  const int *device_effective_seq_len)
     {
         if (seq_len <= 0 || d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts)
             return false;
@@ -1790,6 +1810,13 @@ namespace llaminar2
             !requireCudaDevicePointer(gate_weights, device_ordinal_, "gate weights", "routeCore", stream) ||
             !requireCudaDevicePointer(d_route_logits_, device_ordinal_, "route logits", "routeCore", stream))
             return false;
+        if (device_effective_seq_len &&
+            !requireCudaDevicePointer(device_effective_seq_len, device_ordinal_,
+                                      "effective prefill sequence length",
+                                      "routeCore", stream))
+        {
+            return false;
+        }
 
         /*
          * MTP verifier batches are only M=2..4 rows, and later publication is
@@ -1836,7 +1863,8 @@ namespace llaminar2
         }
         if (!cudaMoE_softmax_topk(d_route_logits_, d_route_indices_, d_route_weights_,
                                   seq_len, num_experts, top_k, normalize_weights,
-                                  device_ordinal_, getStream()))
+                                  device_ordinal_, getStream(),
+                                  device_effective_seq_len))
             return false;
 
         buffers.d_logits = d_route_logits_;
@@ -1942,13 +1970,15 @@ namespace llaminar2
         cudaMoE_weighted_add(output, input, weight, count, device_ordinal_, getStream());
     }
 
-    bool CUDAMoEKernel::routeWithTensors(ITensor *hidden, ITensor *gate_weights,
-                                         int seq_len, int d_model, int num_experts, int top_k,
-                                         bool normalize_weights,
-                                         ITensor *output_indices, ITensor *output_weights,
-                                         MoERoutingResult &host_result)
+    bool CUDAMoEKernel::routeWithTensorsImpl(ITensor *hidden, ITensor *gate_weights,
+                                             int seq_len, int d_model, int num_experts, int top_k,
+                                             bool normalize_weights,
+                                             ITensor *output_indices, ITensor *output_weights,
+                                             MoERoutingResult &host_result,
+                                             const int *device_effective_seq_len,
+                                             const char *context)
     {
-        void *stream = requireStream("CUDAMoEKernel::routeWithTensors");
+        void *stream = requireStream(context);
         const DeviceId device = deviceId();
         if (!ensureTensorOnDevice(hidden, device, stream, "hidden") ||
             !ensureTensorOnDevice(gate_weights, device, stream, "gate_weights") ||
@@ -1958,7 +1988,7 @@ namespace llaminar2
 
         if (seq_len <= 0 || d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts)
         {
-            LOG_ERROR("[CUDAMoEKernel::routeWithTensors] invalid routing shape seq_len="
+            LOG_ERROR("[" << context << "] invalid routing shape seq_len="
                       << seq_len << " d_model=" << d_model
                       << " num_experts=" << num_experts << " top_k=" << top_k);
             return false;
@@ -1997,7 +2027,8 @@ namespace llaminar2
 
         DeviceRouteBuffers buffers;
         if (!routeCore(d_hidden, d_gate, gate_base->native_type(),
-                       seq_len, d_model, num_experts, top_k, normalize_weights, buffers))
+                       seq_len, d_model, num_experts, top_k, normalize_weights, buffers,
+                       device_effective_seq_len))
             return false;
 
         if (!cudaMoE_int_to_float(buffers.d_indices, d_idx, static_cast<int>(buffers.topk_count), device_ordinal_, stream))
@@ -2008,7 +2039,7 @@ namespace llaminar2
                                           static_cast<cudaStream_t>(stream));
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDAMoEKernel::routeWithTensors] D2D weights failed: " << cudaGetErrorString(err));
+            LOG_ERROR("[" << context << "] D2D weights failed: " << cudaGetErrorString(err));
             return false;
         }
 
@@ -2060,7 +2091,7 @@ namespace llaminar2
             err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
             if (err != cudaSuccess)
             {
-                LOG_ERROR("[CUDAMoEKernel::routeWithTensors] stream sync failed: " << cudaGetErrorString(err));
+                LOG_ERROR("[" << context << "] stream sync failed: " << cudaGetErrorString(err));
                 return false;
             }
         }
@@ -2081,6 +2112,43 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool CUDAMoEKernel::routeWithTensors(ITensor *hidden, ITensor *gate_weights,
+                                         int seq_len, int d_model, int num_experts, int top_k,
+                                         bool normalize_weights,
+                                         ITensor *output_indices, ITensor *output_weights,
+                                         MoERoutingResult &host_result)
+    {
+        return routeWithTensorsImpl(hidden, gate_weights,
+                                    seq_len, d_model, num_experts, top_k,
+                                    normalize_weights,
+                                    output_indices, output_weights,
+                                    host_result,
+                                    nullptr,
+                                    "CUDAMoEKernel::routeWithTensors");
+    }
+
+    bool CUDAMoEKernel::routeWithTensorsEffectiveSeqLen(
+        ITensor *hidden, ITensor *gate_weights,
+        int seq_len, int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        MoERoutingResult &host_result,
+        const int *device_effective_seq_len)
+    {
+        if (!device_effective_seq_len)
+        {
+            LOG_ERROR("[CUDAMoEKernel::routeWithTensorsEffectiveSeqLen] missing device effective length scalar");
+            return false;
+        }
+        return routeWithTensorsImpl(hidden, gate_weights,
+                                    seq_len, d_model, num_experts, top_k,
+                                    normalize_weights,
+                                    output_indices, output_weights,
+                                    host_result,
+                                    device_effective_seq_len,
+                                    "CUDAMoEKernel::routeWithTensorsEffectiveSeqLen");
     }
 
     bool CUDAMoEKernel::decodeRouteSelect(DeviceMoELayerRuntime *runtime_layer,
@@ -2305,6 +2373,46 @@ namespace llaminar2
         markDeviceWritten(shared_output, device, stream);
     }
 
+    bool CUDAMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen(
+        ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+        int seq_len, int d_model,
+        const int *device_effective_seq_len)
+    {
+        if (seq_len <= 0)
+            return true;
+        if (!device_effective_seq_len)
+        {
+            LOG_ERROR("[CUDAMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen] missing device effective length scalar");
+            return false;
+        }
+
+        void *stream = requireStream("CUDAMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen");
+        const DeviceId device = deviceId();
+        if (!ensureTensorOnDevice(input, device, stream, "input") ||
+            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
+            !ensureTensorOnDevice(shared_output, device, stream, "shared_output"))
+            return false;
+
+        const auto *in = static_cast<const float *>(input->gpu_data_ptr());
+        const auto *gi = static_cast<const float *>(gate_inp->gpu_data_ptr());
+        auto *so = static_cast<float *>(shared_output->gpu_data_ptr());
+        if (!in || !gi || !so)
+        {
+            LOG_ERROR("[CUDAMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen] null device pointer");
+            return false;
+        }
+
+        if (!cudaMoE_shared_expert_gate_effective_seq_len(
+                in, gi, so, seq_len, d_model, device_effective_seq_len,
+                device_ordinal_, stream))
+        {
+            LOG_ERROR("[CUDAMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen] kernel launch failed");
+            return false;
+        }
+        markDeviceWritten(shared_output, device, stream);
+        return true;
+    }
+
     void CUDAMoEKernel::sharedExpertGateAddFromTensors(
         ITensor *input, ITensor *gate_inp, ITensor *shared_output,
         ITensor *routed_residual, ITensor *combined_output,
@@ -2341,6 +2449,52 @@ namespace llaminar2
         }
         markDeviceWritten(shared_output, device, stream);
         markDeviceWritten(combined_output, device, stream);
+    }
+
+    bool CUDAMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen(
+        ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+        ITensor *routed_residual, ITensor *combined_output,
+        int seq_len, int d_model,
+        const int *device_effective_seq_len)
+    {
+        if (seq_len <= 0)
+            return true;
+        if (!device_effective_seq_len)
+        {
+            LOG_ERROR("[CUDAMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen] missing device effective length scalar");
+            return false;
+        }
+
+        void *stream = requireStream("CUDAMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen");
+        const DeviceId device = deviceId();
+        if (!ensureTensorOnDevice(input, device, stream, "input") ||
+            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
+            !ensureTensorOnDevice(shared_output, device, stream, "shared_output") ||
+            !ensureTensorOnDevice(routed_residual, device, stream, "routed_residual") ||
+            !ensureOutputOnDevice(combined_output, device, stream, "combined_output"))
+            return false;
+
+        const auto *in = static_cast<const float *>(input->gpu_data_ptr());
+        const auto *gi = static_cast<const float *>(gate_inp->gpu_data_ptr());
+        auto *so = static_cast<float *>(shared_output->gpu_data_ptr());
+        const auto *rr = static_cast<const float *>(routed_residual->gpu_data_ptr());
+        auto *co = static_cast<float *>(combined_output->gpu_data_ptr());
+        if (!in || !gi || !so || !rr || !co)
+        {
+            LOG_ERROR("[CUDAMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen] null device pointer");
+            return false;
+        }
+
+        if (!cudaMoE_shared_expert_gate_add_effective_seq_len(
+                in, gi, so, rr, co, seq_len, d_model,
+                device_effective_seq_len, device_ordinal_, stream))
+        {
+            LOG_ERROR("[CUDAMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen] fused gate-add kernel launch failed");
+            return false;
+        }
+        markDeviceWritten(shared_output, device, stream);
+        markDeviceWritten(combined_output, device, stream);
+        return true;
     }
 
     void CUDAMoEKernel::swiGLUFromTensors(ITensor *gate, ITensor *up, int count)
@@ -2384,6 +2538,24 @@ namespace llaminar2
         if (err != cudaSuccess)
             return false;
         err = cudaMemsetAsync(d_group_write_heads_, 0, static_cast<size_t>(num_experts) * sizeof(int),
+                              static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+            return false;
+        /*
+         * Padded prefill replay deliberately marks bucket-tail routes invalid
+         * with expert_id=-1.  The deterministic scatter kernel only writes a
+         * mapping for valid routes, so the ordered down-scatter must start from
+         * an all-invalid map every request.  Otherwise graph replay can reuse
+         * stale slot mappings from the previous real sequence length and write
+         * arbitrary expert output into padded rows.
+         */
+        err = cudaMemsetAsync(d_group_original_to_grouped_, 0xff,
+                              static_cast<size_t>(total_slots) * sizeof(int),
+                              static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+            return false;
+        err = cudaMemsetAsync(d_group_original_expert_ids_, 0xff,
+                              static_cast<size_t>(total_slots) * sizeof(int),
                               static_cast<cudaStream_t>(stream));
         if (err != cudaSuccess)
             return false;
@@ -2915,7 +3087,8 @@ namespace llaminar2
             active_expert_slots,
             selected_tile_m,
             selected_tile_n,
-            debugEnv().gemm.cuda_moe_prefill_fuse_swiglu);
+            debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
+            ordered_scatter_overwrites_output);
         return true;
     }
 

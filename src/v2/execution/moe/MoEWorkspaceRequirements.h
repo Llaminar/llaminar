@@ -16,6 +16,7 @@ namespace llaminar2
         constexpr const char *ROUTE_LOGITS = "moe_route_logits";
         constexpr const char *ROUTE_INDICES = "moe_route_indices";
         constexpr const char *ROUTE_WEIGHTS = "moe_route_weights";
+        constexpr const char *PREFILL_EFFECTIVE_SEQ_LEN = "moe_prefill_effective_seq_len";
 
         constexpr const char *GROUP_INT_INDICES = "moe_group_int_indices";
         constexpr const char *GROUP_OFFSETS = "moe_group_offsets";
@@ -90,6 +91,7 @@ namespace llaminar2
             add(reqs, ROUTE_LOGITS, tokens * static_cast<std::size_t>(num_experts) * sizeof(float));
             add(reqs, ROUTE_INDICES, route_slots * sizeof(int));
             add(reqs, ROUTE_WEIGHTS, route_slots * sizeof(float));
+            add(reqs, PREFILL_EFFECTIVE_SEQ_LEN, sizeof(int));
             return reqs;
         }
 

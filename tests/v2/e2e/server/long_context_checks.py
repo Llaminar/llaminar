@@ -29,6 +29,8 @@ import argparse
 import collections
 import dataclasses
 import json
+import os
+import pathlib
 import re
 import socket
 import sys
@@ -92,6 +94,29 @@ ERROR_STRINGS = (
     "runtime error",
     "server error",
 )
+
+
+def content_looks_like_server_error(content: str) -> str | None:
+    """Return the matching server-error marker when the whole content looks like an error.
+
+    The structured-generation prompt asks for sentences about reliable inference, so a
+    healthy model may legitimately write phrases such as "runtime error" inside a
+    numbered report. Treat these phrases as harness failures only when the response
+    does not contain any numbered report lines and therefore looks like an error body
+    accidentally surfaced as assistant content.
+    """
+
+    if numbered_lines(content):
+        return None
+
+    lower_content = content.strip().lower()
+    if not lower_content:
+        return None
+
+    for error_string in ERROR_STRINGS:
+        if error_string in lower_content:
+            return error_string
+    return None
 
 
 class CheckError(Exception):
@@ -266,6 +291,43 @@ def preview(text: str, limit: int = 160) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3] + "..."
+
+
+def artifact_safe_name(text: str) -> str:
+    """Return a filesystem-safe identifier for failed-response artifacts."""
+
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", text.strip())
+    return safe.strip("_")[:96] or "long_context"
+
+
+def write_failed_content_artifact(args: argparse.Namespace, check_name: str, content: str) -> str:
+    """Persist failed assistant content when the shell harness provides a directory."""
+
+    artifact_dir = os.environ.get("LLAMINAR_E2E_LONG_CONTEXT_ARTIFACT_DIR")
+    if not artifact_dir:
+        return ""
+
+    path = pathlib.Path(artifact_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    artifact_path = path / (
+        f"{artifact_safe_name(args.tag)}_{artifact_safe_name(check_name)}_failed_content.txt"
+    )
+    artifact_path.write_text(content, encoding="utf-8")
+    return str(artifact_path)
+
+
+def raise_with_content_artifact(
+    args: argparse.Namespace,
+    check_name: str,
+    message: str,
+    content: str,
+) -> None:
+    """Raise CheckError and include a durable artifact path when available."""
+
+    artifact = write_failed_content_artifact(args, check_name, content)
+    if artifact:
+        raise CheckError(f"{message}; artifact={artifact}")
+    raise CheckError(message)
 
 
 def require_int_field(mapping: dict[str, Any], field: str, minimum: int = 0) -> int:
@@ -456,11 +518,22 @@ def run_needle_check(args: argparse.Namespace, placement: str) -> str:
             f"records={count}"
         )
 
+    check_name = f"long_needle_recall_{placement}"
     if target_code not in result.content:
-        raise CheckError(f"target code {target_code} missing from content: {preview(result.content)}")
+        raise_with_content_artifact(
+            args,
+            check_name,
+            f"target code {target_code} missing from content: {preview(result.content)}",
+            result.content,
+        )
     leaked = [code for code in distractors if code in result.content]
     if leaked:
-        raise CheckError(f"nearby distractor code(s) appeared: {','.join(leaked)}")
+        raise_with_content_artifact(
+            args,
+            check_name,
+            f"nearby distractor code(s) appeared: {','.join(leaked)}",
+            result.content,
+        )
 
     return (
         f"target={target_code} prompt_tokens={result.usage['prompt_tokens']} "
@@ -549,18 +622,36 @@ def run_multi_needle_json(args: argparse.Namespace) -> str:
     try:
         parsed = json.loads(json_text)
     except json.JSONDecodeError as exc:
-        raise CheckError(f"assistant content is not strict JSON: {exc.msg}; content={preview(result.content)}") from exc
+        raise_with_content_artifact(
+            args,
+            "multi_needle_strict_json_recall",
+            f"assistant content is not strict JSON: {exc.msg}; content={preview(result.content)}",
+            result.content,
+        )
     if not isinstance(parsed, dict):
-        raise CheckError(f"JSON root is {type(parsed).__name__}, expected object")
+        raise_with_content_artifact(
+            args,
+            "multi_needle_strict_json_recall",
+            f"JSON root is {type(parsed).__name__}, expected object",
+            result.content,
+        )
     if set(parsed.keys()) != EXPECTED_JSON_KEYS:
-        raise CheckError(
+        raise_with_content_artifact(
+            args,
+            "multi_needle_strict_json_recall",
             f"JSON keys {sorted(parsed.keys())}, expected {sorted(EXPECTED_JSON_KEYS)}; "
-            f"content={preview(result.content)}"
+            f"content={preview(result.content)}",
+            result.content,
         )
     mismatches = [key for key, value in sentinels.items() if parsed.get(key) != value]
     if mismatches:
         detail = ", ".join(f"{key}={parsed.get(key)!r}" for key in mismatches)
-        raise CheckError(f"sentinel mismatch: {detail}")
+        raise_with_content_artifact(
+            args,
+            "multi_needle_strict_json_recall",
+            f"sentinel mismatch: {detail}",
+            result.content,
+        )
 
     return f"prompt_tokens={result.usage['prompt_tokens']} finish={result.finish_reason}"
 
@@ -699,30 +790,45 @@ def run_structured_generation(args: argparse.Namespace, settings: TierSettings) 
 
     if "\ufffd" in content:
         raise CheckError("replacement character U+FFFD appeared in content")
-    lower_content = content.lower()
-    for error_string in ERROR_STRINGS:
-        if error_string in lower_content:
-            raise CheckError(f"server error-like string appeared in content: {error_string}")
 
     line_numbers = numbered_lines(content)
+    error_string = content_looks_like_server_error(content)
+    if error_string is not None:
+        raise_with_content_artifact(
+            args,
+            "structured_long_generation",
+            f"server error-like string appeared in content: {error_string}",
+            content,
+        )
     if len(line_numbers) < settings.min_numbered_lines:
-        raise CheckError(
-            f"only {len(line_numbers)} numbered lines; expected at least {settings.min_numbered_lines}"
+        raise_with_content_artifact(
+            args,
+            "structured_long_generation",
+            f"only {len(line_numbers)} numbered lines; expected at least {settings.min_numbered_lines}",
+            content,
         )
     progress_ok, progress_detail = validate_number_progression(line_numbers)
     if not progress_ok:
-        raise CheckError(progress_detail)
+        raise_with_content_artifact(args, "structured_long_generation", progress_detail, content)
 
     full_structure_completed = "END_OF_REPORT" in content and len(line_numbers) >= settings.min_numbered_lines
     if result.usage["completion_tokens"] < settings.min_completion_tokens and not full_structure_completed:
-        raise CheckError(
+        raise_with_content_artifact(
+            args,
+            "structured_long_generation",
             f"completion_tokens={result.usage['completion_tokens']} below target "
-            f"{settings.min_completion_tokens}; finish={result.finish_reason}"
+            f"{settings.min_completion_tokens}; finish={result.finish_reason}",
+            content,
         )
 
     degeneration_errors, metrics = degeneration_failures(content)
     if degeneration_errors:
-        raise CheckError("; ".join(degeneration_errors))
+        raise_with_content_artifact(
+            args,
+            "structured_long_generation",
+            "; ".join(degeneration_errors),
+            content,
+        )
 
     metric_bits = [
         f"lines={len(line_numbers)}",
@@ -878,6 +984,9 @@ def run_self_test() -> int:
     failures, metrics = degeneration_failures(repeated_text)
     assert metrics["duplicate_line_ratio"] > 0.30
     assert any("duplicate-line" in failure for failure in failures)
+
+    assert content_looks_like_server_error("runtime error: graph replay failed") == "runtime error"
+    assert content_looks_like_server_error("001 | Reliable inference handles runtime errors safely.") is None
 
     ok, _ = validate_number_progression([1, 2, 3, 4, 5, 6])
     assert ok

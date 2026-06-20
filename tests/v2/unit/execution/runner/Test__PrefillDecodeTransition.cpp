@@ -271,6 +271,33 @@ namespace
             return device_verifier_input_tokens_.data();
         }
 
+        const void *prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+            const int32_t *verifier_tokens,
+            int total_verifier_input_tokens,
+            int draft_token_count) override
+        {
+            ++prepare_mtp_verifier_input_tokens_on_device_count_;
+            ++prepare_mtp_verifier_input_tokens_host_row_count_;
+            last_prepare_mtp_verifier_first_draft_slot_ = -1;
+            last_prepare_mtp_verifier_draft_token_count_ = draft_token_count;
+            last_prepare_mtp_verifier_total_tokens_ = total_verifier_input_tokens;
+            if (!verifier_tokens ||
+                draft_token_count < 0 ||
+                total_verifier_input_tokens != draft_token_count + 1 ||
+                total_verifier_input_tokens >
+                    static_cast<int>(device_verifier_input_tokens_.size()))
+            {
+                return nullptr;
+            }
+
+            for (int i = 0; i < total_verifier_input_tokens; ++i)
+            {
+                device_verifier_input_tokens_[static_cast<size_t>(i)] =
+                    verifier_tokens[i];
+            }
+            return device_verifier_input_tokens_.data();
+        }
+
         const void *prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
             int first_target_sample_slot,
             int first_draft_slot,
@@ -2958,6 +2985,10 @@ namespace
         {
             return prepare_mtp_verifier_input_tokens_on_device_count_;
         }
+        int prepareMTPVerifierInputTokensHostRowCount() const
+        {
+            return prepare_mtp_verifier_input_tokens_host_row_count_;
+        }
         int lastPrepareMTPVerifierFirstToken() const { return last_prepare_mtp_verifier_first_token_; }
         int lastPrepareMTPVerifierFirstDraftSlot() const
         {
@@ -4123,6 +4154,7 @@ namespace
         uint64_t last_batch_outcome_inverse_sample_seed_{0};
         int last_batch_outcome_inverse_sample_first_logical_position_{0};
         int prepare_mtp_verifier_input_tokens_device_first_count_{0};
+        int prepare_mtp_verifier_input_tokens_host_row_count_{0};
         int device_target_shifted_commit_count_{0};
         int resident_logical_state_shifted_commit_count_{0};
         int forward_mtp_from_resident_logical_state_for_device_sampling_count_{0};
@@ -6836,6 +6868,98 @@ namespace
                            {"resident_state_kind", "device_publication_mailbox"},
                            {"prelaunch_timing", "post_bridge"},
                            {"sampling", "greedy"}}),
+                      nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, GroupedGreedyStagesHostVisibleVerifierRowForResidentOutcome)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_grouped_greedy_host_row_device_publication_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true,
+                /*sidecar_sample_fusion=*/true);
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableDeviceResidentMTPSpecStatePublication();
+            mock->hideMTPSpecStatePublicationFromPolicy();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->enableMTPSidecarLogitsStreamHandoff();
+            mock->setVerifierAcceptedPrefixScript({2});
+
+            ASSERT_FALSE(mock->supportsMTPDeviceDraftTokenInput())
+                << "This regression intentionally exercises the warmup-style "
+                   "host-visible verifier row path.";
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            GenerationResult step = runner->decodeStep();
+            ASSERT_TRUE(step.success()) << step.error;
+            EXPECT_THAT(step.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokensHostRowCount(), 1)
+                << "Grouped resident greedy verification must stage a coherent "
+                   "device verifier row even when draft tokens are host-visible.";
+            EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
+            EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1);
+            EXPECT_EQ(mock->lastForwardDeviceTokenIds(),
+                      mock->deviceVerifierInputTokens().data());
+            EXPECT_EQ(mock->lastForwardDeviceTokenSeqLen(), 3);
+
+            const auto &device_verifier_tokens =
+                mock->deviceVerifierInputTokens();
+            EXPECT_THAT(
+                std::vector<int32_t>(
+                    device_verifier_tokens.begin(),
+                    device_verifier_tokens.begin() + 4),
+                ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                            MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                            -1));
+
+            EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 1);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
+            EXPECT_THAT(mock->publicationEvents(),
+                        ElementsAre("device_outcome_publish",
+                                    "host_outcome_bridge",
+                                    "host_state_adopt"));
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            EXPECT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "grouped_outcome_verifier_device_token_inputs",
+                          {{"total_tokens", "3"},
+                           {"sampling", "greedy"}}),
+                      nullptr);
+            EXPECT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "acceptance_trace",
+                          {{"verifier_path",
+                            "grouped_decode_equivalent_greedy"},
+                           {"catchup_implementation",
+                            "device_batch_outcome_device_resident_publication"},
+                           {"decode_equivalent_replay_required", "false"}}),
                       nullptr);
         }
         std::filesystem::remove(export_path);
@@ -10161,6 +10285,38 @@ namespace
         EXPECT_GE(probe.mtp_verifier_token_count, 4u);
     }
 
+    TEST_F(Test__PrefillDecodeTransition, GlobalTPMTPFencesEverySidecarBoundaryBeforeVerifier)
+    {
+        auto mpi = std::make_shared<llaminar2::test::MockMPIContext>(0, 2);
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            mpi,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(runner->prefill(prompt));
+
+        const size_t barriers_before_decode = mpi->barrier_call_count();
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 2);
+        EXPECT_EQ(mock->flushPendingMTPWorkCount(), 4)
+            << "three sidecar rows plus the final sidecar/verifier boundary "
+               "must be drained before target-verifier collectives can start";
+        EXPECT_GE(mpi->barrier_call_count() - barriers_before_decode, 4u)
+            << "global TP MTP needs a rank-wide fence after every sidecar row "
+               "and once more before the target verifier to keep collective "
+               "ordering identical across ranks";
+    }
+
     TEST_F(Test__PrefillDecodeTransition, LocalTPMTPDecodeRunsEveryParticipantAndCommitsVerifierState)
     {
         auto harness = createLocalTPRunner(/*mtp_accept=*/true);
@@ -10286,6 +10442,55 @@ namespace
         EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 1);
         EXPECT_EQ(harness.child0->setAllPositionCount(), 2);
         EXPECT_EQ(harness.child1->setAllPositionCount(), 2);
+    }
+
+    /**
+     * @brief LocalTP must replay grouped-greedy verifier rows until a compact
+     *        cross-shard device outcome reducer exists.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           LocalTPGroupedGreedyWithoutCompactOutcomeFallsBackToSequentialReplay)
+    {
+        PerfStatsCollector::reset();
+        auto harness = createLocalTPRunner(
+            /*mtp_accept=*/true,
+            /*column_parallel_logits=*/true,
+            {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+            /*mtp_draft_tokens=*/2);
+        for (MockInferenceRunner *child : {harness.child0, harness.child1})
+        {
+            child->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            child->enableDeviceResidentMTPSpecStatePublication();
+            child->hideMTPSpecStatePublicationFromPolicy();
+            child->setVerifierAcceptedPrefixScript({2});
+        }
+
+        ASSERT_TRUE(harness.runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step = harness.runner->decodeStep();
+        ASSERT_TRUE(step.success()) << step.error;
+        EXPECT_THAT(step.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 0);
+        EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 0)
+            << "Multi-child LocalTP advertises sharded row sampling, not one "
+               "compact device outcome reducer.";
+        EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 0);
+        EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 0);
+        EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 0);
+        EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 0);
+        EXPECT_GT(harness.child0->commitMTPShiftedCount(), 0);
+        EXPECT_GT(harness.child1->commitMTPShiftedCount(), 0);
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        EXPECT_EQ(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Counter,
+                                 "grouped_outcome_device_resident_publication_uses"),
+                  nullptr);
+        PerfStatsCollector::reset();
     }
 
     TEST_F(Test__PrefillDecodeTransition, MPIDynamicMTPDepthBroadcastsRankZeroDecision)
@@ -10678,6 +10883,46 @@ namespace
         EXPECT_EQ(probe.mtp_transaction_commits, 1u);
         EXPECT_EQ(probe.mtp_transaction_rollbacks, 0u);
         EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MPIDecodeStepBroadcastsTokenBudgetToWorkers)
+    {
+        auto mpi = std::make_shared<llaminar2::test::MockMPIContext>(0, 2);
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            mpi,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true);
+        runner->setMPICoordinatedMode(true);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        const auto payloads_before_decode = mpi->broadcast_int32_payloads();
+
+        runner->setDecodeStepTokenBudget(1);
+        GenerationResult step = runner->decodeStep();
+        runner->setDecodeStepTokenBudget(0);
+
+        ASSERT_TRUE(step.success()) << step.error;
+        EXPECT_THAT(step.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->forwardMTPCount(), 0)
+            << "budget-one decode should clamp all speculative drafts on "
+               "rank 0; workers receive the same budget via DECODE_STEP";
+
+        const auto payloads = mpi->broadcast_int32_payloads();
+        ASSERT_GE(payloads.size(), payloads_before_decode.size() + 2u);
+        const size_t first_decode_payload = payloads_before_decode.size();
+        ASSERT_THAT(payloads[first_decode_payload],
+                    ElementsAre(static_cast<int32_t>(
+                        OrchestrationRunner::MPICommand::DECODE_STEP)));
+        ASSERT_THAT(payloads[first_decode_payload + 1], ElementsAre(1))
+            << "the DECODE_STEP command payload must carry the root token "
+               "budget so worker ranks clamp MTP draft depth identically";
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPTransactionRejectsUnsafeVerifierPrefillSnapshot)

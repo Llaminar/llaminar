@@ -84,6 +84,15 @@ namespace llaminar2
             return;
         }
 
+        err = cudaMalloc(&d_append_count_params_, num_entries * sizeof(int));
+        if (err != cudaSuccess)
+        {
+            LOG_WARN("[CUDARingKVCacheBase] Failed to allocate device append-count params: "
+                     << cudaGetErrorString(err) << " - graph capture disabled");
+            freeDeviceParams();
+            return;
+        }
+
         err = cudaMallocHost(&h_head_params_, num_entries * sizeof(int));
         if (err != cudaSuccess)
         {
@@ -113,16 +122,27 @@ namespace llaminar2
             return;
         }
 
+        err = cudaMallocHost(&h_append_count_params_, num_entries * sizeof(int));
+        if (err != cudaSuccess)
+        {
+            LOG_WARN("[CUDARingKVCacheBase] Failed to allocate pinned append-count params: "
+                     << cudaGetErrorString(err) << " - graph capture disabled");
+            freeDeviceParams();
+            return;
+        }
+
         cudaStream_t init_stream = static_cast<cudaStream_t>(
             GPUDeviceContextPool::instance().getNvidiaContext(device_id_).defaultStream());
         cudaMemsetAsync(d_head_params_, 0, num_entries * sizeof(int), init_stream);
         cudaMemsetAsync(d_count_params_, 0, num_entries * sizeof(int), init_stream);
+        cudaMemsetAsync(d_append_count_params_, 0, num_entries * sizeof(int), init_stream);
         cudaStreamSynchronize(init_stream);
         std::memset(h_head_params_, 0, num_entries * sizeof(int));
         std::memset(h_count_params_, 0, num_entries * sizeof(int));
+        std::memset(h_append_count_params_, 0, num_entries * sizeof(int));
 
         LOG_DEBUG("[CUDARingKVCacheBase] Allocated device params for graph capture: "
-                  << num_entries << " entries (" << num_entries * sizeof(int) * 2 << " bytes)");
+                  << num_entries << " entries (" << num_entries * sizeof(int) * 3 << " bytes)");
     }
 
     void CUDARingKVCacheBase::freeDeviceParams()
@@ -162,6 +182,24 @@ namespace llaminar2
                 fprintf(stderr, "WARNING: cudaFreeHost(h_count_params_) failed: %s\n", cudaGetErrorString(err));
             }
             h_count_params_ = nullptr;
+        }
+        if (d_append_count_params_)
+        {
+            cudaError_t err = cudaFree(d_append_count_params_);
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: cudaFree(d_append_count_params_) failed: %s\n", cudaGetErrorString(err));
+            }
+            d_append_count_params_ = nullptr;
+        }
+        if (h_append_count_params_)
+        {
+            cudaError_t err = cudaFreeHost(h_append_count_params_);
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: cudaFreeHost(h_append_count_params_) failed: %s\n", cudaGetErrorString(err));
+            }
+            h_append_count_params_ = nullptr;
         }
     }
 
@@ -225,19 +263,26 @@ namespace llaminar2
 
     void CUDARingKVCacheBase::setDynamicHead(int layer, int seq_idx, void *gpu_stream)
     {
+        (void)setDynamicAppendState(layer, seq_idx, 0, gpu_stream);
+    }
+
+    bool CUDARingKVCacheBase::setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream)
+    {
         if (!d_head_params_ || !h_head_params_)
-            return;
+            return false;
         if (!validLayerSeq(layer, seq_idx))
-            return;
+            return false;
 
         int idx = layer * batch_size_ + seq_idx;
         refreshHostDeviceParamMirror(layer, seq_idx);
+        if (h_append_count_params_)
+            h_append_count_params_[idx] = append_tokens;
         if (!gpu_stream)
-            return;
+            return false;
         if (isGraphCaptureActive())
         {
-            LOG_ERROR("[CUDARingKVCacheBase] Refusing to upload dynamic KV head inside CUDA graph capture");
-            return;
+            LOG_ERROR("[CUDARingKVCacheBase] Refusing to upload dynamic KV append state inside CUDA graph capture");
+            return false;
         }
 
         cudaError_t err = cudaMemcpyAsync(
@@ -265,6 +310,22 @@ namespace llaminar2
                           << cudaGetErrorString(err));
             }
         }
+        if (d_append_count_params_ && h_append_count_params_)
+        {
+            err = cudaMemcpyAsync(
+                &d_append_count_params_[idx],
+                &h_append_count_params_[idx],
+                sizeof(int),
+                cudaMemcpyHostToDevice,
+                static_cast<cudaStream_t>(gpu_stream));
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDARingKVCacheBase] Failed to upload dynamic KV append count: "
+                          << cudaGetErrorString(err));
+                return false;
+            }
+        }
+        return true;
     }
 
     void CUDARingKVCacheBase::advanceHead(int layer, int seq_idx, int num_tokens)
@@ -305,6 +366,14 @@ namespace llaminar2
             return nullptr;
         const int idx = layer * batch_size_ + seq_idx;
         return &d_head_params_[idx];
+    }
+
+    const int *CUDARingKVCacheBase::deviceDynamicAppendCountPtr(int layer, int seq_idx) const
+    {
+        if (!d_append_count_params_ || !validLayerSeq(layer, seq_idx))
+            return nullptr;
+        const int idx = layer * batch_size_ + seq_idx;
+        return &d_append_count_params_[idx];
     }
 
     void CUDARingKVCacheBase::refreshHostDeviceParamMirror(int layer, int seq_idx)

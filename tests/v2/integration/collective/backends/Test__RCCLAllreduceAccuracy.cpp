@@ -593,6 +593,125 @@ namespace llaminar2
         EXPECT_TRUE(all_iterations_pass) << "Some iterations failed";
     }
 
+    /**
+     * @brief Regress concurrent on-stream FP16 scratch metadata initialization.
+     *
+     * LocalTP graph execution runs one worker thread per device. The FP16
+     * allreduce path therefore cannot resize scratch metadata lazily inside
+     * allreduceOnStream(), because another participant may observe one metadata
+     * vector initialized while the paired vector is still empty. This test uses
+     * explicit HIP streams and exact FP16-representable inputs to exercise the
+     * graph-capturable inference path without depending on precision noise.
+     */
+    TEST_F(RCCLAllreduceAccuracyTest, ViaLocalTPContext_OnStreamFP16ConcurrentScratchMetadata)
+    {
+        std::cout << "\n--- Test: ViaLocalTPContext_OnStreamFP16ConcurrentScratchMetadata ---" << std::endl;
+
+        const int num_gpus = device_count_;
+        const size_t count = QWEN2_HIDDEN_DIM;
+        const float expected_value =
+            static_cast<float>((num_gpus * (num_gpus + 1)) / 2);
+
+        std::vector<std::unique_ptr<FP32Tensor>> tensors(num_gpus);
+        std::vector<hipStream_t> streams(num_gpus, nullptr);
+
+        for (int i = 0; i < num_gpus; ++i)
+        {
+            ASSERT_EQ(hipSetDevice(i), hipSuccess);
+            ASSERT_EQ(hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking), hipSuccess)
+                << "Failed to create non-blocking stream for ROCm GPU " << i;
+
+            std::vector<float> host_values(count, static_cast<float>(i + 1));
+            tensors[i] = std::make_unique<FP32Tensor>(std::vector<size_t>{count});
+            std::memcpy(tensors[i]->mutable_data(), host_values.data(),
+                        count * sizeof(float));
+            ASSERT_TRUE(tensors[i]->ensureOnDevice(DeviceId::rocm(i)))
+                << "Failed to upload tensor to ROCm GPU " << i;
+        }
+
+        std::atomic<int> threads_ready{0};
+        std::atomic<bool> all_success{true};
+        std::mutex start_mutex;
+        std::condition_variable start_cv;
+        bool start_signal = false;
+
+        std::vector<std::thread> threads;
+        for (int i = 0; i < num_gpus; ++i)
+        {
+            threads.emplace_back([&, i]()
+                                 {
+                ASSERT_EQ(hipSetDevice(i), hipSuccess);
+                threads_ready.fetch_add(1, std::memory_order_release);
+
+                {
+                    std::unique_lock<std::mutex> lock(start_mutex);
+                    start_cv.wait(lock, [&]() { return start_signal; });
+                }
+
+                const std::string stage_name =
+                    "OnStreamFP16Scratch_gpu" + std::to_string(i);
+                const bool ok = tp_ctx_->allreduceOnStream(
+                    tensors[i].get(),
+                    stage_name,
+                    count,
+                    streams[i],
+                    "fp16");
+                if (!ok)
+                {
+                    all_success.store(false, std::memory_order_release);
+                    return;
+                }
+
+                const hipError_t sync_err = hipStreamSynchronize(streams[i]);
+                if (sync_err != hipSuccess)
+                {
+                    std::cerr << "  [ERROR] GPU " << i
+                              << " stream synchronize failed: "
+                              << hipGetErrorString(sync_err) << std::endl;
+                    all_success.store(false, std::memory_order_release);
+                } });
+        }
+
+        while (threads_ready.load(std::memory_order_acquire) < num_gpus)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(start_mutex);
+            start_signal = true;
+        }
+        start_cv.notify_all();
+
+        for (auto &thread : threads)
+        {
+            thread.join();
+        }
+
+        ASSERT_TRUE(all_success.load(std::memory_order_acquire))
+            << "Concurrent on-stream FP16 allreduce failed";
+
+        for (int i = 0; i < num_gpus; ++i)
+        {
+            const float *data = tensors[i]->data();
+            for (size_t j = 0; j < count; ++j)
+            {
+                ASSERT_NEAR(data[j], expected_value, 0.0f)
+                    << "GPU " << i << " mismatch at element " << j;
+            }
+        }
+
+        for (int i = 0; i < num_gpus; ++i)
+        {
+            ASSERT_EQ(hipSetDevice(i), hipSuccess);
+            if (streams[i])
+            {
+                ASSERT_EQ(hipStreamDestroy(streams[i]), hipSuccess);
+                streams[i] = nullptr;
+            }
+        }
+    }
+
     // =========================================================================
     // Partial Count Tests (simulates decode with count < buffer size)
     // =========================================================================

@@ -119,6 +119,35 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Clear request stream ownership while preserving captured token buffers.
+         *
+         * Prefill graph replay captures the embedding kernel's dynamic token-id
+         * device slot by address. The forward engine refreshes that slot before
+         * every replay/capture, so request reset should drop only the stream
+         * binding here. Resetting kernel dynamic state would mark a preserved
+         * executable cold even though its backing workspace remains valid.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+            if (cached_kernel_)
+                cached_kernel_->setGPUStream(nullptr);
+        }
+
+        /**
+         * @brief Preserve warmed embedding resources across request reset.
+         *
+         * Initialized prefill buckets still need a strict capture preflight, but
+         * they should not lose the kernel/workspace objects that the warmup just
+         * prepared. Token contents are overwritten in the stable buffer before
+         * the next capture attempt.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionStatePreservingCapturedReplay();
+        }
+
         /// Check if this stage is ready for prefill graph capture.
         /// Requires: GPU device, workspace bound, kernel created.
         bool isPrefillGraphCaptureReady() const

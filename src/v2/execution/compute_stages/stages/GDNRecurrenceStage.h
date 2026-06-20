@@ -166,6 +166,33 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Reset request-local GDN metadata while preserving capture slots.
+         *
+         * Prefill graphs capture recurrent-state snapshot buffers and the
+         * effective-length scalar by address. The replay prelude refreshes the
+         * scalar before launch, and onGraphReplayed() rebinds the kernel for
+         * publication. Do not clear the verifier workspace binding while a
+         * Ready prefill executable is being preserved.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+            prefill_effective_seq_len_ = 0;
+            prefill_bucket_seq_len_ = 0;
+            prefill_replay_params_set_ = false;
+            if (params_.kernel)
+                params_.kernel->setGPUStream(nullptr);
+        }
+
+        /**
+         * @brief Preserve warmed GDN workspaces for a fresh capture attempt.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionStatePreservingCapturedReplay();
+        }
+
         bool hasPrefillReplayParams() const override { return true; }
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
         bool supportsPaddedPrefillRealLengthContract() const override;

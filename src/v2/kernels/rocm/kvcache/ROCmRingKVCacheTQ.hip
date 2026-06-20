@@ -789,9 +789,8 @@ namespace llaminar2
         if (!d_dequant_params_ || !h_dequant_params_)
             return;
 
-        (void)gpu_stream;
-        // Append head params are handled by ROCmRingKVCacheBase. TQ dequant
-        // metadata is prepared through setDynamicDequantParams().
+        ROCmRingKVCacheBase::setDynamicHead(layer, seq_idx, gpu_stream);
+        // TQ dequant metadata is prepared through setDynamicDequantParams().
     }
 
     void ROCmRingKVCacheTQ::setDynamicDequantParams(

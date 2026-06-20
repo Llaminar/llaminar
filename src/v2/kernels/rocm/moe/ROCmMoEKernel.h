@@ -113,6 +113,14 @@ namespace llaminar2
             ITensor *output_indices, ITensor *output_weights,
             MoERoutingResult &host_result) override;
 
+        bool routeWithTensorsEffectiveSeqLen(
+            ITensor *hidden, ITensor *gate_weights,
+            int seq_len, int d_model, int num_experts, int top_k,
+            bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights,
+            MoERoutingResult &host_result,
+            const int *device_effective_seq_len) override;
+
         bool decodeRouteSelect(
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *hidden, ITensor *gate_weights,
@@ -145,10 +153,21 @@ namespace llaminar2
             ITensor *input, ITensor *gate_inp, ITensor *shared_output,
             int seq_len, int d_model) override;
 
+        bool sharedExpertGateFromTensorsEffectiveSeqLen(
+            ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+            int seq_len, int d_model,
+            const int *device_effective_seq_len) override;
+
         void sharedExpertGateAddFromTensors(
             ITensor *input, ITensor *gate_inp, ITensor *shared_output,
             ITensor *routed_residual, ITensor *combined_output,
             int seq_len, int d_model) override;
+
+        bool sharedExpertGateAddFromTensorsEffectiveSeqLen(
+            ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+            ITensor *routed_residual, ITensor *combined_output,
+            int seq_len, int d_model,
+            const int *device_effective_seq_len) override;
 
         void swiGLUFromTensors(ITensor *gate, ITensor *up, int count) override;
 
@@ -462,7 +481,16 @@ namespace llaminar2
         };
         bool routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                        int seq_len, int d_model, int num_experts, int top_k,
-                       bool normalize_weights, DeviceRouteBuffers &bufs);
+                       bool normalize_weights, DeviceRouteBuffers &bufs,
+                       const int *device_effective_seq_len = nullptr);
+        bool routeWithTensorsImpl(
+            ITensor *hidden, ITensor *gate_weights,
+            int seq_len, int d_model, int num_experts, int top_k,
+            bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights,
+            MoERoutingResult &host_result,
+            const int *device_effective_seq_len,
+            const char *context);
 
         struct GroupedDownDescriptorTable
         {

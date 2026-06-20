@@ -19,6 +19,7 @@
 #include "tensors/FP16Utils.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/IMoEKernel.h"
+#include "loaders/PreparedWeightStore.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
@@ -1526,6 +1527,74 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_CPUActiveExpertWithoutPreparedEngineRet
 
     MoEExpertComputeStage stage(params);
     EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
+}
+
+TEST_F(MoEExpertComputeStageTest, MTPMoESidecarReusesPreparedExpertSlabsAfterRawRelease)
+{
+    const int d = 256;
+    const int inter = 256;
+    const int experts = 4;
+    const int local_start = 2;
+    const int local_count = 2;
+    const int sidecar_layer_idx = 28;
+
+    auto gate_exps = createExpertQ4K(experts, inter, d, 281);
+    auto up_exps = createExpertQ4K(experts, inter, d, 282);
+    auto down_exps = createExpertQ4K(experts, d, inter, 283);
+
+    auto make_params = [&]()
+    {
+        MoEExpertComputeStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.gate_exps = gate_exps.get();
+        params.up_exps = up_exps.get();
+        params.down_exps = down_exps.get();
+        params.num_experts = experts;
+        params.top_k = 1;
+        params.d_model = d;
+        params.expert_intermediate = inter;
+        params.layer_idx = sidecar_layer_idx;
+        params.local_expert_start = local_start;
+        params.local_expert_count = local_count;
+        params.expert_mask.assign(experts, false);
+        for (int expert = local_start; expert < local_start + local_count; ++expert)
+            params.expert_mask[static_cast<size_t>(expert)] = true;
+        return params;
+    };
+
+    PreparedWeightStore store(ModelContextId{1234});
+    auto initial = make_params();
+    initial.prepared_store = &store;
+    ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(initial));
+    ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(initial));
+    ASSERT_TRUE(initial.gate_slab_ref.has_value());
+    EXPECT_EQ(store.totalPopulatedExperts(), static_cast<size_t>(local_count * 3));
+
+    gate_exps->release_raw_data();
+    up_exps->release_raw_data();
+    down_exps->release_raw_data();
+    ASSERT_TRUE(gate_exps->is_raw_data_released());
+    ASSERT_TRUE(up_exps->is_raw_data_released());
+    ASSERT_TRUE(down_exps->is_raw_data_released());
+
+    auto sidecar = make_params();
+    sidecar.prepared_store = &store;
+    ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(sidecar));
+    ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(sidecar))
+        << "MTP sidecar graph build must reuse PreparedWeightStore slabs after host raw data release";
+
+    EXPECT_TRUE(sidecar.gate_slab_ref.has_value());
+    EXPECT_TRUE(sidecar.up_slab_ref.has_value());
+    EXPECT_TRUE(sidecar.down_slab_ref.has_value());
+    EXPECT_EQ(sidecar.prepared_gate_gemm[0], nullptr);
+    EXPECT_EQ(sidecar.prepared_up_gemm[0], nullptr);
+    EXPECT_EQ(sidecar.prepared_down_gemm[0], nullptr);
+    for (int expert = local_start; expert < local_start + local_count; ++expert)
+    {
+        EXPECT_NE(sidecar.prepared_gate_gemm[static_cast<size_t>(expert)], nullptr);
+        EXPECT_NE(sidecar.prepared_up_gemm[static_cast<size_t>(expert)], nullptr);
+        EXPECT_NE(sidecar.prepared_down_gemm[static_cast<size_t>(expert)], nullptr);
+    }
 }
 
 TEST_F(MoEExpertComputeStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
