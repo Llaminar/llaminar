@@ -4092,6 +4092,21 @@ namespace llaminar2
             combined.merge(c->getWorkspaceRequirements(rows, d_model, intermediate));
 
         /*
+         * The CUDA grouped verifier path can overlap the shared gate and up
+         * projections on separate explicit streams.  The individual GEMM
+         * engines only know about their serial stream-0 partial buffer, so the
+         * stage must declare the side-stream partial arena once it knows the
+         * fused projection fan-out.  This keeps graph capture allocation-free
+         * and makes missing workspace fail during planning instead of halfway
+         * through verifier replay.
+         */
+        addCudaConcurrentDecodeGemvSideStreamWorkspace(
+            combined,
+            params_.device_id,
+            rows,
+            /*projection_count=*/2);
+
+        /*
          * Grouped shared-expert decode and verifier prefill use IMoEKernel
          * scratch in addition to the three projection GEMM workspaces.  Declare
          * those buffers here so a standalone shared-expert stage cannot rely on

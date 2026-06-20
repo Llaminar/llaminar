@@ -19,6 +19,7 @@
 #include "tensors/FP16Utils.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/IMoEKernel.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/PreparedWeightTestHarness.h"
@@ -28,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <memory>
 #include <vector>
 
 using namespace llaminar2;
@@ -131,6 +133,106 @@ namespace
             return device_idx < 0;
         }
     };
+
+    class WorkspaceOnlyGemm final : public ITensorGemm, public IWorkspaceConsumer
+    {
+    public:
+        WorkspaceOnlyGemm(int default_n, int default_k)
+            : default_n_(default_n),
+              default_k_(default_k)
+        {
+        }
+
+        bool supports_device(int device_idx) const override
+        {
+            return device_idx >= 0;
+        }
+
+        bool multiply_tensor(
+            const TensorBase *,
+            TensorBase *,
+            int, int, int,
+            bool,
+            float,
+            float,
+            const TensorBase *,
+            const IMPIContext *,
+            int,
+            DeviceWorkspaceManager *,
+            int) override
+        {
+            return false;
+        }
+
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+        {
+            const int rows = std::max(1, std::min(m, 4));
+            const int out_cols = n > 0 ? n : default_n_;
+            const int in_cols = k > 0 ? k : default_k_;
+            const int k_groups = (in_cols + 31) / 32;
+
+            WorkspaceRequirements reqs;
+            reqs.buffers.push_back({
+                GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,
+                static_cast<size_t>(k_groups) * static_cast<size_t>(rows) *
+                    static_cast<size_t>(out_cols) * sizeof(float),
+                256,
+                true});
+            return reqs;
+        }
+
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override
+        {
+            workspace_ = workspace;
+        }
+
+        bool hasWorkspace() const override
+        {
+            return workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *getWorkspace() const override
+        {
+            return workspace_;
+        }
+
+    private:
+        int default_n_ = 0;
+        int default_k_ = 0;
+        DeviceWorkspaceManager *workspace_ = nullptr;
+    };
+
+    PreparedWeightRef registerWorkspaceOnlyGemm(
+        PreparedWeightStore &store,
+        TensorBase *tensor,
+        DeviceId device,
+        const std::string &canonical_name,
+        std::shared_ptr<ITensorGemm> kernel)
+    {
+        namespace kf = llaminar::v2::kernels;
+
+        auto binding = makePreparedWeightTestBinding(
+            tensor,
+            device,
+            canonical_name,
+            store.modelId());
+
+        auto prepared_weights = std::make_shared<kf::KernelFactory::PreparedGemmWeights>();
+        prepared_weights->owned_kernel = kernel;
+        prepared_weights->kernel = kernel.get();
+
+        auto handle = std::make_shared<kf::KernelFactory::PreparedGemmHandle>();
+        handle->tensor = tensor;
+        handle->device_id = device;
+        handle->kind = kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED;
+        handle->prepared_weights = std::move(prepared_weights);
+
+        return store.registerPreparedGemmHandle(
+            binding,
+            PreparedWeightKind::CudaInt8PackedGemm,
+            device,
+            std::move(handle));
+    }
 }
 
 // =========================================================================
@@ -1609,6 +1711,74 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_TypeAndName)
     EXPECT_EQ(stage.name(), "shared_expert_ffn");
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
     EXPECT_GT(stage.estimatedFlops(), 0u);
+}
+
+TEST_F(MoEExpertComputeStageTest, SharedExpert_CudaSmallMDeclaresGateUpSideStreamWorkspace)
+{
+    constexpr int rows = 4;
+    constexpr int d_model = 64;
+    constexpr int intermediate = 128;
+    const DeviceId device = DeviceId::cuda(0);
+
+    auto input = TestTensorFactory::createFP32({rows, d_model});
+    auto gate_w = TestTensorFactory::createFP32({intermediate, d_model});
+    auto up_w = TestTensorFactory::createFP32({intermediate, d_model});
+    auto down_w = TestTensorFactory::createFP32({d_model, intermediate});
+    auto output = TestTensorFactory::createFP32({rows, d_model});
+
+    PreparedWeightStore store(ModelContextId{9101});
+    auto gate_ref = registerWorkspaceOnlyGemm(
+        store,
+        gate_w.get(),
+        device,
+        "blk.0.ffn_shexp_gate.weight",
+        std::make_shared<WorkspaceOnlyGemm>(intermediate, d_model));
+    auto up_ref = registerWorkspaceOnlyGemm(
+        store,
+        up_w.get(),
+        device,
+        "blk.0.ffn_shexp_up.weight",
+        std::make_shared<WorkspaceOnlyGemm>(intermediate, d_model));
+    auto down_ref = registerWorkspaceOnlyGemm(
+        store,
+        down_w.get(),
+        device,
+        "blk.0.ffn_shexp_down.weight",
+        std::make_shared<WorkspaceOnlyGemm>(d_model, intermediate));
+
+    SharedExpertFFNStage::Params params;
+    params.device_id = device;
+    params.input = input.get();
+    params.gate_w = gate_w.get();
+    params.up_w = up_w.get();
+    params.down_w = down_w.get();
+    params.output = output.get();
+    params.seq_len = rows;
+    params.d_model = d_model;
+    params.intermediate = intermediate;
+    params.prepared_ref_gate = gate_ref;
+    params.prepared_ref_up = up_ref;
+    params.prepared_ref_down = down_ref;
+    params.prepared_store = &store;
+    params.force_grouped_verifier_prefill_for_decode = true;
+
+    SharedExpertFFNStage stage(params);
+    const WorkspaceRequirements reqs =
+        stage.getWorkspaceRequirements(rows, d_model, intermediate);
+
+    const auto *serial =
+        reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    const auto *side_stream =
+        reqs.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+
+    ASSERT_NE(serial, nullptr)
+        << "The stage must merge the underlying GEMM K-parallel partial buffer.";
+    ASSERT_NE(side_stream, nullptr)
+        << "CUDA shared-expert M=2..4 verifier gate/up can overlap on explicit "
+           "side streams, so the stage must declare the side-stream partial arena.";
+    EXPECT_EQ(side_stream->size_bytes, serial->size_bytes)
+        << "Shared gate/up has one side stream beyond the main stream, sized for "
+           "the largest projection's serial partial buffer.";
 }
 
 TEST_F(MoEExpertComputeStageTest, SharedGate_TypeAndName)

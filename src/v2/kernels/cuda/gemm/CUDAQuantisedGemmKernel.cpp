@@ -1932,6 +1932,112 @@ namespace llaminar2
                     return false;
                 }
 
+                /*
+                 * Small verifier batches are decode-equivalent because each
+                 * projection still uses the same NativeVNNI small-M GEMV kernel
+                 * and the same serial-M1 dispatch policy selected by
+                 * beginVerifierDecodeEquivalentScope().  The projections are
+                 * independent once the activation rows are quantized, so we can
+                 * overlap them on explicit side streams as long as every stream
+                 * has a distinct declared K-parallel partial arena.
+                 */
+                const bool concurrent_small_m =
+                    bindings.size() >= 2 &&
+                    debugEnv().gemm.cuda_concurrent_decode &&
+                    !debugEnv().gemm.deterministic;
+
+                if (concurrent_small_m)
+                {
+                    auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
+                    if (isGraphCaptureActive() && !pool.initialized)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
+                                  "Small-M verifier concurrent projection path entered graph capture "
+                                  "before its stream pool was initialized. Warmup must initialize "
+                                  "the pool so capture never creates streams or events.");
+                        return false;
+                    }
+                    if (!pool.initialized)
+                        pool.init(cuda_device_id_, static_cast<int>(bindings.size()));
+
+                    const int active_slots =
+                        std::min(static_cast<int>(bindings.size()), kCudaConcurrentDecodeWorkspaceSlots);
+                    cudaQuantGemm_recordEvent(pool.quant_ready, gpu_stream_);
+
+                    for (int pi = 0; pi < static_cast<int>(bindings.size()); ++pi)
+                    {
+                        const auto &binding = bindings[static_cast<size_t>(pi)];
+                        const int stream_idx = pi % active_slots;
+
+                        if (pi >= active_slots)
+                            cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.completion[stream_idx]);
+                        cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.quant_ready);
+
+                        try
+                        {
+                            binding.kernel->bindConcurrentNativeDecodeScratch(
+                                m,
+                                binding.n,
+                                k,
+                                stream_idx,
+                                active_slots);
+                        }
+                        catch (const std::exception &ex)
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
+                                      "Small-M verifier concurrent scratch binding failed for projection "
+                                      << pi << " (" << (binding.name ? binding.name : "unnamed")
+                                      << "): " << ex.what());
+                            return false;
+                        }
+
+                        void *saved_stream = binding.kernel->getGPUStream();
+                        binding.kernel->setGPUStream(pool.streams[stream_idx]);
+                        const bool projection_ok = binding.kernel->multiply_quantized_small_m_gemv(
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            binding.output,
+                            binding.bias,
+                            m,
+                            binding.n,
+                            k,
+                            1.0f,
+                            0.0f);
+                        binding.kernel->setGPUStream(saved_stream);
+
+                        if (!projection_ok)
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
+                                      "Small-M verifier concurrent GEMV failed for projection "
+                                      << pi << " (" << (binding.name ? binding.name : "unnamed")
+                                      << ") stream_slot=" << stream_idx);
+                            return false;
+                        }
+
+                        cudaQuantGemm_recordEvent(pool.completion[stream_idx], pool.streams[stream_idx]);
+                    }
+
+                    for (int si = 0; si < active_slots; ++si)
+                        cudaQuantGemm_streamWaitEvent(gpu_stream_, pool.completion[si]);
+
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "cuda_native_vnni_small_m_concurrent_projection_groups",
+                            1.0,
+                            "gemm",
+                            "cuda:" + std::to_string(cuda_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"m", std::to_string(m)},
+                                {"k", std::to_string(k)},
+                                {"projections", std::to_string(bindings.size())},
+                                {"streams", std::to_string(active_slots)}});
+                    }
+
+                    return true;
+                }
+
                 for (size_t i = 0; i < bindings.size(); ++i)
                 {
                     const auto &binding = bindings[i];

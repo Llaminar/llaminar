@@ -1,7 +1,7 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Scope: Qwen3.6 dense/MoE MTP on CUDA/ROCm/CPU across SingleDevice,
-LocalTP, LocalPP, NodeLocalTP, ExpertOverlay. Keep under 6 KB.
+Scope: Qwen3.6 dense/MoE MTP on CUDA/ROCm/CPU across SingleDevice, LocalTP,
+LocalPP, NodeLocalTP, ExpertOverlay. Keep under 6 KB.
 
 RAG: **G** correct and speed-positive, **A** correct but slow/stale,
 **R** failing, speed-negative, or unproven. Fresh speed rows use bounded
@@ -12,22 +12,22 @@ RAG: **G** correct and speed-positive, **A** correct but slow/stale,
 Dense SingleDevice CUDA is green. ROCm dense is correct but still needs a full
 speed refresh. SingleDevice MoE correctness is restored after removing the
 unaccepted combined routed+shared verifier owner from production graph wiring.
-The accepted MoE verifier route is split branch-local math: routed experts use
-the grouped verifier pipeline; the shared expert uses standalone
-decode-equivalent GEMV-many plus the normal shared-gate combine.
+Accepted MoE verifier route: routed experts use grouped verifier; shared expert
+uses decode-equivalent GEMV-many plus normal shared-gate combine.
 
 Latest MoE stochastic fixed-d3 refresh:
-`benchmark_results/mtp_vllm_style/20260619T233454Z-moe-stochastic-gate-residency-reset-guard`.
-Acceptance stayed at `30/39` (`76.92%`) on both CUDA and ROCm. This slice
-added a semantic runtime-table reset regression and made shared-gate graph
-capture require a device-resident gate tensor after warmup.
+`20260620T005048Z-moe-stochastic-cuda-shared-concurrent`.
+Acceptance stayed at `30/39` (`76.92%`) on both GPUs. CUDA production shared
+FFN now quantizes activation once and overlaps shared gate/up GEMV on declared
+side-stream workspace; MTP is still speed-negative but CUDA improved from
+`74.82 tok/s`.
 
-Focused verifier FFN refresh after the reset guard:
+Focused verifier FFN refresh after the reset/workspace guards:
 `v2_perf_moe_verifier_prefill` CUDA gates are green. Routed M4 grouped verifier
-is `0.1068 ms` vs `9.6632 ms` row replay (`90.5x`); combined routed+shared
-upper-bound M4 is `0.1880 ms` vs `10.1835 ms` (`54.2x`). Production
-`SharedExpertFFNStage` all-codebook M=2/3/4 is exact under cos/L2/KLD/max_abs
-and stays speed-positive (`2.6x-5.5x` in the latest run).
+is `0.1062 ms` vs `9.6544 ms` row replay (`90.9x`); combined routed+shared
+upper-bound M4 is `0.1849 ms` vs `10.2789 ms` (`55.6x`). Production
+`SharedExpertFFNStage` M=2/3/4 all-codebook gates are exact under
+cos/L2/KLD/max_abs and speed-positive (`4.5x-8.1x`).
 
 ## Device And Topology Matrix
 
@@ -48,12 +48,11 @@ and stays speed-positive (`2.6x-5.5x` in the latest run).
 
 | Device | Baseline | Stoch fixed d3 | Acceptance | Main blocker | RAG |
 |---|---:|---:|---:|---|:---:|
-| CUDA | `138.70 tok/s` | `75.61 tok/s` (`0.55x`) | `30/39` | verifier forward `537.2 ms`; sidecar `43.0 ms`; distribution build `19.7 ms` | R |
-| ROCm | `83.43 tok/s` | `74.69 tok/s` (`0.90x`) | `30/39` | verifier forward `295.3 ms`; first-sidecar prelaunch `109.9 ms`; response wait `167.0 ms` | A/R |
+| CUDA | `138.11 tok/s` | `88.44 tok/s` (`0.64x`) | `30/39` | verifier `445.6 ms`; graph replay `181.5 ms`; stage body `144.2 ms`; dist build `19.6 ms` | R |
+| ROCm | `84.34 tok/s` | `68.01 tok/s` (`0.81x`) | `30/39` | verifier `523.6 ms`; graph replay `198.8 ms`; stage body `169.3 ms`; dist build `58.2 ms` | A/R |
 
-Regression note: the bad run
-`20260619T230340Z-moe-verifier-stage-refresh` collapsed acceptance to `2/45`
-on both GPUs. Root cause was production re-promotion of the combined
+Regression note: `20260619T230340Z-moe-verifier-stage-refresh` collapsed
+acceptance to `2/45` on both GPUs. Root cause was re-promotion of the combined
 routed+shared verifier owner despite existing strict full-model failures. The
 guard tests now require routed grouped verifier plus shared GEMV-many and assert
 that `mtp.moe_combined_decode_equivalent_verifier_prefill_rows` is absent.
@@ -79,10 +78,11 @@ the active bottleneck is verifier producer time.
   `MTPBenchmarkStyleDepth3LongPromptGreedyMatchesReference`.
 - CUDA/ROCm path guards passed and now reject the combined verifier counter.
 - CUDA/ROCm `MTPStochasticSamplingVerifierRuns` passed after the fix.
-- `V2_Unit_MoERuntimeTable` now proves histogram reset preserves placement
-  banks and captured runtime-table pointers.
-- `V2_Unit_PrefillGraphCapturability` now rejects shared-gate graph capture
+- `V2_Unit_MoERuntimeTable` proves histogram reset preserves placement banks.
+- `V2_Unit_PrefillGraphCapturability` rejects shared-gate graph capture
   until the effective gate tensor is device-resident on the stage device.
+- `V2_Unit_MoEExpertComputeStage` now proves CUDA M=2..4 shared-expert
+  verifier rows declare side-stream GEMV partial workspace structurally.
 - Shared-expert `SharedExpertFFNStage` M=2/3/4 all-codebook gates pass on
   CUDA/ROCm with cosine, relative L2, KLD, and max_abs checks.
 - The experimental lower-level shared-as-MoE prefill route is not accepted and
@@ -94,8 +94,10 @@ the active bottleneck is verifier producer time.
 
 1. Keep SingleDevice priority. CUDA/ROCm MoE MTP is correct enough to optimize
    but not speed-accepted.
-2. Attack full MoE verifier producer economics: routed expert FFN, shared FFN,
-   router, GDN/attention, and any remaining serial verifier stage.
+2. Attack full MoE verifier producer economics. Latest CUDA stage buckets are
+   GEMM `35.2 ms`, routed FFN `27.8 ms`, shared FFN `25.3 ms`, GDN projection
+   `17.5 ms`; latest ROCm buckets are routed FFN `48.7 ms`, router `15.4 ms`,
+   GDN projection `13.4 ms`, attention/recurrence about `10.8 ms`.
 3. Do not revive the combined routed+shared owner without strict L2, KLD,
    cosine, max_abs, token, and continuation proof.
 4. Prefer branch-side concurrent or fused decode-equivalent producers over graph
